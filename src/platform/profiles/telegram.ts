@@ -187,11 +187,87 @@ async function sendComposite(
 
 
 /**
- * Whether an inbound session is a forum-topic message (pure, for unit testing).
+ * Raw inbound topic fields, read off the Satori session (pure, for unit testing).
  *
- * The adapter reports a topic message as channel.id = bare message_thread_id with
- * guild.id = chat id, so guildId !== channelId and it is non-direct. A plain group
- * message has channel.id == chat.id == guild.id (equal); DMs are isDirect.
+ * Why this is needed at all: the adapter's decodeMessage assigns channel.id from a
+ * `chat.type === 'private'` branch that returns `chat.id` and NEVER looks at
+ * message_thread_id — the topic branch exists only for groups (lib/index.cjs). So for
+ * Bot API 9.4 private-chat topics (Feb 2026: forum topics inside a 1-on-1 DM), every
+ * topic collapses onto the same bare chat id and the thread is lost before agent-anywhere
+ * sees it. Telegram does send the fields — verified against live getUpdates:
+ *
+ *   {"chat":{"id":5865716608,"type":"private"},
+ *    "message_thread_id":7353,"is_topic_message":true}
+ *
+ * The adapter stashes the whole update via session.setInternal('telegram', update), which
+ * merges it onto `session.telegram` — so the dropped fields are still reachable here.
+ * This mirrors how hermes reads them (`chat_type == 'dm' and is_topic_message`).
+ */
+export function rawTopicFields(session: unknown): {
+  threadId?: string;
+  isTopicMessage: boolean;
+} {
+  const tg = (session as { telegram?: Record<string, unknown> } | undefined)?.telegram;
+  // The internal payload is the Update; the message may sit under any of these keys.
+  const msg = (tg?.message ??
+    tg?.edited_message ??
+    tg?.channel_post ??
+    tg?.edited_channel_post ??
+    // A callback_query (button click) carries its own nested message.
+    (tg?.callback_query as { message?: Record<string, unknown> } | undefined)?.message) as
+    | Record<string, unknown>
+    | undefined;
+  if (!msg) return { isTopicMessage: false };
+  const rawThread = msg.message_thread_id;
+  const threadId =
+    typeof rawThread === 'number' || typeof rawThread === 'string'
+      ? String(rawThread)
+      : undefined;
+  return { threadId, isTopicMessage: msg.is_topic_message === true };
+}
+
+/**
+ * Telegram's General/root topic id. A message in the DM root (outside any topic) either
+ * omits message_thread_id entirely or reports the General lane; treating General as a
+ * topic would give the root chat a composite id that differs from the plain chat id,
+ * splitting one conversation into two sessions.
+ */
+const TELEGRAM_GENERAL_TOPIC_ID = '1';
+
+/**
+ * Routing/outbound channel key for an inbound session (pure, for unit testing).
+ *
+ * THE single implementation of the composite rebuild, shared by inboundChannelId and by
+ * the button/command interaction paths. Those paths must agree with the message path:
+ * a button clicked inside a topic has to resolve to the same channel key as the message
+ * that posted the buttons, or a blocking `ask` never matches its pending request.
+ */
+export function topicAwareChannelId(session: {
+  guildId?: string;
+  channelId?: string;
+  isDirect?: boolean;
+}): string {
+  if (!isTopicSession(session)) return session.channelId ?? '';
+  const { threadId, isTopicMessage } = rawTopicFields(session);
+  if (isTopicMessage && threadId && session.guildId == null) {
+    // Private-chat topic: channelId IS the chat id (no guild exists).
+    return `${session.channelId}:${threadId}`;
+  }
+  // Group forum: chat id lives in guildId, the bare topic id in channelId.
+  return `${session.guildId}:${session.channelId}`;
+}
+
+
+/**
+ * Whether an inbound session is a topic message — group forum OR private-chat topic
+ * (pure, for unit testing).
+ *
+ * Two shapes, because the adapter reports them differently:
+ *  - group forum: channel.id is the BARE message_thread_id and guild.id is the chat id,
+ *    so guildId !== channelId and non-direct.
+ *  - private-chat topic (Bot API 9.4): channel.id is just the chat id and there is no
+ *    guild at all, so the only evidence is is_topic_message + message_thread_id on the
+ *    raw update.
  *
  * Single source of truth for both `isThread` and `inboundChannelId`: if these two
  * disagreed, a message would be routed as a thread but replied to as a plain channel
@@ -203,7 +279,10 @@ export function isTopicSession(session: {
   isDirect?: boolean;
 }): boolean {
   const { guildId, channelId } = session;
-  return Boolean(guildId && channelId && guildId !== channelId && !session.isDirect);
+  if (guildId && channelId && guildId !== channelId && !session.isDirect) return true;
+  // Private-chat topic: no guild, channelId == chat id; the raw update is the only witness.
+  const { threadId, isTopicMessage } = rawTopicFields(session);
+  return Boolean(isTopicMessage && threadId && threadId !== TELEGRAM_GENERAL_TOPIC_ID);
 }
 
 /**
@@ -307,19 +386,18 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
     },
 
     inboundChannelId(session) {
-      // Rebuild the composite `<chatId>:<topicId>` for forum-topic messages.
+      // Rebuild the composite `<chatId>:<topicId>` for topic messages.
       //
-      // This closes the gap that made topic replies land in the group's General channel: the
-      // adapter reports channel.id as the BARE message_thread_id, but sendMessage needs the
-      // chat id to address the API and the topic id to reach the topic. Echoing the bare id
-      // back used it as chat_id — a different chat entirely (or an API error). Emitting the
-      // composite here makes one id serve both routing and sending, and it round-trips through
+      // This closes the gap that made topic replies land outside the topic: the adapter
+      // reports a group-forum topic as the BARE message_thread_id, and drops the topic
+      // fields entirely for a private-chat topic — but sendMessage needs the chat id to
+      // address the API and the topic id to reach the lane. Emitting the composite here
+      // makes one id serve both routing and sending, and it round-trips through
       // decodeChannel() which every outbound path already calls.
       //
-      // Non-topic messages (DM, plain group) are returned unchanged: their channel.id is
-      // already a complete send target.
-      if (!isTopicSession(session)) return session.channelId ?? '';
-      return `${session.guildId}:${session.channelId}`;
+      // Non-topic messages (DM root, plain group) are returned unchanged: their
+      // channel.id is already a complete send target.
+      return topicAwareChannelId(session);
     },
 
     attachmentMeta() {
@@ -478,8 +556,7 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
       // channelId mirrors inboundChannelId so a click inside a forum topic resolves to the
       // same channel key as the message that sent the buttons (see mountSatoriButtonInteraction).
       mountSatoriButtonInteraction(ctx, 'telegram', emit, {
-        channelId: (session) =>
-          isTopicSession(session) ? `${session.guildId}:${session.channelId}` : session.channelId ?? '',
+        channelId: (session) => topicAwareChannelId(session),
       });
     },
 
@@ -508,9 +585,7 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
         // Same composite rebuild as inboundChannelId: a `/cmd` sent inside a forum topic arrives
         // with the bare topic_id, so the receipt (and the routed message) must carry the composite
         // or they land in the group's General channel instead of the topic.
-        const channelId = isTopicSession(session)
-          ? `${session.guildId}:${session.channelId}`
-          : session.channelId ?? '';
+        const channelId = topicAwareChannelId(session);
         emit({
           platform: 'telegram',
           channelId,

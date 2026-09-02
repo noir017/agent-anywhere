@@ -185,16 +185,17 @@ describe('lark profile delivery contract (send/edit reach Lark as converted mark
 
   it('sendMessage passes converted markdown to bot.sendMessage and returns the first id', async () => {
     const { bot, calls } = fakeBot();
-    const ref = await profile.sendMessage!(bot, 'oc_1', '# Title\nhello');
+    const ref = await profile.sendMessage!(bot, { channel: 'oc_1' }, '# Title\nhello');
     expect(calls.send).toHaveLength(1);
     expect(calls.send[0]).toEqual({ channelId: 'oc_1', content: '**Title**\nhello' });
-    expect(ref).toEqual({ channelId: 'oc_1', messageId: 'om_42' });
+    expect(ref).toEqual({ address: { channel: 'oc_1' }, messageId: 'om_42' });
   });
 
   it('editMessage passes converted markdown to bot.editMessage', async () => {
     const { bot, calls } = fakeBot();
-    await profile.editMessage!(bot, { channelId: 'oc_1', messageId: 'om_7' }, '## Sub');
+    await profile.editMessage!(bot, { address: { channel: 'oc_1' }, messageId: 'om_7' }, '## Sub');
     expect(calls.edit).toHaveLength(1);
+    // The fake records the raw bot.editMessage args, hence channelId (not an address).
     expect(calls.edit[0]).toEqual({ channelId: 'oc_1', messageId: 'om_7', content: '**Sub**' });
   });
 
@@ -202,7 +203,7 @@ describe('lark profile delivery contract (send/edit reach Lark as converted mark
     const { bot, calls } = fakeBot();
     await profile.editMessage!(
       bot,
-      { channelId: 'oc_1', messageId: 'om_1' },
+      { address: { channel: 'oc_1' }, messageId: 'om_1' },
       'intro\n\n| Name | Score |\n|------|-------|\n| Ada | 95 |'
     );
     const content = calls.edit[0]!.content;
@@ -215,8 +216,8 @@ describe('lark profile delivery contract (send/edit reach Lark as converted mark
     const md = '**bold**\n- a\n- b\n# Heading\n| K | V |\n|---|---|\n| a | 1 |';
     const a = fakeBot();
     const b = fakeBot();
-    await profile.sendMessage!(a.bot, 'oc_1', md);
-    await profile.editMessage!(b.bot, { channelId: 'oc_1', messageId: 'om_1' }, md);
+    await profile.sendMessage!(a.bot, { channel: 'oc_1' }, md);
+    await profile.editMessage!(b.bot, { address: { channel: 'oc_1' }, messageId: 'om_1' }, md);
     expect(a.calls.send[0]!.content).toBe(b.calls.edit[0]!.content);
   });
 });

@@ -19,7 +19,7 @@ describe('line profile capabilities', () => {
 describe('line reply push fallback (no cached replyToken)', () => {
   it('token miss ⇒ falls back to bot.sendMessage, returns the first message id', async () => {
     const profile = createLineProfile();
-    const ref: MessageRef = { channelId: 'U123', messageId: 'm1' };
+    const ref: MessageRef = { address: { channel: 'U123' }, messageId: 'm1' };
 
     const sendMessage = vi.fn().mockResolvedValue(['pushed-id']);
     const replyMessage = vi.fn();
@@ -30,7 +30,7 @@ describe('line reply push fallback (no cached replyToken)', () => {
     // No token: skip internal.replyMessage, use push; return the push message id.
     expect(replyMessage).not.toHaveBeenCalled();
     expect(sendMessage).toHaveBeenCalledWith('U123', 'Hello');
-    expect(out).toEqual({ channelId: 'U123', messageId: 'pushed-id' });
+    expect(out).toEqual({ address: { channel: 'U123' }, messageId: 'pushed-id' });
   });
 
   it('push fallback returns no id ⇒ tolerates empty string (no throw)', async () => {
@@ -39,14 +39,14 @@ describe('line reply push fallback (no cached replyToken)', () => {
     // consistency the push fallback now tolerates empty too (no sendForRef "no id ⇒
     // throw"). The old assertion froze the previous inconsistent behavior.
     const profile = createLineProfile();
-    const ref: MessageRef = { channelId: 'U123', messageId: 'm1' };
+    const ref: MessageRef = { address: { channel: 'U123' }, messageId: 'm1' };
     const bot = {
       sendMessage: vi.fn().mockResolvedValue([]),
       internal: { replyMessage: vi.fn() },
     } as unknown as Bot;
 
     const out = await profile.reply!(bot, ref, 'x');
-    expect(out).toEqual({ channelId: 'U123', messageId: '' });
+    expect(out).toEqual({ address: { channel: 'U123' }, messageId: '' });
   });
 });
 
@@ -64,7 +64,7 @@ describe('line profile delivery contract (text is flattened before send)', () =>
     const sendMessage = vi.fn().mockResolvedValue(['m-1']);
     const bot = { sendMessage, internal: { replyMessage: vi.fn() } } as unknown as Bot;
 
-    const ref = await profile.sendMessage!(bot, 'U123', MD);
+    const ref = await profile.sendMessage!(bot, { channel: 'U123' }, MD);
     expect(sendMessage).toHaveBeenCalledTimes(1);
     const sent = String(sendMessage.mock.calls[0]![1]);
     expect(sent).not.toMatch(/\*\*/);
@@ -72,14 +72,14 @@ describe('line profile delivery contract (text is flattened before send)', () =>
     expect(sent).not.toContain('|');
     expect(sent).toContain('Title');
     expect(sent).toContain('docs (https://x.com/a)');
-    expect(ref).toEqual({ channelId: 'U123', messageId: 'm-1' });
+    expect(ref).toEqual({ address: { channel: 'U123' }, messageId: 'm-1' });
   });
 
   it('reply push fallback flattens markdown before pushing', async () => {
     const sendMessage = vi.fn().mockResolvedValue(['m-2']);
     const bot = { sendMessage, internal: { replyMessage: vi.fn() } } as unknown as Bot;
 
-    await profile.reply!(bot, { channelId: 'U123', messageId: 'm0' }, '**hi** there');
+    await profile.reply!(bot, { address: { channel: 'U123' }, messageId: 'm0' }, '**hi** there');
     const sent = String(sendMessage.mock.calls[0]![1]);
     expect(sent).toBe('hi there');
   });

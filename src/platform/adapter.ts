@@ -114,6 +114,14 @@ export interface PlatformCapabilities {
    */
   maxSlashCommands?: number;
   /**
+   * Whether a received slash command MUST be answered to close out the platform's interaction
+   * (Discord: the adapter auto-emits a DEFERRED response and the UI shows "the application did not
+   * respond" until a followup lands, so the daemon sends a short receipt). Telegram-style platforms
+   * deliver slash as an ordinary message with nothing to close, where that receipt is pure noise —
+   * the real reply is already coming. Absent/undefined treated as false.
+   */
+  slashNeedsAck?: boolean;
+  /**
    * Whether the platform supports purely-runtime slash registration (no manual out-of-band step).
    * Absent/undefined treated as true, compatible with all existing profiles (Discord
    * bulkOverwrite, Telegram setMyCommands are both runtime). Slack explicitly false: its slash

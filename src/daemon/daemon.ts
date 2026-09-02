@@ -466,9 +466,8 @@ export class Daemon {
 
   /**
    * Native slash command: the daemon doesn't interpret it; it synthesizes a `/<name> <input>` inbound
-   * message for the agent (command semantics, /help, etc. are the agent's job). ev.reply only consumes
-   * the interaction (some platforms, e.g. Discord, auto-defer and need one followup), best-effort;
-   * the real answer streams back via the normal channel.
+   * message for the agent (command semantics, /help, etc. are the agent's job). The real answer
+   * streams back via the normal channel.
    */
   private onCommand(ev: CommandInteraction): void {
     console.log(`[slash] received native command /${ev.name} (${ev.platform} ch=${ev.channelId})`);
@@ -488,10 +487,15 @@ export class Daemon {
       mentionedSelf: true,
     };
     this.onInbound(msg);
-    // Consume the interaction (best-effort; failures only logged). Short receipt, no command semantics.
-    void ev.reply(`▸ /${ev.name}`).catch((e) =>
-      console.error('[slash] interaction acknowledgement failed:', e instanceof Error ? e.message : e)
-    );
+    // Acknowledge only where the platform requires it to close out the interaction (Discord's
+    // auto-DEFERRED response needs a followup or the UI reads "the application did not respond").
+    // Where slash arrives as an ordinary message the receipt is pure noise — the agent's own reply
+    // is already on its way — so it is skipped. Best-effort; failures only logged.
+    if (this.platforms.get(ev.platform)?.capabilities.slashNeedsAck) {
+      void ev.reply(`▸ /${ev.name}`).catch((e) =>
+        console.error('[slash] interaction acknowledgement failed:', e instanceof Error ? e.message : e)
+      );
+    }
   }
 
   /** A session's agent reported its command list: record it (empty clears the entry), then debounce re-register. */

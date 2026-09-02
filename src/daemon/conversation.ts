@@ -253,10 +253,14 @@ export class ConversationRegistry {
 
     let state = this.conversations.get(key);
     if (!state) {
-      // First sight of this conversation: the pipeline chooses its INITIAL agent, unless a previous
-      // daemon run already bound one — a restart must not silently move the conversation to
-      // routing.default and strand the agent that was mid-task.
-      const agentId = this.store?.boundAgent(key) ?? choice.agentId;
+      // First sight of this conversation in THIS daemon run. Precedence:
+      //  1. an explicit `/oc` — the user just said who they want, and that outranks everything;
+      //  2. a binding persisted by a previous run — a restart must not silently move the
+      //     conversation to routing.default and strand the agent that was mid-task;
+      //  3. the pipeline / routing.default.
+      // Order matters: reading the store first would make the first message after a restart
+      // ignore its own `/cc` prefix and answer as whoever was bound before.
+      const agentId = choice.explicit ? choice.agentId : (this.store?.boundAgent(key) ?? choice.agentId);
       state = {
         merger: this.buildMerger(key),
         agentId,

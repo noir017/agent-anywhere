@@ -72,7 +72,7 @@ const clock = {
 const drain = (): Promise<void> => new Promise((r) => setTimeout(r, 20));
 
 /** Rig: records outbound text, the prompts that reached an agent, and picker hook calls. */
-function rig(cfg: Config = baseConfig) {
+function rig(cfg: Config = baseConfig, persistedAgent?: string) {
   const prompts: Array<{ sessionId: string; prompt: string }> = [];
   const sessions = new Map<string, AgentSession>();
   const factory: AgentFactory = {
@@ -115,9 +115,9 @@ function rig(cfg: Config = baseConfig) {
     factory,
     clock,
     { onPickerRequest: (sessionId, agentId) => void pickerCalls.push({ sessionId, agentId }) },
-    // Store stub: no persisted bindings, and writes are ignored.
+    // Store stub. `persistedAgent` simulates a binding left by a previous daemon run.
     {
-      boundAgent: () => undefined,
+      boundAgent: () => persistedAgent,
       bind: () => {},
       agentSession: () => undefined,
       setAgentSession: () => {},
@@ -331,5 +331,34 @@ describe('sticky agent binding (the reported bug)', () => {
       expect(p.sessionId).toBe(KEY);
       expect(p.sessionId).not.toMatch(/\b(oc|cc)\b/);
     }
+  });
+});
+
+/**
+ * What happens on the FIRST message after a restart.
+ *
+ * In-memory state is gone but conversations.json is not, so `route()` has to choose between the
+ * persisted binding and whatever this message asks for. Both directions matter and they pull
+ * opposite ways, which is why each gets a case.
+ */
+describe('first message after a restart', () => {
+  it('an explicit /cc outranks the persisted binding', async () => {
+    // The user just said who they want. Reading the store first would make this message answer as
+    // whoever was bound before and ignore its own prefix.
+    const { send, sent } = rig(baseConfig, 'oc');
+    await send('/cc hello');
+    // No rebind notice: this is the conversation's first binding in this run, not a switch.
+    expect(sent.some((t) => t.includes('is answering this conversation now'))).toBe(false);
+    // The header names who actually took it.
+    expect(sent.some((t) => t.includes('🤖 claude'))).toBe(true);
+    expect(sent.some((t) => t.includes('🤖 opencode'))).toBe(false);
+  });
+
+  it('a plain message resumes the persisted agent, not routing.default', async () => {
+    const { send, sent } = rig(baseConfig, 'oc');
+    await send('continue where we left off');
+    // routing.default is cc; the persisted binding must win.
+    expect(sent.some((t) => t.includes('🤖 opencode'))).toBe(true);
+    expect(sent.some((t) => t.includes('🤖 claude'))).toBe(false);
   });
 });

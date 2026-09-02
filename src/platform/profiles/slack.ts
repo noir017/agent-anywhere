@@ -496,6 +496,15 @@ export function createSlackProfile(): PlatformProfile<SlackPlatformConfig> {
       return false;
     },
 
+    decodeChannelKey(channelId) {
+      // Slack carries the same composite shape as Telegram (`<channel>:<thread_ts>`, produced by
+      // createThread), so it inherits the same latent gap: satori-core's generic deleteMessage /
+      // fetchHistory / sendFile would otherwise pass the whole key to bot.* as a channel id.
+      // Declaring the inverse fixes all three at once — no Slack-specific work needed.
+      const { channel, threadTs } = decodeChannel(channelId);
+      return { channelId: channel, lane: threadTs };
+    },
+
     attachmentMeta() {
       return slackAttachmentMeta();
     },

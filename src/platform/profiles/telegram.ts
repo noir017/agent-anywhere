@@ -6,9 +6,10 @@
 // Adapter behaviors relied on (verified against adapter src/.d.ts + lib/index.cjs):
 // - TelegramBot.inject=['http'] (even for polling), so install must ctx.plugin(HttpService) first.
 // - reply: <quote id=...> -> reply_to_message_id (message.ts 'quote' branch).
-// - buttons: <button id=X>label</button> -> inline keyboard callback_data:X; click arrives via
-//   'interaction/button' (session.event.button.id===callback_data); adapter auto-answers the
-//   callback query. callback_data is capped at 64 bytes.
+// - buttons: an inline keyboard is posted via internal.sendMessage's reply_markup (NOT the Satori
+//   <button> encoder, which would route through the adapter and mangle a composite channel id);
+//   the click arrives as 'interaction/button' with session.event.button.id === callback_data, and
+//   the adapter auto-answers the callback query. callback_data is capped at 64 bytes.
 // - slash: bot.updateCommands -> internal.setMyCommands (gated by config.slash). Inbound
 //   /cmd@bot args arrives as 'interaction/command' with session.content rewritten to
 //   `command + rest` and NO structured argv.options -- must split from content ourselves.
@@ -19,7 +20,8 @@
 //   the thread before we see it; the raw update survives on session.telegram (setInternal), which
 //   is where rawTopicFields recovers it. Group topics arrive as a BARE message_thread_id in
 //   channel.id with the chat id in guild.id.
-import { h } from '@satorijs/core';
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
 import TelegramAdapter from '@satorijs/adapter-telegram';
 import type { Bot, Session, Universal } from '@satorijs/core';
 
@@ -32,7 +34,6 @@ import {
   installHttpService,
   mountSatoriButtonInteraction,
   resolveDefaultPlugin,
-  sendForRef,
   splitCompositeChannel,
 } from '../profile-helpers.js';
 import {
@@ -127,7 +128,10 @@ interface TelegramInternal {
     message_thread_id?: number;
     text: string;
     parse_mode?: string;
+    reply_to_message_id?: number;
+    reply_markup?: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
   }): Promise<{ message_id?: number }>;
+  sendDocument(payload: FormData): Promise<{ message_id?: number }>;
   editMessageText(payload: {
     chat_id: string | number;
     message_id: number;
@@ -149,11 +153,10 @@ interface TelegramHttp {
  * (message_thread_id). Plain (no `:`): the whole string is chatId, topicId undefined.
  * edit/react only need chat_id + message_id, so they use this just to extract chatId.
  *
- * Known gap: satori-core's deleteMessage / fetchHistory do NOT go through profile overrides and
- * pass channelId straight to bot.deleteMessage / bot.getMessageList. Our sendMessage override
- * returns a real (non-composite) chatId, so autoThread-generated refs never carry a composite
- * key; only directly using createThread's composite threadId for delete/fetchHistory would hit
- * one (a rare path). Properly supporting it needs core-side decoding or override seams; deferred.
+ * Exposed to satori-core through `decodeChannelKey`, which is what closed the gap this comment
+ * used to describe: the generic deleteMessage / fetchHistory / sendFile paths don't go through a
+ * profile override, so they passed the composite key straight to `bot.*`. Core now decodes via
+ * the seam, so those paths see a real chat id like every other.
  */
 export function decodeChannel(channelId: string): { chatId: string; topicId?: string } {
   const { head, tail } = splitCompositeChannel(channelId);
@@ -161,18 +164,28 @@ export function decodeChannel(channelId: string): { chatId: string; topicId?: st
 }
 
 /**
- * Composite-aware raw send (pure plumbing, shared by the sendMessage override and the
- * slash-command receipt).
+ * Composite-aware raw send — THE single outbound text path for this profile (sendMessage, reply,
+ * sendButtons and the slash-command receipt all go through it).
  *
  * MUST be used instead of `bot.sendMessage` / `sendForRef` for any channelId that may be
- * composite: those call the adapter, which treats the whole `<chatId>:<topicId>` string as
- * chat_id and either targets the wrong chat or errors out. Decoding here is what actually
- * routes a message into a forum topic.
+ * composite: those call the adapter, whose encoder computes `chat_id = session.guildId ||
+ * channelId`. On an outbound-only send there is no inbound session, so the whole
+ * `<chatId>:<topicId>` string becomes chat_id and Telegram answers 400 `chat not found`. That is
+ * precisely how `ask` buttons went missing inside a topic: the send threw, and the daemon sat on
+ * the pending ask until it timed out. Decoding here is what actually routes into a forum topic.
+ *
+ * `extra` carries the per-caller payload (reply_to_message_id, reply_markup) so that adding a new
+ * outbound kind means passing a field here, not writing a fresh send path that can forget to
+ * decode — the omission this function exists to prevent.
  */
 async function sendComposite(
   bot: Bot,
   channelId: string,
-  text: string
+  text: string,
+  extra: {
+    replyToMessageId?: string;
+    buttons?: Array<{ id: string; label: string }>;
+  } = {}
 ): Promise<{ channelId: string; messageId: string }> {
   const { chatId, topicId } = decodeChannel(channelId);
   const internal = bot.internal as unknown as TelegramInternal;
@@ -181,6 +194,20 @@ async function sendComposite(
     ...(topicId != null ? { message_thread_id: Number(topicId) } : {}),
     text: fragmentToTelegramHtml(renderTelegramMarkdown(text)),
     parse_mode: 'HTML',
+    ...(extra.replyToMessageId != null
+      ? { reply_to_message_id: Number(extra.replyToMessageId) }
+      : {}),
+    // One button per row: labels are agent-authored and can be long, and Telegram squeezes a
+    // shared row into unreadable slivers. callback_data is capped at 64 bytes (encodeCallbackData).
+    ...(extra.buttons?.length
+      ? {
+          reply_markup: {
+            inline_keyboard: extra.buttons.map((b) => [
+              { text: b.label, callback_data: encodeCallbackData(b.id) },
+            ]),
+          },
+        }
+      : {}),
   });
   const messageId = msg?.message_id;
   if (messageId == null) {
@@ -394,6 +421,13 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
       return topicAwareChannelId(session);
     },
 
+    decodeChannelKey(channelId) {
+      // Declared inverse of inboundChannelId, so satori-core's generic outbound paths
+      // (deleteMessage / fetchHistory / sendFile) never hand a composite key to the adapter.
+      const { chatId, topicId } = decodeChannel(channelId);
+      return { channelId: chatId, lane: topicId };
+    },
+
     attachmentMeta() {
       // Telegram element attrs come from $getFileFromId, which gives only a temporary src
       // (+ document filename) with NO mime/size. Return empty; the download/inject layer falls
@@ -402,15 +436,10 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
     },
 
     async reply(bot, ref, text) {
-      // <quote id=...> -> reply_to_message_id, i.e. Telegram's native quoted reply. The body is
-      // markdown-rendered to Satori nodes (bold/code/links/etc.) before the quote element.
-      return sendForRef(
-        bot,
-        ref.channelId,
-        [h('quote', { id: ref.messageId }), ...renderTelegramMarkdown(text)],
-        'telegram',
-        'reply'
-      );
+      // reply_to_message_id = Telegram's native quoted reply. Routed through sendComposite (not
+      // sendForRef) so a reply inside a forum topic keeps its message_thread_id — via the adapter
+      // the composite key would land as chat_id and be rejected.
+      return sendComposite(bot, ref.channelId, text, { replyToMessageId: ref.messageId });
     },
 
     async createThread(bot, ref, name) {
@@ -442,6 +471,34 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
       // which Telegram rejects/garbles. Rendering to HTML ourselves (fragmentToTelegramHtml) and editing
       // via internal.editMessageText keeps the streaming first-send and subsequent-edits consistent.
       return sendComposite(bot, channelId, text);
+    },
+
+    async sendFile(bot, channelId, file, lane) {
+      // Override exists because the generic encoder reads message_thread_id off the INBOUND
+      // session, which an outbound-only send has none of — so a file could never reach a topic
+      // that way. Upload multipart exactly as the adapter does (internal.sendDocument with an
+      // `attach://` reference), adding the lane explicitly.
+      //
+      // Fields are appended only when present: FormData stringifies undefined to the literal
+      // "undefined", which Telegram rejects.
+      const internal = bot.internal as unknown as TelegramInternal;
+      const name = file.name ?? path.basename(file.path);
+      const data = await readFile(file.path);
+      const form = new FormData();
+      form.append('chat_id', channelId);
+      if (lane != null) form.append('message_thread_id', lane);
+      if (file.caption) {
+        form.append('caption', fragmentToTelegramHtml(renderTelegramMarkdown(file.caption)));
+        form.append('parse_mode', 'HTML');
+      }
+      form.append('document', `attach://${name}`);
+      form.append(name, new Blob([new Uint8Array(data)]), name);
+      const msg = await internal.sendDocument(form);
+      const messageId = msg?.message_id;
+      if (messageId == null) {
+        throw new Error(`[telegram] sendFile did not return a message id (channel=${channelId})`);
+      }
+      return { channelId, messageId: String(messageId) };
     },
 
     async addReaction(bot, ref, emoji) {
@@ -489,23 +546,12 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
     },
 
     async sendButtons(bot, channelId, text, buttons) {
-      // h('button',{id}) without a type makes callback_data===id. callback_data is capped at 64
-      // bytes, so encodeCallbackData encodes safely (truncate + hash); on click,
-      // session.event.button.id is this encoded value, which mountButtonEvents echoes back -- closing the loop.
-      const group = h(
-        'button-group',
-        {},
-        buttons.map((b) => h('button', { id: encodeCallbackData(b.id) }, b.label))
-      );
-      // Markdown-render the leading text, then append the inline-keyboard group (renderTelegramMarkdown
-      // returns [] for empty text, so this also covers the no-text case).
-      return sendForRef(
-        bot,
-        channelId,
-        [...renderTelegramMarkdown(text), group],
-        'telegram',
-        'sendButtons'
-      );
+      // THE reported bug: this used sendForRef -> bot.sendMessage, so inside a forum topic the
+      // composite key reached the adapter as a literal chat_id and Telegram rejected the send with
+      // 400. The `ask` message never appeared and the daemon blocked until the ask timed out —
+      // from the user's side, the options simply never showed up. Now posted through the same
+      // decoding path as every other send, with the inline keyboard attached.
+      return sendComposite(bot, channelId, text, { buttons });
     },
 
     async typing(bot, channelId) {

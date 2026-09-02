@@ -167,6 +167,19 @@ export async function createSatoriAdapter(
   const inboundChannel = (session: Session): string =>
     profile.inboundChannelId?.(session) ?? session.channelId ?? '';
 
+  /**
+   * Split an outbound routing key into the platform's real channel + optional sub-lane, via
+   * profile.decodeChannelKey (identity when the profile declares none).
+   *
+   * Applied to every Satori-GENERIC outbound path below, because those hand channelId straight
+   * to `bot.*` and the adapter treats the whole string as its chat id — a composite key
+   * (`<chat>:<topic>`) then reaches the API verbatim and is rejected. Profile overrides
+   * (sendMessage/editMessage/…) receive the key UNDECODED: decoding is their own business and
+   * they already do it, so decoding here too would strip the lane they need.
+   */
+  const outboundChannel = (channelId: string): { channelId: string; lane?: string } =>
+    profile.decodeChannelKey?.(channelId) ?? { channelId };
+
   /** session → InboundMessage. */
   const toInbound = (session: Session): InboundMessage => {
     const { text, attachments } = normalizeElements(session.elements);
@@ -346,10 +359,20 @@ export async function createSatoriAdapter(
     },
 
     async deleteMessage(ref) {
-      await getBot().deleteMessage(ref.channelId, ref.messageId);
+      // Generic path: decode first, or a composite key reaches the adapter as a literal chat id.
+      const { channelId } = outboundChannel(ref.channelId);
+      await getBot().deleteMessage(channelId, ref.messageId);
     },
 
     async sendFile(channelId, file) {
+      // Decode before either path: the generic encoder can't parse a composite key, and the
+      // profile override wants the lane separated out.
+      const { channelId: chat, lane } = outboundChannel(channelId);
+      // Profile override takes precedence: a sub-lane (Telegram forum topic) can't be expressed
+      // through the generic encoder, which reads the thread only off an inbound session.
+      if (profile.sendFile) {
+        return profile.sendFile(getBot(), chat, file, lane);
+      }
       // Send a local file via Satori elements: a file:// URL points at a local path and the
       // encoder uploads it as an attachment. caption becomes the message text.
       const fileUrl = file.path.startsWith('file:') ? file.path : `file://${file.path}`;
@@ -357,12 +380,12 @@ export async function createSatoriAdapter(
       if (file.caption) fragment.push(h.text(file.caption));
       // h.file(url, attrs): title controls the displayed file name.
       fragment.push(h.file(fileUrl, file.name ? { title: file.name } : {}));
-      const ids = await getBot().sendMessage(channelId, fragment);
+      const ids = await getBot().sendMessage(chat, fragment);
       const messageId = ids[0];
       if (!messageId) {
-        throw new Error(`[${profile.type}] sendFile did not return a message id (channel=${channelId})`);
+        throw new Error(`[${profile.type}] sendFile did not return a message id (channel=${chat})`);
       }
-      return { channelId, messageId };
+      return { channelId: chat, messageId };
     },
 
     async addReaction(ref, emoji) {
@@ -400,8 +423,12 @@ export async function createSatoriAdapter(
       // bot.getMessageList(channelId, next?/messageId?, direction, limit?, order):
       // 2nd arg is the pagination anchor messageId; direction='before' fetches older history,
       // order='asc' returns data in chronological order. Returns { data: Universal.Message[], ... }.
-      const res = await getBot().getMessageList(channelId, opts.before, 'before', opts.limit, 'asc');
-      return res.data.map((m) => messageToInbound(channelId, m));
+      // Generic path, so decode first (see outboundChannel). History is per-channel on every
+      // platform here — a sub-lane can't be filtered server-side, so the lane is dropped and
+      // results carry the decoded channel.
+      const { channelId: chat } = outboundChannel(channelId);
+      const res = await getBot().getMessageList(chat, opts.before, 'before', opts.limit, 'asc');
+      return res.data.map((m) => messageToInbound(chat, m));
     },
 
     async start() {

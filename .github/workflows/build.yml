@@ -1,0 +1,58 @@
+name: Build
+
+# Upstream `ci.yml` is a quality gate only — it uploads a coverage report and no
+# installable artifact. This workflow adds the packaging step: same gates first
+# (a tarball that fails typecheck/lint/tests is not worth installing), then
+# `npm pack` so the exact CI-built tarball can be fetched with `gh run download`
+# and installed with `npm i -g`.
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # `npm ci` (not `npm install`): installs strictly from package-lock.json, so
+      # the toolchain here can't drift from what upstream CI validated.
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      # `npm pack` emits the same tarball `npm publish` would, so what gets installed
+      # on the target is byte-identical to a real release build. --pack-destination
+      # keeps it out of the repo root.
+      - name: Pack tarball
+        run: |
+          mkdir -p dist-pack
+          npm pack --pack-destination dist-pack
+
+      # Print the digest so the tarball installed on the target can be verified
+      # against what CI actually produced.
+      - name: Show artifact digest
+        run: |
+          ls -l dist-pack/
+          sha256sum dist-pack/*.tgz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-anywhere-tarball
+          path: dist-pack/*.tgz
+          if-no-files-found: error

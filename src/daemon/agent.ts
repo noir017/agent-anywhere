@@ -22,6 +22,30 @@ export interface AgentStreamHandlers {
    * The daemon registers native platform slash from it.
    */
   onAvailableCommands?(cmds: AgentCommand[]): void;
+  /**
+   * Agent reports live context usage (ACP `usage_update`): tokens currently in context and the
+   * window size. Optional — a harness that never sends it leaves the footer's context segment
+   * absent rather than showing a guessed number.
+   *
+   * Sent repeatedly within a turn (claude-agent-acp emits one mid-stream per assistant message and
+   * one at turn end); each is a full snapshot, so consumers overwrite rather than accumulate.
+   */
+  onUsage?(usage: AgentUsage): void;
+  /**
+   * The model actually serving this session, as the harness reports it (ACP session config option
+   * `model`). More accurate than config: the `claude` harness takes its model from ANTHROPIC_MODEL
+   * and resolves aliases like `opus[1m]` internally, so only the harness knows the concrete model.
+   * Fired once after session startup and again on any `config_option_update`.
+   */
+  onModel?(model: string): void;
+}
+
+/** Live context usage from the agent (ACP UsageUpdate: `used` / `size`). */
+export interface AgentUsage {
+  /** Tokens currently in context. */
+  used: number;
+  /** Total context window size in tokens. */
+  size: number;
 }
 
 export interface RunTurnInput {

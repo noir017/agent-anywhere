@@ -8,6 +8,7 @@ import { client, ndJsonStream, PROTOCOL_VERSION } from '@agentclientprotocol/sdk
 import type {
   ActiveSession,
   ClientConnection,
+  ClientContext,
 } from '@agentclientprotocol/sdk';
 import type {
   ContentBlock,
@@ -15,6 +16,7 @@ import type {
   PermissionOption,
   RequestPermissionRequest,
   RequestPermissionResponse,
+  SessionConfigOption,
   SessionUpdate,
 } from '@agentclientprotocol/sdk';
 import type { AgentDef, Config } from '../config/schema.js';
@@ -167,6 +169,119 @@ export function createAcpAgentFactory(cfg: Config, socketPath: string, store?: S
 /** Thrown by the per-turn silence watchdog so runTurn can reap the hung subprocess before rethrowing. */
 class TurnTimeoutError extends Error {}
 
+/**
+ * Pull the live model's display name out of an ACP `configOptions` list (as returned by session/new
+ * and refreshed by `config_option_update`).
+ *
+ * Why bother, when the config already names a model: for some agents it doesn't. The `claude` harness
+ * takes its model from the ANTHROPIC_MODEL env var (the only source that survives Claude Code
+ * rewriting settings.model), so `agents[].model` is empty and the config knows only an alias like
+ * `opus[1m]` — never the concrete model actually serving the turn. The harness resolves that alias
+ * itself and reports the result here, so this is the only accurate source.
+ *
+ * Shape (SessionConfigOption): the model selector is `{id:'model', type:'select', currentValue,
+ * options}` where options are either flat SessionConfigSelectOption[] or grouped
+ * SessionConfigSelectGroup[] ({group, options}). Returns undefined when the agent exposes no model
+ * selector; falls back to the raw `currentValue` when the option isn't listed at all (an
+ * allowlisted-but-unlisted model still reports a currentValue).
+ *
+ * Label choice: prefer the option's human-readable `name`, but only when it doesn't LOSE information
+ * the id carries. The claude harness is inconsistent here — its option list labels `sonnet[1m]` as
+ * "Sonnet 5 (1M context)" but `opus[1m]` as plain "Opus", so taking `name` verbatim would report a
+ * 1M-context Opus session as merely "Opus" while the footer's own context segment reads `/ 1M`.
+ * Since a bare number in the name ("Sonnet 5") is not the same claim as a context qualifier, the
+ * check is specifically for the id's bracketed suffix (`[1m]`), which is the part that changes what
+ * the model IS rather than how it's spelled.
+ */
+export function liveModelName(options: SessionConfigOption[] | null | undefined): string | undefined {
+  const opt = options?.find((o) => o.id === MODEL_CONFIG_ID);
+  if (!opt || opt.type !== 'select') return undefined;
+  const current = opt.currentValue;
+  if (typeof current !== 'string' || current.length === 0) return undefined;
+  // Flatten grouped options so both shapes are searched the same way.
+  const flat = opt.options.flatMap((entry) =>
+    'group' in entry ? entry.options : [entry]
+  );
+  const name = flat.find((o) => o.value === current)?.name;
+  if (!name) return current;
+  return nameKeepsQualifiers(name, current) ? name : current;
+}
+
+/**
+ * Whether `name` still conveys every bracketed qualifier present in the option `id` (e.g. `[1m]`).
+ * Compared loosely — bracket-free and case-insensitive — so "Sonnet 5 (1M context)" counts as
+ * carrying `[1m]`, while a bare "Opus" does not carry it for id `opus[1m]`.
+ */
+function nameKeepsQualifiers(name: string, id: string): boolean {
+  const haystack = name.toLowerCase().replace(/[[\]()\s]/g, '');
+  return [...id.matchAll(/\[([^\]]+)\]/g)].every((m) =>
+    haystack.includes(m[1]!.toLowerCase().replace(/\s/g, ''))
+  );
+}
+
+/** ACP's well-known id for the model selector among a session's config options. */
+const MODEL_CONFIG_ID = 'model';
+
+/**
+ * Enforce `agents[].model` on a freshly created session, returning the resulting live model name
+ * (undefined when nothing was applied, so the caller keeps what session/new reported).
+ *
+ * Why this exists: session/new carries the model only as a `_meta.model` hint, which the spec lets
+ * an agent ignore — and opencode does. Verified against the deployed harness: with
+ * `_meta.model: 'anthropic/claude-opus-5'` it still reported `opencode/big-pickle` (its own
+ * default), while `session/set_config_option` set it correctly. So a configured model was silently
+ * not taking effect, and the only visible symptom was the footer naming a model nobody asked for.
+ *
+ * Best-effort by design — a harness with no model selector, an unknown model id, or an agent that
+ * rejects the request must not fail the turn. Anything unexpected is logged once and the session
+ * proceeds on whatever the harness chose, which is strictly better than refusing to answer. The
+ * mismatch stays visible in the footer either way.
+ */
+async function applyModelPreference(
+  ctx: ClientContext,
+  session: ActiveSession,
+  def: AgentDef
+): Promise<string | undefined> {
+  const want = def.model;
+  if (!want) return undefined;
+
+  const opt = (session.newSessionResponse?.configOptions ?? []).find((o) => o.id === MODEL_CONFIG_ID);
+  // No model selector at all (the claude harness pins its model via ANTHROPIC_MODEL instead):
+  // nothing to set, and saying so at debug avoids a scary warning for a supported setup.
+  if (!opt || opt.type !== 'select') {
+    console.debug(`[acp] agent "${def.id}" exposes no model selector; leaving model.${want ? ` (configured "${want}" applies only if the harness reads it elsewhere)` : ''}`);
+    return undefined;
+  }
+  if (opt.currentValue === want) return undefined; // already correct — don't spend a round trip
+
+  // Only offer ids the agent actually lists; a typo would otherwise surface as an opaque rejection.
+  const offered = opt.options.flatMap((entry) => ('group' in entry ? entry.options : [entry]));
+  if (offered.length > 0 && !offered.some((o) => o.value === want)) {
+    console.warn(
+      `[acp] agent "${def.id}": configured model "${want}" is not among the models it offers; ` +
+        `continuing with "${opt.currentValue}". Available: ${offered.map((o) => o.value).join(', ')}`
+    );
+    return undefined;
+  }
+
+  try {
+    const res = await ctx.request('session/set_config_option', {
+      sessionId: session.sessionId,
+      configId: MODEL_CONFIG_ID,
+      value: want,
+    });
+    const applied = liveModelName(res?.configOptions);
+    console.log(`[acp] agent "${def.id}": model set to "${want}"`);
+    return applied;
+  } catch (err) {
+    console.warn(
+      `[acp] agent "${def.id}": could not set model "${want}" (${err instanceof Error ? err.message : err}); ` +
+        `continuing with "${opt.currentValue}"`
+    );
+    return undefined;
+  }
+}
+
 function createAcpSession(
   def: AgentDef,
   socketPath: string,
@@ -185,6 +300,12 @@ function createAcpSession(
   let hintInjected = false;
   /** Intentional-abort flag: set by abort(); used to return silently when prompt ends as cancelled. */
   let aborting = false;
+  /**
+   * Model the harness reports as actually serving this session (from the session/new or session/load
+   * config options). Undefined when the agent exposes no model selector; the footer then falls back
+   * to the configured value. Cleared on dispose so a rebuilt child re-reports.
+   */
+  let liveModel: string | undefined;
 
   /**
    * Reset the three connection handles to undefined (without killing the process). Shared by the child
@@ -196,6 +317,9 @@ function createAcpSession(
     proc = undefined;
     conn = undefined;
     active = undefined;
+    // The next child re-reports its own model; keeping a stale name would misattribute the footer
+    // if the rebuilt session resolves a different one.
+    liveModel = undefined;
   }
 
   /** Max wait for initialize + session/new after spawn; on timeout, treat spawn as failed (ENOENT etc.) instead of hanging. */
@@ -316,12 +440,14 @@ function createAcpSession(
         ).attachSession.bind(ctx);
         const resumed = attach({ sessionId: persistedId });
         try {
-          await ctx.request('session/load', {
+          const loaded = await ctx.request('session/load', {
             sessionId: persistedId,
             cwd,
             mcpServers: acpMcpServers(def, socketPath),
           });
           active = resumed;
+          // session/load reports the resumed session's config the same way session/new does.
+          liveModel = liveModelName(loaded?.configOptions);
           console.log(`[acp] resumed persisted session for "${def.id}" (${persistedId})`);
         } catch (err) {
           // Stored id no longer loadable (history pruned, cwd moved, harness downgraded): start fresh.
@@ -344,6 +470,10 @@ function createAcpSession(
           })
           .start();
         active = session; // active set = "ready": assigned last so a half-ready session isn't reused
+        liveModel = liveModelName(session.newSessionResponse?.configOptions);
+        // _meta.model above is a hint some harnesses ignore (verified: opencode reports its own
+        // default regardless), so enforce the choice through the protocol's own setter.
+        liveModel = (await applyModelPreference(ctx, session, def)) ?? liveModel;
         store?.set(sessionId, session.sessionId); // remember for post-restart session/load resume
       } catch (err) {
         // session/new returning auth_required (un-logged-in harness) surfaces as an opaque reject. Build
@@ -405,6 +535,12 @@ function createAcpSession(
         toolLedger: new Map(),
         toolIndexSeq: 0,
       };
+
+      // Report the live model up front, from the session/new response captured at startup. Doing it
+      // here rather than inside ensureStarted keeps it per-turn: handlers belong to this turn, and a
+      // session started on an earlier turn would otherwise never report its model to a later one.
+      // config_option_update supersedes this if the model changes mid-session.
+      if (liveModel) handlers.onModel?.(liveModel);
 
       // The SDK updates queue is bound to the whole session, not cleared per turn (prompt() only
       // clearErrors, keeping values). After last turn's cancel, the agent may still emit a late
@@ -589,10 +725,38 @@ export function translateUpdate(u: SessionUpdate, st: TurnState): void {
       break;
     }
 
+    // Live context usage: tokens in context + window size. Both are the harness's own numbers
+    // (claude-agent-acp reads them from the SDK's context tally and learns the real window from the
+    // model's reported capabilities), so the footer never has to guess a limit. Emitted several
+    // times per turn as full snapshots — the consumer keeps the latest.
+    case 'usage_update': {
+      ingestUsage(st, u.used, u.size);
+      break;
+    }
+
+    // The agent's session config changed (model / mode / effort picker). Only the model interests
+    // us: re-read it so a mid-session model switch is reflected in the footer.
+    case 'config_option_update': {
+      const model = liveModelName(u.configOptions);
+      if (model) st.handlers.onModel?.(model);
+      break;
+    }
+
     // agent_thought_chunk / plan* / *_update etc.: not rendered (consistent with existing behavior).
     default:
       break;
   }
+}
+
+/**
+ * Forward a context snapshot, ignoring unusable ones. A zero/absent window would render as a
+ * divide-by-zero percentage, so the snapshot is dropped and the footer degrades to "no context
+ * segment" rather than a bogus "0%". Extracted from translateUpdate to keep that switch's
+ * complexity within the lint budget.
+ */
+function ingestUsage(st: TurnState, used: unknown, size: unknown): void {
+  if (typeof used !== 'number' || typeof size !== 'number' || size <= 0) return;
+  st.handlers.onUsage?.({ used, size });
 }
 
 /** Merge a tool's latest fields, then trigger start / finish per readiness. */

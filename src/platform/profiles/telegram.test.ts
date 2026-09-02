@@ -4,6 +4,8 @@ import {
   decodeChannel,
   specsToTelegramCommands,
   createTelegramProfile,
+  topicAwareChannelId,
+  rawTopicFields,
 } from './telegram.js';
 
 // ── Fake bot for delivery-contract tests ──────────────────────────────────────
@@ -246,5 +248,112 @@ describe('inboundChannelId (forum-topic composite rebuild)', () => {
       chat_id: '-1001234567890',
       message_thread_id: 99,
     });
+  });
+});
+
+/**
+ * Private-chat topics (Bot API 9.4, Feb 2026).
+ *
+ * The bug: the adapter's decodeMessage picks channel.id from a `chat.type === 'private'`
+ * branch that returns chat.id and never looks at message_thread_id — the topic branch is
+ * group-only. So every topic in a DM collapsed onto the same bare chat id (one shared
+ * session for all topics) and replies went to the DM root, leaving the asking topic silent.
+ *
+ * The payloads below are the REAL shape captured from live getUpdates against this bot,
+ * not a guess:
+ *   {"chat":{"id":5865716608,"type":"private"},
+ *    "message_thread_id":7353,"is_topic_message":true}
+ */
+describe('private-chat topics (Bot API 9.4)', () => {
+  const profile = createTelegramProfile();
+
+  /** A DM session as the adapter builds it: no guild, channelId == chat id, plus the raw update. */
+  const dmSession = (opts: { threadId?: number; isTopic?: boolean; underKey?: string }) => {
+    const msg: Record<string, unknown> = {
+      chat: { id: 5865716608, type: 'private' },
+      ...(opts.threadId != null ? { message_thread_id: opts.threadId } : {}),
+      ...(opts.isTopic ? { is_topic_message: true } : {}),
+    };
+    return {
+      channelId: '5865716608',
+      isDirect: true,
+      telegram: { [opts.underKey ?? 'message']: msg },
+    } as never;
+  };
+
+  it('rawTopicFields reads the fields the adapter drops', () => {
+    expect(rawTopicFields(dmSession({ threadId: 7353, isTopic: true }))).toEqual({
+      threadId: '7353',
+      isTopicMessage: true,
+    });
+  });
+
+  it('rawTopicFields also finds them on edited_message and callback_query', () => {
+    expect(rawTopicFields(dmSession({ threadId: 7353, isTopic: true, underKey: 'edited_message' })))
+      .toEqual({ threadId: '7353', isTopicMessage: true });
+    const cbq = {
+      telegram: {
+        callback_query: {
+          message: { chat: { id: 1, type: 'private' }, message_thread_id: 7353, is_topic_message: true },
+        },
+      },
+    } as never;
+    expect(rawTopicFields(cbq)).toEqual({ threadId: '7353', isTopicMessage: true });
+  });
+
+  it('rawTopicFields is safe on a session with no raw update at all', () => {
+    expect(rawTopicFields({} as never)).toEqual({ isTopicMessage: false });
+    expect(rawTopicFields(undefined)).toEqual({ isTopicMessage: false });
+  });
+
+  it('treats a DM topic message as a thread (the adapter reports isDirect with no guild)', () => {
+    expect(profile.isThread(dmSession({ threadId: 7353, isTopic: true }))).toBe(true);
+  });
+
+  it('builds <chatId>:<topicId> for a DM topic — chat id comes from channelId, not guildId', () => {
+    expect(topicAwareChannelId(dmSession({ threadId: 7353, isTopic: true }))).toBe(
+      '5865716608:7353'
+    );
+  });
+
+  it('keeps two topics in the same DM on SEPARATE ids (they used to collapse into one)', () => {
+    const a = topicAwareChannelId(dmSession({ threadId: 7353, isTopic: true }));
+    const b = topicAwareChannelId(dmSession({ threadId: 7364, isTopic: true }));
+    expect(a).not.toBe(b);
+    expect([a, b]).toEqual(['5865716608:7353', '5865716608:7364']);
+  });
+
+  it('leaves the DM root alone (no thread fields at all)', () => {
+    expect(topicAwareChannelId(dmSession({}))).toBe('5865716608');
+    expect(profile.isThread(dmSession({}))).toBe(false);
+  });
+
+  it('treats the General lane (thread id 1) as the root, not a topic', () => {
+    // General would otherwise get a composite id that differs from the plain chat id,
+    // splitting one conversation into two sessions.
+    expect(topicAwareChannelId(dmSession({ threadId: 1, isTopic: true }))).toBe('5865716608');
+    expect(profile.isThread(dmSession({ threadId: 1, isTopic: true }))).toBe(false);
+  });
+
+  it('ignores message_thread_id when is_topic_message is absent (a plain reply chain)', () => {
+    // Telegram sets message_thread_id on ordinary reply chains too; without
+    // is_topic_message it is not a topic and must not create a separate lane.
+    expect(topicAwareChannelId(dmSession({ threadId: 7353 }))).toBe('5865716608');
+  });
+
+  it('a DM topic reply carries chat_id=<chat> + message_thread_id=<topic> (end-to-end)', async () => {
+    const routed = topicAwareChannelId(dmSession({ threadId: 7353, isTopic: true }));
+    const { bot, calls } = fakeBot();
+    await profile.sendMessage!(bot, routed, 'reply');
+    // Before the fix this sent chat_id='5865716608' with NO thread → the DM root.
+    expect(calls.send[0]).toMatchObject({
+      chat_id: '5865716608',
+      message_thread_id: 7353,
+    });
+  });
+
+  it('group forum still works (chat id from guildId) — no regression', () => {
+    const group = { guildId: '-1001234567890', channelId: '99', isDirect: false } as never;
+    expect(topicAwareChannelId(group)).toBe('-1001234567890:99');
   });
 });

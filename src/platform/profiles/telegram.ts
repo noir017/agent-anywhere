@@ -575,8 +575,9 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
     mountButtonEvents(ctx, emit) {
       // callback_query -> 'interaction/button'; adapter auto-answers the callback query.
       // session.event.button.id === callback_data (the encodeCallbackData'd id from send).
-      // channelId mirrors inboundChannelId so a click inside a forum topic resolves to the
-      // same channel key as the message that sent the buttons (see mountSatoriButtonInteraction).
+      // The SAME resolver as the message path, so a click inside a forum topic resolves to the
+      // conversation that posted the buttons — otherwise a blocking `ask` never matches its
+      // pending request and sits until timeout.
       mountSatoriButtonInteraction(ctx, telegramConversation, emit);
     },
 

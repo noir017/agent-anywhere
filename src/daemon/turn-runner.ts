@@ -1,5 +1,5 @@
 import type { Config } from '../config/schema.js';
-import { agentDisplayName, findAgent } from '../config/schema.js';
+import { findAgent } from '../config/schema.js';
 import { looksLikeCommand } from './routing.js';
 import type { AgentCommand, InboundMessage, SessionId } from '../types.js';
 import type { PlatformAdapter } from '../platform/adapter.js';
@@ -399,8 +399,9 @@ export class TurnRunner {
    * - the model comes from the agent's session config when available; `agents[].model` is empty for
    *   an env-pinned harness and at best an unresolved alias.
    *
-   * The agent field names the harness, matching the header bubble — the config id is operator
-   * shorthand and means nothing to a reader of the conversation.
+   * The agent field is the config id (`cc` / `oc`), deliberately terse: the footer is a compact
+   * status line appended to every reply, so it uses the short name even though the header bubble —
+   * sent once per session — spells out the harness.
    */
   private buildFooter(sessionId: SessionId, ref: TurnRef): string {
     if (!this.config.display.footer.enabled) return '';
@@ -408,7 +409,7 @@ export class TurnRunner {
     const def = findAgent(this.config, agentId);
     return formatRuntimeFooter(
       {
-        agent: agentDisplayName(def, agentId),
+        agent: agentId,
         model: ref.model ?? this.deps.getModelOverride(sessionId) ?? def?.model,
         contextTokens: ref.usage?.used,
         contextLength: ref.usage?.size,

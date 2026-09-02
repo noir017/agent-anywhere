@@ -102,10 +102,10 @@ export class ConversationRegistry {
     private readonly agents: AgentFactory,
     private readonly clock: { now(): number; schedule(fn: () => void, ms: number): () => void },
     /**
-     * Optional callback hooks. onAvailableCommands: fired when a session's agent reports its command
+     * Optional callback hooks. onAvailableCommands: fired when a conversation's agent reports its command
      * list (daemon aggregates and dynamically registers native slash). Absent = don't care (test/no-slash).
      * onPickerRequest: fired when a harness picker command (`/claude`, `/opencode`) is invoked for a
-     * session of that harness; the daemon owns the button UI, the registry only resolves who it is for.
+     * conversation of that harness; the daemon owns the button UI, the registry only resolves who it is for.
      */
     private readonly hooks?: {
       onAvailableCommands?(id: ConversationId, agentId: string, cmds: AgentCommand[]): void;
@@ -384,7 +384,7 @@ export class ConversationRegistry {
   /**
    * Rewrite a leading generic command into the target harness's native spelling, or refuse it.
    *
-   * Native platform slash is global while agents are per-session, so the registered menu is a
+   * Native platform slash is global while agents are bound per conversation, so the registered menu is a
    * fixed generic vocabulary (see core/command-translate.ts) rather than the union of what each
    * agent reports — a union cannot say who owns an entry, and an entry invoked from it routes to
    * `routing.default` rather than to the agent that offered it.
@@ -405,7 +405,7 @@ export class ConversationRegistry {
     const name = agentDisplayName(def, state.agentId);
 
     // Harness picker (`/claude`, `/opencode`): offers the agent's OWN commands, so it only means
-    // something in a session of that harness. Invoked elsewhere it is reported as inapplicable
+    // something in a conversation of that harness. Invoked elsewhere it is reported as inapplicable
     // rather than forwarded — the target agent would not recognize it either.
     const picker = pickerHarnessFor(this.config, parsed.name);
     if (picker) {
@@ -418,7 +418,7 @@ export class ConversationRegistry {
             addressOf(msg.conversation),
             `This conversation is answered by ${name}, so /${parsed.name} does not apply here.\nSwitch with \`/<agent>\` first, then run /${parsed.name}.`
           )
-          .catch((e) => console.warn('[session] failed to report an inapplicable picker:', e instanceof Error ? e.message : e));
+          .catch((e) => console.warn('[conversation] failed to report an inapplicable picker:', e instanceof Error ? e.message : e));
       }
       return undefined;
     }
@@ -433,7 +433,7 @@ export class ConversationRegistry {
           addressOf(msg.conversation),
           `${name} does not support /${parsed.name}.\nIts own commands are available under /${name}.`
         )
-        .catch((e) => console.warn('[session] failed to report an unsupported command:', e instanceof Error ? e.message : e));
+        .catch((e) => console.warn('[conversation] failed to report an unsupported command:', e instanceof Error ? e.message : e));
       console.log(`[command] /${parsed.name} unsupported by ${state.agentId} (${name}); not forwarded`);
       return undefined;
     }
@@ -446,7 +446,7 @@ export class ConversationRegistry {
   }
 
   /**
-   * Send the once-per-session header bubble (`🤖 opencode`) and mark the session announced.
+   * Send the once-per-conversation header bubble (`🤖 opencode`) and mark it announced.
    *
    * Sent on receipt rather than with the reply, so it doubles as an immediate "got it, working on
    * it" — the agent subprocess may take seconds to spawn on the first turn.

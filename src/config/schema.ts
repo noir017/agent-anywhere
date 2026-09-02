@@ -251,13 +251,20 @@ export const ConfigSchema = z
     }),
 
     /**
-     * Session scope. Sessions live for the daemon's lifetime (no automatic reclamation);
-     * guardrail params (turnTimeoutMs/…) stay frozen in EXPERIENCE.
+     * Conversation scope. Conversations live for the daemon's lifetime (no automatic
+     * reclamation); guardrail params (turnTimeoutMs/…) stay frozen in EXPERIENCE.
      */
     session: z
       .object({
-        /** Session ownership scope (global default, overridable by route.use.scope). */
-        scope: SessionScope.default('per_channel'),
+        /**
+         * What counts as one conversation (global default, overridable by route.use.scope).
+         *
+         * Defaults to per_thread: a Telegram topic / Slack thread / Discord thread is its own
+         * conversation, and the channel root is another. That matches what a topic is FOR — people
+         * open one per task — and it is the only scope under which two topics of one chat don't
+         * share an agent's context. Use per_channel to fold every lane of a channel together.
+         */
+        scope: SessionScope.default('per_thread'),
       })
       .default({}),
 

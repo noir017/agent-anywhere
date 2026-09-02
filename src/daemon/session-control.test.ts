@@ -3,6 +3,7 @@ import { ConversationRegistry } from './conversation.js';
 import type { Config } from '../config/schema.js';
 import type { PlatformAdapter } from '../platform/adapter.js';
 import type { AgentFactory, AgentSession } from './agent.js';
+import type { InboundMessage } from '../types.js';
 
 /**
  * Unit tests for the ConversationRegistry control surface (model override + reset).
@@ -41,13 +42,13 @@ const clock = {
 };
 
 /** A DM inbound in the one conversation these tests use. */
-function inbound(content: string, messageId: string): never {
+function inbound(content: string, messageId: string): InboundMessage {
   return {
     conversation: { platform: 'discord', channel: 'c1', kind: 'direct', user: 'u1' },
     messageId,
     content,
     timestamp: 0,
-  } as never;
+  };
 }
 
 /** ConversationStore stub; `cleared` records which conversations were reset by /new. */
@@ -354,7 +355,7 @@ describe('native slash produces one turn', () => {
     const { reg, sent } = rig();
     // Exactly what Telegram sends for one `/oc 你好`, in order.
     reg.route(inbound('', 'm1'));
-    reg.route({ ...inbound('/oc 你好', 'm2'), mentionedSelf: true } as never);
+    reg.route({ ...inbound('/oc 你好', 'm2'), mentionedSelf: true });
     // Before the fix this was ['🤖 claude', '🤖 opencode'].
     expect(headers(sent)).toEqual(['🤖 opencode']);
   });

@@ -41,7 +41,7 @@ routing:
   pipeline: []      # ordered; first fully-matching rule wins
 
 session:
-  scope: per_channel   # per_thread | per_channel | per_user | shared
+  scope: per_thread    # per_thread | per_channel | per_user | shared
 
 access:
   allowFrom: []     # identities "<instance-id>:<userId>"; EMPTY = anyone can drive
@@ -187,22 +187,33 @@ the same `/name input` text). When a rule matches via `command`, the router cons
 the prefix: the agent receives only the rest (`/codex fix it` → codex gets `fix it`),
 and a bare `/name` with nothing after it is acked with a usage hint instead of
 starting a turn. Commands matching no rule pass through to the agent untouched
-(that's how agent-native commands like `/model` keep working). Sessions are keyed
-per routed agent, so `/codex …` next to default-agent chat in the same channel keeps
-two separate conversations; `/codex /new` clears codex's.
+(that's how agent-native commands like `/model` keep working).
+
+A `when.command` rule also **binds** the conversation to that agent: `/codex fix the
+tests` routes to codex, and every plain message after it stays with codex until someone
+types another `/<agent>`. Config chooses a conversation's *first* agent; the user
+chooses it thereafter. A bare `/codex` just rebinds and says so.
+
+Switching agents never discards context. Each conversation remembers every agent's own
+session separately, so `/codex` → `/claude` → `/codex` resumes codex where it left off.
+Only `/new` clears anything, and it clears the whole conversation.
 
 ## `session.scope`
 
-Which conversations share one agent session (context/memory):
+What counts as one conversation (i.e. what shares an agent's context):
 
-| value | one session per |
+| value | one conversation per |
 |---|---|
-| `per_channel` | channel (default) |
-| `per_thread` | thread |
-| `per_user` | user |
+| `per_thread` | thread / Telegram topic / Slack thread — plus the channel root, separately (default) |
+| `per_channel` | channel, with all its threads folded in |
+| `per_user` | user, wherever they write |
 | `shared` | whole deployment |
 
-Sessions live for the daemon's lifetime; `/new` (sent in chat) clears one.
+Conversations live for the daemon's lifetime; `/new` (sent in chat) clears one.
+
+State lives in `<configDir>/conversations.json`: per conversation, the bound agent plus
+each agent's own session id. A pre-0.3 `sessions.json` is migrated automatically on
+first start, so in-flight work survives the upgrade.
 
 ## `access.allowFrom`
 

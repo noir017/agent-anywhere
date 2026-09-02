@@ -1,23 +1,28 @@
 # `src/daemon/` — the running system
 
-The only module allowed to depend on every other one. It owns routing, session
+The only module allowed to depend on every other one. It owns routing, conversation
 lifetime, turn orchestration, and the agent runtimes.
+
+Vocabulary, since the two used to be one word and that is much of why this went wrong:
+a **conversation** is the IM-side unit (a topic, a thread, a channel — see
+[`core/conversation.ts`](../core/README.md)); a **session** is the agent-side one (an ACP
+session id, agy's conversation id). One conversation holds one session *per agent*.
 
 ## Files
 
 | File | Role |
 |---|---|
-| `daemon.ts` | Top-level wiring: platforms + session registry + IPC. Slash registration, `ask` buttons, harness pickers. |
-| `routing.ts` | Pure: inbound → `{ agentId, scope }` → session key |
-| `session.ts` | `SessionRegistry` — per-session state, access + gating, command translation |
+| `daemon.ts` | Top-level wiring: platforms + conversation registry + IPC. Slash registration, `ask` buttons, harness pickers. |
+| `routing.ts` | Pure: inbound → which agent (and whether the user *asked* for it) + which scope |
+| `conversation.ts` | `ConversationRegistry` — per-conversation state, agent binding, access + gating, command translation |
 | `turn-runner.ts` | One turn end to end: prompt, streaming, tools, footer, errors |
 | `agent.ts` | `AgentFactory` / `AgentSession` / `AgentStreamHandlers` interfaces. Dependency-free. |
 | `agent-factory.ts` | Dispatch: which runtime serves which agent |
 | `agent-acp.ts` | ACP runtime (claude, codex, opencode, gemini, custom) |
 | `agent-agy.ts` | Antigravity CLI runtime — its own stream-json protocol |
 | `agent-common.ts` | Protocol-agnostic helpers shared by both runtimes |
-| `session-store.ts` | Persistent session-key → agent-session-id map |
-| `session-token-registry.ts` | Per-session reverse-command token ↔ session id |
+| `conversation-store.ts` | Persisted per conversation: the bound agent + each agent's own session id |
+| `conversation-token-registry.ts` | Per-conversation reverse-command token ↔ conversation id |
 | `attachment-io.ts` | Real attachment IO + the SSRF guards |
 | `reverse-cli-shim.ts` | Guarantees `agent-anywhere` is on the agent's PATH |
 
@@ -27,18 +32,19 @@ lifetime, turn orchestration, and the agent runtimes.
 adapter.onMessage
    │
    ▼
-Daemon.onInbound ─── cross-event dedup (platform:channel:message, 15 s TTL)
+Daemon.onInbound ─── cross-event dedup (platform:address:message, 15 s TTL)
    │
    ▼
-SessionRegistry.route
+ConversationRegistry.route
    ├─ access gate        access.allowFrom — `platform:userId`
-   ├─ resolveRoute       routing.pipeline, first match wins → agentId + scope
-   ├─ sessionKey         scope + agentId → the session id
-   ├─ bare-command ack   `/codex` alone → usage reply, no turn
-   ├─ /new · /clear      reset session, drop the persisted id, ack. Never forwarded.
+   ├─ conversationKey    scope + the message's ConversationRef → the conversation id
+   ├─ resolveAgent       routing.pipeline → { agentId, explicit }
    ├─ response gate      core/inbound-gate shouldRespond
+   ├─ /new · /clear      reset the conversation, drop every agent's id, ack. Never forwarded.
+   ├─ bind or rebind     new conversation → bind; explicit `/oc` → rebind; else keep the bound agent
+   ├─ bare-command ack   `/codex` alone → binding ack, no turn
    ├─ command translate  generic → native, or refuse; harness picker
-   ├─ header bubble      once per session, on receipt
+   ├─ header bubble      once per conversation, on receipt
    ▼
 InboundMerger.ingest ── merge window / queue / interrupt
    ▼
@@ -48,74 +54,116 @@ TurnRunner.runTurn
 Several orderings in `route()` are load-bearing and commented in place:
 
 - **`hasActiveSession` is read before any merger is built** — otherwise it is always
-  true once a session exists and the thread-participation exemption is distorted.
+  true once a conversation exists and the thread-participation exemption is distorted.
 - **Gating runs on the original content**, not the prefix-stripped one. A bare `/oc`
   strips to empty and would trip the empty-message gate, losing the usage ack. The gate
   rejects messages that *arrived* empty (a native slash command's phantom message), not
   ones `route` just emptied.
-- **Command translation sits after session creation**: it is the first point that knows
-  *which* agent will answer, and the last point at which the message can still be
-  refused.
+- **Command translation sits after binding**: it is the first point that knows *which*
+  agent will answer, and the last point at which the message can still be refused.
 - **The header is sent after every gate**, so it cannot become a probe — a message that
   will not be answered gets no acknowledgement of any kind.
 - **`/new` is intercepted before the merger**, so it works mid-turn (dispose aborts the
   in-flight turn).
 
-## Routing and session keys
+## Routing, binding, and conversation keys
 
-`resolveRoute` walks `routing.pipeline` in order; the first rule whose `when` **fully**
-matches wins, else `routing.default`. Match fields: `platform` (instance id),
-`serverId`, `channelId`, `userId`, `chat` (private/group/thread), `isBot`, `command`.
+`routing.ts` answers two questions with **different lifetimes**, which is why it is two
+functions rather than one:
+
+- `resolveScope` — how a conversation is identified. A property of config.
+- `resolveAgent` — `{ agentId, explicit }`. Config chooses a conversation's *initial*
+  agent; after that the user does.
+
+Both walk `routing.pipeline` in order; the first rule whose `when` **fully** matches
+wins, else `routing.default`. Match fields: `platform` (instance id), `serverId`,
+`channelId` (matches the channel, ignoring any lane), `userId`, `chat`
+(private/group/thread), `isBot`, `command`.
 
 `when.command` matches the leading `/name` of **plain message text**, so command routing
 works on every platform regardless of native slash support — `Daemon.onCommand`
-synthesizes native invocations into `/name input` text, so one code path covers both. A
-rule that matches via `command` sets `consumedCommand`, and the caller **must** strip
-the prefix so the target agent does not try to interpret it as one of its own commands.
+synthesizes native invocations into a full inbound message, so one code path covers both.
 
-Session keys are qualified by agent id:
+**`explicit` is the hinge.** It is true only when the winning rule matched via
+`when.command` — i.e. the user *named* the agent. The registry then:
+
+| situation | what happens |
+|---|---|
+| conversation is new | bind the resolved agent (or the one the store remembers, after a restart) |
+| existing + explicit `/oc` | **rebind**: dispose the outgoing subprocess, keep its stored session id |
+| existing + not explicit | **use the bound agent** — the fix for the reported bug |
+
+A non-command rule deliberately does *not* rebind an existing conversation: re-applying
+it on every message would make the binding impossible to change, and stickiness
+meaningless. The `/name` prefix is consumed, so the target agent never sees it.
+
+Conversation keys carry **no agent id**:
 
 ```
-shared       → <agentId>:shared
-per_user     → <agentId>:<platform>:u:<userId>
-per_channel  → <agentId>:<platform>:c:<channelId>     (default)
-per_thread   → <agentId>:<platform>:t:<channelId>
+shared       → shared
+per_user     → <platform>#u#<userId>
+per_channel  → <platform>#<channel>
+per_thread   → <platform>#<channel>#<thread|>      (default)
 ```
 
-The agent qualifier matters: without it, two agents addressed in the same place (`/codex …`
-next to default-agent chat in one channel) would collide, and whichever was created
-first would capture the key forever.
+That absence is the whole point. When the agent led the key, `/oc hi` and the plain
+message after it were two different conversations in one topic — the second silently fell
+back to `routing.default` with empty context. Under `per_thread` the lane component is
+present but empty for a channel root, so a root and a topic can never collide.
 
-## Session lifetime
+## Conversation lifetime
 
-**Sessions live for the daemon's lifetime.** There is deliberately no automatic
-reclamation — evicting a session would silently drop conversation context and kill a
-resident subprocess, and the live-session set is naturally bounded by `access.allowFrom`
-in any sane deployment. A session ends when the daemon stops or the user sends `/new`.
+**Conversations live for the daemon's lifetime.** There is deliberately no automatic
+reclamation — evicting one would silently drop the agent's context and kill a resident
+subprocess, and the live set is naturally bounded by `access.allowFrom` in any sane
+deployment. A conversation's context ends only when the daemon stops or the user sends
+`/new`.
 
-`SessionState` is one object per session (previously parallel `Map`s). Creation sets it
-in one assignment (no half-init), release is one `sessions.delete` (no leak), and adding
-a per-session field touches only that interface. The stable token is the exception — it
-lives in `SessionTokenRegistry`, since token bookkeeping is a separate concern from
-turn orchestration.
+`ConversationState` is one object per conversation (previously parallel `Map`s). Creation
+sets it in one assignment (no half-init), release is one `delete` (no leak), and adding a
+field touches only that interface. The stable token is the exception — it lives in
+`SessionTokenRegistry`, since token bookkeeping is a separate concern from turn
+orchestration.
 
-Context survives restarts via `SessionStore` (`<configDir>/sessions.json`): a
-write-through session-key → agent-session-id map. The harness keeps the actual history
-on its own disk; this only remembers *which* session belongs to each key, so a restarted
-daemon can `session/load` it (ACP) or pass `--conversation` (agy) instead of starting
-blank. A missing or corrupt file degrades to empty — context loss, not a crash. `/new`
-deletes the entry, otherwise the context would resurrect on the next restart.
+### The agent owns its context
+
+**The IM side is a client. It must never make an agent restart a task.** That rule
+decides the store's shape: `ConversationStore` (`<configDir>/conversations.json`) holds,
+per conversation, the bound agent *and* a map of `agentId → that agent's own session id`.
+
+Keying sessions by `(conversation, agent)` is what makes `/oc` → `/cc` → `/oc` *resume*
+opencode's thread instead of starting over — and what stops claude from ever being handed
+opencode's session id. The harness keeps the actual history on its own disk; this only
+remembers *which* of its sessions belongs where, so a restarted daemon can `session/load`
+it (ACP) or pass `--conversation` (agy) rather than starting blank.
+
+A missing or corrupt file degrades to empty (bindings lost, agent histories untouched).
+`/new` is the single context-destroying path in the system, and it clears **every**
+agent's id for that conversation: the topic *is* the conversation, so a reset that let
+another agent's history resurface on the next `/oc` would be a surprise rather than a
+reset. A pre-0.3 `sessions.json` is migrated on first start (`migrateLegacySessions`), so
+in-flight work survives the upgrade.
+
+### Auto-thread adoption
+
+When `autoThread: perTurn` opens a thread mid-turn, the reply moves into it — so the
+user's next message arrives from a place that would otherwise key as a *new* conversation,
+and the agent would answer its own follow-up from scratch. `TurnRunner` calls
+`deps.adoptThread`, and the registry aliases the thread's key to the conversation that
+opened it. The alias is in-memory only: after a restart such a thread becomes its own
+conversation, which is a self-correcting degradation, unlike discarding context.
 
 ## `TurnRunner`
 
 One turn, end to end. It receives a narrow DI interface (`TurnRunnerDeps`) rather than
-the whole `SessionRegistry`, to avoid bidirectional coupling: the registry stays the sole
-owner of state and lifecycle, and the runner borrows read-only views (`agentIdOf`,
-`tokenFor`, `getModelOverride`) plus one write entry (`setActiveChannel`).
+the whole `ConversationRegistry`, to avoid bidirectional coupling: the registry stays the
+sole owner of state and lifecycle, and the runner borrows read-only views (`agentIdOf`,
+`tokenFor`, `getModelOverride`) plus two write entries (`setActiveAddress`,
+`adoptThread`).
 
-Per turn it: resolves the platform instance from the batch (a shared-scope session may
-hop instances between turns, so this is per-turn, not per-session) → resolves the channel
-(creating a thread first when `autoThread: perTurn`, so the whole turn lands in it) →
+Per turn it: resolves the platform instance from the batch (a shared-scope conversation
+may hop instances between turns, so this is per-turn) → resolves the outbound address
+(opening a thread first when `autoThread: perTurn`, so the whole turn lands in it) →
 starts a typing keep-alive loop (Discord's indicator self-expires ~10 s) → builds a
 `StreamBuffer` factory and a `ToolRenderer` → runs the agent turn → final-flushes with
 the footer.
@@ -162,7 +210,7 @@ force-disposed and the turn fails.
           gemini/custom
 ```
 
-Everything above this boundary — `SessionRegistry`, `TurnRunner`, `StreamBuffer`,
+Everything above this boundary — `ConversationRegistry`, `TurnRunner`, `StreamBuffer`,
 `ToolRenderer` — is **protocol-agnostic** and reused unchanged by both runtimes. Keep it
 that way: a new protocol means a new sibling runtime implementing `AgentFactory`, not a
 branch upstream.
@@ -171,15 +219,16 @@ branch upstream.
 import it, so putting the dispatch there would create a cycle. That is why
 `agent-factory.ts` is its own file.
 
-`dispose(sessionId)` fans out to both runtimes rather than tracking ownership: callers
-hold only a session key, and disposing a session a runtime never created is a documented
-no-op.
+`dispose(conversationId)` fans out to both runtimes rather than tracking ownership:
+callers hold only a conversation key, and disposing one a runtime never created is a
+documented no-op.
 
 ### `agent-acp.ts` — the ACP runtime
 
-The daemon is the ACP **client/host**. Each `(sessionId, agentId)` spawns a resident ACP
-agent child, and `session/update` notifications are translated back into
-`AgentStreamHandlers`:
+The daemon is the ACP **client/host**. Each conversation+agent pair spawns a resident ACP
+agent child — one per `(conversationId, agentId)`, which is why two agents can answer the
+same topic without sharing a process — and `session/update` notifications are translated
+back into `AgentStreamHandlers`:
 
 | ACP | → |
 |---|---|
@@ -226,7 +275,7 @@ Protocol mapping (verified empirically against agy 1.1.22):
 | `step_type:"tool"` ACTIVE / DONE | `onToolStart` / `onToolFinish` |
 | text↔tool boundary | `onSegmentBreak` |
 | `event:"result"` | turn end (`SUCCESS`, else an error upstream) |
-| `init.conversation_id` | `SessionStore` entry, replayed via `--conversation` |
+| `init.conversation_id` | stored under `(conversation, agy)`, replayed via `--conversation` |
 | SIGINT | abort (agy has no in-band cancel) |
 
 Launched with `--disable-slash-commands` by default: in stream-json mode a CLI-answered
@@ -268,21 +317,22 @@ buttons — never a guessed list. Names already reachable through the generic vo
 are filtered out. Buttons are capped at 25 (Discord's components-per-message limit; the
 `claude` harness reports ~39, so this is reached in practice) and the remainder is
 **listed as text, not dropped**. A click is delivered straight back to the recorded
-session via `dispatchToSession` — re-routing a bare `/init` would send it to
-`routing.default`, the exact misdelivery this design removes. The clicker is re-checked
+conversation via `dispatchTo` — re-routing a bare `/init` would resolve it against the
+pipeline instead of the conversation's bound agent, landing on whichever agent config
+prefers rather than the one whose menu offered it. The clicker is re-checked
 against the allowlist, because a button in a shared channel can be pressed by someone
 other than the person who opened the menu.
 
 **Inbound dedup.** On platforms where a slash *is* a normal message (Telegram), one
 `/cmd` fires both a message event and a command event with the same `messageId`; they are
-deduped by `platform:channelId:messageId` within 15 s. When `messageId` is empty (Slack
+deduped by `platform:<address>:messageId` within 15 s. When `messageId` is empty (Slack
 slash) dedup is skipped — distinct events would collide on the empty-string key, and
 those platforms have no double-fire anyway.
 
-**`lastResolvedSessionId`** is a scratch slot written by `resolveChannel` and read by
-`handleReverse`, because IPC's `handle(action, channelId)` signature omits the session id.
-It is safe **only** because there is no `await` between the two within one dispatch. The
-constraint is documented at the field; if you add an await there, you break it.
+**`lastResolvedConversationId`** is a scratch slot written by `resolveAddress` and read by
+`handleReverse`, because IPC's `handle(action, address)` signature omits the conversation
+id. It is safe **only** because there is no `await` between the two within one dispatch.
+The constraint is documented at the field; if you add an await there, you break it.
 
 **Graceful shutdown** runs once (signals repeat on double Ctrl-C): remove signal
 handlers, stop IPC, stop every adapter, clear pending asks/picks, dispose the registry.
@@ -301,10 +351,10 @@ Downloads early-exit on a `content-length` over the cap. Saved filenames are san
 against traversal and prefixed with a short hash to avoid overwrite. Coverage thresholds
 are set on this file's pure guards specifically (`vitest.config.ts`).
 
-**`session-token-registry.ts`** compares tokens with `timingSafeEqual` against each
+**`conversation-token-registry.ts`** compares tokens with `timingSafeEqual` against each
 registered token rather than a `Map.get`, so a timing side-channel cannot reveal how many
 leading characters of a guess are correct. Defense in depth — tokens are 122-bit UUIDs
-and the socket is `0600` — but cheap, since the live-session set is small.
+and the socket is `0600` — but cheap, since the live set is small.
 
 **`reverse-cli-shim.ts`** guarantees the hint's promise that `agent-anywhere` is on PATH.
 Whether it actually is depends on how the daemon was launched: a global npm install puts
@@ -319,9 +369,15 @@ back to whatever PATH offers.
 
 Twelve test files. `agent-acp.test.ts` and `agent-agy.test.ts` cover protocol
 translation; `routing.test.ts`, `command-routing.test.ts`, `session-control.test.ts`,
-`session-store.test.ts`, `session-token-registry.test.ts`, `multi-platform.test.ts`,
-`slash-register.test.ts`, `ask-button.test.ts`, `permission.test.ts`, and
-`attachment-io.test.ts` cover the rest.
+`conversation-store.test.ts`, `conversation-token-registry.test.ts`,
+`multi-platform.test.ts`, `slash-register.test.ts`, `ask-button.test.ts`,
+`permission.test.ts`, and `attachment-io.test.ts` cover the rest.
+
+Two suites are load-bearing for the design rather than for a function:
+`command-routing.test.ts`'s *sticky agent binding* block reproduces the reported bug
+(`/oc hi` then a plain follow-up must stay with opencode, in one conversation), and
+`conversation-store.test.ts` pins the "agent owns its context" invariant — bind, switch
+away, switch back, and the first agent's own session id is still there.
 
 `daemon.ts` and `turn-runner.ts` have no direct test file — their pure helpers are
 exported and tested from the files above (`parseAskButtonId`, `parsePickButtonId`,

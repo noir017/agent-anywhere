@@ -25,9 +25,9 @@ it. Do not duplicate that content here.
 | Module | Responsibility | Doc |
 |---|---|---|
 | `src/config/` | Config schema, loading, `${VAR}` expansion, v0→v1 migration | [README](src/config/README.md) |
-| `src/core/` | Platform-agnostic pure logic: gating, merging, streaming, tool bubbles, footer, attachments, command vocabulary | [README](src/core/README.md) |
+| `src/core/` | Platform-agnostic pure logic: conversation identity, gating, merging, streaming, tool bubbles, footer, attachments, command vocabulary | [README](src/core/README.md) |
 | `src/platform/` | Satori-based IM adapters: the profile seam, 8 platform profiles, per-dialect markdown renderers | [README](src/platform/README.md) |
-| `src/daemon/` | The running system: routing, sessions, turn orchestration, agent runtimes (ACP + agy) | [README](src/daemon/README.md) |
+| `src/daemon/` | The running system: routing, conversations, turn orchestration, agent runtimes (ACP + agy) | [README](src/daemon/README.md) |
 | `src/ipc/` | Reverse-command protocol over a unix socket (agent → daemon → chat) | [README](src/ipc/README.md) |
 | `src/commands/` | CLI entry points: `setup`, `doctor`, `start`, reverse commands | [README](src/commands/README.md) |
 | `src/types.ts` | Domain data shapes shared across modules. Types only, no behavior. | — |
@@ -113,7 +113,7 @@ security-critical guards. Pure-wiring entrypoints (`cli.ts`, `types.ts`) are exc
 
 What is worth testing here: pure functions in `core/`, the parsers and renderers in
 `platform/*-markdown.ts`, the security guards (`attachment-io.ts` SSRF checks,
-`ipc/protocol.ts` validation, `session-token-registry.ts`), and routing/gating
+`ipc/protocol.ts` validation, `conversation-token-registry.ts`), and routing/gating
 decisions. What is not: Satori adapter plumbing and live network paths — there is no
 integration harness, so those are verified by hand.
 

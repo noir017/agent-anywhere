@@ -53,7 +53,7 @@ const baseConfig = makeConfig();
  * old scheme this was `cc:discord:c:c1` or `oc:discord:c:c1` depending on who answered, which is
  * exactly why `/oc hi` followed by a plain message produced two conversations in one place.
  */
-const KEY = 'discord#c1';
+const KEY = 'discord#c1#'; // per_thread (the default): the trailing field is the empty lane
 
 /**
  * Real timers, with the merge window set to 0 in config below so a routed message dispatches on the
@@ -269,7 +269,7 @@ describe('dispatchTo', () => {
 
   it('reports failure for an unknown conversation instead of dropping the message', async () => {
     const { reg } = rig();
-    const ok = reg.dispatchTo('discord#nope', {
+    const ok = reg.dispatchTo('discord#nope#', {
       conversation: { platform: 'discord', channel: 'c1', kind: 'direct', user: 'u1' },
       messageId: 'click',
       content: '/init',

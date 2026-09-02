@@ -79,6 +79,31 @@ describe('display config survives the experience merge', () => {
     expect(cfg.stream.charThreshold).toBeGreaterThan(0);
     expect(cfg.stream.silentToken).toBe('[SILENT]');
   });
+
+  it('reactions default to on, so existing deployments keep their 👀/✅ markers', () => {
+    expect(parseConfig(raw()).display.reactions.enabled).toBe(true);
+  });
+
+  it('reactions can be switched off from config.yaml', () => {
+    const cfg = parseConfig(raw({ reactions: { enabled: false } }));
+    expect(cfg.display.reactions.enabled).toBe(false);
+  });
+
+  it('switching reactions off leaves the frozen emoji themselves in place', () => {
+    // The toggle must not be confused with the emoji: those stay in EXPERIENCE, which is why the
+    // switch had to go under `display` instead of next to them under `inbound.reactions`.
+    const cfg = parseConfig(raw({ reactions: { enabled: false } }));
+    expect(cfg.inbound.reactions.received).toBe('👀');
+    expect(cfg.inbound.reactions.done).toBe('✅');
+  });
+
+  it('a reactions toggle written under `inbound` is discarded (frozen block owns it)', () => {
+    // Same trap as `stream` above: `inbound` belongs to EXPERIENCE, so putting the switch there
+    // would be silently overwritten. Pins that the working location is `display`.
+    const cfg = parseConfig({ ...raw(), inbound: { reactions: { enabled: false } } } as never);
+    expect(cfg.display.reactions.enabled).toBe(true);
+    expect((cfg.inbound.reactions as Record<string, unknown>).enabled).toBeUndefined();
+  });
 });
 
 /**

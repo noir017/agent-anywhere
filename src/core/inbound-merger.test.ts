@@ -112,3 +112,85 @@ describe('InboundMerger interrupt', () => {
     expect(h.batches[1]).toEqual(['m2']);
   });
 });
+
+/**
+ * Lifecycle reactions (display.reactions.enabled).
+ *
+ * The emoji land on the USER's own message — 👀 while the turn runs, then ✅/❌ (Telegram maps those
+ * into its allow-set as 👌/👎). In a single-operator DM that is pure noise: the reply itself already
+ * proves the message was seen. Turning it off must suppress every one of the three, and must not
+ * disturb the turn itself.
+ */
+describe('InboundMerger lifecycle reactions', () => {
+  /** Harness with turns that settle immediately, so both the received and done paths are observable. */
+  function reactionHarness(reactionsEnabled: boolean | undefined, failTurn = false) {
+    const clock = makeClock();
+    const reacted: string[] = [];
+    const deps: MergerDeps = {
+      now: clock.now,
+      schedule: clock.schedule,
+      addReaction: vi.fn(async (_ref, emoji: string) => void reacted.push(emoji)),
+      runTurn: vi.fn(() => (failTurn ? Promise.reject(new Error('boom')) : Promise.resolve())),
+    };
+    const merger = new InboundMerger(
+      {
+        mergeWindowMs: 1500,
+        maxMergeWindowMs: 5000,
+        interruptOnNewMessage: true,
+        reactions,
+        ...(reactionsEnabled === undefined ? {} : { reactionsEnabled }),
+      },
+      deps
+    );
+    return { merger, clock, deps, reacted };
+  }
+
+  it('enabled: marks the message 👀 on receipt and ✅ when the turn completes', async () => {
+    const h = reactionHarness(true);
+    await h.merger.ingest(msg('m1'));
+    expect(h.reacted).toEqual(['👀']);
+    h.clock.advance(1500);
+    await tick();
+    expect(h.reacted).toEqual(['👀', '✅']);
+  });
+
+  it('disabled: sends no reaction at all, and the turn still runs', async () => {
+    const h = reactionHarness(false);
+    await h.merger.ingest(msg('m1'));
+    h.clock.advance(1500);
+    await tick();
+    // The actual bug being fixed: the user's message must come back unmarked.
+    expect(h.deps.addReaction).not.toHaveBeenCalled();
+    expect(h.reacted).toEqual([]);
+    // Suppressing the decoration must not suppress the work.
+    expect(h.deps.runTurn).toHaveBeenCalledTimes(1);
+    expect(h.merger.isIdle()).toBe(true);
+  });
+
+  it('disabled: a FAILED turn is also left unmarked (no ❌ either)', async () => {
+    // ❌ goes through the same choke point. Losing it costs no information: turn-runner sends a
+    // readable "this turn failed" message in-channel regardless.
+    const h = reactionHarness(false, true);
+    await h.merger.ingest(msg('m1'));
+    h.clock.advance(1500);
+    await tick();
+    expect(h.reacted).toEqual([]);
+    expect(h.merger.isIdle()).toBe(true);
+  });
+
+  it('enabled: a failed turn is marked ❌', async () => {
+    const h = reactionHarness(true, true);
+    await h.merger.ingest(msg('m1'));
+    h.clock.advance(1500);
+    await tick();
+    expect(h.reacted).toEqual(['👀', '❌']);
+  });
+
+  it('omitted: defaults to reacting, so an old caller keeps the previous behavior', async () => {
+    const h = reactionHarness(undefined);
+    await h.merger.ingest(msg('m1'));
+    h.clock.advance(1500);
+    await tick();
+    expect(h.reacted).toEqual(['👀', '✅']);
+  });
+});

@@ -2,22 +2,31 @@
  * Domain types shared across modules. Data shapes only; behavior lives in each module.
  */
 
-/** A platform-agnostic message reference, usable for in-place edit / reaction. */
+import type { ConversationAddress, ConversationRef } from './core/conversation.js';
+
+/**
+ * A platform-agnostic message reference, usable for in-place edit / reaction / reply.
+ *
+ * Carries the full address rather than a channel string so that an operation on a
+ * message inside a Telegram topic or a Slack thread still knows its lane. (Edits and
+ * reactions happen not to need the lane on either API — but a ref that silently dropped
+ * it was a trap for every future operation that does, and `reply` genuinely needs it.)
+ */
 export interface MessageRef {
-  channelId: string;
+  address: ConversationAddress;
   messageId: string;
 }
 
 /** Inbound message (already normalized by the Satori adapter core). */
 export interface InboundMessage {
-  /** Platform INSTANCE id (the `platforms:` map key) — what routing when.platform and access.allowFrom identities match. */
-  platform: string;
+  /**
+   * Where this message lives: channel, optional sub-lane (topic/thread), space, kind.
+   * The single source of truth for routing, gating and every reply — see
+   * core/conversation.ts for why this is a struct and not a composite string.
+   */
+  conversation: ConversationRef;
   /** Platform type ('discord'/'telegram'/…), for logs and type-specific behavior. Optional: absent on synthesized messages. */
   platformType?: string;
-  channelId: string;
-  /** Server/workspace id (Discord guild, Slack workspace…); best-effort from the adapter, used for route serverId matching. */
-  guildId?: string;
-  userId: string;
   messageId: string;
   /** Plain text content (platform markup stripped). */
   content: string;
@@ -46,10 +55,6 @@ export interface InboundMessage {
   authorName?: string;
   /** Whether the sender is a bot; used for gating (allowBots: none/mentions/all filters on this). */
   authorIsBot?: boolean;
-  /** Whether it's a DM; used for gating (DMs usually respond without a mention). */
-  isDirect?: boolean;
-  /** Whether it's a thread/subchannel (Discord thread); used for gating (joined threads can be mention-exempt). */
-  isThread?: boolean;
   /** Whether this message @-mentioned the bot itself; used for gating (guild channels need a mention by default). */
   mentionedSelf?: boolean;
   /** Body of the replied-to message; used for reply backfill (feeds context to the agent). */
@@ -63,12 +68,13 @@ export interface InboundMessage {
  * The adapter receives a Discord MESSAGE_COMPONENT interaction, auto-ACKs, and normalizes to this shape.
  */
 export interface ButtonInteraction {
-  /** Platform identifier, e.g. 'discord'. */
-  platform: string;
-  /** Channel of the interaction (a thread is also a channel). */
-  channelId: string;
-  /** Id of the user who clicked. */
-  userId: string;
+  /**
+   * Where the click happened — resolved by the SAME profile.resolveConversation as the
+   * message path, so a button clicked inside a topic reaches the conversation that
+   * posted it. When these disagreed, a blocking `ask` could never match its pending
+   * request and sat until timeout.
+   */
+  conversation: ConversationRef;
   /** Id of the message the clicked button is on. */
   messageId: string;
   /** Button custom_id (the button id given at send time; no prefix added at this layer). */
@@ -80,12 +86,8 @@ export interface ButtonInteraction {
  * The adapter receives a Discord APPLICATION_COMMAND interaction, auto-ACKs, and normalizes to this shape.
  */
 export interface CommandInteraction {
-  /** Platform identifier, e.g. 'discord'. */
-  platform: string;
-  /** Channel where the command was invoked. */
-  channelId: string;
-  /** Id of the user who triggered the command. */
-  userId: string;
+  /** Where the command was invoked (same resolution as the message path). */
+  conversation: ConversationRef;
   /** Interaction message id (the Discord interaction's own id). */
   messageId: string;
   /** Command name, e.g. 'model'. */
@@ -94,7 +96,7 @@ export interface CommandInteraction {
   options: Record<string, unknown>;
   /**
    * Reply closure: replies via followup using the session bound to this interaction.
-   * It's a self-contained closure (rather than re-sending by channelId) because only the
+   * It's a self-contained closure (rather than re-sending by address) because only the
    * original session carries the interaction token needed to hit followup; doing it without
    * the session via internal is possible but requires storing token+app_id ourselves.
    */
@@ -137,10 +139,14 @@ export interface SlashCommandSpec {
 }
 
 /**
- * Identifier of an agent session: which session an inbound message belongs to. Computed by
- * routing.ts sessionKey(scope, msg) per session scope (per_thread/per_channel/per_user/shared).
+ * Identifier of a conversation: which conversation an inbound message belongs to.
+ * Computed by core/conversation.ts conversationKey(scope, ref) per scope
+ * (per_thread/per_channel/per_user/shared).
+ *
+ * Deliberately NOT agent-qualified: the agent answering a conversation is a mutable
+ * property of it, not part of its identity (see core/conversation.ts).
  */
-export type SessionId = string;
+export type ConversationId = string;
 
 /**
  * Tool-bubble render mode (domain concept shared by the core renderer and config schema).

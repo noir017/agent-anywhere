@@ -4,17 +4,40 @@
 // interface and reusing all of core.
 //
 // Types come from @satorijs/core (Context/Session/Bot/h); outbound operation params use
-// this repo's platform-agnostic domain types (MessageRef/SlashCommandSpec/...).
+// this repo's platform-agnostic domain types (ConversationAddress/MessageRef/...).
 import type { Context, Session, Bot, h } from '@satorijs/core';
 
 import type { PlatformConfig } from './config-schemas.js';
-import type {
-  ButtonInteraction,
-  CommandInteraction,
-  MessageRef,
-  SlashCommandSpec,
-} from '../types.js';
+import type { ConversationAddress, ConversationRef } from '../core/conversation.js';
+import type { MessageRef, SlashCommandSpec } from '../types.js';
 import type { PlatformCapabilities } from './adapter.js';
+
+/**
+ * What a profile reports about an inbound event's location: a ConversationRef minus the
+ * two fields core fills itself (`platform` is the instance id, which the profile doesn't
+ * know; `user` comes from the session uniformly).
+ */
+export type ResolvedConversation = Omit<ConversationRef, 'platform' | 'user'>;
+
+/**
+ * The location half of an interaction event as a PROFILE reports it: the same
+ * platform-shaped conversation `resolveConversation` returns, plus the sender. Core adds
+ * the instance id, exactly as it does for messages, so an interaction and a message from
+ * the same place always produce the same ConversationRef.
+ */
+export interface ProfileInteractionEvent {
+  conversation: ResolvedConversation;
+  user: string;
+  messageId: string;
+}
+
+export type ProfileButtonEvent = ProfileInteractionEvent & { buttonId: string };
+
+export type ProfileCommandEvent = ProfileInteractionEvent & {
+  name: string;
+  options: Record<string, unknown>;
+  reply: (text: string) => Promise<void>;
+};
 
 /**
  * Platform seam: a platform's specific points are all implemented here.
@@ -22,11 +45,14 @@ import type { PlatformCapabilities } from './adapter.js';
  * Design principles:
  * - Satori-generic Bot methods (sendMessage/editMessage/deleteMessage/createReaction/
  *   deleteReaction/getMessageList) are called directly by satori-core, not via profile.
- * - Platform field differences (mention/direct/thread detection, attachment meta keys) are
- *   normalized by the profile.
+ * - Platform field differences (mention detection, conversation shape, attachment meta
+ *   keys) are normalized by the profile.
  * - Platform-specific operations (typing/thread/buttons/reply/slash registration,
  *   interaction event mounting) go through the profile; an unimplemented optional method
  *   means the platform doesn't support it, and core degrades per capabilities or throws clearly.
+ * - Every outbound method takes a ConversationAddress, never a channel string. A platform
+ *   whose threads need a separate wire parameter (Telegram message_thread_id, Slack
+ *   thread_ts) reads `address.thread`; one whose threads are channels ignores it.
  */
 export interface PlatformProfile<P extends PlatformConfig = PlatformConfig> {
   /** Platform TYPE (the config discriminator, e.g. 'discord'), written to InboundMessage.platformType. */
@@ -48,41 +74,32 @@ export interface PlatformProfile<P extends PlatformConfig = PlatformConfig> {
 
   /** Whether this message @-mentions the bot itself. */
   detectMention(session: Session, selfId: string | undefined): boolean;
-  /** Whether it's a DM. */
-  isDirect(session: Session): boolean;
-  /** Whether it's a thread/subchannel. */
-  isThread(session: Session): boolean;
+
   /**
-   * Inbound channelId override: the routing/outbound key for this message.
+   * THE one place a platform describes its conversation model: which channel this event
+   * belongs to, whether it sits in a sub-lane, and what kind of place it is.
    *
-   * Exists because an adapter's inbound channel.id can be a NARROWER identifier than what
-   * sending requires. Telegram forum topics are the case in point: the adapter reports a
-   * topic message's channel.id as the bare message_thread_id (dropping the chat id), while
-   * `sendMessage` needs the composite `<chatId>:<topicId>` — so echoing session.channelId
-   * back would post to the wrong place. The profile rebuilds the composite here, giving one
-   * id that is valid for BOTH routing and sending.
+   * ── Why this is a single method ───────────────────────────────────────────────
+   * It used to be four (`isDirect`, `isThread`, `inboundChannelId`, `decodeChannelKey`),
+   * derived independently from the same session. They could disagree, and did: a
+   * message routed as a thread but replied to as a plain channel. Telegram needed a
+   * dedicated test just to police the agreement, and Slack failed it silently
+   * (`isThread` hardcoded false while its outbound path emitted thread keys). One
+   * method cannot disagree with itself.
    *
-   * Absent ⇒ session.channelId unchanged (correct for platforms whose inbound id is already
-   * a complete send target).
+   * Called by core on EVERY inbound path — message, button click, slash command — so a
+   * profile cannot wire it for messages and forget the interactions. That omission is
+   * why buttons clicked inside a Telegram topic used to resolve to the chat root.
+   *
+   * Contract:
+   *  - `channel` MUST be a complete API target on its own (Telegram: the chat id, never
+   *    the bare message_thread_id the adapter reports for group topics).
+   *  - `thread` is set ONLY when addressing needs an extra wire parameter. A Discord
+   *    thread is `kind: 'thread'` with NO `thread`, because its id is already a channel.
+   *  - `kind` is the sole thread/DM witness for routing and gating.
    */
-  inboundChannelId?(session: Session): string | undefined;
-  /**
-   * Split a routing key back into the platform's real channel plus an optional sub-lane
-   * (Telegram forum topic id, Slack thread_ts) — the declared inverse of inboundChannelId.
-   *
-   * Exists so the composite key stays INVISIBLE above this seam. satori-core's generic
-   * outbound paths (deleteMessage / fetchHistory / sendFile) hand channelId straight to
-   * `bot.*`, and a Satori adapter treats the whole string as its chat id — Telegram's encoder
-   * builds `chat_id: "-100123:99"` and the Bot API answers 400. Previously each profile method
-   * decoded by hand, so any path that forgot (or was added later) silently broke; declaring
-   * the inverse once lets core decode for all of them.
-   *
-   * Absent ⇒ the key IS the channel (correct for platforms that encode nothing extra).
-   *
-   * MUST round-trip with inboundChannelId: decodeChannelKey(inboundChannelId(s)) has to
-   * recover the real channel, or a reply lands somewhere other than where it was asked.
-   */
-  decodeChannelKey?(channelId: string): { channelId: string; lane?: string };
+  resolveConversation(session: Session): ResolvedConversation;
+
   /** Extract mime/size from a single media element (keys differ per platform). */
   attachmentMeta(el: h): { mime?: string; size?: number };
 
@@ -90,17 +107,21 @@ export interface PlatformProfile<P extends PlatformConfig = PlatformConfig> {
 
   /** True reply: send a platform-native reply targeting ref. */
   reply?(bot: Bot, ref: MessageRef, text: string): Promise<MessageRef>;
-  /** Create a thread from a message. */
+  /**
+   * Create a thread from a message. Returns the new thread's address — `{channel: <new
+   * channel>}` where threads are channels (Discord), `{channel, thread}` where they are a
+   * lane (Telegram topics, Slack thread_ts).
+   */
   createThread?(
     bot: Bot,
     ref: MessageRef,
     name: string,
     opts?: { autoArchiveMinutes?: number }
-  ): Promise<{ threadId: string }>;
+  ): Promise<{ address: ConversationAddress }>;
   /** Send a message with buttons. */
   sendButtons?(
     bot: Bot,
-    channelId: string,
+    address: ConversationAddress,
     text: string,
     buttons: Array<{ id: string; label: string; style?: string }>
   ): Promise<MessageRef>;
@@ -116,31 +137,26 @@ export interface PlatformProfile<P extends PlatformConfig = PlatformConfig> {
     opts?: { guildId?: string }
   ): Promise<void>;
   /** Typing indicator. */
-  typing?(bot: Bot, channelId: string): Promise<void>;
-  /** Outbound send override: when a platform encodes extra dimensions (e.g. thread_ts /
-   *  message_thread_id) into channelId, the profile decodes the composite channelId before
-   *  sending (otherwise falls back to generic bot.sendMessage). Returns the first message's MessageRef. */
-  sendMessage?(bot: Bot, channelId: string, text: string): Promise<MessageRef>;
+  typing?(bot: Bot, address: ConversationAddress): Promise<void>;
+  /**
+   * Outbound send override: for platforms whose Satori encoder cannot express the lane.
+   * The encoder reads its thread parameter off the INBOUND session, which an
+   * outbound-only send doesn't have, so such platforms post via `internal.*` themselves.
+   * Absent ⇒ core's generic bot.sendMessage (correct where `address.thread` is never set).
+   */
+  sendMessage?(bot: Bot, address: ConversationAddress, text: string): Promise<MessageRef>;
   /** Outbound edit override: when the platform adapter doesn't wrap editing as generic
    *  bot.editMessage, the profile implements it (e.g. Slack's internal.chatUpdate). Otherwise
    *  satori-core falls back to generic bot.editMessage. */
   editMessage?(bot: Bot, ref: MessageRef, text: string): Promise<void>;
   /**
-   * Outbound file override: needed when a sub-lane (Telegram forum topic) can't be expressed
-   * through the generic encoder.
-   *
-   * satori-core's generic sendFile builds a `file://` element and calls bot.sendMessage, but
-   * Telegram's encoder reads message_thread_id off the INBOUND session — which an outbound-only
-   * send doesn't have — so a file could never be routed into a topic that way. A profile
-   * implementing this posts the upload itself with the lane attached.
-   *
-   * `channelId` is already decoded by core; `lane` carries the sub-lane when one was encoded.
+   * Outbound file override: same reason as sendMessage — the generic encoder can't attach
+   * the lane to an upload, so a file could never reach a Telegram topic through it.
    */
   sendFile?(
     bot: Bot,
-    channelId: string,
-    file: { path: string; name?: string; caption?: string },
-    lane?: string
+    address: ConversationAddress,
+    file: { path: string; name?: string; caption?: string }
   ): Promise<MessageRef>;
   /**
    * Rendered length of `text` in the units the platform's message-length limit (capabilities
@@ -163,6 +179,10 @@ export interface PlatformProfile<P extends PlatformConfig = PlatformConfig> {
   /**
    * Receive button-click events, normalize, and emit back.
    *
+   * The emitted event carries only the platform-specific parts; core stamps the instance
+   * id and resolves the conversation via resolveConversation, so a profile cannot derive
+   * the location differently here than it does for messages.
+   *
    * Button-mount strategy decision table for new platforms (pick one, top-down priority):
    * 1) Adapter exposes the Satori-generic 'interaction/button' event ⇒ use the
    *    `mountSatoriButtonInteraction` helper directly. Discord/Telegram/QQ take this path (QQ's
@@ -171,7 +191,7 @@ export interface PlatformProfile<P extends PlatformConfig = PlatformConfig> {
    *    raw frames (see Slack wrapping adapter.accept, Lark via internal callback). This is the
    *    last resort; honestly document the internal behavior depended upon (Hyrum's Law).
    */
-  mountButtonEvents?(ctx: Context, emit: (ev: ButtonInteraction) => void): void;
+  mountButtonEvents?(ctx: Context, emit: (ev: ProfileButtonEvent) => void): void;
   /** Receive slash invocation events, normalize, and emit back. */
-  mountCommandEvents?(ctx: Context, emit: (ev: CommandInteraction) => void): void;
+  mountCommandEvents?(ctx: Context, emit: (ev: ProfileCommandEvent) => void): void;
 }

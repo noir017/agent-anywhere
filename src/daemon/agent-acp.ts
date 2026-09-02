@@ -20,7 +20,7 @@ import type { AgentDef, Config } from '../config/schema.js';
 import { findAgent } from '../config/schema.js';
 import type { AgentFactory, AgentSession, AgentStreamHandlers, RunTurnInput } from './agent.js';
 import { looksLikeCommand } from './routing.js';
-import type { SessionStore } from './session-store.js';
+import type { ConversationStore } from './conversation-store.js';
 import {
   buildAgentEnv,
   buildInputPreview,
@@ -35,7 +35,7 @@ import {
 /**
  * AgentFactory's ACP (Agent Client Protocol) implementation on the official @agentclientprotocol/sdk.
  *
- * agent-anywhere daemon = ACP "client/host". Each (sessionId, agentId) spawns a resident ACP agent child
+ * agent-anywhere daemon = ACP "client/host". Each (conversationId, agentId) spawns a resident ACP agent child
  * (claude-agent-acp / gemini --experimental-acp / any custom), translating ACP session/update stream
  * notifications back to the existing AgentStreamHandlers, reusing all outbound rendering (StreamBuffer / ToolRenderer).
  *
@@ -141,7 +141,7 @@ function resolveHarness(def: AgentDef): { command: string; args: string[] } {
 
 // ───────────────────────────────── factory / session ─────────────────────────────────
 
-export function createAcpAgentFactory(cfg: Config, socketPath: string, store?: SessionStore): AgentFactory {
+export function createAcpAgentFactory(cfg: Config, socketPath: string, store?: ConversationStore): AgentFactory {
   const sessions = new Map<string, AgentSession>();
   const turnTimeoutMs = cfg.session.turnTimeoutMs;
 
@@ -284,9 +284,10 @@ async function applyModelPreference(
 function createAcpSession(
   def: AgentDef,
   socketPath: string,
-  sessionId: string,
+  /** The conversation this agent instance serves (store key half; the other half is def.id). */
+  conversationId: string,
   turnTimeoutMs: number,
-  store?: SessionStore
+  store?: ConversationStore
 ): AgentSession {
   const decorate: PromptDecorator = defaultPromptDecorator;
   const cwd = resolveAgentCwd(def);
@@ -402,7 +403,10 @@ function createAcpSession(
       // this session's queue (the pre-prompt drain then discards them; history must not re-render to
       // the IM). attachSession is TS-private on ClientContext but stable at runtime — the SDK offers
       // no public "ActiveSession from an existing sessionId" path.
-      const persistedId = store?.get(sessionId);
+      // Keyed by (conversation, agent): this agent's OWN prior session here, never another
+      // agent's. Switching /oc -> /cc -> /oc must resume opencode's thread rather than restart the
+      // user's task -- the agent owns its context and the gateway must not disturb it.
+      const persistedId = store?.agentSession(conversationId, def.id);
       if (persistedId && initResult.agentCapabilities?.loadSession) {
         const attach = (
           ctx as unknown as { attachSession(r: { sessionId: string }): ActiveSession }
@@ -443,7 +447,7 @@ function createAcpSession(
         // _meta.model above is a hint some harnesses ignore (verified: opencode reports its own
         // default regardless), so enforce the choice through the protocol's own setter.
         liveModel = (await applyModelPreference(ctx, session, def)) ?? liveModel;
-        store?.set(sessionId, session.sessionId); // remember for post-restart session/load resume
+        store?.setAgentSession(conversationId, def.id, session.sessionId); // for post-restart session/load resume
       } catch (err) {
         // session/new returning auth_required (un-logged-in harness) surfaces as an opaque reject. Build
         // a readable hint from the authMethods the agent advertised in the initialize response (no interactive auth).
@@ -485,7 +489,7 @@ function createAcpSession(
   }
 
   return {
-    sessionId,
+    conversationId,
 
     async runTurn(input: RunTurnInput, handlers: AgentStreamHandlers): Promise<void> {
       aborting = false;

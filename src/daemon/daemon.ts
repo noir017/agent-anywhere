@@ -11,14 +11,20 @@ import type {
   AgentCommand,
   ButtonInteraction,
   CommandInteraction,
+  ConversationId,
   InboundMessage,
   MessageRef,
-  SessionId,
   SlashCommandSpec,
 } from '../types.js';
+import {
+  addressOf,
+  formatAddress,
+  type ConversationAddress,
+  type ConversationRef,
+} from '../core/conversation.js';
 import type { AgentFactory } from './agent.js';
-import { SessionRegistry } from './session.js';
-import type { SessionStore } from './session-store.js';
+import { ConversationRegistry } from './conversation.js';
+import type { ConversationStore } from './conversation-store.js';
 import { IpcServer } from '../ipc/server.js';
 import type { IpcAction } from '../ipc/protocol.js';
 
@@ -153,7 +159,7 @@ interface PendingAsk {
    * can't be resolved (token expired / test stub): the guard then doesn't apply to this ask,
    * matching legacy behavior when no hook is injected — never locks a session on resolve failure.
    */
-  sessionId?: SessionId;
+  conversationId?: ConversationId;
 }
 
 /**
@@ -163,22 +169,21 @@ interface PendingAsk {
  * at 64 bytes and encodeCallbackData degrades to a lossy hash above it, so a name encoded into the
  * id would not survive the round trip. The id carries only an index into this list.
  *
- * `sessionId` is the session the menu was opened for. The click is delivered straight back to it —
- * re-routing a bare `/init` would send it to `routing.default` instead of the agent that offered it.
+ * `conversation` is the conversation the menu was opened for. The click is delivered straight back
+ * to it — re-routing a bare `/init` would resolve against the pipeline instead of the conversation's
+ * bound agent, landing on whichever agent config prefers rather than the one that offered the menu.
  */
 interface PendingPick {
-  sessionId: SessionId;
+  conversationId: ConversationId;
   /** Native command names, positionally matching the button indices. */
   names: string[];
-  /** Channel the menu was posted in (where the click's synthesized message originates). */
-  channelId: string;
-  /** Platform instance the menu was posted on. */
-  platform: string;
+  /** Where the menu was posted (origin of the click's synthesized message). */
+  conversation: ConversationRef;
 }
 
 /** Main daemon: wires platform, session registry, and IPC server together. `agent-anywhere start` constructs and run()s it. */
 export class Daemon {
-  private registry: SessionRegistry;
+  private registry: ConversationRegistry;
   private ipc: IpcServer;
   /** Pending ask requests: reqId → wait handle. Resolved and deleted on click or timeout. */
   private pendingAsks = new Map<string, PendingAsk>();
@@ -206,7 +211,7 @@ export class Daemon {
    * first await, and handleAsk reads this value before its first await (sendButtons) — so within one
    * dispatch it can't be clobbered by another connection (Node single-threaded, no interleaving).
    */
-  private lastResolvedSessionId: SessionId | undefined;
+  private lastResolvedConversationId: ConversationId | undefined;
 
   constructor(
     private readonly config: Config,
@@ -214,8 +219,8 @@ export class Daemon {
     private readonly platforms: Map<string, PlatformAdapter>,
     agents: AgentFactory,
     socketPath: string,
-    /** Persistent sessionKey → ACP sessionId map (context survives daemon restarts; /new clears). */
-    store?: SessionStore
+    /** Persistent conversation state (agent binding + each agent's own session id). */
+    store?: ConversationStore
   ) {
     // Real runtime clock; core classes never read the system clock directly (for testability).
     const clock = {
@@ -226,21 +231,21 @@ export class Daemon {
       },
     };
 
-    this.registry = new SessionRegistry(config, platforms, agents, clock, {
-      // A session's agent reported its command list → record it under that AGENT (feeds the pickers).
-      onAvailableCommands: (_sessionId, agentId, cmds) => this.onAgentCommands(agentId, cmds),
-      // A harness picker (/claude, /opencode) was invoked in a session of that harness.
-      onPickerRequest: (sessionId, agentId, msg) => this.onPickerRequest(sessionId, agentId, msg),
+    this.registry = new ConversationRegistry(config, platforms, agents, clock, {
+      // A conversation's agent reported its command list → record it under that AGENT (feeds pickers).
+      onAvailableCommands: (_id, agentId, cmds) => this.onAgentCommands(agentId, cmds),
+      // A harness picker (/claude, /opencode) was invoked in a conversation of that harness.
+      onPickerRequest: (id, agentId, msg) => this.onPickerRequest(id, agentId, msg),
     }, store);
     this.ipc = new IpcServer(socketPath, {
-      // resolveChannel is also the sole capture point for the session owning this reverse command:
-      // IPC only forwards channelId to handle, not sessionId. So reverse-lookup the sessionId by token
-      // and stash it for the synchronously-following handleReverse (see lastResolvedSessionId).
-      resolveChannel: (token, override) => {
-        this.lastResolvedSessionId = this.registry.sessionForToken(token);
-        return this.registry.resolveChannel(token, override);
+      // resolveAddress is also the sole capture point for the conversation owning this reverse
+      // command: IPC only forwards the address to handle. So reverse-lookup by token and stash it
+      // for the synchronously-following handleReverse (see lastResolvedConversationId).
+      resolveAddress: (token, override) => {
+        this.lastResolvedConversationId = this.registry.conversationForToken(token);
+        return this.registry.resolveAddress(token, override);
       },
-      handle: (action, channelId) => this.handleReverse(action, channelId),
+      handle: (action, address) => this.handleReverse(action, address),
     });
   }
 
@@ -313,63 +318,57 @@ export class Daemon {
   }
 
   /**
-   * Adapter for the session owning the current reverse command. Reads the scratch
-   * lastResolvedSessionId (see its doc: valid because this runs synchronously after
-   * resolveChannel within one dispatch) and resolves session → platform instance →
-   * adapter. Cross-channel override sends go to the SAME instance as the session —
-   * a channelId alone can't identify a platform.
+   * Adapter for the conversation owning the current reverse command. Reads the scratch
+   * lastResolvedConversationId (see its doc: valid because this runs synchronously after
+   * resolveAddress within one dispatch) and resolves conversation → platform instance →
+   * adapter. Cross-channel override sends go to the SAME instance as the conversation —
+   * an address alone can't identify a platform.
    */
   private reverseAdapter(): PlatformAdapter {
-    const sid = this.lastResolvedSessionId;
-    const pid = sid ? this.registry.platformForSession(sid) : undefined;
+    const id = this.lastResolvedConversationId;
+    const pid = id ? this.registry.platformFor(id) : undefined;
     const adapter = pid ? this.platforms.get(pid) : undefined;
     if (!adapter) {
-      throw new Error('cannot resolve the platform instance for this reverse command (session expired?)');
+      throw new Error('cannot resolve the platform instance for this reverse command (conversation expired?)');
     }
     return adapter;
   }
 
-  /** Execute one reverse command (channelId already resolved by IPC). */
-  private async handleReverse(action: IpcAction, channelId: string): Promise<unknown> {
-    // Resolve BEFORE any await: the sessionId scratch slot is only synchronously valid.
+  /** Execute one reverse command (address already resolved and validated by IPC). */
+  private async handleReverse(action: IpcAction, address: ConversationAddress): Promise<unknown> {
+    // Resolve BEFORE any await: the conversation scratch slot is only synchronously valid.
     const platform = this.reverseAdapter();
     switch (action.kind) {
       case 'send-message':
-        return platform.sendMessage(channelId, action.text);
+        return platform.sendMessage(address, action.text);
       case 'reply':
         // Capability gate: platforms without native reply degrade to a plain send (closest semantics,
         // message still reaches the channel, no low-level error).
         if (!platform.capabilities.reply) {
-          return platform.sendMessage(channelId, action.text);
+          return platform.sendMessage(address, action.text);
         }
         // True reply: native platform reply (Discord message_reference).
-        return platform.replyMessage(
-          { channelId, messageId: action.messageId },
-          action.text
-        );
+        return platform.replyMessage({ address, messageId: action.messageId }, action.text);
       case 'edit-message':
         // Capability gate: editing can't be degraded to a fresh send (different message, wrong
         // semantics), so throw a clear error instead of silently doing the wrong thing.
         if (!platform.capabilities.editMessage) {
           throw new Error('unsupported operation: this platform does not support editing messages');
         }
-        return platform.editMessage({ channelId, messageId: action.messageId }, action.text);
+        return platform.editMessage({ address, messageId: action.messageId }, action.text);
       case 'send-file':
-        return platform.sendFile(channelId, {
+        return platform.sendFile(address, {
           path: action.path,
           name: action.name,
           caption: action.caption,
         });
       case 'react':
-        return platform.addReaction(
-          { channelId, messageId: action.messageId },
-          action.emoji
-        );
+        return platform.addReaction({ address, messageId: action.messageId }, action.emoji);
       case 'delete':
-        return platform.deleteMessage({ channelId, messageId: action.messageId });
+        return platform.deleteMessage({ address, messageId: action.messageId });
       case 'fetch-messages':
         return {
-          messages: await platform.fetchHistory(channelId, {
+          messages: await platform.fetchHistory(address, {
             limit: action.limit,
             before: action.before,
           }),
@@ -379,10 +378,7 @@ export class Daemon {
         if (!platform.capabilities.thread) {
           throw new Error('unsupported operation: this platform does not support creating threads');
         }
-        return platform.createThread(
-          { channelId, messageId: action.messageId },
-          action.name
-        );
+        return platform.createThread({ address, messageId: action.messageId }, action.name);
       case 'ask':
         // Capability gate: throw (not return { chosen: null }) when buttons are unsupported. ask means
         // "let the user choose"; silently returning null would mask the problem, while throwing gives
@@ -390,7 +386,7 @@ export class Daemon {
         if (!platform.capabilities.buttons) {
           throw new Error('unsupported operation: this platform does not support interactive buttons (ask)');
         }
-        return this.handleAsk(platform, action, channelId);
+        return this.handleAsk(platform, action, address);
       default: {
         // Exhaustiveness guard: a new IpcAction variant missed here fails to compile.
         const _exhaustive: never = action;
@@ -406,12 +402,12 @@ export class Daemon {
   private async handleAsk(
     platform: PlatformAdapter,
     action: Extract<IpcAction, { kind: 'ask' }>,
-    channelId: string
+    address: ConversationAddress
   ): Promise<{ chosen: string | null }> {
     const labels = action.options;
-    // Anchor session: read the stash before any await (later awaits yield, allowing a subsequent
-    // dispatch to overwrite the value).
-    const sessionId = this.lastResolvedSessionId;
+    // Anchor the conversation: read the stash before any await (later awaits yield, allowing a
+    // subsequent dispatch to overwrite the value).
+    const conversationId = this.lastResolvedConversationId;
     // Empty-options fast path: protocol options has no min(1), so an empty array would post a
     // "no buttons" message and idle until timeoutMs. With nothing to pick, return "no selection" now.
     if (labels.length === 0) {
@@ -423,7 +419,7 @@ export class Daemon {
       id: `${ASK_PREFIX}${reqId}:${i}`,
       label,
     }));
-    const ref = await platform.sendButtons(channelId, action.prompt, buttons);
+    const ref = await platform.sendButtons(address, action.prompt, buttons);
 
     const timeoutMs = action.timeoutMs ?? DEFAULT_ASK_TIMEOUT_MS;
     return new Promise<{ chosen: string | null }>((resolve) => {
@@ -442,7 +438,7 @@ export class Daemon {
         labels,
         prompt: action.prompt,
         adapter: platform,
-        sessionId,
+        conversationId,
       });
     });
   }
@@ -484,7 +480,7 @@ export class Daemon {
       for (const [k, t] of this.recentRouted) {
         if (now - t > DEDUP_TTL_MS) this.recentRouted.delete(k);
       }
-      const key = `${msg.platform}:${msg.channelId}:${msg.messageId}`;
+      const key = `${msg.conversation.platform}:${formatAddress(addressOf(msg.conversation))}:${msg.messageId}`;
       if (this.recentRouted.has(key)) return; // same source message already routed (slash≡message platforms)
       this.recentRouted.set(key, now);
     }
@@ -497,15 +493,19 @@ export class Daemon {
    * streams back via the normal channel.
    */
   private onCommand(ev: CommandInteraction): void {
-    console.log(`[slash] received native command /${ev.name} (${ev.platform} ch=${ev.channelId})`);
+    console.log(
+      `[slash] received native command /${ev.name} (${ev.conversation.platform} ${formatAddress(addressOf(ev.conversation))})`
+    );
     // Reconstruct the raw slash text: input (our registered named param) or raw (platforms without
     // structured params, e.g. Telegram).
     const input = String(ev.options.input ?? ev.options.raw ?? '').trim();
     const content = input ? `/${ev.name} ${input}` : `/${ev.name}`;
+    // The interaction carries a full ConversationRef, resolved by the same profile method as the
+    // message path. That matters: the synthesized message used to be built from a bare channel id
+    // with no kind and no space, so `when.chat` always read 'group' and `when.serverId` could never
+    // match — a rule could route a typed message and its slash equivalent to different places.
     const msg: InboundMessage = {
-      platform: ev.platform,
-      channelId: ev.channelId,
-      userId: ev.userId,
+      conversation: ev.conversation,
       messageId: ev.messageId,
       content,
       timestamp: Date.now(),
@@ -518,7 +518,7 @@ export class Daemon {
     // auto-DEFERRED response needs a followup or the UI reads "the application did not respond").
     // Where slash arrives as an ordinary message the receipt is pure noise — the agent's own reply
     // is already on its way — so it is skipped. Best-effort; failures only logged.
-    if (this.platforms.get(ev.platform)?.capabilities.slashNeedsAck) {
+    if (this.platforms.get(ev.conversation.platform)?.capabilities.slashNeedsAck) {
       void ev.reply(`▸ /${ev.name}`).catch((e) =>
         console.error('[slash] interaction acknowledgement failed:', e instanceof Error ? e.message : e)
       );
@@ -545,12 +545,13 @@ export class Daemon {
    * Only the commands the agent actually reported are offered — no guessed list. Ones already
    * reachable through the generic vocabulary are filtered out, since they have a top-level entry.
    */
-  private onPickerRequest(sessionId: SessionId, agentId: string, msg: InboundMessage): void {
-    const adapter = this.platforms.get(msg.platform);
+  private onPickerRequest(conversationId: ConversationId, agentId: string, msg: InboundMessage): void {
+    const adapter = this.platforms.get(msg.conversation.platform);
     if (!adapter) return;
+    const address = addressOf(msg.conversation);
     const send = (text: string): void => {
       void adapter
-        .sendMessage(msg.channelId, text)
+        .sendMessage(address, text)
         .catch((e) => console.error('[picker] reply failed:', e instanceof Error ? e.message : e));
     };
 
@@ -579,10 +580,9 @@ export class Daemon {
     const overflow = offered.slice(PICKER_BUTTON_MAX);
     const reqId = randomUUID().slice(0, 8);
     this.pendingPicks.set(reqId, {
-      sessionId,
+      conversationId,
       names: shown.map((c) => c.name),
-      channelId: msg.channelId,
-      platform: msg.platform,
+      conversation: msg.conversation,
     });
 
     let prompt = `${label} commands:`;
@@ -590,7 +590,7 @@ export class Daemon {
       prompt += `\n\n${overflow.length} more (type them directly): ${overflow.map((c) => `/${c.name}`).join(', ')}`;
     }
     const buttons = shown.map((c, i) => ({ id: `${PICK_PREFIX}${reqId}:${i}`, label: `/${c.name}` }));
-    void adapter.sendButtons(msg.channelId, prompt, buttons).catch((e) => {
+    void adapter.sendButtons(address, prompt, buttons).catch((e) => {
       this.pendingPicks.delete(reqId);
       console.error('[picker] failed to post the menu:', e instanceof Error ? e.message : e);
     });
@@ -610,18 +610,21 @@ export class Daemon {
     const name = pick.names[parsed.index];
     if (name === undefined) return;
 
+    const clicker = ev.conversation;
     const allow = this.config.access.allowFrom;
-    if (allow.length > 0 && !allow.includes(`${ev.platform}:${ev.userId}`)) {
-      console.log(`[access] denied picker click from ${ev.platform}:${ev.userId}`);
+    if (allow.length > 0 && !allow.includes(`${clicker.platform}:${clicker.user}`)) {
+      console.log(`[access] denied picker click from ${clicker.platform}:${clicker.user}`);
       return;
     }
 
     // One-shot: a menu button runs once, so drop it rather than let a stale menu be re-clicked.
     this.pendingPicks.delete(parsed.reqId);
-    const delivered = this.registry.dispatchToSession(pick.sessionId, {
-      platform: pick.platform,
-      channelId: pick.channelId,
-      userId: ev.userId,
+    const platformId = pick.conversation.platform;
+    const address = addressOf(pick.conversation);
+    const delivered = this.registry.dispatchTo(pick.conversationId, {
+      // The menu's own conversation, with the clicker as sender: the command must run where the
+      // menu was posted, by whoever pressed it.
+      conversation: { ...pick.conversation, user: clicker.user },
       messageId: ev.messageId,
       content: `/${name}`,
       timestamp: Date.now(),
@@ -630,14 +633,14 @@ export class Daemon {
     });
     if (!delivered) {
       void this.platforms
-        .get(pick.platform)
-        ?.sendMessage(pick.channelId, `That session is gone — send a message first, then run /${name}.`)
+        .get(platformId)
+        ?.sendMessage(address, `That conversation is gone — send a message first, then run /${name}.`)
         .catch(() => undefined);
       return;
     }
     void this.platforms
-      .get(pick.platform)
-      ?.editMessage({ channelId: pick.channelId, messageId: ev.messageId }, `→ /${name}`)
+      .get(platformId)
+      ?.editMessage({ address, messageId: ev.messageId }, `→ /${name}`)
       .catch(() => undefined);
   }
 

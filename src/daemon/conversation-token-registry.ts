@@ -1,8 +1,8 @@
 import { randomUUID, timingSafeEqual } from 'node:crypto';
-import type { SessionId } from '../types.js';
+import type { ConversationId } from '../types.js';
 
 /**
- * Bidirectional registry of per-session stable token ↔ sessionId.
+ * Bidirectional registry of per-session stable token ↔ conversationId.
  *
  * Extracted from SessionRegistry: token bookkeeping is a separate concern (reverse-command auth +
  * locate) and shouldn't mix with session-lifecycle/turn-orchestration state in one class.
@@ -11,22 +11,22 @@ import type { SessionId } from '../types.js';
  * resolve the current channel via token→session→activeChannel.
  */
 export class SessionTokenRegistry {
-  private bySession = new Map<SessionId, string>();
-  private byToken = new Map<string, SessionId>();
+  private bySession = new Map<ConversationId, string>();
+  private byToken = new Map<string, ConversationId>();
 
   /** Get/build a session's stable token (fixed on first call; reused on later turns). */
-  tokenFor(sessionId: SessionId): string {
-    let token = this.bySession.get(sessionId);
+  tokenFor(conversationId: ConversationId): string {
+    let token = this.bySession.get(conversationId);
     if (!token) {
       token = `sess_${randomUUID()}`;
-      this.bySession.set(sessionId, token);
-      this.byToken.set(token, sessionId);
+      this.bySession.set(conversationId, token);
+      this.byToken.set(token, conversationId);
     }
     return token;
   }
 
   /**
-   * Reverse-lookup sessionId by token (reverse-command entry); undefined if unregistered.
+   * Reverse-lookup conversationId by token (reverse-command entry); undefined if unregistered.
    *
    * Compares against each registered token in constant time (timingSafeEqual) rather than a plain
    * Map.get, so a timing side-channel can't reveal how many leading characters of a guessed token
@@ -34,7 +34,7 @@ export class SessionTokenRegistry {
    * cheap (the live-session set is small) and removes the foot-gun. Length is compared first
    * (timingSafeEqual requires equal length); leaking only the length is acceptable.
    */
-  sessionFor(token: string): SessionId | undefined {
+  conversationFor(token: string): ConversationId | undefined {
     const probe = Buffer.from(token);
     for (const [known, sid] of this.byToken) {
       const candidate = Buffer.from(known);
@@ -44,9 +44,9 @@ export class SessionTokenRegistry {
   }
 
   /** Release a session's token registration (clear both directions). */
-  release(sessionId: SessionId): void {
-    const token = this.bySession.get(sessionId);
+  release(conversationId: ConversationId): void {
+    const token = this.bySession.get(conversationId);
     if (token) this.byToken.delete(token);
-    this.bySession.delete(sessionId);
+    this.bySession.delete(conversationId);
   }
 }

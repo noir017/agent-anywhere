@@ -61,7 +61,8 @@ export interface RunTurnInput {
 }
 
 export interface AgentSession {
-  readonly sessionId: string;
+  /** The conversation this agent instance serves (the factory's key). */
+  readonly conversationId: string;
   /**
    * Run one turn, translating runtime stream events to handlers.
    * resolve = turn ended naturally; reject = error; abort() can interrupt.

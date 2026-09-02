@@ -2,7 +2,7 @@ import type { Config } from '../config/schema.js';
 import type { AgentFactory } from './agent.js';
 import { createAcpAgentFactory } from './agent-acp.js';
 import { createAgyAgentFactory } from './agent-agy.js';
-import type { SessionStore } from './session-store.js';
+import type { ConversationStore } from './conversation-store.js';
 
 /**
  * Agent-runtime dispatch: build one AgentFactory that routes each agent to the runtime speaking its
@@ -17,7 +17,7 @@ import type { SessionStore } from './session-store.js';
  * This lives in its own module rather than in agent.ts so the interface file stays dependency-free
  * (both runtimes import it, so putting the dispatch there would create an import cycle).
  */
-export function createAgentFactory(cfg: Config, socketPath: string, store?: SessionStore): AgentFactory {
+export function createAgentFactory(cfg: Config, socketPath: string, store?: ConversationStore): AgentFactory {
   // Both runtimes are constructed up front (each is just a Map plus closures; children spawn lazily
   // on the first turn), so an unused one costs nothing.
   const acp = createAcpAgentFactory(cfg, socketPath, store);

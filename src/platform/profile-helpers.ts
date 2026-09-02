@@ -1,6 +1,6 @@
 // Shared pure utilities for platform profiles: collapse the "same decision" repeated across
-// profiles (outbound id extraction + error, attachment meta extraction, composite channelId
-// split, button message fragment, Satori button interaction mounting).
+// profiles (outbound id extraction + error, attachment meta extraction, button message
+// fragment, Satori button interaction mounting).
 //
 // Design principle: collapse only IDENTICAL decisions; where platform SDKs genuinely differ
 // (e.g. whether reply carries a quote, ts validation on thread creation), each profile keeps
@@ -10,7 +10,9 @@ import HttpService from '@cordisjs/plugin-http';
 import ServerService from '@cordisjs/plugin-server';
 import type { Bot, Context, Session } from '@satorijs/core';
 
-import type { ButtonInteraction } from '../types.js';
+import type { ConversationAddress } from '../core/conversation.js';
+import type { MessageRef } from '../types.js';
+import type { ProfileButtonEvent, ResolvedConversation } from './profile.js';
 
 /**
  * A CJS package imported as ESM default yields the whole module.exports (namespace); the
@@ -74,19 +76,23 @@ export function firstMessageId(
 }
 
 /**
- * Generic outbound tail: `bot.sendMessage(channelId, content)` → take first id → build
+ * Generic outbound tail: `bot.sendMessage(address.channel, content)` → take first id → build
  * MessageRef. Covers the shared "send then take first id" decision across
  * sendMessage / reply / sendButtons.
+ *
+ * For profiles whose threads are channels in their own right (Discord) or which have no thread
+ * concept at all — a profile that reports a `thread` lane must post via `internal.*` itself,
+ * because the Satori encoder has no way to attach it.
  */
 export async function sendForRef(
   bot: Bot,
-  channelId: string,
+  address: ConversationAddress,
   content: h[] | string,
   platform: string,
   op: string
-): Promise<{ channelId: string; messageId: string }> {
-  const ids = await bot.sendMessage(channelId, content);
-  return { channelId, messageId: firstMessageId(ids, platform, op, channelId) };
+): Promise<MessageRef> {
+  const ids = await bot.sendMessage(address.channel, content);
+  return { address, messageId: firstMessageId(ids, platform, op, address.channel) };
 }
 
 /**
@@ -122,18 +128,6 @@ export function attrAttachmentMeta(
   attrs: Record<string, unknown> | undefined
 ): { mime?: string; size?: number } {
   return { mime: attrMime(attrs), size: attrSize(attrs) };
-}
-
-/**
- * Split a composite channelId `<head>:<tail>` (only at the first `:`; no `:` means tail is
- * undefined). Platforms use this to carry extra dimensions (Slack thread_ts, Telegram topic id):
- * each profile's decodeChannel just wraps it with a platform-specific field name instead of
- * re-implementing the split.
- */
-export function splitCompositeChannel(channelId: string): { head: string; tail?: string } {
-  const i = channelId.indexOf(':');
-  if (i < 0) return { head: channelId };
-  return { head: channelId.slice(0, i), tail: channelId.slice(i + 1) || undefined };
 }
 
 /**
@@ -226,32 +220,50 @@ export function deferUntilLogin(
 }
 
 /**
- * Mount the Satori-generic button-click interaction ('interaction/button'):
- * `session.event.button.id` is the button id given at send time, normalized into a
- * ButtonInteraction and emitted back. For platforms on this event (telegram / line / qq); when
- * opts.botPlatform is given, only that sub-bot's interactions are received (QQ guild sub-bot
- * 'qqguild'). Discord / Slack / Lark have different button paths and implement their own.
+ * `resolveConversation` for a platform with NO thread concept: the adapter's channel id is
+ * already a complete target, and the only distinction is DM vs group.
  *
- * opts.channelId lets a profile widen the adapter's channel.id into a real send target
- * (Telegram topics → `<chatId>:<topicId>`). It must match that
- * profile's inboundChannelId, or a button clicked inside a topic resolves to a different
- * channel than the message that produced it — for a blocking `ask`, the click would never
- * be matched back to its pending request.
+ * Used by lark / qq / line / wecom / dingtalk. Telegram, Slack and Discord each have a real
+ * thread model and implement their own. Sharing this makes the thread-less case a single
+ * decision rather than five copies that could drift apart.
+ */
+export function plainConversation(session: Session): ResolvedConversation {
+  const channel = session.channelId ?? '';
+  const space = session.guildId;
+  return {
+    channel,
+    // A guild id equal to the channel id carries no information (several adapters set both to
+    // the chat id for a flat group), so it is not reported as a space.
+    ...(space && space !== channel ? { space } : {}),
+    kind: session.isDirect === true ? 'direct' : 'group',
+  };
+}
+
+/**
+ * Mount the Satori-generic button-click interaction ('interaction/button'):
+ * `session.event.button.id` is the button id given at send time, normalized and emitted back.
+ * For platforms on this event (telegram / line / qq); when opts.botPlatform is given, only that
+ * sub-bot's interactions are received (QQ guild sub-bot 'qqguild'). Discord / Slack / Lark have
+ * different button paths and implement their own.
+ *
+ * The location comes from the profile's OWN `resolveConversation`, passed in by the caller, so a
+ * button clicked inside a topic resolves to exactly the conversation the message path would give
+ * it. When those disagreed, a blocking `ask` could never match its pending request and sat until
+ * timeout.
  */
 export function mountSatoriButtonInteraction(
   ctx: Context,
-  platform: string,
-  emit: (ev: ButtonInteraction) => void,
-  opts?: { botPlatform?: string; channelId?: (session: Session) => string }
+  resolveConversation: (session: Session) => ResolvedConversation,
+  emit: (ev: ProfileButtonEvent) => void,
+  opts?: { botPlatform?: string }
 ): void {
   ctx.on('interaction/button', (session: Session) => {
     if (opts?.botPlatform && session.bot.platform !== opts.botPlatform) return;
     const buttonId = session.event?.button?.id;
     if (!buttonId) return;
     emit({
-      platform,
-      channelId: opts?.channelId?.(session) ?? session.channelId ?? '',
-      userId: session.userId ?? '',
+      conversation: resolveConversation(session),
+      user: session.userId ?? '',
       messageId: session.messageId ?? '',
       buttonId,
     });

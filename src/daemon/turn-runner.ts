@@ -1,7 +1,8 @@
 import type { Config } from '../config/schema.js';
 import { findAgent } from '../config/schema.js';
 import { looksLikeCommand } from './routing.js';
-import type { AgentCommand, InboundMessage, SessionId } from '../types.js';
+import { addressOf, sameAddress, type ConversationAddress } from '../core/conversation.js';
+import type { AgentCommand, ConversationId, InboundMessage } from '../types.js';
 import type { PlatformAdapter } from '../platform/adapter.js';
 import type { AgentFactory, AgentStreamHandlers, AgentUsage } from './agent.js';
 import { StreamBuffer } from '../core/stream-buffer.js';
@@ -13,22 +14,31 @@ import { createAttachmentIngestDeps } from './attachment-io.js';
 /**
  * Collaborator capabilities TurnRunner needs (DI interface).
  *
- * Deliberately exposes only what running one turn needs, not the whole SessionRegistry — to avoid
- * TurnRunner ↔ SessionRegistry bidirectional coupling. SessionRegistry remains the sole owner of
- * state/lifecycle; this borrows read-only views (agentIdOf / tokenFor / modelOverride) and a small
- * write entry (activeChannel set/delete).
+ * Deliberately exposes only what running one turn needs, not the whole ConversationRegistry — to
+ * avoid bidirectional coupling. The registry remains the sole owner of state/lifecycle; this
+ * borrows read-only views (agentIdOf / tokenFor / modelOverride) and a small write entry
+ * (activeAddress set/delete).
  */
 export interface TurnRunnerDeps {
-  /** Get this session's stable per-session token (reverse-command auth + locate). */
-  tokenFor(sessionId: SessionId): string;
-  /** Get the session's fixed agent id (falls back to routing.default). */
-  agentIdOf(sessionId: SessionId): string;
-  /** Read this session's model override (/model); undefined means use agent.model. */
-  getModelOverride(sessionId: SessionId): string | undefined;
-  /** Mark this session's current-turn channel + platform instance (set at turn start); reverse commands locate by them. */
-  setActiveChannel(sessionId: SessionId, channelId: string, platformId: string): void;
-  /** Clear this session's current-turn channel (delete at turn end). */
-  deleteActiveChannel(sessionId: SessionId): void;
+  /** Get this conversation's stable token (reverse-command auth + locate). */
+  tokenFor(id: ConversationId): string;
+  /** Get the agent currently bound to this conversation (falls back to routing.default). */
+  agentIdOf(id: ConversationId): string;
+  /** Read this conversation's model override (/model); undefined means use agent.model. */
+  getModelOverride(id: ConversationId): string | undefined;
+  /** Mark the current turn's target address + platform instance; reverse commands locate by them. */
+  setActiveAddress(id: ConversationId, address: ConversationAddress, platformId: string): void;
+  /** Clear the current turn's address (at turn end). */
+  deleteActiveAddress(id: ConversationId): void;
+  /**
+   * Register an auto-created thread as belonging to an existing conversation.
+   *
+   * autoThread opens a thread mid-turn and moves the reply into it. Without this the user's first
+   * message typed inside that thread would identify as a NEW conversation and start an empty one —
+   * the agent would answer its own follow-up from scratch. The registry keeps an alias so the
+   * thread continues the conversation that opened it, agent and context intact.
+   */
+  adoptThread?(id: ConversationId, address: ConversationAddress, platformId: string): void;
 }
 
 /**
@@ -79,7 +89,7 @@ export class TurnRunner {
      * a change. Absent = don't care (test/no-slash).
      */
     private readonly hooks?: {
-      onAvailableCommands?(sessionId: SessionId, agentId: string, cmds: AgentCommand[]): void;
+      onAvailableCommands?(id: ConversationId, agentId: string, cmds: AgentCommand[]): void;
     }
   ) {}
 
@@ -91,29 +101,30 @@ export class TurnRunner {
    * drop the streaming cursor with no footer and no command fallback, since the continuing batch
    * produces its own reply (and its own ✅). Absent = never interrupted (treat as a normal turn).
    */
-  async runTurn(sessionId: SessionId, batch: InboundMessage[], signal?: AbortSignal): Promise<void> {
+  async runTurn(conversationId: ConversationId, batch: InboundMessage[], signal?: AbortSignal): Promise<void> {
     // The turn's platform is the batch's platform instance (all messages of one batch come from
     // one merger, i.e. one channel — same instance; a shared-scope session may hop instances
     // between turns, so this resolves per turn, not per session).
     const last = batch[batch.length - 1]!; // batch is non-empty: the merger never dispatches an empty batch
-    const platform = this.adapterFor(last.platform);
+    const platformId = last.conversation.platform;
+    const platform = this.adapterFor(platformId);
 
-    // All subsequent outbound (TurnContext.channelId, typing, StreamBuffer sink, tool bubbles, reverse
-    // commands) use this channelId; on autoThread it's the new thread id so the whole turn lands in it.
-    const channelId = await this.resolveTurnChannel(platform, batch);
+    // All subsequent outbound (typing, StreamBuffer sink, tool bubbles, reverse commands) targets
+    // this address; on autoThread it is the newly opened thread, so the whole turn lands in it.
+    const address = await this.resolveTurnAddress(platform, batch, conversationId, platformId);
 
-    const sessionToken = this.deps.tokenFor(sessionId);
-    const agentId = this.deps.agentIdOf(sessionId);
-    // Mark this session's current-turn channel + platform: reverse commands locate via token→session→these.
-    this.deps.setActiveChannel(sessionId, channelId, last.platform);
+    const sessionToken = this.deps.tokenFor(conversationId);
+    const agentId = this.deps.agentIdOf(conversationId);
+    // Mark the current turn's address + platform: reverse commands locate via token→conversation→these.
+    this.deps.setActiveAddress(conversationId, address, platformId);
 
     // Typing keep-alive: Discord's typing indicator self-expires ~10s, so re-fire every typingIntervalMs
     // (fire-and-forget, never gates the turn). Cancelled + stopTyping in finally.
-    const stopTypingLoop = this.startTypingLoop(platform, channelId);
+    const stopTypingLoop = this.startTypingLoop(platform, address);
 
-    // StreamBuffer factory closure: sink bound to this turn's channelId, callable repeatedly to rotate a
+    // StreamBuffer factory closure: sink bound to this turn's address, callable repeatedly to rotate a
     // fresh buffer per segment — trailing text below a tool bubble goes to a new message, not editing the prior one.
-    const makeStream = (): StreamBuffer => this.makeStreamBuffer(platform, channelId);
+    const makeStream = (): StreamBuffer => this.makeStreamBuffer(platform, address);
 
     // Turn-level mutable container: stream (active text buffer, rotated at segment boundaries),
     // producedOutput (whether the turn emitted visible output) and usage (latest context snapshot
@@ -137,8 +148,8 @@ export class TurnRunner {
         emojiMap: this.config.tools.emojiMap,
       },
       {
-        sendBubble: (text) => platform.sendMessage(channelId, text),
-        // accumulate mode flushes whole tool progress/completion into one bubble (channelId closure).
+        sendBubble: (text) => platform.sendMessage(address, text),
+        // accumulate mode flushes whole tool progress/completion into one bubble (address closure).
         // Capability-gated: on platforms with editMessage=false (QQ/LINE/WeCom) editMessage throws, so
         // pass undefined to let ToolRenderer degrade to separate (one new bubble per tool) instead of
         // throwing on every accumulate edit. Symmetric with StreamBuffer's noEdit inference.
@@ -158,9 +169,9 @@ export class TurnRunner {
       );
     };
 
-    const agent = this.agents.getOrCreate(sessionId, agentId);
+    const agent = this.agents.getOrCreate(conversationId, agentId);
     const prompt = await this.buildPrompt(batch);
-    console.log(`[turn] ${sessionId} starting turn (${batch.length} message(s))`);
+    console.log(`[turn] ${conversationId} starting turn (${batch.length} message(s))`);
 
     // producedOutput (whether the turn emitted visible output) lives in the ref above. Used for the
     // command zero-output fallback: a few built-ins (e.g. /compact) produce a marker-only shell stripped
@@ -170,8 +181,8 @@ export class TurnRunner {
 
     try {
       await agent.runTurn(
-        { prompt, sessionToken, model: this.deps.getModelOverride(sessionId) },
-        this.buildStreamHandlers(sessionId, ref, makeStream, tools, enqueue)
+        { prompt, sessionToken, model: this.deps.getModelOverride(conversationId) },
+        this.buildStreamHandlers(conversationId, ref, makeStream, tools, enqueue)
       );
       await effects;                       // wait for all queued side effects to land
       if (signal?.aborted) {
@@ -179,20 +190,20 @@ export class TurnRunner {
         // cursor with no footer (it didn't finish), and skip the command fallback. The continuing
         // batch starts a fresh turn and produces its own reply + ✅.
         await ref.stream.complete();
-        console.log(`[turn] ${sessionId} turn interrupted (continuing with newer input)`);
+        console.log(`[turn] ${conversationId} turn interrupted (continuing with newer input)`);
       } else {
         // Final flush: footer only on the last stream (intermediate segments carry none).
-        await ref.stream.complete({ footer: this.buildFooter(sessionId, ref) });
+        await ref.stream.complete({ footer: this.buildFooter(conversationId, ref) });
         // Command zero-output fallback: the agent ran a command but produced nothing displayable (often
         // harness-swallowed built-in stdout, or an unknown command); send a note instead of total silence. best-effort.
         if (isCommandTurn && !ref.producedOutput) {
-          await this.sendCommandFallback(platform, channelId, lastContent);
+          await this.sendCommandFallback(platform, address, lastContent);
         }
-        console.log(`[turn] ${sessionId} turn complete`);
+        console.log(`[turn] ${conversationId} turn complete`);
       }
     } catch (err) {
       // Log error detail (InboundMerger only adds a ❌ reaction, keeping no reason).
-      console.error(`[turn] ${sessionId} turn failed:`, err instanceof Error ? err.stack ?? err.message : err);
+      console.error(`[turn] ${conversationId} turn failed:`, err instanceof Error ? err.stack ?? err.message : err);
       // Surface a readable reason in-channel: the agent-acp error messages (auth_required, startup
       // / turn timeout, command not on PATH) are written to be user-actionable, but otherwise only
       // a bare ❌ reaction reaches the user. Best-effort and capped — a send failure here must not
@@ -200,13 +211,13 @@ export class TurnRunner {
       const reason = err instanceof Error ? err.message : String(err);
       const short = reason.length > 300 ? reason.slice(0, 299) + '…' : reason;
       await platform
-        .sendMessage(channelId, `❌ This turn failed: ${short}`)
+        .sendMessage(address, `❌ This turn failed: ${short}`)
         .catch((e) => console.error('[turn] failed to send error notice:', e instanceof Error ? e.message : e));
       throw err;
     } finally {
       stopTypingLoop();
-      await platform.stopTyping(channelId);
-      this.deps.deleteActiveChannel(sessionId);
+      await platform.stopTyping(address);
+      this.deps.deleteActiveAddress(conversationId);
     }
   }
 
@@ -223,7 +234,7 @@ export class TurnRunner {
    * → tool bubble → trailing text" in strict arrival order, no interleaving, failures swallowed.
    */
   private buildStreamHandlers(
-    sessionId: SessionId,
+    conversationId: ConversationId,
     ref: TurnRef,
     makeStream: () => StreamBuffer,
     tools: ToolRenderer,
@@ -254,7 +265,7 @@ export class TurnRunner {
       // Non-blocking, errors swallowed.
       onAvailableCommands: (cmds) => {
         try {
-          this.hooks?.onAvailableCommands?.(sessionId, this.deps.agentIdOf(sessionId), cmds);
+          this.hooks?.onAvailableCommands?.(conversationId, this.deps.agentIdOf(conversationId), cmds);
         } catch (e) {
           console.error('[turn] onAvailableCommands hook failed:', e instanceof Error ? e.message : e);
         }
@@ -281,41 +292,54 @@ export class TurnRunner {
   }
 
   /**
-   * Resolve this turn's outbound channel: when the instance's autoThread='perTurn', the channel
-   * supports threads, and the message is non-thread/non-DM, best-effort create a thread and move the
-   * whole turn into it; on failure or when not applicable, fall back to the trigger message's channel
-   * — never block the turn.
+   * Resolve this turn's outbound address: when the instance's autoThread='perTurn', the platform
+   * supports threads, and the message is non-thread/non-DM, best-effort open a thread and move the
+   * whole turn into it; on failure or when not applicable, fall back to the trigger message's own
+   * address — never block the turn.
+   *
+   * A newly opened thread is ADOPTED by this conversation (deps.adoptThread) so the user's reply
+   * inside it continues here. Without that the reply identifies as a new conversation and the agent
+   * answers its own thread from scratch — the whole point of auto-threading is that the exchange
+   * moves, not that it restarts.
    */
-  private async resolveTurnChannel(platform: PlatformAdapter, batch: InboundMessage[]): Promise<string> {
+  private async resolveTurnAddress(
+    platform: PlatformAdapter,
+    batch: InboundMessage[],
+    conversationId: ConversationId,
+    platformId: string
+  ): Promise<ConversationAddress> {
     const last = batch[batch.length - 1]!; // batch is non-empty: the merger never dispatches an empty batch
-    const platformCfg = this.config.platforms[last.platform];
+    const own = addressOf(last.conversation);
+    const platformCfg = this.config.platforms[platformId];
     if (
       platformCfg?.autoThread === 'perTurn' &&
       platform.capabilities.thread &&
-      !last.isThread &&
-      !last.isDirect
+      last.conversation.kind === 'group'
     ) {
       try {
         const flat = this.buildThreadName(batch) || 'Conversation';
-        const { threadId } = await platform.createThread(
-          { channelId: last.channelId, messageId: last.messageId },
+        const { address } = await platform.createThread(
+          { address: own, messageId: last.messageId },
           flat,
           { autoArchiveMinutes: platformCfg.threadAutoArchiveMinutes }
         );
-        return threadId;
+        if (!sameAddress(address, own)) {
+          this.deps.adoptThread?.(conversationId, address, platformId);
+        }
+        return address;
       } catch (e) {
-        console.error('[turn] autoThread failed to create thread, falling back to original channel:', e instanceof Error ? e.message : e);
+        console.error('[turn] autoThread failed to create thread, falling back to the original channel:', e instanceof Error ? e.message : e);
       }
     }
-    return last.channelId;
+    return own;
   }
 
   /**
-   * StreamBuffer factory: sink bound to the given channelId; each call yields a fresh buffer for
+   * StreamBuffer factory: sink bound to the given address; each call yields a fresh buffer for
    * per-segment rotation (trailing text below a tool bubble goes to a new message, not editing the prior).
    * noEdit: on platforms without in-place edit (QQ/LINE/WeCom), take the "send-only, merge whole" path.
    */
-  private makeStreamBuffer(platform: PlatformAdapter, channelId: string): StreamBuffer {
+  private makeStreamBuffer(platform: PlatformAdapter, address: ConversationAddress): StreamBuffer {
     return new StreamBuffer(
       {
         charThreshold: this.config.stream.charThreshold,
@@ -336,7 +360,7 @@ export class TurnRunner {
         schedule: this.clock.schedule,
         send: async (text) => {
           try {
-            const ref = await platform.sendMessage(channelId, text);
+            const ref = await platform.sendMessage(address, text);
             console.log(`[out] send ok (${text.length} chars) → ${ref.messageId}`);
             return ref;
           } catch (e) {
@@ -361,11 +385,11 @@ export class TurnRunner {
    * Command zero-output fallback: the agent ran a command but produced nothing displayable (often
    * harness-swallowed built-in stdout, or an unknown command); send a note. best-effort, failures logged.
    */
-  private async sendCommandFallback(platform: PlatformAdapter, channelId: string, lastContent: string): Promise<void> {
+  private async sendCommandFallback(platform: PlatformAdapter, address: ConversationAddress, lastContent: string): Promise<void> {
     const cmd = lastContent.split(/\s+/)[0];
     await platform
       .sendMessage(
-        channelId,
+        address,
         `ℹ️ Ran \`${cmd}\`, but there was no output to display.\n(A few built-in commands such as /compact don't relay their results to IM; an unknown command does nothing.)`
       )
       .catch((e) => console.error('[turn] failed to send command fallback notice:', e instanceof Error ? e.message : e));
@@ -376,12 +400,12 @@ export class TurnRunner {
    * Returns a cancel handle (called at turn end to stop re-scheduling). Each startTyping is
    * fire-and-forget and swallows errors — typing never gates the turn.
    */
-  private startTypingLoop(platform: PlatformAdapter, channelId: string): () => void {
+  private startTypingLoop(platform: PlatformAdapter, address: ConversationAddress): () => void {
     let cancel: (() => void) | null = null;
     let stopped = false;
     const beat = (): void => {
       if (stopped) return;
-      void platform.startTyping(channelId).catch(() => {});
+      void platform.startTyping(address).catch(() => {});
       cancel = this.clock.schedule(beat, this.config.inbound.typingIntervalMs);
     };
     beat();
@@ -407,14 +431,14 @@ export class TurnRunner {
    * status line appended to every reply, so it uses the short name even though the header bubble —
    * sent once per session — spells out the harness.
    */
-  private buildFooter(sessionId: SessionId, ref: TurnRef): string {
+  private buildFooter(conversationId: ConversationId, ref: TurnRef): string {
     if (!this.config.display.footer.enabled) return '';
-    const agentId = this.deps.agentIdOf(sessionId);
+    const agentId = this.deps.agentIdOf(conversationId);
     const def = findAgent(this.config, agentId);
     return formatRuntimeFooter(
       {
         agent: agentId,
-        model: ref.model ?? this.deps.getModelOverride(sessionId) ?? def?.model,
+        model: ref.model ?? this.deps.getModelOverride(conversationId) ?? def?.model,
         contextTokens: ref.usage?.used,
         contextLength: ref.usage?.size,
         cwd: def?.cwd,

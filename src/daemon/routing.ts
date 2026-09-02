@@ -1,21 +1,28 @@
 import type { Config, SessionScope } from '../config/schema.js';
-import type { InboundMessage, SessionId } from '../types.js';
+import type { ConversationRef, ConversationKind } from '../core/conversation.js';
+import type { InboundMessage } from '../types.js';
 
 /**
- * Routing and session assignment: map an inbound (or slash command) to "which agent + which session key".
+ * Routing: map an inbound message to "which agent, in which scope".
  *
- * - resolveRoute: match routing.pipeline in order; first rule whose `when` fully matches uses its `use`, else routing.default.
- * - sessionKey: compute a stable session key per scope (same key = same agent session, context across turns).
+ * Split deliberately in two, because the two answers have different lifetimes:
+ *  - the SCOPE decides how a conversation is identified, and is a property of config;
+ *  - the AGENT is a mutable property of a conversation, and config only chooses its
+ *    INITIAL value (plus explicit reassignment via a `/name` command).
+ *
+ * Conversation identity itself lives in core/conversation.ts — note that no function here
+ * builds a key. The agent used to lead the session key, which made `/oc hi` and its plain
+ * follow-up two different conversations in one topic.
  */
 
-/** Route-match input (both InboundMessage and slash commands normalize to this minimal shape). */
+/** Route-match input (both inbound messages and slash commands normalize to this minimal shape). */
 export interface RouteInput {
   platform: string;
-  channelId: string;
-  userId: string;
-  guildId?: string;
-  isDirect?: boolean;
-  isThread?: boolean;
+  channel: string;
+  thread?: string;
+  space?: string;
+  user: string;
+  kind: ConversationKind;
   isBot?: boolean;
   /**
    * Leading `/name` of the message text, if any. Native slash commands also arrive here: the
@@ -25,26 +32,30 @@ export interface RouteInput {
   command?: string;
 }
 
-export interface RouteResult {
+export interface AgentChoice {
   agentId: string;
-  scope: SessionScope;
   /**
-   * True when the winning rule matched via `when.command`: the router consumed the `/name`
-   * prefix, and the caller must strip it from the content so the target agent doesn't try to
-   * interpret it as one of its own slash commands.
+   * True when the winning rule matched via `when.command` — i.e. the user NAMED this agent
+   * (`/oc …`). Only an explicit choice rebinds an existing conversation; a rule matching on
+   * platform or channel merely supplies the initial agent, because re-applying it on every
+   * message would make binding impossible to change and stickiness meaningless.
+   *
+   * Also tells the caller the `/name` prefix was consumed and must be stripped, so the target
+   * agent doesn't try to run it as one of its own slash commands.
    */
-  consumedCommand: boolean;
+  explicit: boolean;
 }
 
 /** Normalize a RouteInput from an InboundMessage. */
 export function routeInputFromMessage(msg: InboundMessage): RouteInput {
+  const c = msg.conversation;
   return {
-    platform: msg.platform,
-    channelId: msg.channelId,
-    userId: msg.userId,
-    guildId: msg.guildId,
-    isDirect: msg.isDirect,
-    isThread: msg.isThread,
+    platform: c.platform,
+    channel: c.channel,
+    ...(c.thread != null ? { thread: c.thread } : {}),
+    ...(c.space != null ? { space: c.space } : {}),
+    user: c.user,
+    kind: c.kind,
     isBot: msg.authorIsBot,
     command: parseTextCommand(msg.content)?.name,
   };
@@ -81,21 +92,17 @@ export function looksLikeCommand(text: string): boolean {
   return parseTextCommand(text) !== null;
 }
 
-/** Chat kind (for when.chat matching). */
-function chatKind(input: RouteInput): 'private' | 'group' | 'thread' {
-  if (input.isDirect) return 'private';
-  if (input.isThread) return 'thread';
-  return 'group';
-}
-
 /** Whether a rule's `when` fully matches. Provided fields must all match; omitted = unrestricted. */
 function matchesWhen(when: Config['routing']['pipeline'][number]['when'], input: RouteInput): boolean {
   if (when.platform !== undefined && when.platform !== input.platform) return false;
-  // serverId: a rule with a serverId condition never matches when the message has no guildId (avoid false global match).
-  if (when.serverId !== undefined && when.serverId !== input.guildId) return false;
-  if (when.channelId !== undefined && when.channelId !== input.channelId) return false;
-  if (when.userId !== undefined && when.userId !== input.userId) return false;
-  if (when.chat !== undefined && when.chat !== chatKind(input)) return false;
+  // serverId: a rule with a serverId condition never matches when the message has no space
+  // (avoid a false global match).
+  if (when.serverId !== undefined && when.serverId !== input.space) return false;
+  // channelId matches the channel, ignoring any thread lane: "this channel" naturally covers
+  // its topics, which is what an operator writing a channel id means.
+  if (when.channelId !== undefined && when.channelId !== input.channel) return false;
+  if (when.userId !== undefined && when.userId !== input.user) return false;
+  if (when.chat !== undefined && when.chat !== input.kind) return false;
   if (when.isBot !== undefined && when.isBot !== Boolean(input.isBot)) return false;
   // command: matches the message's leading /name (native slash commands arrive as `/name input` text too).
   if (when.command !== undefined) {
@@ -105,43 +112,54 @@ function matchesWhen(when: Config['routing']['pipeline'][number]['when'], input:
   return true;
 }
 
-/** Resolve the route: return the chosen agentId / scope. */
-export function resolveRoute(cfg: Config, input: RouteInput): RouteResult {
-  for (const rule of cfg.routing.pipeline) {
-    if (matchesWhen(rule.when, input)) {
-      return {
-        agentId: rule.use.agent,
-        scope: rule.use.scope ?? cfg.session.scope,
-        consumedCommand: rule.when.command !== undefined,
-      };
-    }
-  }
-  return { agentId: cfg.routing.default, scope: cfg.session.scope, consumedCommand: false };
+/** The first matching rule, or undefined when the pipeline doesn't match. */
+function firstMatch(
+  cfg: Config,
+  input: RouteInput
+): Config['routing']['pipeline'][number] | undefined {
+  return cfg.routing.pipeline.find((rule) => matchesWhen(rule.when, input));
 }
 
 /**
- * Compute the session key per scope, qualified by the routed agent — two agents addressed in the
- * same place (e.g. `/codex …` next to default-agent chat in one channel) keep separate sessions
- * instead of the first-created agent capturing the key forever.
- * - shared: one global session (per agent).
- * - per_user: isolated by sender.
- * - per_channel: isolated by channel (inside a thread, channelId is the thread id).
- * - per_thread: isolated by thread; for non-thread contexts channelId is the channel id, same as
- *   per_channel (true parent-channel distinction needs a platform parent id, left to adapters).
+ * Which scope identifies this message's conversation.
+ *
+ * Resolved per message rather than stored, so it stays a pure function of config. A rule's
+ * `use.scope` override applies whenever that rule matches.
  */
-export function sessionKey(
-  scope: SessionScope,
-  agentId: string,
-  input: { platform: string; channelId: string; userId: string }
-): SessionId {
-  switch (scope) {
-    case 'shared':
-      return `${agentId}:shared`;
-    case 'per_user':
-      return `${agentId}:${input.platform}:u:${input.userId}`;
-    case 'per_channel':
-      return `${agentId}:${input.platform}:c:${input.channelId}`;
-    case 'per_thread':
-      return `${agentId}:${input.platform}:t:${input.channelId}`;
-  }
+export function resolveScope(cfg: Config, input: RouteInput): SessionScope {
+  return firstMatch(cfg, input)?.use.scope ?? cfg.session.scope;
+}
+
+/**
+ * Which agent this message asks for, and whether it asked EXPLICITLY.
+ *
+ * The caller (ConversationRegistry) decides what to do with a non-explicit answer: for an
+ * existing conversation it is ignored in favour of the bound agent. That is the whole fix for
+ * "`/oc hi` answered by opencode, the next message answered by claude".
+ */
+export function resolveAgent(cfg: Config, input: RouteInput): AgentChoice {
+  const rule = firstMatch(cfg, input);
+  if (!rule) return { agentId: cfg.routing.default, explicit: false };
+  return { agentId: rule.use.agent, explicit: rule.when.command !== undefined };
+}
+
+/** Convenience for callers that need both (one pipeline walk each; the pipeline is tiny). */
+export function resolveRoute(
+  cfg: Config,
+  input: RouteInput
+): { agent: AgentChoice; scope: SessionScope } {
+  return { agent: resolveAgent(cfg, input), scope: resolveScope(cfg, input) };
+}
+
+/** Build a RouteInput straight from a ConversationRef (for paths with no message body). */
+export function routeInputFromRef(ref: ConversationRef, command?: string): RouteInput {
+  return {
+    platform: ref.platform,
+    channel: ref.channel,
+    ...(ref.thread != null ? { thread: ref.thread } : {}),
+    ...(ref.space != null ? { space: ref.space } : {}),
+    user: ref.user,
+    kind: ref.kind,
+    ...(command != null ? { command } : {}),
+  };
 }

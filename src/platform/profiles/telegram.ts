@@ -7,7 +7,7 @@
 // - TelegramBot.inject=['http'] (even for polling), so install must ctx.plugin(HttpService) first.
 // - reply: <quote id=...> -> reply_to_message_id (message.ts 'quote' branch).
 // - buttons: an inline keyboard is posted via internal.sendMessage's reply_markup (NOT the Satori
-//   <button> encoder, which would route through the adapter and mangle a composite channel id);
+//   <button> encoder, which routes through the adapter and cannot attach message_thread_id);
 //   the click arrives as 'interaction/button' with session.event.button.id === callback_data, and
 //   the adapter auto-answers the callback query. callback_data is capped at 64 bytes.
 // - slash: bot.updateCommands -> internal.setMyCommands (gated by config.slash). Inbound
@@ -25,16 +25,16 @@ import path from 'node:path';
 import TelegramAdapter from '@satorijs/adapter-telegram';
 import type { Bot, Session, Universal } from '@satorijs/core';
 
-import type { SlashCommandSpec } from '../../types.js';
+import type { ConversationAddress } from '../../core/conversation.js';
+import type { MessageRef, SlashCommandSpec } from '../../types.js';
 import type { PlatformCapabilities } from '../adapter.js';
-import type { PlatformProfile } from '../profile.js';
+import type { PlatformProfile, ResolvedConversation } from '../profile.js';
 import type { TelegramPlatformConfig } from '../config-schemas.js';
 import {
   deferUntilLogin,
   installHttpService,
   mountSatoriButtonInteraction,
   resolveDefaultPlugin,
-  splitCompositeChannel,
 } from '../profile-helpers.js';
 import {
   renderTelegramMarkdown,
@@ -146,57 +146,56 @@ interface TelegramHttp {
 }
 
 /**
- * Decode a composite channelId (pure, for unit testing).
+ * Numeric message_thread_id from an address, validated.
  *
- * Forum-topic threads carry the `chat + topic` pair as `<chatId>:<topicId>` (both numeric, so
- * the `:` split is safe). Composite: split on the first `:` into real chatId + topicId
- * (message_thread_id). Plain (no `:`): the whole string is chatId, topicId undefined.
- * edit/react only need chat_id + message_id, so they use this just to extract chatId.
- *
- * Exposed to satori-core through `decodeChannelKey`, which is what closed the gap this comment
- * used to describe: the generic deleteMessage / fetchHistory / sendFile paths don't go through a
- * profile override, so they passed the composite key straight to `bot.*`. Core now decodes via
- * the seam, so those paths see a real chat id like every other.
+ * Telegram's `message_thread_id` is an integer. The previous scheme reached the API with
+ * `Number('99:5') === NaN` whenever a malformed composite key slipped through, and Telegram
+ * answers that with an opaque 400 far from the cause. Fail here, naming the value.
  */
-export function decodeChannel(channelId: string): { chatId: string; topicId?: string } {
-  const { head, tail } = splitCompositeChannel(channelId);
-  return { chatId: head, topicId: tail };
+function topicIdOf(address: ConversationAddress): number {
+  const n = Number(address.thread);
+  if (!Number.isInteger(n)) {
+    throw new Error(
+      `[telegram] message_thread_id must be an integer, got ${JSON.stringify(address.thread)} (channel=${address.channel})`
+    );
+  }
+  return n;
 }
 
 /**
- * Composite-aware raw send — THE single outbound text path for this profile (sendMessage, reply,
- * sendButtons and the slash-command receipt all go through it).
+ * Composite-aware raw send — THE single outbound text path for this profile (sendMessage,
+ * reply, sendButtons and the slash-command receipt all go through it).
  *
- * MUST be used instead of `bot.sendMessage` / `sendForRef` for any channelId that may be
- * composite: those call the adapter, whose encoder computes `chat_id = session.guildId ||
- * channelId`. On an outbound-only send there is no inbound session, so the whole
- * `<chatId>:<topicId>` string is handed to the Bot API as chat_id. Verified live, the failure
- * is worse than a clean error because it differs by chat type:
+ * MUST be used instead of `bot.sendMessage` / `sendForRef` for anything that may carry a
+ * topic: those call the adapter, whose encoder computes `chat_id = session.guildId ||
+ * channelId` and reads `message_thread_id` off the INBOUND session — which an outbound-only
+ * send does not have. So through the adapter a topic-bound message either loses its lane or,
+ * back when the lane was smuggled inside the channel string, handed Telegram a malformed
+ * chat_id. Verified live, that failed two different ways:
  *   - private chat: Telegram parses the id LENIENTLY, truncating at the ':' — the send SUCCEEDS
  *     (ok=true) but lands in the chat ROOT with no message_thread_id. Silently wrong place.
  *   - group/supergroup: hard 400 `chat not found`.
  * That is how `ask` buttons went missing from a topic: in a group the send threw and the daemon
  * sat on the pending ask until timeout, while in a DM the buttons appeared — just outside the
- * topic that asked. Decoding here is what actually routes into the topic.
+ * topic that asked.
  *
  * `extra` carries the per-caller payload (reply_to_message_id, reply_markup) so that adding a new
- * outbound kind means passing a field here, not writing a fresh send path that can forget to
- * decode — the omission this function exists to prevent.
+ * outbound kind means passing a field here, not writing a fresh send path that can forget the
+ * lane — the omission this function exists to prevent.
  */
 async function sendComposite(
   bot: Bot,
-  channelId: string,
+  address: ConversationAddress,
   text: string,
   extra: {
     replyToMessageId?: string;
     buttons?: Array<{ id: string; label: string }>;
   } = {}
-): Promise<{ channelId: string; messageId: string }> {
-  const { chatId, topicId } = decodeChannel(channelId);
+): Promise<MessageRef> {
   const internal = bot.internal as unknown as TelegramInternal;
   const msg = await internal.sendMessage({
-    chat_id: chatId,
-    ...(topicId != null ? { message_thread_id: Number(topicId) } : {}),
+    chat_id: address.channel,
+    ...(address.thread != null ? { message_thread_id: topicIdOf(address) } : {}),
     text: fragmentToTelegramHtml(renderTelegramMarkdown(text)),
     parse_mode: 'HTML',
     ...(extra.replyToMessageId != null
@@ -216,10 +215,12 @@ async function sendComposite(
   });
   const messageId = msg?.message_id;
   if (messageId == null) {
-    throw new Error(`[telegram] sendMessage did not return a message id (channel=${channelId})`);
+    throw new Error(`[telegram] sendMessage did not return a message id (channel=${address.channel})`);
   }
-  // ref uses the real chatId so later edit/react take the chat_id+message_id path.
-  return { channelId: chatId, messageId: String(messageId) };
+  // The ref keeps the full address (lane included) so a later reply into this message stays
+  // in its topic. Edits and reactions read only address.channel, which the Bot API is happy
+  // with — those two endpoints take no thread parameter.
+  return { address, messageId: String(messageId) };
 }
 
 /**
@@ -263,68 +264,59 @@ export function rawTopicFields(session: unknown): {
 }
 
 /**
- * Telegram's General/root topic id. A message in the DM root (outside any topic) either
- * omits message_thread_id entirely or reports the General lane; treating General as a
- * topic would give the root chat a composite id that differs from the plain chat id,
- * splitting one conversation into two sessions.
+ * Telegram's General/root topic id. A message in the root (outside any real topic) either
+ * omits message_thread_id entirely or reports the General lane; treating General as a topic
+ * would give the root its own conversation separate from the plain chat, splitting one
+ * conversation in two. Applied to BOTH shapes below — it used to guard only the private-chat
+ * branch, which was correct by accident (the adapter happens to report group General as
+ * channel.id === chat.id) rather than by intent.
  */
 const TELEGRAM_GENERAL_TOPIC_ID = '1';
 
 /**
- * Routing/outbound channel key for an inbound session (pure, for unit testing).
+ * THE single Telegram conversation resolver: chat id, optional topic lane, kind.
  *
- * Emits the composite `<chatId>:<topicId>` for topic messages, which is what every
- * outbound path already decodes (decodeChannel) — so one id is valid for BOTH routing
- * and sending. Without it a reply cannot address the topic: the adapter reports a group
- * forum topic as the bare message_thread_id, and for a private-chat topic it drops the
- * topic fields entirely. Non-topic messages (DM root, plain group) pass through
- * unchanged; their channel.id is already a complete send target.
+ * Replaces the previous quartet (isDirect / isThread / inboundChannelId / decodeChannelKey)
+ * plus the `<chatId>:<topicId>` composite string they passed between them. Those could
+ * disagree — and the topic id had to be re-derived at five encode sites and seventeen decode
+ * sites, of which every one that was forgotten sent to the wrong place.
  *
- * THE single implementation, shared by inboundChannelId and by the button/command
- * interaction paths. Those must agree with the message path: a button clicked inside a
- * topic has to resolve to the same channel key as the message that posted the buttons,
- * or a blocking `ask` never matches its pending request.
+ * Two inbound shapes, because the adapter reports them differently:
+ *  - group forum: `guild.id` is the chat and `channel.id` is the BARE message_thread_id, so
+ *    the chat must be recovered from guildId — echoing channel.id back would address a
+ *    nonexistent chat.
+ *  - private-chat topic (Bot API 9.4): `channel.id` is the chat and there is no guild at all;
+ *    the raw update (rawTopicFields) is the only witness that a topic exists.
  */
-export function topicAwareChannelId(session: {
+export function telegramConversation(session: {
   guildId?: string;
   channelId?: string;
   isDirect?: boolean;
-}): string {
-  if (!isTopicSession(session)) return session.channelId ?? '';
+}): ResolvedConversation {
   const { threadId, isTopicMessage } = rawTopicFields(session);
-  if (isTopicMessage && threadId && session.guildId == null) {
-    // Private-chat topic: channelId IS the chat id (no guild exists).
-    return `${session.channelId}:${threadId}`;
-  }
-  // Group forum: chat id lives in guildId, the bare topic id in channelId.
-  return `${session.guildId}:${session.channelId}`;
-}
+  const inTopic = isTopicMessage && threadId != null && threadId !== TELEGRAM_GENERAL_TOPIC_ID;
 
-/**
- * Whether an inbound session is a topic message — group forum OR private-chat topic
- * (pure, for unit testing).
- *
- * Two shapes, because the adapter reports them differently:
- *  - group forum: channel.id is the BARE message_thread_id and guild.id is the chat id,
- *    so guildId !== channelId and non-direct.
- *  - private-chat topic (Bot API 9.4): channel.id is just the chat id and there is no
- *    guild at all, so the only evidence is is_topic_message + message_thread_id on the
- *    raw update.
- *
- * Single source of truth for both `isThread` and `inboundChannelId`: if these two
- * disagreed, a message would be routed as a thread but replied to as a plain channel
- * (or the reverse), which is exactly the bug the composite rebuild exists to fix.
- */
-function isTopicSession(session: {
-  guildId?: string;
-  channelId?: string;
-  isDirect?: boolean;
-}): boolean {
-  const { guildId, channelId } = session;
-  if (guildId && channelId && guildId !== channelId && !session.isDirect) return true;
-  // Private-chat topic: no guild, channelId == chat id; the raw update is the only witness.
-  const { threadId, isTopicMessage } = rawTopicFields(session);
-  return Boolean(isTopicMessage && threadId && threadId !== TELEGRAM_GENERAL_TOPIC_ID);
+  // Group forum topic: guildId holds the chat, channelId the bare topic id.
+  if (session.guildId && session.channelId && session.guildId !== session.channelId && !session.isDirect) {
+    return {
+      channel: session.guildId,
+      thread: session.channelId,
+      space: session.guildId,
+      kind: 'thread',
+    };
+  }
+
+  const channel = session.channelId ?? '';
+  // Private-chat topic: the chat id is already channelId; the lane comes off the raw update.
+  if (inTopic && session.guildId == null) {
+    return { channel, thread: threadId, kind: 'thread' };
+  }
+  // Plain group or chat root.
+  return {
+    channel,
+    ...(session.guildId ? { space: session.guildId } : {}),
+    kind: session.isDirect === true ? 'direct' : 'group',
+  };
 }
 
 /**
@@ -413,24 +405,8 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
       return false;
     },
 
-    isDirect(session) {
-      return session.isDirect ?? false;
-    },
-
-    isThread(session) {
-      // Group forum topic or private-chat topic; see isTopicSession for both shapes.
-      return isTopicSession(session);
-    },
-
-    inboundChannelId(session) {
-      return topicAwareChannelId(session);
-    },
-
-    decodeChannelKey(channelId) {
-      // Declared inverse of inboundChannelId, so satori-core's generic outbound paths
-      // (deleteMessage / fetchHistory / sendFile) never hand a composite key to the adapter.
-      const { chatId, topicId } = decodeChannel(channelId);
-      return { channelId: chatId, lane: topicId };
+    resolveConversation(session) {
+      return telegramConversation(session);
     },
 
     attachmentMeta() {
@@ -444,25 +420,30 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
       // reply_to_message_id = Telegram's native quoted reply. Routed through sendComposite (not
       // sendForRef) so a reply inside a forum topic keeps its message_thread_id — via the adapter
       // the composite key would land as chat_id and be rejected.
-      return sendComposite(bot, ref.channelId, text, { replyToMessageId: ref.messageId });
+      return sendComposite(bot, ref.address, text, { replyToMessageId: ref.messageId });
     },
 
     async createThread(bot, ref, name) {
       // createForumTopic returns an already-unwrapped ForumTopic { message_thread_id, ... }.
       // Forum topics work ONLY in topic-enabled supergroups; normal groups/DMs are rejected by the
       // Bot API (throws), and the upstream autoThread catches and falls back. There is no
-      // startThreadFromMessage semantics, so we build the topic from chat_id alone. Returns the
-      // composite threadId `<chatId>:<topicId>`; sendMessage later decodes message_thread_id from it.
+      // startThreadFromMessage semantics, so the topic is built from chat_id alone.
+      //
+      // `ref.address.channel` is always the real chat, even when the caller is already inside a
+      // topic — the lane lives in its own field now. Under the old composite scheme this method
+      // was the one path that never decoded, so an agent running `create-thread` from inside a
+      // topic sent `chat_id: "-100123:99"` (400 in a group, silent truncation in a DM) and
+      // returned the malformed triple `-100123:99:5`.
       const internal = bot.internal as unknown as TelegramInternal;
-      const topic = await internal.createForumTopic({ chat_id: ref.channelId, name });
+      const topic = await internal.createForumTopic({ chat_id: ref.address.channel, name });
       const topicId = topic?.message_thread_id;
       if (topicId == null) {
-        throw new Error(`[telegram] createForumTopic did not return a message_thread_id (chat=${ref.channelId})`);
+        throw new Error(`[telegram] createForumTopic did not return a message_thread_id (chat=${ref.address.channel})`);
       }
-      return { threadId: `${ref.channelId}:${topicId}` };
+      return { address: { channel: ref.address.channel, thread: String(topicId) } };
     },
 
-    async sendMessage(bot, channelId, text) {
+    async sendMessage(bot, address, text) {
       // Outbound override: special handling only when channelId is composite `<chatId>:<topicId>` --
       // decode message_thread_id and send into the topic via internal.sendMessage (which returns an
       // already-unwrapped Message). The returned ref uses the REAL chatId (non-composite), so later
@@ -475,10 +456,10 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
       // tags (<br/>, <code-block>) as literal HTML and drops newlines after a closing tag, both of
       // which Telegram rejects/garbles. Rendering to HTML ourselves (fragmentToTelegramHtml) and editing
       // via internal.editMessageText keeps the streaming first-send and subsequent-edits consistent.
-      return sendComposite(bot, channelId, text);
+      return sendComposite(bot, address, text);
     },
 
-    async sendFile(bot, channelId, file, lane) {
+    async sendFile(bot, address, file) {
       // Override exists because the generic encoder reads message_thread_id off the INBOUND
       // session, which an outbound-only send has none of — so a file could never reach a topic
       // that way. Upload multipart exactly as the adapter does (internal.sendDocument with an
@@ -490,8 +471,8 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
       const name = file.name ?? path.basename(file.path);
       const data = await readFile(file.path);
       const form = new FormData();
-      form.append('chat_id', channelId);
-      if (lane != null) form.append('message_thread_id', lane);
+      form.append('chat_id', address.channel);
+      if (address.thread != null) form.append('message_thread_id', String(topicIdOf(address)));
       if (file.caption) {
         form.append('caption', fragmentToTelegramHtml(renderTelegramMarkdown(file.caption)));
         form.append('parse_mode', 'HTML');
@@ -501,9 +482,9 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
       const msg = await internal.sendDocument(form);
       const messageId = msg?.message_id;
       if (messageId == null) {
-        throw new Error(`[telegram] sendFile did not return a message id (channel=${channelId})`);
+        throw new Error(`[telegram] sendFile did not return a message id (channel=${address.channel})`);
       }
-      return { channelId, messageId: String(messageId) };
+      return { address, messageId: String(messageId) };
     },
 
     async addReaction(bot, ref, emoji) {
@@ -513,10 +494,9 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
       // upstream safeReaction). message_id must be numeric. Defensive decode: ref.channelId should
       // already be the real chatId, but decoding is safe if a composite key arrives.
       const mapped = mapTelegramReactionEmoji(emoji);
-      const { chatId } = decodeChannel(ref.channelId);
       const http = (bot as unknown as { http: TelegramHttp }).http;
       await http.post('/setMessageReaction', {
-        chat_id: chatId,
+        chat_id: ref.address.channel,
         message_id: Number(ref.messageId),
         reaction: [{ type: 'emoji', emoji: mapped }],
       });
@@ -525,10 +505,9 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
     async removeReaction(bot, ref, _emoji) {
       // Telegram has no "remove by emoji" semantics: setMessageReaction with an empty array clears
       // all of this bot's reactions. Hence _emoji is ignored (signature matches profile.ts / lark).
-      const { chatId } = decodeChannel(ref.channelId);
       const http = (bot as unknown as { http: TelegramHttp }).http;
       await http.post('/setMessageReaction', {
-        chat_id: chatId,
+        chat_id: ref.address.channel,
         message_id: Number(ref.messageId),
         reaction: [],
       });
@@ -540,30 +519,28 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
       // fragment without visiting it, leaking Satori-only tags (<br/>, <code-block>) and dropping
       // newlines after closing tags. Defensive decode in case ref.channelId is a composite key
       // (normally sendMessage already returns the real chatId).
-      const { chatId } = decodeChannel(ref.channelId);
       const internal = bot.internal as unknown as TelegramInternal;
       await internal.editMessageText({
-        chat_id: chatId,
+        chat_id: ref.address.channel,
         message_id: Number(ref.messageId),
         text: fragmentToTelegramHtml(renderTelegramMarkdown(text)),
         parse_mode: 'HTML',
       });
     },
 
-    async sendButtons(bot, channelId, text, buttons) {
+    async sendButtons(bot, address, text, buttons) {
       // THE reported bug: this used sendForRef -> bot.sendMessage, so the composite key reached
       // the adapter as a literal chat_id (see sendComposite for the two ways Telegram then
       // mishandles it — silent chat-root delivery in a DM, hard 400 in a group). Either way the
       // options never appeared in the topic that asked for them. Now posted through the same
       // decoding path as every other send, with the inline keyboard attached.
-      return sendComposite(bot, channelId, text, { buttons });
+      return sendComposite(bot, address, text, { buttons });
     },
 
-    async typing(bot, channelId) {
+    async typing(bot, address) {
       // internal.sendChatAction auto-expires after ~5s with no stop (core's stopTyping is a no-op).
       // channelId may be composite (topic case), so decode and use the real chatId plus
       // message_thread_id; otherwise typing lands on the wrong chat or misses the topic.
-      const { chatId, topicId } = decodeChannel(channelId);
       const internal = bot.internal as
         | {
             sendChatAction?: (payload: {
@@ -574,9 +551,9 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
           }
         | undefined;
       await internal?.sendChatAction?.({
-        chat_id: chatId,
+        chat_id: address.channel,
         action: 'typing',
-        ...(topicId != null ? { message_thread_id: Number(topicId) } : {}),
+        ...(address.thread != null ? { message_thread_id: topicIdOf(address) } : {}),
       });
     },
 
@@ -600,9 +577,7 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
       // session.event.button.id === callback_data (the encodeCallbackData'd id from send).
       // channelId mirrors inboundChannelId so a click inside a forum topic resolves to the
       // same channel key as the message that sent the buttons (see mountSatoriButtonInteraction).
-      mountSatoriButtonInteraction(ctx, 'telegram', emit, {
-        channelId: (session) => topicAwareChannelId(session),
-      });
+      mountSatoriButtonInteraction(ctx, telegramConversation, emit);
     },
 
     mountCommandEvents(ctx, emit) {
@@ -627,18 +602,18 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
         // Telegram slash is just a normal message, no followup token, so reply straight to the
         // channel. (This Satori version's Session has no .send; use bot.sendMessage.)
         const bot = session.bot;
-        // Same composite rebuild as inboundChannelId: a `/cmd` sent inside a forum topic arrives
-        // with the bare topic_id, so the receipt (and the routed message) must carry the composite
-        // or they land in the group's General channel instead of the topic.
-        const channelId = topicAwareChannelId(session);
+        // Same resolver as the message path: a `/cmd` sent inside a forum topic arrives with the
+        // bare topic_id in channel.id, so without this the receipt (and the routed message) would
+        // land in the group's General channel instead of the topic.
+        const conversation = telegramConversation(session);
         emit({
-          platform: 'telegram',
-          channelId,
-          userId: session.userId ?? '',
+          conversation,
+          user: session.userId ?? '',
           messageId: session.messageId ?? '',
           name,
           options,
-          reply: (text: string) => sendComposite(bot, channelId, text).then(() => undefined),
+          reply: (text: string) =>
+            sendComposite(bot, { channel: conversation.channel, ...(conversation.thread != null ? { thread: conversation.thread } : {}) }, text).then(() => undefined),
         });
       });
     },

@@ -1,0 +1,158 @@
+import type { SessionScope } from '../config/schema.js';
+
+/**
+ * Conversation identity — the domain type this whole gateway is organized around.
+ *
+ * ── Why this exists ───────────────────────────────────────────────────────────
+ * A chat platform's "where" is not always a single id. Telegram forum topics and
+ * Slack threads are a `(channel, sub-lane)` PAIR: the lane is a separate wire
+ * parameter (`message_thread_id`, `thread_ts`), not part of the channel id. The
+ * previous model had one opaque `channelId: string`, so a topic had to be smuggled
+ * through as the composite string `"<chatId>:<topicId>"` — built in five places,
+ * decoded in seventeen, validated in none. Every path that forgot to decode sent to
+ * the wrong place, and because Telegram truncates a malformed chat_id LENIENTLY in
+ * private chats, half those failures were silent.
+ *
+ * So the pair is a struct. The composite string is gone; it survives only at the two
+ * boundaries that genuinely need text (the persisted store key and the `--channel`
+ * CLI flag), each with one tested formatter and one validating parser below.
+ */
+
+/**
+ * WHERE a message lives: identity, not address.
+ *
+ * Distinct from ConversationAddress because identity carries things the wire does
+ * not need (`space`, `kind`, `user`) and routing/gating decisions read them.
+ */
+export interface ConversationRef {
+  /** Platform INSTANCE id (the `platforms:` map key) — what routing `when.platform` and `access.allowFrom` match. */
+  platform: string;
+  /**
+   * The platform's real channel/chat id, always a valid API target on its own.
+   *
+   * For Discord this is the thread's own id when in a thread (a Discord thread IS a
+   * channel); for Telegram it is the chat id even inside a topic.
+   */
+  channel: string;
+  /**
+   * Sub-lane WITHIN `channel` that needs an extra wire parameter to address
+   * (Telegram `message_thread_id`, Slack `thread_ts`). Absent on platforms whose
+   * threads are channels in their own right — a Discord thread has `kind: 'thread'`
+   * but no `thread`, because `channel` already addresses it completely.
+   */
+  thread?: string;
+  /** Guild / workspace / team id, when the platform has one. Matched by routing `when.serverId`. */
+  space?: string;
+  /**
+   * Conversation kind. THE single thread/DM witness — it replaces the old separate
+   * `isDirect` + `isThread` booleans, which were derived independently of the
+   * addressing and could therefore disagree with it (a message routed as a thread
+   * but replied to as a plain channel, or the reverse).
+   */
+  kind: ConversationKind;
+  /** Sender id (part of identity under `per_user` scope; also the `access.allowFrom` subject). */
+  user: string;
+}
+
+export type ConversationKind = 'direct' | 'group' | 'thread';
+
+/**
+ * WHERE to send: the subset of a ConversationRef the platform layer puts on the wire.
+ *
+ * Outbound paths take this rather than a whole ref, so a send cannot accidentally
+ * depend on `kind` or `user` — and so an outbound-only send (one with no inbound
+ * message behind it, e.g. a reverse command) is expressible without inventing them.
+ */
+export interface ConversationAddress {
+  channel: string;
+  thread?: string;
+}
+
+/** Narrow a ref to the fields needed for sending. */
+export function addressOf(ref: ConversationRef): ConversationAddress {
+  return ref.thread != null ? { channel: ref.channel, thread: ref.thread } : { channel: ref.channel };
+}
+
+/** Whether two addresses point at the same place. */
+export function sameAddress(a: ConversationAddress, b: ConversationAddress): boolean {
+  return a.channel === b.channel && (a.thread ?? '') === (b.thread ?? '');
+}
+
+/**
+ * Separator for the textual address form. `/` rather than `:` because platform ids
+ * legitimately contain `:` (nothing in the tree contains `/`): Slack's `thread_ts` is
+ * `1234567890.123456`, Telegram supergroup ids are `-100…`, and the old `:` scheme
+ * could not tell `a:b:c` apart from a channel that simply had a colon in it.
+ */
+const ADDRESS_SEP = '/';
+
+/**
+ * Render an address for the two places that need text: the `--channel` CLI flag and
+ * log lines. `channel` alone when there is no lane, `channel/thread` when there is.
+ */
+export function formatAddress(a: ConversationAddress): string {
+  return a.thread != null && a.thread !== '' ? `${a.channel}${ADDRESS_SEP}${a.thread}` : a.channel;
+}
+
+/**
+ * Parse the textual form back, VALIDATING it.
+ *
+ * The old composite split accepted anything and let a malformed lane reach the API as
+ * `Number('99:5') === NaN`, which Telegram rejects with an opaque 400 far from the
+ * cause. Here a bad string fails at the boundary, with the offending input named.
+ * Throws rather than returning null because both callers (CLI option parsing, IPC
+ * request validation) want the message verbatim.
+ */
+export function parseAddress(s: string): ConversationAddress {
+  const bad = (why: string): never => {
+    throw new Error(`invalid channel ${JSON.stringify(s)}: ${why} (expected "<channel>" or "<channel>${ADDRESS_SEP}<thread>")`);
+  };
+  const parts = s.split(ADDRESS_SEP);
+  if (parts.length > 2) bad(`too many "${ADDRESS_SEP}" separators`);
+  const [channel = '', thread] = parts;
+  if (!channel) bad('empty channel');
+  if (thread !== undefined && thread === '') bad('empty thread');
+  return thread !== undefined ? { channel, thread } : { channel };
+}
+
+/**
+ * Field separator for conversation keys. `#` is not `/` (the address separator) on
+ * purpose: a key is not an address and must never be parsed as one. Keys are opaque
+ * map/JSON keys — nothing in the codebase parses them back.
+ */
+const KEY_SEP = '#';
+
+/**
+ * The conversation key: which conversation an inbound message belongs to.
+ *
+ * NOTE what is absent: the agent id. It used to lead the key, which meant the agent
+ * was part of the conversation's IDENTITY — so `/oc hi` and the plain follow-up after
+ * it produced two different keys, two subprocesses and two contexts in one topic. The
+ * agent is now a mutable property OF a conversation (see ConversationStore), not part
+ * of its name. One topic is one conversation, whoever is currently answering it.
+ *
+ * Scopes:
+ *  - per_thread  — a Telegram topic / Slack thread is its own conversation, and the
+ *    channel root is a separate one. The `thread` component is present but empty for
+ *    the root, so root and lane can never collide.
+ *  - per_channel — every lane inside a channel shares one conversation.
+ *  - per_user    — one conversation per sender, wherever they write.
+ *  - shared      — one global conversation.
+ */
+export function conversationKey(scope: SessionScope, ref: ConversationRef): string {
+  switch (scope) {
+    case 'shared':
+      return 'shared';
+    case 'per_user':
+      return `${ref.platform}${KEY_SEP}u${KEY_SEP}${ref.user}`;
+    case 'per_channel':
+      return `${ref.platform}${KEY_SEP}${ref.channel}`;
+    case 'per_thread':
+      return `${ref.platform}${KEY_SEP}${ref.channel}${KEY_SEP}${ref.thread ?? ''}`;
+  }
+}
+
+/** Human-readable one-liner for logs: `telegram-bot #5865716608/7353`. */
+export function describeConversation(ref: ConversationRef): string {
+  return `${ref.platform} #${formatAddress(addressOf(ref))}`;
+}

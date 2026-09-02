@@ -2,7 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import type { AgentDef, Config } from '../config/schema.js';
 import { findAgent } from '../config/schema.js';
 import type { AgentFactory, AgentSession, AgentStreamHandlers, RunTurnInput } from './agent.js';
-import type { SessionStore } from './session-store.js';
+import type { ConversationStore } from './conversation-store.js';
 import {
   buildAgentEnv,
   buildInputPreview,
@@ -92,7 +92,7 @@ export const AGY_COMMAND = 'agy';
 
 // ───────────────────────────────── factory / session ─────────────────────────────────
 
-export function createAgyAgentFactory(cfg: Config, socketPath: string, store?: SessionStore): AgentFactory {
+export function createAgyAgentFactory(cfg: Config, socketPath: string, store?: ConversationStore): AgentFactory {
   const sessions = new Map<string, AgentSession>();
 
   return {
@@ -121,8 +121,9 @@ const START_TIMEOUT_MS = 30_000;
 function createAgySession(
   def: AgentDef,
   socketPath: string,
-  sessionId: string,
-  store?: SessionStore
+  /** The conversation this agent instance serves (store key half; the other half is def.id). */
+  conversationId: string,
+  store?: ConversationStore
 ): AgentSession {
   const cwd = resolveAgentCwd(def);
 
@@ -132,7 +133,7 @@ function createAgySession(
   let ready = false;
   /**
    * agy's conversation id for this session, as last seen on the wire. Only used to avoid redundant
-   * SessionStore writes; the value that actually gets replayed is read back from the store at spawn
+   * store writes; the value that actually gets replayed is read back from the store at spawn
    * (so a /new that clears the store is honored even if this child already knew an id).
    */
   let lastSeenConversationId: string | undefined;
@@ -180,7 +181,9 @@ function createAgySession(
 
     // Replay this session's prior conversation so a daemon restart keeps the context (the ACP
     // runtime's session/load equivalent). agy owns the history on its own disk; we only remember which.
-    const child = spawn(AGY_COMMAND, buildAgyArgs(def, cwd, store?.get(sessionId)), {
+    // Keyed by (conversation, agent) so agy resumes ITS conversation here, not one belonging to
+    // another agent that also answered in this topic.
+    const child = spawn(AGY_COMMAND, buildAgyArgs(def, cwd, store?.agentSession(conversationId, def.id)), {
       cwd,
       env: buildAgentEnv(def, sessionToken, socketPath),
     });
@@ -278,11 +281,11 @@ function createAgySession(
   function rememberConversation(id?: string): void {
     if (!id || id === lastSeenConversationId) return;
     lastSeenConversationId = id;
-    store?.set(sessionId, id);
+    store?.setAgentSession(conversationId, def.id, id);
   }
 
   return {
-    sessionId,
+    conversationId,
 
     async runTurn(input: RunTurnInput, handlers: AgentStreamHandlers): Promise<void> {
       aborting = false;

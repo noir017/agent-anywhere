@@ -8,7 +8,7 @@ import type { Bot, Session, Universal } from '@satorijs/core';
 
 import type { SlashCommandSpec } from '../../types.js';
 import type { PlatformCapabilities } from '../adapter.js';
-import type { PlatformProfile } from '../profile.js';
+import type { PlatformProfile, ResolvedConversation } from '../profile.js';
 import type { DiscordPlatformConfig } from '../config-schemas.js';
 import { renderDiscordMarkdown } from '../discord-markdown.js';
 import {
@@ -70,6 +70,30 @@ function renderOrFallback(text: string): string {
  */
 function detectThread(channelType: number | undefined): boolean {
   return channelType === 11 || channelType === 12;
+}
+
+/**
+ * Discord's conversation shape (pure, for unit testing).
+ *
+ * A Discord thread IS a channel: it has its own snowflake id and every API call targets it
+ * directly. So `kind: 'thread'` is reported WITHOUT a `thread` lane — the lane field means
+ * "addressing needs an extra wire parameter", which is true for Telegram topics and Slack
+ * thread_ts but never here. Consequently a Discord thread is its own conversation under every
+ * scope, including per_channel.
+ */
+export function discordConversation(session: {
+  channelId?: string;
+  guildId?: string;
+  isDirect?: boolean;
+  event?: { channel?: { type?: number } };
+}): ResolvedConversation {
+  const channel = session.channelId ?? '';
+  const kind = session.isDirect
+    ? 'direct'
+    : detectThread(session.event?.channel?.type)
+      ? 'thread'
+      : 'group';
+  return { channel, ...(session.guildId ? { space: session.guildId } : {}), kind };
 }
 
 /**
@@ -171,13 +195,8 @@ export function createDiscordProfile(): PlatformProfile<DiscordPlatformConfig> {
       return findAtMention(session.elements, selfId);
     },
 
-    isDirect(session) {
-      return session.isDirect ?? false;
-    },
-
-    isThread(session) {
-      const channelType = (session.event?.channel as { type?: number } | undefined)?.type;
-      return detectThread(channelType);
+    resolveConversation(session) {
+      return discordConversation(session as Parameters<typeof discordConversation>[0]);
     },
 
     attachmentMeta(el) {
@@ -190,7 +209,7 @@ export function createDiscordProfile(): PlatformProfile<DiscordPlatformConfig> {
       // native reply. Returns a MessageRef from the first message id.
       return sendForRef(
         bot,
-        ref.channelId,
+        ref.address,
         [h('quote', { id: ref.messageId }), h.text(text)],
         'discord',
         'replyMessage'
@@ -210,14 +229,15 @@ export function createDiscordProfile(): PlatformProfile<DiscordPlatformConfig> {
       if (!internal.startThreadFromMessage) {
         throw new Error('[discord] startThreadFromMessage is not available');
       }
-      const channel = await internal.startThreadFromMessage(ref.channelId, ref.messageId, {
+      const channel = await internal.startThreadFromMessage(ref.address.channel, ref.messageId, {
         name,
         auto_archive_duration: opts?.autoArchiveMinutes ?? 1440,
       });
-      return { threadId: channel.id };
+      // A Discord thread is a channel of its own — no lane needed to address it.
+      return { address: { channel: channel.id } };
     },
 
-    async sendButtons(bot, channelId, text, buttons) {
+    async sendButtons(bot, address, text, buttons) {
       // <button-group> wraps one row (max 5 per row; adapter's lastRow() auto-wraps).
       // h('button',{ id, class }) without a type makes custom_id === id, unprefixed here.
       const group = h(
@@ -227,14 +247,14 @@ export function createDiscordProfile(): PlatformProfile<DiscordPlatformConfig> {
       );
       return sendForRef(
         bot,
-        channelId,
+        address,
         buildButtonMessageFragment(text, group),
         'discord',
         'sendButtons'
       );
     },
 
-    async sendMessage(bot, channelId, text) {
+    async sendMessage(bot, address, text) {
       // Send content via the raw Discord API, bypassing the Satori encoder's markdown escaping.
       // Satori's sanitize backslash-escapes | * _ ` ~ ( ) [ ], causing two problems:
       //  1. escaping inflates length: markdown-heavy content chunked to <=2000 can exceed 2000
@@ -245,12 +265,12 @@ export function createDiscordProfile(): PlatformProfile<DiscordPlatformConfig> {
         createMessage: (channelId: string, params: { content: string }) => Promise<{ id: string }>;
       };
       // renderOrFallback rewrites GFM tables → bullets (see its definition for why only tables).
-      const msg = await internal.createMessage(channelId, { content: renderOrFallback(text) });
+      const msg = await internal.createMessage(address.channel, { content: renderOrFallback(text) });
       const messageId = msg.id;
       if (!messageId) {
-        throw new Error(`[discord] createMessage did not return a message id (channel=${channelId})`);
+        throw new Error(`[discord] createMessage did not return a message id (channel=${address.channel})`);
       }
-      return { channelId, messageId };
+      return { address, messageId };
     },
 
     async editMessage(bot, ref, text) {
@@ -262,7 +282,7 @@ export function createDiscordProfile(): PlatformProfile<DiscordPlatformConfig> {
           params: { content: string }
         ) => Promise<unknown>;
       };
-      await internal.editMessage(ref.channelId, ref.messageId, { content: renderOrFallback(text) });
+      await internal.editMessage(ref.address.channel, ref.messageId, { content: renderOrFallback(text) });
     },
 
     async registerCommands(ctx, getBot, cmds, opts) {
@@ -285,13 +305,13 @@ export function createDiscordProfile(): PlatformProfile<DiscordPlatformConfig> {
       );
     },
 
-    async typing(bot, channelId) {
+    async typing(bot, address) {
       // Satori has no unified typing API; use Discord's native internal.
       // triggerTypingIndicator: Discord's typing auto-expires after ~10s.
       const internal = bot.internal as
         | { triggerTypingIndicator?: (channelId: string) => Promise<void> }
         | undefined;
-      await internal?.triggerTypingIndicator?.(channelId);
+      await internal?.triggerTypingIndicator?.(address.channel);
     },
 
     mountButtonEvents(ctx, emit) {
@@ -299,7 +319,7 @@ export function createDiscordProfile(): PlatformProfile<DiscordPlatformConfig> {
       // "interaction failed". Just normalize the click onto Satori's generic
       // 'interaction/button' path (session.event.button.id === custom_id, unprefixed).
       // Single Discord bot, no botPlatform filtering needed.
-      mountSatoriButtonInteraction(ctx, 'discord', emit);
+      mountSatoriButtonInteraction(ctx, discordConversation, emit);
     },
 
     mountCommandEvents(ctx, emit) {
@@ -315,9 +335,8 @@ export function createDiscordProfile(): PlatformProfile<DiscordPlatformConfig> {
         // adapter's auto-emitted DEFERRED interaction response.
         const bot = session.bot;
         emit({
-          platform: 'discord',
-          channelId: session.channelId ?? '',
-          userId: session.userId ?? '',
+          conversation: discordConversation(session),
+          user: session.userId ?? '',
           messageId: session.messageId ?? '',
           name: argv.name,
           options: (argv.options ?? {}) as Record<string, unknown>,

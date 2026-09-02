@@ -30,6 +30,7 @@ import type { WecomPlatformConfig } from '../config-schemas.js';
 import {
   installHttpService,
   installServerService,
+  plainConversation,
   resolveDefaultPlugin,
   sendForRef,
 } from '../profile-helpers.js';
@@ -119,14 +120,11 @@ export function createWecomProfile(): PlatformProfile<WecomPlatformConfig> {
       return false;
     },
 
-    isDirect() {
-      // Always 1:1: adapter treats everything as user↔app direct chat.
-      return true;
-    },
-
-    isThread() {
-      // No thread concept.
-      return false;
+    resolveConversation(session) {
+      // Always 1:1: the adapter treats everything as a user↔app direct chat, and there is no
+      // thread concept. Force 'direct' rather than reading session.isDirect — the adapter does
+      // not set it, and the DM gate (respond without a mention) depends on this.
+      return { ...plainConversation(session), kind: 'direct' };
     },
 
     attachmentMeta(_el: h) {
@@ -135,12 +133,12 @@ export function createWecomProfile(): PlatformProfile<WecomPlatformConfig> {
       return {};
     },
 
-    async sendMessage(bot, channelId, text) {
+    async sendMessage(bot, address, text) {
       // Outbound send override: WeCom is the only text path here (no reply/buttons).
       // Flatten CommonMark → plain text first (WeCom shows markup literally), then
       // defer to the generic send tail. Without this the generic path would push the
       // raw markdown verbatim.
-      return sendForRef(bot, channelId, toPlainText(text), 'wecom', 'sendMessage');
+      return sendForRef(bot, address, toPlainText(text), 'wecom', 'sendMessage');
     },
 
     // —— All optional methods omitted (unsupported; satori-core degrades per capabilities) ——

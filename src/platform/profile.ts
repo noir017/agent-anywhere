@@ -66,6 +66,23 @@ export interface PlatformProfile<P extends PlatformConfig = PlatformConfig> {
    * a complete send target).
    */
   inboundChannelId?(session: Session): string | undefined;
+  /**
+   * Split a routing key back into the platform's real channel plus an optional sub-lane
+   * (Telegram forum topic id, Slack thread_ts) — the declared inverse of inboundChannelId.
+   *
+   * Exists so the composite key stays INVISIBLE above this seam. satori-core's generic
+   * outbound paths (deleteMessage / fetchHistory / sendFile) hand channelId straight to
+   * `bot.*`, and a Satori adapter treats the whole string as its chat id — Telegram's encoder
+   * builds `chat_id: "-100123:99"` and the Bot API answers 400. Previously each profile method
+   * decoded by hand, so any path that forgot (or was added later) silently broke; declaring
+   * the inverse once lets core decode for all of them.
+   *
+   * Absent ⇒ the key IS the channel (correct for platforms that encode nothing extra).
+   *
+   * MUST round-trip with inboundChannelId: decodeChannelKey(inboundChannelId(s)) has to
+   * recover the real channel, or a reply lands somewhere other than where it was asked.
+   */
+  decodeChannelKey?(channelId: string): { channelId: string; lane?: string };
   /** Extract mime/size from a single media element (keys differ per platform). */
   attachmentMeta(el: h): { mime?: string; size?: number };
 
@@ -108,6 +125,23 @@ export interface PlatformProfile<P extends PlatformConfig = PlatformConfig> {
    *  bot.editMessage, the profile implements it (e.g. Slack's internal.chatUpdate). Otherwise
    *  satori-core falls back to generic bot.editMessage. */
   editMessage?(bot: Bot, ref: MessageRef, text: string): Promise<void>;
+  /**
+   * Outbound file override: needed when a sub-lane (Telegram forum topic) can't be expressed
+   * through the generic encoder.
+   *
+   * satori-core's generic sendFile builds a `file://` element and calls bot.sendMessage, but
+   * Telegram's encoder reads message_thread_id off the INBOUND session — which an outbound-only
+   * send doesn't have — so a file could never be routed into a topic that way. A profile
+   * implementing this posts the upload itself with the lane attached.
+   *
+   * `channelId` is already decoded by core; `lane` carries the sub-lane when one was encoded.
+   */
+  sendFile?(
+    bot: Bot,
+    channelId: string,
+    file: { path: string; name?: string; caption?: string },
+    lane?: string
+  ): Promise<MessageRef>;
   /**
    * Rendered length of `text` in the units the platform's message-length limit (capabilities
    * .maxMessageLength) actually counts. agent-anywhere chunks outbound text BEFORE the profile renders

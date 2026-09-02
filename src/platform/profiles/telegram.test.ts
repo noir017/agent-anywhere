@@ -24,10 +24,11 @@ type SendBot = Parameters<NonNullable<Profile['sendMessage']>>[0];
 interface Captured {
   send: Array<Record<string, unknown>>;
   edit: Array<Record<string, unknown>>;
+  upload: FormData[];
 }
 
 function fakeBot(): { bot: SendBot; calls: Captured } {
-  const calls: Captured = { send: [], edit: [] };
+  const calls: Captured = { send: [], edit: [], upload: [] };
   const internal = {
     sendMessage: (p: Record<string, unknown>) => {
       calls.send.push(p);
@@ -36,6 +37,10 @@ function fakeBot(): { bot: SendBot; calls: Captured } {
     editMessageText: (p: Record<string, unknown>) => {
       calls.edit.push(p);
       return Promise.resolve({});
+    },
+    sendDocument: (form: FormData) => {
+      calls.upload.push(form);
+      return Promise.resolve({ message_id: 77 });
     },
   };
   const guard = (): never => {
@@ -355,5 +360,165 @@ describe('private-chat topics (Bot API 9.4)', () => {
   it('group forum still works (chat id from guildId) — no regression', () => {
     const group = { guildId: '-1001234567890', channelId: '99', isDirect: false } as never;
     expect(topicAwareChannelId(group)).toBe('-1001234567890:99');
+  });
+});
+
+/**
+ * Outbound paths that were still handing the composite key to the ADAPTER.
+ *
+ * The topic fix converted sendMessage but not sendButtons or reply: both still went through
+ * sendForRef -> bot.sendMessage. The adapter's encoder computes `chat_id = session.guildId ||
+ * channelId`, and an outbound-only send has no session — so the whole "<chat>:<topic>" string
+ * became chat_id and Telegram answered 400. For sendButtons that was the user-visible bug: the
+ * `ask` never posted, and the daemon blocked on the pending ask until it timed out, so the
+ * options simply never appeared inside the topic.
+ *
+ * fakeBot's guard() throws if a profile reaches for bot.* — the exact drift being fixed — so
+ * these fail loudly rather than silently regressing.
+ */
+describe('outbound paths inside a topic (composite key must never reach the adapter)', () => {
+  const profile = createTelegramProfile();
+
+  it('sendButtons posts into the topic with an inline keyboard (THE reported bug)', async () => {
+    const { bot, calls } = fakeBot();
+    const ref = await profile.sendButtons!(bot, '-1001234567890:99', 'Pick **one**', [
+      { id: 'ask:r1:0', label: 'Deploy' },
+      { id: 'ask:r1:1', label: 'Cancel' },
+    ]);
+    expect(calls.send).toHaveLength(1);
+    expect(calls.send[0]).toMatchObject({
+      chat_id: '-1001234567890', // before the fix: the literal '-1001234567890:99'
+      message_thread_id: 99,
+      parse_mode: 'HTML',
+    });
+    // The buttons must survive as a real inline keyboard, or there is nothing to click.
+    expect(calls.send[0]!.reply_markup).toEqual({
+      inline_keyboard: [
+        [{ text: 'Deploy', callback_data: 'ask:r1:0' }],
+        [{ text: 'Cancel', callback_data: 'ask:r1:1' }],
+      ],
+    });
+    // Ref carries the real chat id, so the daemon's later edit (strip buttons / mark chosen) works.
+    expect(ref).toEqual({ channelId: '-1001234567890', messageId: '42' });
+  });
+
+  it('sendButtons still works in a plain chat (no thread field invented)', async () => {
+    const { bot, calls } = fakeBot();
+    await profile.sendButtons!(bot, '5865716608', 'Pick', [{ id: 'a', label: 'A' }]);
+    expect(calls.send[0]).toMatchObject({ chat_id: '5865716608' });
+    expect(calls.send[0]!.message_thread_id).toBeUndefined();
+  });
+
+  it('sendButtons hashes an over-long button id so callback_data stays within 64 bytes', async () => {
+    const { bot, calls } = fakeBot();
+    const longId = 'ask:' + 'x'.repeat(200) + ':0';
+    await profile.sendButtons!(bot, '1', 'p', [{ id: longId, label: 'Go' }]);
+    const kb = calls.send[0]!.reply_markup as {
+      inline_keyboard: Array<Array<{ callback_data: string }>>;
+    };
+    const data = kb.inline_keyboard[0]![0]!.callback_data;
+    expect(Buffer.byteLength(data, 'utf8')).toBeLessThanOrEqual(64);
+  });
+
+  it('reply targets the topic and carries reply_to_message_id', async () => {
+    const { bot, calls } = fakeBot();
+    await profile.reply!(bot, { channelId: '-1001234567890:99', messageId: '7' }, 'pong');
+    expect(calls.send[0]).toMatchObject({
+      chat_id: '-1001234567890',
+      message_thread_id: 99,
+      reply_to_message_id: 7,
+    });
+  });
+
+  it('sendFile uploads into the topic via multipart (the generic encoder cannot)', async () => {
+    const { bot, calls } = fakeBot();
+    // A real file: sendFile reads it off disk, so point at one that exists.
+    const ref = await profile.sendFile!(bot, '-1001234567890', { path: 'package.json' }, '99');
+    expect(calls.upload).toHaveLength(1);
+    const form = calls.upload[0]!;
+    expect(form.get('chat_id')).toBe('-1001234567890');
+    expect(form.get('message_thread_id')).toBe('99');
+    expect(form.get('document')).toBe('attach://package.json');
+    expect(ref).toEqual({ channelId: '-1001234567890', messageId: '77' });
+  });
+
+  it('sendFile omits message_thread_id outside a topic (never the string "undefined")', async () => {
+    const { bot, calls } = fakeBot();
+    await profile.sendFile!(bot, '123', { path: 'package.json' }, undefined);
+    // FormData stringifies undefined to "undefined", which Telegram rejects — the field must be absent.
+    expect(calls.upload[0]!.has('message_thread_id')).toBe(false);
+  });
+});
+
+/**
+ * decodeChannelKey is the DECLARED inverse of inboundChannelId. satori-core's generic outbound
+ * paths rely on it, so the round-trip is the contract: whatever routing emits must decode back to
+ * the real chat, or a reply lands somewhere other than where it was asked.
+ */
+describe('decodeChannelKey round-trips with inboundChannelId', () => {
+  const profile = createTelegramProfile();
+
+  it('recovers chat + lane for a group forum topic', () => {
+    const s = { guildId: '-1001234567890', channelId: '99', isDirect: false } as never;
+    const key = profile.inboundChannelId!(s)!;
+    expect(profile.decodeChannelKey!(key)).toEqual({
+      channelId: '-1001234567890',
+      lane: '99',
+    });
+  });
+
+  it('recovers chat + lane for a private-chat topic (Bot API 9.4)', () => {
+    const s = {
+      channelId: '5865716608',
+      isDirect: true,
+      telegram: {
+        message: {
+          chat: { id: 5865716608, type: 'private' },
+          message_thread_id: 7353,
+          is_topic_message: true,
+        },
+      },
+    } as never;
+    const key = profile.inboundChannelId!(s)!;
+    expect(profile.decodeChannelKey!(key)).toEqual({ channelId: '5865716608', lane: '7353' });
+  });
+
+  it('leaves a non-topic key alone, with no lane', () => {
+    for (const plain of ['5865716608', '-1001234567890']) {
+      expect(profile.decodeChannelKey!(plain)).toEqual({ channelId: plain, lane: undefined });
+    }
+  });
+});
+
+/**
+ * Private-chat topics are the SILENT half of the bug, so they get their own case.
+ *
+ * Verified against the live Bot API: for a private chat Telegram parses "5865716608:7529"
+ * leniently, truncating at the ':' — getChat returns the user and sendMessage answers ok=true
+ * with NO message_thread_id. So the old code posted the buttons to the DM root and reported
+ * success; nothing errored, the options were just in the wrong place. (A group composite,
+ * "-100...:99", hard-fails with 400 chat not found instead.)
+ *
+ * A test asserting only "does not throw" would therefore have passed against the bug. These
+ * assert the thread field explicitly.
+ */
+describe('private-chat topic buttons land in the topic, not the DM root', () => {
+  const profile = createTelegramProfile();
+
+  it('sendButtons carries message_thread_id for a private-chat topic', async () => {
+    const { bot, calls } = fakeBot();
+    await profile.sendButtons!(bot, '5865716608:7529', 'Pick', [{ id: 'ask:p:0', label: 'Yes' }]);
+    expect(calls.send[0]).toMatchObject({
+      chat_id: '5865716608',
+      message_thread_id: 7529, // the field whose absence made the old send silently wrong
+    });
+    expect(calls.send[0]!.reply_markup).toBeDefined();
+  });
+
+  it('the chat id is split, never passed through with the topic still attached', async () => {
+    const { bot, calls } = fakeBot();
+    await profile.sendButtons!(bot, '5865716608:7529', 'Pick', [{ id: 'a', label: 'A' }]);
+    // The exact old-code payload: a composite string as chat_id.
+    expect(calls.send[0]!.chat_id).not.toBe('5865716608:7529');
   });
 });

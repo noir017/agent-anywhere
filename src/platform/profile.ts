@@ -52,6 +52,20 @@ export interface PlatformProfile<P extends PlatformConfig = PlatformConfig> {
   isDirect(session: Session): boolean;
   /** Whether it's a thread/subchannel. */
   isThread(session: Session): boolean;
+  /**
+   * Inbound channelId override: the routing/outbound key for this message.
+   *
+   * Exists because an adapter's inbound channel.id can be a NARROWER identifier than what
+   * sending requires. Telegram forum topics are the case in point: the adapter reports a
+   * topic message's channel.id as the bare message_thread_id (dropping the chat id), while
+   * `sendMessage` needs the composite `<chatId>:<topicId>` — so echoing session.channelId
+   * back would post to the wrong place. The profile rebuilds the composite here, giving one
+   * id that is valid for BOTH routing and sending.
+   *
+   * Absent ⇒ session.channelId unchanged (correct for platforms whose inbound id is already
+   * a complete send target).
+   */
+  inboundChannelId?(session: Session): string | undefined;
   /** Extract mime/size from a single media element (keys differ per platform). */
   attachmentMeta(el: h): { mime?: string; size?: number };
 

@@ -179,3 +179,72 @@ describe('telegram profile delivery contract (send/edit reach Telegram as valid 
     expect(ref).toEqual({ channelId: '-1001234567890', messageId: '42' });
   });
 });
+
+/**
+ * Inbound forum-topic identity.
+ *
+ * The bug these cover: the adapter reports a topic message's channel.id as the BARE
+ * message_thread_id (chat id only in guild.id), and the inbound path echoed that straight
+ * through. Replying with it used a topic id as chat_id, so answers surfaced in the group's
+ * General channel while the topic itself stayed silent — visible in "All" but not in the
+ * topic. inboundChannelId rebuilds the composite `<chatId>:<topicId>` that every outbound
+ * path already decodes, making one id valid for both routing and sending.
+ */
+describe('inboundChannelId (forum-topic composite rebuild)', () => {
+  const profile = createTelegramProfile();
+  // Session shape used by isThread/inboundChannelId (the two fields plus isDirect).
+  const sess = (o: Partial<{ guildId: string; channelId: string; isDirect: boolean }>) =>
+    o as unknown as Parameters<NonNullable<typeof profile.inboundChannelId>>[0];
+
+  it('rebuilds <chatId>:<topicId> for a topic message', () => {
+    const s = sess({ guildId: '-1001234567890', channelId: '99', isDirect: false });
+    expect(profile.inboundChannelId!(s)).toBe('-1001234567890:99');
+  });
+
+  it('round-trips through decodeChannel back to the real chat + topic', () => {
+    const s = sess({ guildId: '-1001234567890', channelId: '99', isDirect: false });
+    // This is the actual contract: whatever inbound emits must be decodable by the
+    // outbound path, or the reply lands in the wrong place.
+    expect(decodeChannel(profile.inboundChannelId!(s)!)).toEqual({
+      chatId: '-1001234567890',
+      topicId: '99',
+    });
+  });
+
+  it('leaves a DM channelId untouched (already a complete send target)', () => {
+    const s = sess({ channelId: '5865716608', isDirect: true });
+    expect(profile.inboundChannelId!(s)).toBe('5865716608');
+  });
+
+  it('leaves a plain group channelId untouched (channel.id == chat.id == guild.id)', () => {
+    const s = sess({ guildId: '-100999', channelId: '-100999', isDirect: false });
+    expect(profile.inboundChannelId!(s)).toBe('-100999');
+  });
+
+  it('agrees with isThread on every shape (they must never disagree)', () => {
+    const shapes = [
+      { guildId: '-100123', channelId: '99', isDirect: false }, // topic
+      { guildId: '-100123', channelId: '-100123', isDirect: false }, // plain group
+      { channelId: '55', isDirect: true }, // DM
+    ];
+    for (const raw of shapes) {
+      const s = sess(raw);
+      const isTopic = profile.isThread(s as never);
+      const rebuilt = profile.inboundChannelId!(s)!;
+      // A composite is emitted exactly when the message is a topic message.
+      expect(rebuilt.includes(':')).toBe(isTopic);
+    }
+  });
+
+  it('a topic reply targets the topic, not the group root (end-to-end of the fix)', async () => {
+    const s = sess({ guildId: '-1001234567890', channelId: '99', isDirect: false });
+    const routedChannelId = profile.inboundChannelId!(s)!;
+    const { bot, calls } = fakeBot();
+    await profile.sendMessage!(bot, routedChannelId, 'reply');
+    // Before the fix this posted with chat_id='99' (a topic id used as a chat id).
+    expect(calls.send[0]).toMatchObject({
+      chat_id: '-1001234567890',
+      message_thread_id: 99,
+    });
+  });
+});

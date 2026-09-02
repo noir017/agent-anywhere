@@ -231,12 +231,18 @@ export function deferUntilLogin(
  * ButtonInteraction and emitted back. For platforms on this event (telegram / line / qq); when
  * opts.botPlatform is given, only that sub-bot's interactions are received (QQ guild sub-bot
  * 'qqguild'). Discord / Slack / Lark have different button paths and implement their own.
+ *
+ * opts.channelId lets a profile widen the adapter's channel.id into a real send target
+ * (Telegram forum topics: bare topic_id → `<chatId>:<topicId>`). It must match that
+ * profile's inboundChannelId, or a button clicked inside a topic resolves to a different
+ * channel than the message that produced it — for a blocking `ask`, the click would never
+ * be matched back to its pending request.
  */
 export function mountSatoriButtonInteraction(
   ctx: Context,
   platform: string,
   emit: (ev: ButtonInteraction) => void,
-  opts?: { botPlatform?: string }
+  opts?: { botPlatform?: string; channelId?: (session: Session) => string }
 ): void {
   ctx.on('interaction/button', (session: Session) => {
     if (opts?.botPlatform && session.bot.platform !== opts.botPlatform) return;
@@ -244,7 +250,7 @@ export function mountSatoriButtonInteraction(
     if (!buttonId) return;
     emit({
       platform,
-      channelId: session.channelId ?? '',
+      channelId: opts?.channelId?.(session) ?? session.channelId ?? '',
       userId: session.userId ?? '',
       messageId: session.messageId ?? '',
       buttonId,

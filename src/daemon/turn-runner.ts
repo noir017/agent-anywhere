@@ -73,10 +73,13 @@ export class TurnRunner {
     private readonly deps: TurnRunnerDeps,
     /**
      * Optional callback hooks. onAvailableCommands: fired when a session's agent reports its command
-     * list (daemon aggregates and dynamically registers native slash). Absent = don't care (test/no-slash).
+     * list. The agentId is passed alongside because the daemon keys those lists by AGENT, not by
+     * session: a command set is a property of the harness and its configuration, so every session of
+     * one agent reports the same list, and keying by session would make the newest report look like
+     * a change. Absent = don't care (test/no-slash).
      */
     private readonly hooks?: {
-      onAvailableCommands?(sessionId: SessionId, cmds: AgentCommand[]): void;
+      onAvailableCommands?(sessionId: SessionId, agentId: string, cmds: AgentCommand[]): void;
     }
   ) {}
 
@@ -247,10 +250,11 @@ export class TurnRunner {
           tools.resetSegment();
           ref.stream = makeStream();
         }),
-      // Agent reported available commands: forward to the daemon hook (dynamic slash registration). Non-blocking, errors swallowed.
+      // Agent reported available commands: forward to the daemon hook (feeds the harness pickers).
+      // Non-blocking, errors swallowed.
       onAvailableCommands: (cmds) => {
         try {
-          this.hooks?.onAvailableCommands?.(sessionId, cmds);
+          this.hooks?.onAvailableCommands?.(sessionId, this.deps.agentIdOf(sessionId), cmds);
         } catch (e) {
           console.error('[turn] onAvailableCommands hook failed:', e instanceof Error ? e.message : e);
         }

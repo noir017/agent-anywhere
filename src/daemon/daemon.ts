@@ -1,5 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import type { Config } from '../config/schema.js';
+import { agentDisplayName, findAgent } from '../config/schema.js';
+import {
+  genericCommandSpecs,
+  genericNativeNames,
+  pickerCommandsFor,
+} from '../core/command-translate.js';
 import type { PlatformAdapter } from '../platform/adapter.js';
 import type {
   AgentCommand,
@@ -23,43 +29,13 @@ const SLASH_NAME_RE = /^[a-z0-9_-]{1,32}$/;
 const SLASH_DESC_MAX = 100;
 
 /**
- * Built-in slash command names per harness, used for registration priority: when the platform
- * caps command count (capabilities.maxSlashCommands), built-ins win seats over numerous skills.
- *
- * Split by harness because the only available signal is the command name — adapters report
- * commands without a "built-in vs skill/MCP" marker. Names outside this list lose priority only
- * (still selectable / text-invokable); correctness is unaffected. gemini/codex lists are best-effort.
- */
-const BUILTIN_COMMANDS_BY_HARNESS: Record<string, string[]> = {
-  claude: [
-    'add-dir', 'agents', 'bug', 'compact', 'config', 'context', 'doctor', 'export',
-    'feedback', 'help', 'hooks', 'ide', 'init', 'install-github-app', 'mcp', 'memory',
-    'model', 'output-style', 'permissions', 'pr-comments', 'privacy-settings', 'resume',
-    'review', 'status', 'statusline', 'terminal-setup', 'upgrade', 'usage', 'vim',
-  ],
-  // Gemini CLI common built-ins (best-effort; defer to actual --help).
-  gemini: [
-    'about', 'auth', 'bug', 'chat', 'clear', 'compress', 'docs', 'editor', 'help',
-    'mcp', 'memory', 'privacy', 'restore', 'stats', 'theme', 'tools',
-  ],
-  // Codex built-in list not yet stable; left empty (no impact on correctness, just no priority).
-  codex: [],
-};
-
-/** Union of all harness built-ins (for priority decisions). */
-const BUILTIN_COMMANDS = new Set<string>(Object.values(BUILTIN_COMMANDS_BY_HARNESS).flat());
-
-/**
- * Daemon-level slash commands, registered ahead of agent-discovered ones. Both are intercepted in
+ * Daemon-level slash commands, registered ahead of the rest. Both are intercepted in
  * SessionRegistry.route (see CONTEXT_CLEAR_RE) and never reach the agent.
  */
 const DAEMON_COMMANDS: SlashCommandSpec[] = [
   { name: 'new', description: 'Start a fresh conversation (clears context)' },
   { name: 'clear', description: 'Alias of /new: start a fresh conversation' },
 ];
-
-/** Command-registration debounce: merge bursts of per-session/per-turn reports into one platform call. */
-const REGISTER_DEBOUNCE_MS = 800;
 
 /**
  * Inbound dedup TTL: on "slash-is-a-normal-message" platforms (e.g. Telegram), one `/cmd` fires
@@ -72,8 +48,38 @@ const DEDUP_TTL_MS = 15_000;
 /** Default timeout for an unclicked ask/clarify button (fallback when action.timeoutMs is absent). */
 const DEFAULT_ASK_TIMEOUT_MS = 120_000;
 
+/**
+ * Max buttons in a harness-command menu. Discord allows 25 components per message (5 rows × 5);
+ * commands beyond this are listed as text instead of dropped. The `claude` harness reports ~39,
+ * so this cap is reached in practice, not hypothetically.
+ */
+const PICKER_BUTTON_MAX = 25;
+
 /** ask button custom_id prefix. Format `ask:<reqId>:<index>` (must not start with `input`). */
 const ASK_PREFIX = 'ask:';
+
+/** Harness-picker button custom_id prefix. Format `cmd:<reqId>:<index>`. */
+const PICK_PREFIX = 'cmd:';
+
+/**
+ * Parse a `<prefix><reqId>:<index>` button custom_id (pure, testable). Returns null when the
+ * prefix does not match or the shape is invalid. Shared by the ask and picker buttons so both
+ * accept exactly the same id grammar.
+ */
+function parsePrefixedButtonId(
+  buttonId: string,
+  prefix: string
+): { reqId: string; index: number } | null {
+  if (!buttonId.startsWith(prefix)) return null;
+  const rest = buttonId.slice(prefix.length);
+  const sep = rest.lastIndexOf(':');
+  if (sep <= 0) return null;
+  const reqId = rest.slice(0, sep);
+  const indexStr = rest.slice(sep + 1);
+  // Accept only a non-negative integer string (reject empty/non-digit; Number('') would be 0).
+  if (!reqId || !/^\d+$/.test(indexStr)) return null;
+  return { reqId, index: Number(indexStr) };
+}
 
 /**
  * Parse an ask button custom_id (pure, testable). Recognizes only `ask:<reqId>:<index>`;
@@ -82,15 +88,16 @@ const ASK_PREFIX = 'ask:';
 export function parseAskButtonId(
   buttonId: string
 ): { reqId: string; index: number } | null {
-  if (!buttonId.startsWith(ASK_PREFIX)) return null;
-  const rest = buttonId.slice(ASK_PREFIX.length);
-  const sep = rest.lastIndexOf(':');
-  if (sep <= 0) return null;
-  const reqId = rest.slice(0, sep);
-  const indexStr = rest.slice(sep + 1);
-  // Accept only a non-negative integer string (reject empty/non-digit; Number('') would be 0).
-  if (!reqId || !/^\d+$/.test(indexStr)) return null;
-  return { reqId, index: Number(indexStr) };
+  return parsePrefixedButtonId(buttonId, ASK_PREFIX);
+}
+
+/**
+ * Parse a harness-picker button custom_id (pure, testable). Recognizes only `cmd:<reqId>:<index>`.
+ */
+export function parsePickButtonId(
+  buttonId: string
+): { reqId: string; index: number } | null {
+  return parsePrefixedButtonId(buttonId, PICK_PREFIX);
 }
 
 /**
@@ -110,35 +117,26 @@ export function agentCommandToSpec(cmd: AgentCommand): SlashCommandSpec | null {
 }
 
 /**
- * Aggregate per-session command lists into a name-deduped registration set (pure, testable).
- * Native platform slash is global/workspace-scoped, so take the union; first name wins.
- * Invalid names are dropped and returned for logging (not silently swallowed).
+ * The complete set of slash commands this deployment registers (pure, testable).
+ *
+ * Fixed at startup, derived only from config — deliberately NOT the union of what agents report.
+ * Native slash is global (Telegram setMyCommands is per-bot, Discord per-application) while agents
+ * are per-session, so a union menu could neither say who owned an entry nor route one correctly:
+ * an agent-specific command invoked from it fell through to `routing.default`. It also churned,
+ * since each agent re-reports its full list every turn and the last reporter won the menu.
+ *
+ * Three layers, in registration order:
+ *  - daemon commands (/new, /clear) — intercepted before any agent
+ *  - the generic vocabulary — translated per harness at invocation (core/command-translate.ts)
+ *  - one picker per configured harness (/claude, /opencode) — the escape hatch to that agent's
+ *    own commands, which are no longer registered globally
  */
-export function buildUnionSpecs(perSession: Iterable<AgentCommand[]>): {
-  specs: SlashCommandSpec[];
-  dropped: string[];
-} {
-  const byName = new Map<string, SlashCommandSpec>();
-  const dropped: string[] = [];
-  for (const cmds of perSession) {
-    for (const c of cmds) {
-      const spec = agentCommandToSpec(c);
-      if (!spec) {
-        dropped.push(c.name);
-        continue;
-      }
-      if (!byName.has(spec.name)) byName.set(spec.name, spec);
-    }
-  }
-  // Built-ins first (so they survive cap truncation over numerous skills), then alphabetical.
-  // Stable ordering also makes the registration signature comparable (avoids dup registrations).
-  const specs = [...byName.values()].sort((a, b) => {
-    const ab = BUILTIN_COMMANDS.has(a.name) ? 0 : 1;
-    const bb = BUILTIN_COMMANDS.has(b.name) ? 0 : 1;
-    if (ab !== bb) return ab - bb; // built-in (0) before non-built-in (1)
-    return a.name.localeCompare(b.name);
-  });
-  return { specs, dropped };
+export function buildRegisteredSpecs(cfg: Pick<Config, 'agents'>): SlashCommandSpec[] {
+  const specs = [...DAEMON_COMMANDS, ...genericCommandSpecs(), ...pickerCommandsFor(cfg)];
+  // Dedup defensively: a harness named like a generic command (or a future daemon command) must not
+  // register twice — Telegram rejects the whole setMyCommands batch on a duplicate name.
+  const seen = new Set<string>();
+  return specs.filter((s) => (seen.has(s.name) ? false : (seen.add(s.name), true)));
 }
 
 /** A pending ask request (IPC response blocked, awaiting a button click or timeout). */
@@ -158,17 +156,40 @@ interface PendingAsk {
   sessionId?: SessionId;
 }
 
+/**
+ * A posted harness-command menu, awaiting a click.
+ *
+ * `names` holds the real command names because the button id cannot: Telegram caps callback_data
+ * at 64 bytes and encodeCallbackData degrades to a lossy hash above it, so a name encoded into the
+ * id would not survive the round trip. The id carries only an index into this list.
+ *
+ * `sessionId` is the session the menu was opened for. The click is delivered straight back to it —
+ * re-routing a bare `/init` would send it to `routing.default` instead of the agent that offered it.
+ */
+interface PendingPick {
+  sessionId: SessionId;
+  /** Native command names, positionally matching the button indices. */
+  names: string[];
+  /** Channel the menu was posted in (where the click's synthesized message originates). */
+  channelId: string;
+  /** Platform instance the menu was posted on. */
+  platform: string;
+}
+
 /** Main daemon: wires platform, session registry, and IPC server together. `agent-anywhere start` constructs and run()s it. */
 export class Daemon {
   private registry: SessionRegistry;
   private ipc: IpcServer;
   /** Pending ask requests: reqId → wait handle. Resolved and deleted on click or timeout. */
   private pendingAsks = new Map<string, PendingAsk>();
-  /** Latest reported available commands per session (source for dynamic slash registration; unioned). */
-  private sessionCommands = new Map<SessionId, AgentCommand[]>();
-  /** Per-instance signature of registered commands; skip if unchanged to avoid redundant API calls. */
-  private registeredSigs = new Map<string, string>();
-  private registerTimer: NodeJS.Timeout | null = null;
+  /**
+   * Latest command list reported per AGENT (not per session): the set is a property of the harness
+   * and its config, so every session of one agent reports the same list. Feeds the harness pickers;
+   * no longer drives registration, which is now fixed at startup (see buildRegisteredSpecs).
+   */
+  private agentCommands = new Map<string, AgentCommand[]>();
+  /** Pending harness-picker menus: reqId → the session and command names it was built for. */
+  private pendingPicks = new Map<string, PendingPick>();
   /** Instances whose "slash must be registered out-of-band" skip notice was printed (log once each). */
   private skipRuntimeRegisterLogged = new Set<string>();
   /** Inbound dedup: `platform:channelId:messageId` → timestamp (see DEDUP_TTL_MS). */
@@ -206,8 +227,10 @@ export class Daemon {
     };
 
     this.registry = new SessionRegistry(config, platforms, agents, clock, {
-      // A session's agent reported available commands → record and debounce re-registration of the union.
-      onAvailableCommands: (sessionId, cmds) => this.onAgentCommands(sessionId, cmds),
+      // A session's agent reported its command list → record it under that AGENT (feeds the pickers).
+      onAvailableCommands: (_sessionId, agentId, cmds) => this.onAgentCommands(agentId, cmds),
+      // A harness picker (/claude, /opencode) was invoked in a session of that harness.
+      onPickerRequest: (sessionId, agentId, msg) => this.onPickerRequest(sessionId, agentId, msg),
     }, store);
     this.ipc = new IpcServer(socketPath, {
       // resolveChannel is also the sole capture point for the session owning this reverse command:
@@ -233,7 +256,9 @@ export class Daemon {
       await adapter.start();
       console.log(`[daemon] platform instance "${id}" (${adapter.platformType}) started`);
     }
-    // No static slash registration: commands are registered dynamically from agent available_commands_update.
+    // The registered set is fixed and derived from config (see buildRegisteredSpecs), so it is
+    // registered once here rather than re-derived whenever an agent reports its commands.
+    await this.registerCommands();
     await this.ipc.start();
     // Graceful stop on SIGINT (Ctrl-C) / SIGTERM (kill / container stop); otherwise resident ACP
     // child processes are orphaned and the socket file lingers. Removed again in stop().
@@ -271,10 +296,7 @@ export class Daemon {
         console.error(`[daemon] failed to stop platform instance "${id}":`, e instanceof Error ? e.message : e)
       );
     }
-    if (this.registerTimer) {
-      clearTimeout(this.registerTimer);
-      this.registerTimer = null;
-    }
+    this.pendingPicks.clear();
     // Clear pending asks after ipc/platform are down: no new clicks or asks can arrive now. Clear each
     // timer and resolve null ("no selection") so any caller still blocked on ask IPC gets a result
     // rather than hanging forever. Best-effort: never throw.
@@ -425,8 +447,13 @@ export class Daemon {
     });
   }
 
-  /** Button click: resolve the matching pending ask; otherwise ignore (reserved for future interactions). */
+  /** Button click: resolve the matching pending ask or picker; otherwise ignore. */
   private onButton(ev: ButtonInteraction): void {
+    const pick = parsePickButtonId(ev.buttonId);
+    if (pick) {
+      this.onPickClick(ev, pick);
+      return;
+    }
     const parsed = parseAskButtonId(ev.buttonId);
     if (!parsed) return;
     const pending = this.pendingAsks.get(parsed.reqId);
@@ -498,41 +525,136 @@ export class Daemon {
     }
   }
 
-  /** A session's agent reported its command list: record it (empty clears the entry), then debounce re-register. */
-  private onAgentCommands(sessionId: SessionId, cmds: AgentCommand[]): void {
-    if (cmds.length === 0) this.sessionCommands.delete(sessionId);
-    else this.sessionCommands.set(sessionId, cmds);
-    this.scheduleRegister();
-  }
-
-  /** Debounce one union registration (merge bursts of reports into a single platform call). */
-  private scheduleRegister(): void {
-    if (this.registerTimer) clearTimeout(this.registerTimer);
-    this.registerTimer = setTimeout(() => {
-      this.registerTimer = null;
-      void this.registerDiscoveredCommands();
-    }, REGISTER_DEBOUNCE_MS);
+  /**
+   * An agent reported its command list: record it under that agent (empty clears the entry).
+   *
+   * Keyed by agent rather than by session because the list is a property of the harness and its
+   * configuration — every session of one agent reports the same set, and the previous per-session
+   * keying made the newest report look like a change to the menu. Registration no longer depends on
+   * this at all; it only feeds the harness pickers.
+   */
+  private onAgentCommands(agentId: string, cmds: AgentCommand[]): void {
+    if (cmds.length === 0) this.agentCommands.delete(agentId);
+    else this.agentCommands.set(agentId, cmds);
   }
 
   /**
-   * Register the union of all sessions' reported commands on EVERY slash-capable instance.
-   * Per-instance: capability gating, count cap, registration signature (skip when unchanged),
-   * and discord's commandGuildId. Best-effort — failures only logged, never thrown.
+   * A harness picker (`/claude`, `/opencode`) was invoked in a session of that harness: post the
+   * agent's own commands as buttons.
+   *
+   * Only the commands the agent actually reported are offered — no guessed list. Ones already
+   * reachable through the generic vocabulary are filtered out, since they have a top-level entry.
    */
-  private async registerDiscoveredCommands(): Promise<void> {
-    const { specs: discovered, dropped } = buildUnionSpecs(this.sessionCommands.values());
-    // Daemon-level context commands lead the list (they are intercepted in SessionRegistry.route and
-    // must win any same-named agent command; leading also keeps them inside platform count caps).
-    const all = [...DAEMON_COMMANDS, ...discovered.filter((s) => !DAEMON_COMMANDS.some((d) => d.name === s.name))];
-    if (dropped.length > 0) {
-      console.warn(`[slash] skipping ${dropped.length} command(s) with invalid names: ${dropped.join(', ')}`);
+  private onPickerRequest(sessionId: SessionId, agentId: string, msg: InboundMessage): void {
+    const adapter = this.platforms.get(msg.platform);
+    if (!adapter) return;
+    const send = (text: string): void => {
+      void adapter
+        .sendMessage(msg.channelId, text)
+        .catch((e) => console.error('[picker] reply failed:', e instanceof Error ? e.message : e));
+    };
+
+    const def = findAgent(this.config, agentId);
+    const label = agentDisplayName(def, agentId);
+    const reported = this.agentCommands.get(agentId);
+    if (!reported || reported.length === 0) {
+      // Truthful about the cause rather than showing an empty menu: the list arrives over ACP once a
+      // session exists, and spawning an agent subprocess merely to populate a menu is a worse trade.
+      send(`No command list from ${label} yet — send it a message first, then try /${label} again.`);
+      return;
     }
+
+    // Drop names already reachable generically (a second entry for the same thing is noise), and
+    // any the platform would reject.
+    const generic = genericNativeNames(def?.harness);
+    const offered = reported.filter((c) => !generic.has(c.name) && agentCommandToSpec(c) !== null);
+    if (offered.length === 0) {
+      send(`${label} reports no commands beyond the ones already in the menu.`);
+      return;
+    }
+
+    // Buttons are capped (Discord allows 25 per message); the remainder is listed as text rather
+    // than silently dropped, and stays invokable by typing.
+    const shown = offered.slice(0, PICKER_BUTTON_MAX);
+    const overflow = offered.slice(PICKER_BUTTON_MAX);
+    const reqId = randomUUID().slice(0, 8);
+    this.pendingPicks.set(reqId, {
+      sessionId,
+      names: shown.map((c) => c.name),
+      channelId: msg.channelId,
+      platform: msg.platform,
+    });
+
+    let prompt = `${label} commands:`;
+    if (overflow.length > 0) {
+      prompt += `\n\n${overflow.length} more (type them directly): ${overflow.map((c) => `/${c.name}`).join(', ')}`;
+    }
+    const buttons = shown.map((c, i) => ({ id: `${PICK_PREFIX}${reqId}:${i}`, label: `/${c.name}` }));
+    void adapter.sendButtons(msg.channelId, prompt, buttons).catch((e) => {
+      this.pendingPicks.delete(reqId);
+      console.error('[picker] failed to post the menu:', e instanceof Error ? e.message : e);
+    });
+  }
+
+  /**
+   * A picker button was clicked: run that command in the session the menu was opened for.
+   *
+   * Delivered straight to the recorded session, NOT re-routed: a bare `/init` carries no agent
+   * prefix, so routing would send it to `routing.default` — the exact misdelivery this design
+   * removes. The clicker is re-checked against the allowlist because a button in a shared channel
+   * can be pressed by someone other than the person who opened the menu.
+   */
+  private onPickClick(ev: ButtonInteraction, parsed: { reqId: string; index: number }): void {
+    const pick = this.pendingPicks.get(parsed.reqId);
+    if (!pick) return;
+    const name = pick.names[parsed.index];
+    if (name === undefined) return;
+
+    const allow = this.config.access.allowFrom;
+    if (allow.length > 0 && !allow.includes(`${ev.platform}:${ev.userId}`)) {
+      console.log(`[access] denied picker click from ${ev.platform}:${ev.userId}`);
+      return;
+    }
+
+    // One-shot: a menu button runs once, so drop it rather than let a stale menu be re-clicked.
+    this.pendingPicks.delete(parsed.reqId);
+    const delivered = this.registry.dispatchToSession(pick.sessionId, {
+      platform: pick.platform,
+      channelId: pick.channelId,
+      userId: ev.userId,
+      messageId: ev.messageId,
+      content: `/${name}`,
+      timestamp: Date.now(),
+      // A click is an explicit, directed invocation: bypass the "server channel needs @" gate.
+      mentionedSelf: true,
+    });
+    if (!delivered) {
+      void this.platforms
+        .get(pick.platform)
+        ?.sendMessage(pick.channelId, `That session is gone — send a message first, then run /${name}.`)
+        .catch(() => undefined);
+      return;
+    }
+    void this.platforms
+      .get(pick.platform)
+      ?.editMessage({ channelId: pick.channelId, messageId: ev.messageId }, `→ /${name}`)
+      .catch(() => undefined);
+  }
+
+  /**
+   * Register this deployment's fixed command set on every slash-capable instance.
+   *
+   * Called once at startup: the set derives from config alone (see buildRegisteredSpecs), so unlike
+   * the previous agent-reported union it cannot change while running. Best-effort — a failure is
+   * logged and never throws, since slash is a convenience over plain-text commands.
+   */
+  private async registerCommands(): Promise<void> {
+    const all = buildRegisteredSpecs(this.config);
     for (const [id, adapter] of this.platforms) {
       if (!adapter.capabilities.slashCommands) continue; // no registration support: plain-text passthrough still works
       // slashCommands=true only means "can receive slash", not "can register at runtime". Platforms with
       // canRegisterSlashAtRuntime===false (e.g. Slack: slash registered out-of-band via App panel/manifest)
-      // have a no-op registerCommands, so skip — don't re-invoke a no-op on every debounce.
-      // Missing/undefined is treated as true (Discord/Telegram and other runtime-registering profiles).
+      // have a no-op registerCommands, so skip it.
       if (adapter.capabilities.canRegisterSlashAtRuntime === false) {
         if (!this.skipRuntimeRegisterLogged.has(id)) {
           this.skipRuntimeRegisterLogged.add(id);
@@ -542,32 +664,26 @@ export class Daemon {
         }
         continue;
       }
-      // Instance count cap (per-IM capability; unset = unlimited). Beyond it, register only the first N
-      // (built-ins already sorted first, see buildUnionSpecs); the rest are logged (still text-invokable),
-      // never silently truncated.
+      // Instance count cap (per-IM capability; unset = unlimited). The fixed set is far below every
+      // real cap, but truncation is reported rather than silent if that ever stops being true.
       const cap = adapter.capabilities.maxSlashCommands ?? Infinity;
       let specs = all;
       if (all.length > cap) {
         const over = all.slice(cap).map((s) => s.name);
         specs = all.slice(0, cap);
         console.warn(
-          `[slash] instance "${id}": command count ${all.length} exceeds the cap ${cap}; registering only the first ${cap} (built-ins prioritized); ` +
+          `[slash] instance "${id}": command count ${all.length} exceeds the cap ${cap}; registering only the first ${cap}; ` +
             `not registered (still invokable as /cmd text): ${over.join(', ')}`
         );
       }
-      const sig = JSON.stringify(specs);
-      if (sig === this.registeredSigs.get(id)) continue; // same as registered set; skip redundant platform API call
-      this.registeredSigs.set(id, sig);
       try {
         // commandGuildId is discord-only (instant guild-level registration); other types register globally.
         const cfg = this.config.platforms[id];
         const guildId = cfg?.type === 'discord' ? cfg.commandGuildId : undefined;
         await adapter.registerCommands(specs, guildId ? { guildId } : undefined);
-        console.log(`[slash] instance "${id}": registered ${specs.length} agent command(s)`);
+        console.log(`[slash] instance "${id}": registered ${specs.length} command(s)`);
       } catch (e) {
-        // On failure, reset the signature so the next change retries.
-        this.registeredSigs.delete(id);
-        console.error(`[slash] instance "${id}": dynamic registration failed:`, e instanceof Error ? e.message : e);
+        console.error(`[slash] instance "${id}": registration failed:`, e instanceof Error ? e.message : e);
       }
     }
   }

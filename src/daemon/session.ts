@@ -1,4 +1,5 @@
 import type { Config } from '../config/schema.js';
+import { agentDisplayName, findAgent } from '../config/schema.js';
 import { SessionTokenRegistry } from './session-token-registry.js';
 import { parseTextCommand, resolveRoute, routeInputFromMessage, sessionKey } from './routing.js';
 import type { AgentCommand, InboundMessage, SessionId } from '../types.js';
@@ -33,6 +34,12 @@ interface SessionState {
   activeChannel?: string;
   /** Active turn's platform instance id (set/cleared with activeChannel). */
   activePlatform?: string;
+  /**
+   * Whether this session already announced itself with the header bubble (display.header.enabled).
+   * Once per session, so a long conversation isn't punctuated by a banner on every turn; cleared by
+   * resetSession so /clear and /new announce the fresh conversation again.
+   */
+  headerSent?: boolean;
 }
 
 /**
@@ -168,10 +175,17 @@ export class SessionRegistry {
     const key = sessionKey(route.scope, route.agentId, msg);
 
     // Inbound response gating (a second gate over the adapter's self/channelAllowed filter:
-    // bot/mention/dm/thread/ignored). Read hasActiveSession before any buildMerger, else once a merger
-    // exists this boolean is always true and the "already in a thread" exemption is distorted.
+    // bot/mention/dm/thread/ignored/empty). Read hasActiveSession before any buildMerger, else once
+    // a merger exists this boolean is always true and the "already in a thread" exemption is
+    // distorted.
+    //
+    // Gated on the ORIGINAL content, not the prefix-stripped one: a bare `/oc` strips to empty and
+    // would trip the empty-message gate, losing the usage ack below. The gate's job is to reject
+    // messages that arrived with nothing in them (a native slash command's phantom empty message),
+    // not ones this method just emptied.
     const hasActiveSession = this.sessions.has(key);
-    const decision = shouldRespond(msg, this.gateFor(msg.platform), { hasActiveSession });
+    const gateMsg = bareCommand !== undefined ? { ...msg, content: `/${bareCommand}` } : msg;
+    const decision = shouldRespond(gateMsg, this.gateFor(msg.platform), { hasActiveSession });
     if (!decision.respond) {
       // Ignored messages create no merger, don't ingest, and don't bump lastActivity (no keep-alive).
       console.log(`[gate] ignoring message (${decision.reason}) ch=${msg.channelId}`);
@@ -214,7 +228,36 @@ export class SessionRegistry {
     } else {
       state.platform = msg.platform; // shared-scope sessions may hop platform instances
     }
+    // Announce which agent is about to answer, before the turn starts (see sendHeader). Placed after
+    // every gate above so it can't become a probe: a message that isn't going to be answered gets no
+    // acknowledgement of any kind.
+    this.sendHeader(state, msg);
     void state.merger.ingest(msg);
+  }
+
+  /**
+   * Send the once-per-session header bubble (`🤖 opencode`) and mark the session announced.
+   *
+   * Sent on receipt rather than with the reply, so it doubles as an immediate "got it, working on
+   * it" — the agent subprocess may take seconds to spawn on the first turn.
+   *
+   * Names the harness, not the config id: `oc` is an operator's typing shorthand and means nothing
+   * to a reader. Deliberately shows no model — at receipt time no agent session exists, so the
+   * model that will serve the turn is unknowable, and the configured value is not a safe stand-in
+   * (a harness may substitute its own). The model belongs in the footer, reported after the fact.
+   *
+   * Best-effort: a send failure must never block the turn, so it's logged and dropped.
+   */
+  private sendHeader(state: SessionState, msg: InboundMessage): void {
+    if (!this.config.display.header.enabled || state.headerSent) return;
+    // Mark before awaiting: two messages arriving inside the merge window would otherwise both see
+    // headerSent=false and send twice.
+    state.headerSent = true;
+    const name = agentDisplayName(findAgent(this.config, state.agentId), state.agentId);
+    void this.platforms
+      .get(msg.platform)
+      ?.sendMessage(msg.channelId, `🤖 ${name}`)
+      .catch((e) => console.warn('[session] failed to send header:', e instanceof Error ? e.message : e));
   }
 
   /** allowFrom access gate: empty = unrestricted; non-empty allows only allowlisted identities. */
@@ -279,11 +322,14 @@ export class SessionRegistry {
   /**
    * Reset session context (/new, /clear): dispose the agent subprocess and delete the persisted ACP
    * session id, so the next message starts a truly fresh session — including after a daemon restart.
-   * Keeps merger and modelOverride (reset clears only conversation context).
+   * Keeps merger and modelOverride (reset clears only conversation context), but clears headerSent so
+   * the fresh conversation announces its agent again.
    */
   resetSession(sessionId: SessionId): void {
     this.agents.dispose(sessionId);
     this.store?.delete(sessionId);
+    const state = this.sessions.get(sessionId);
+    if (state) state.headerSent = false;
   }
 
   /** Shutdown: release all mergers and agent sessions. */

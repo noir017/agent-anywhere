@@ -46,8 +46,9 @@ function fakeBot(): { bot: SendBot; calls: Captured } {
 /**
  * Inbound thread detection — the asymmetry this refactor closed.
  *
- * Slack's adapter exposes no thread flag: when `thread_ts !== ts` it backfills the ROOT message
- * into session.quote and nothing else. The profile used to give up there and hardcode "not a
+ * Slack's adapter exposes no thread flag: it populates session.quote with the thread ROOT, and
+ * only when `thread_ts !== ts` — so the quote is a reliable witness of "this is a thread reply",
+ * and `quote.id` is the thread_ts itself. The profile used to give up there and hardcode "not a
  * thread", while its OUTBOUND side happily emitted thread addresses — so a reply typed inside a
  * thread was routed as ordinary channel traffic and answered in the channel.
  */

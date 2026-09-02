@@ -84,18 +84,21 @@ function slackAttachmentMeta(): { mime?: string; size?: number } {
  * Slack's conversation shape (pure, for unit testing).
  *
  * -- Inbound thread detection ------------------------------------------------
- * A Slack thread is `thread_ts`, and the adapter exposes no thread flag on the session: when
- * `thread_ts !== ts` it backfills the ROOT message into `session.quote` and nothing else
- * (adapter lib/index.cjs adaptMessage). This profile used to give up there and hardcode
- * "not a thread", so a reply typed inside a thread was routed as if it were in the channel --
- * while the outbound side happily emitted thread addresses. Reading the quote closes that
- * asymmetry: `quote.id` IS the thread_ts the adapter looked up.
+ * A Slack thread is `thread_ts`, and the adapter exposes no thread flag on the session. What it
+ * does do (lib/index.cjs adaptMessage) is:
  *
- * The cost is honest and bounded: the adapter also fills `quote` for a plain in-channel reply,
- * so a quoted non-thread message reads as a thread rooted at the quoted message. That errs
- * toward keeping a conversation together rather than splitting it, and Slack itself treats
- * "post with thread_ts of any message" as starting that message's thread -- so the address is
- * valid either way.
+ *     if (data.thread_ts && data.thread_ts !== data.ts) {
+ *       message.quote = await bot.getMessage(payload.channel.id, data.thread_ts);
+ *     }
+ *
+ * — i.e. `quote` is populated ONLY for a genuine thread reply, and `quote.id` is the thread root's
+ * ts, which IS the thread_ts. (Slack has no separate "quote a message" primitive that could set it
+ * otherwise; quoting in the client posts a link unfurl, which lands in `attachments`.) So the quote
+ * is a reliable witness, not a heuristic.
+ *
+ * This profile used to give up here and hardcode "not a thread", while its OUTBOUND side happily
+ * emitted thread addresses — so a reply typed inside a thread was routed as if it were ordinary
+ * channel traffic, and answered in the channel.
  */
 export function slackConversation(session: {
   channelId?: string;

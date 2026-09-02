@@ -1,5 +1,4 @@
 import type { Config } from '../config/schema.js';
-import { findAgent } from '../config/schema.js';
 import { SessionTokenRegistry } from './session-token-registry.js';
 import { parseTextCommand, resolveRoute, routeInputFromMessage, sessionKey } from './routing.js';
 import type { AgentCommand, InboundMessage, SessionId } from '../types.js';
@@ -175,10 +174,17 @@ export class SessionRegistry {
     const key = sessionKey(route.scope, route.agentId, msg);
 
     // Inbound response gating (a second gate over the adapter's self/channelAllowed filter:
-    // bot/mention/dm/thread/ignored). Read hasActiveSession before any buildMerger, else once a merger
-    // exists this boolean is always true and the "already in a thread" exemption is distorted.
+    // bot/mention/dm/thread/ignored/empty). Read hasActiveSession before any buildMerger, else once
+    // a merger exists this boolean is always true and the "already in a thread" exemption is
+    // distorted.
+    //
+    // Gated on the ORIGINAL content, not the prefix-stripped one: a bare `/oc` strips to empty and
+    // would trip the empty-message gate, losing the usage ack below. The gate's job is to reject
+    // messages that arrived with nothing in them (a native slash command's phantom empty message),
+    // not ones this method just emptied.
     const hasActiveSession = this.sessions.has(key);
-    const decision = shouldRespond(msg, this.gateFor(msg.platform), { hasActiveSession });
+    const gateMsg = bareCommand !== undefined ? { ...msg, content: `/${bareCommand}` } : msg;
+    const decision = shouldRespond(gateMsg, this.gateFor(msg.platform), { hasActiveSession });
     if (!decision.respond) {
       // Ignored messages create no merger, don't ingest, and don't bump lastActivity (no keep-alive).
       console.log(`[gate] ignoring message (${decision.reason}) ch=${msg.channelId}`);
@@ -229,12 +235,16 @@ export class SessionRegistry {
   }
 
   /**
-   * Send the once-per-session header bubble (`🤖 cc · opus[1m]`) and mark the session announced.
+   * Send the once-per-session header bubble (`🤖 cc`) and mark the session announced.
    *
    * Sent on receipt rather than with the reply, so it doubles as an immediate "got it, working on
-   * it" — the agent subprocess may take seconds to spawn on the first turn. That timing is also why
-   * the model here is the CONFIGURED one: no ACP session exists yet, so the live model the footer
-   * reports isn't knowable. Header = which agent and what was asked for, footer = what actually ran.
+   * it" — the agent subprocess may take seconds to spawn on the first turn.
+   *
+   * Deliberately shows the agent id ONLY, no model. At receipt time no agent session exists yet, so
+   * the model that will actually serve the turn is unknowable, and the configured value is not a
+   * safe stand-in: some harnesses ignore it outright (opencode runs its own default regardless of
+   * `agents[].model`), so printing it would state a falsehood in the most authoritative-looking
+   * place. The model belongs in the footer, where it is reported by the harness after the fact.
    *
    * Best-effort: a send failure must never block the turn, so it's logged and dropped.
    */
@@ -243,12 +253,9 @@ export class SessionRegistry {
     // Mark before awaiting: two messages arriving inside the merge window would otherwise both see
     // headerSent=false and send twice.
     state.headerSent = true;
-    const def = findAgent(this.config, state.agentId);
-    const model = state.modelOverride ?? def?.model;
-    const text = model ? `🤖 ${state.agentId} · ${model}` : `🤖 ${state.agentId}`;
     void this.platforms
       .get(msg.platform)
-      ?.sendMessage(msg.channelId, text)
+      ?.sendMessage(msg.channelId, `🤖 ${state.agentId}`)
       .catch((e) => console.warn('[session] failed to send header:', e instanceof Error ? e.message : e));
   }
 

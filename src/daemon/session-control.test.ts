@@ -237,10 +237,13 @@ describe('SessionRegistry header bubble', () => {
     expect(headers(sent)).toEqual(['🤖 cc']);
   });
 
-  it('shows the model when the agent config carries one', () => {
+  it('never shows a model, even when the agent config carries one', () => {
+    // Deliberate: at receipt time no agent session exists, so the model that will actually serve
+    // the turn is unknown — and the configured value can be an outright lie (opencode ignores
+    // agents[].model and runs its own default). The footer reports the real one after the fact.
     const { sent, send } = rig(headerConfig());
     send('/oc hello');
-    expect(headers(sent)).toEqual(['🤖 oc · anthropic/claude-opus-5']);
+    expect(headers(sent)).toEqual(['🤖 oc']);
   });
 
   it('announces only once across many turns in the same session', () => {
@@ -259,13 +262,13 @@ describe('SessionRegistry header bubble', () => {
     expect(headers(sent)).toEqual(['🤖 cc', '🤖 cc']);
   });
 
-  it('a /model override takes precedence over the configured model', () => {
+  it('a /model override does not appear either (same reason)', () => {
     const { reg, sent, send } = rig(headerConfig());
     send('one'); // creates the session
     reg.setModelOverride('cc:discord:c:c1', 'claude-sonnet-4-5');
     reg.resetSession('cc:discord:c:c1'); // re-arm the header without clearing the override
     send('two');
-    expect(headers(sent)).toEqual(['🤖 cc', '🤖 cc · claude-sonnet-4-5']);
+    expect(headers(sent)).toEqual(['🤖 cc', '🤖 cc']);
   });
 
   it('separate channels each get their own announcement', () => {
@@ -308,5 +311,57 @@ describe('SessionRegistry header bubble', () => {
     const { sent, send } = rig(headerConfig({ display: { header: { enabled: false }, footer: { enabled: false, fields: [] } } }));
     send('hello');
     expect(headers(sent)).toEqual([]);
+  });
+});
+
+/**
+ * A native slash command must produce exactly ONE turn.
+ *
+ * Telegram delivers `/oc hi` as two inbounds: the empty text message the client sends alongside the
+ * command, and the command event itself. The empty one has no `/oc`, so routing sent it to the
+ * DEFAULT agent — the user saw `🤖 cc` appear before `🤖 oc`, and cc ran a turn nobody asked for.
+ */
+describe('SessionRegistry native slash produces one turn', () => {
+  function rig() {
+    const { factory } = makeFactory();
+    const sent: string[] = [];
+    const platform = {
+      capabilities: { thread: false },
+      sendMessage: async (channelId: string, text: string) => {
+        sent.push(text);
+        return { channelId, messageId: 'm1' };
+      },
+    } as unknown as PlatformAdapter;
+    const cfg = {
+      ...(baseConfig as unknown as Record<string, unknown>),
+      agents: [
+        { id: 'cc', harness: 'claude', args: [], env: {} },
+        { id: 'oc', harness: 'opencode', args: [], env: {} },
+      ],
+      routing: { default: 'cc', pipeline: [{ when: { command: 'oc' }, use: { agent: 'oc' } }] },
+      display: { header: { enabled: true }, footer: { enabled: false, fields: [] } },
+    } as unknown as Config;
+    const reg = new SessionRegistry(cfg, new Map([['discord', platform]]), factory, clock);
+    // The header announcement is the observable proxy for "this agent got a turn".
+    return { reg, sent };
+  }
+
+  const headers = (sent: string[]): string[] => sent.filter((t) => t.startsWith('🤖'));
+
+  it('the phantom empty message does not announce or route to the default agent', () => {
+    const { reg, sent } = rig();
+    // Exactly what Telegram sends for one `/oc 你好`, in order.
+    reg.route({ platform: 'discord', channelId: 'c1', userId: 'u1', messageId: 'm1', content: '', isDirect: true } as never);
+    reg.route({ platform: 'discord', channelId: 'c1', userId: 'u1', messageId: 'm2', content: '/oc 你好', isDirect: true, mentionedSelf: true } as never);
+    // Before the fix this was ['🤖 cc', '🤖 oc'].
+    expect(headers(sent)).toEqual(['🤖 oc']);
+  });
+
+  it('a bare /oc still gets its usage ack (the gate must not eat it)', () => {
+    // `/oc` alone strips to empty content, but it is NOT an empty inbound — the user typed
+    // something, so they get told how to use it rather than silence.
+    const { reg, sent } = rig();
+    reg.route({ platform: 'discord', channelId: 'c1', userId: 'u1', messageId: 'm1', content: '/oc', isDirect: true } as never);
+    expect(sent.some((t) => t.includes('routed to agent "oc"'))).toBe(true);
   });
 });

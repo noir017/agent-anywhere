@@ -40,6 +40,7 @@ export interface GateDecision {
  * Decide whether to respond to an inbound message.
  *
  * Strict order, short-circuiting on the first hit; each branch yields a stable `reason`:
+ *  0. nothing to act on      → false 'empty'
  *  1. blocklisted channel    → false 'ignored-channel'
  *  2. bot author filter      → 'bot-blocked' / 'bot-no-mention' (else continue)
  *  3. DM                     → 'dm' / 'dm-disabled'
@@ -57,7 +58,16 @@ export function shouldRespond(
   cfg: GateConfig,
   ctx: GateContext
 ): GateDecision {
-  // 1) Blocklisted channel: highest priority, ignore outright.
+  // 0) Nothing to act on: no text and no attachments. Platforms genuinely deliver these — a
+  // Telegram native slash command arrives as BOTH an empty text message and a command event, and
+  // the empty one carries no command, so it would route to the DEFAULT agent and start a second,
+  // pointless turn alongside the real one (`/oc hi` answered by oc AND cc). An attachment-only
+  // message (image with no caption) is real input, so it must still pass.
+  if (msg.content.trim().length === 0 && (msg.attachments?.length ?? 0) === 0) {
+    return { respond: false, reason: 'empty' };
+  }
+
+  // 1) Blocklisted channel: highest priority among the real gates, ignore outright.
   if (cfg.ignoredChannels.includes(msg.channelId)) {
     return { respond: false, reason: 'ignored-channel' };
   }

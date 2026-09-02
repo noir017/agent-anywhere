@@ -134,6 +134,9 @@ export function createDiscordProfile(): PlatformProfile<DiscordPlatformConfig> {
     buttons: true,
     slashCommands: true,
     maxSlashCommands: 100, // Discord per-scope application command limit
+    // The adapter auto-emits a DEFERRED interaction response on INTERACTION_CREATE; without a
+    // followup the user sees "the application did not respond", so the daemon must acknowledge.
+    slashNeedsAck: true,
   };
 
   return {

@@ -8,6 +8,7 @@ import { client, ndJsonStream, PROTOCOL_VERSION } from '@agentclientprotocol/sdk
 import type {
   ActiveSession,
   ClientConnection,
+  ClientContext,
 } from '@agentclientprotocol/sdk';
 import type {
   ContentBlock,
@@ -221,6 +222,66 @@ function nameKeepsQualifiers(name: string, id: string): boolean {
 /** ACP's well-known id for the model selector among a session's config options. */
 const MODEL_CONFIG_ID = 'model';
 
+/**
+ * Enforce `agents[].model` on a freshly created session, returning the resulting live model name
+ * (undefined when nothing was applied, so the caller keeps what session/new reported).
+ *
+ * Why this exists: session/new carries the model only as a `_meta.model` hint, which the spec lets
+ * an agent ignore — and opencode does. Verified against the deployed harness: with
+ * `_meta.model: 'anthropic/claude-opus-5'` it still reported `opencode/big-pickle` (its own
+ * default), while `session/set_config_option` set it correctly. So a configured model was silently
+ * not taking effect, and the only visible symptom was the footer naming a model nobody asked for.
+ *
+ * Best-effort by design — a harness with no model selector, an unknown model id, or an agent that
+ * rejects the request must not fail the turn. Anything unexpected is logged once and the session
+ * proceeds on whatever the harness chose, which is strictly better than refusing to answer. The
+ * mismatch stays visible in the footer either way.
+ */
+async function applyModelPreference(
+  ctx: ClientContext,
+  session: ActiveSession,
+  def: AgentDef
+): Promise<string | undefined> {
+  const want = def.model;
+  if (!want) return undefined;
+
+  const opt = (session.newSessionResponse?.configOptions ?? []).find((o) => o.id === MODEL_CONFIG_ID);
+  // No model selector at all (the claude harness pins its model via ANTHROPIC_MODEL instead):
+  // nothing to set, and saying so at debug avoids a scary warning for a supported setup.
+  if (!opt || opt.type !== 'select') {
+    console.debug(`[acp] agent "${def.id}" exposes no model selector; leaving model.${want ? ` (configured "${want}" applies only if the harness reads it elsewhere)` : ''}`);
+    return undefined;
+  }
+  if (opt.currentValue === want) return undefined; // already correct — don't spend a round trip
+
+  // Only offer ids the agent actually lists; a typo would otherwise surface as an opaque rejection.
+  const offered = opt.options.flatMap((entry) => ('group' in entry ? entry.options : [entry]));
+  if (offered.length > 0 && !offered.some((o) => o.value === want)) {
+    console.warn(
+      `[acp] agent "${def.id}": configured model "${want}" is not among the models it offers; ` +
+        `continuing with "${opt.currentValue}". Available: ${offered.map((o) => o.value).join(', ')}`
+    );
+    return undefined;
+  }
+
+  try {
+    const res = await ctx.request('session/set_config_option', {
+      sessionId: session.sessionId,
+      configId: MODEL_CONFIG_ID,
+      value: want,
+    });
+    const applied = liveModelName(res?.configOptions);
+    console.log(`[acp] agent "${def.id}": model set to "${want}"`);
+    return applied;
+  } catch (err) {
+    console.warn(
+      `[acp] agent "${def.id}": could not set model "${want}" (${err instanceof Error ? err.message : err}); ` +
+        `continuing with "${opt.currentValue}"`
+    );
+    return undefined;
+  }
+}
+
 function createAcpSession(
   def: AgentDef,
   socketPath: string,
@@ -410,6 +471,9 @@ function createAcpSession(
           .start();
         active = session; // active set = "ready": assigned last so a half-ready session isn't reused
         liveModel = liveModelName(session.newSessionResponse?.configOptions);
+        // _meta.model above is a hint some harnesses ignore (verified: opencode reports its own
+        // default regardless), so enforce the choice through the protocol's own setter.
+        liveModel = (await applyModelPreference(ctx, session, def)) ?? liveModel;
         store?.set(sessionId, session.sessionId); // remember for post-restart session/load resume
       } catch (err) {
         // session/new returning auth_required (un-logged-in harness) surfaces as an opaque reject. Build
@@ -666,11 +730,7 @@ export function translateUpdate(u: SessionUpdate, st: TurnState): void {
     // model's reported capabilities), so the footer never has to guess a limit. Emitted several
     // times per turn as full snapshots — the consumer keeps the latest.
     case 'usage_update': {
-      const { used, size } = u;
-      // A zero/absent window would render as a divide-by-zero percentage; drop the snapshot
-      // instead so the footer degrades to "no context segment" rather than "0%".
-      if (typeof used !== 'number' || typeof size !== 'number' || size <= 0) break;
-      st.handlers.onUsage?.({ used, size });
+      ingestUsage(st, u.used, u.size);
       break;
     }
 
@@ -686,6 +746,17 @@ export function translateUpdate(u: SessionUpdate, st: TurnState): void {
     default:
       break;
   }
+}
+
+/**
+ * Forward a context snapshot, ignoring unusable ones. A zero/absent window would render as a
+ * divide-by-zero percentage, so the snapshot is dropped and the footer degrades to "no context
+ * segment" rather than a bogus "0%". Extracted from translateUpdate to keep that switch's
+ * complexity within the lint budget.
+ */
+function ingestUsage(st: TurnState, used: unknown, size: unknown): void {
+  if (typeof used !== 'number' || typeof size !== 'number' || size <= 0) return;
+  st.handlers.onUsage?.({ used, size });
 }
 
 /** Merge a tool's latest fields, then trigger start / finish per readiness. */

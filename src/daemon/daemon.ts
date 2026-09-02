@@ -44,6 +44,10 @@ const BUILTIN_COMMANDS_BY_HARNESS: Record<string, string[]> = {
   ],
   // Codex built-in list not yet stable; left empty (no impact on correctness, just no priority).
   codex: [],
+  // agy reports no command list at all, and this harness deliberately launches with
+  // --disable-slash-commands (a CLI-answered slash would otherwise kill the session — see
+  // agent-agy.ts buildAgyArgs), so nothing is ever registered for it.
+  agy: [],
 };
 
 /** Union of all harness built-ins (for priority decisions). */

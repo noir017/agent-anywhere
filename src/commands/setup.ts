@@ -119,11 +119,12 @@ export async function runSetup(): Promise<void> {
   });
 
   const harness = await select({
-    message: 'Agent harness (the ACP-speaking agent):',
+    message: 'Agent harness (the coding agent to drive):',
     choices: [
       { name: 'Claude (via claude-agent-acp)', value: 'claude' },
       { name: 'Gemini CLI (native ACP)', value: 'gemini' },
       { name: 'Codex', value: 'codex' },
+      { name: 'Antigravity CLI (agy)', value: 'agy' },
       { name: 'Custom (provide your own command)', value: 'custom' },
     ],
     default: 'claude',

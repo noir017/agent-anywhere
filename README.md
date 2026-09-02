@@ -12,26 +12,26 @@ English | [简体中文](README.zh-CN.md)
 
 </div>
 
-A gateway daemon that connects chat platforms to any coding agent speaking the
-[Agent Client Protocol](https://agentclientprotocol.com) — Claude Code, Codex,
-OpenCode. Message the bot; the agent runs on your machine and
+A gateway daemon that connects chat platforms to your coding agent — Claude Code,
+Codex, OpenCode (via the [Agent Client Protocol](https://agentclientprotocol.com)),
+or Google's Antigravity CLI. Message the bot; the agent runs on your machine and
 streams its answer into a single, live-edited message.
 
 ```text
  Discord ───┐
  Telegram ──┤     ┌──────────────────────┐
  Slack ─────┤     │        daemon        │       ┌─► claude
- Lark ──────┼────►│  routing · sessions  │◄─ACP─►├─► codex
+ Lark ──────┼────►│  routing · sessions  │◄─────►├─► codex
  QQ ────────┤     │  streaming · access  │       ├─► opencode
- LINE ──────┤     └──────────▲───────────┘       └─► custom
- WeCom ─────┤                │ unix socket
+ LINE ──────┤     └──────────▲───────────┘       ├─► agy
+ WeCom ─────┤                │ unix socket       └─► custom
  DingTalk ──┘                └─ agent-anywhere CLI (send-file / ask / react …)
 ```
 
 ## Features
 
 - **Eight platforms, one daemon** — Discord, Telegram, Slack, Lark, QQ, LINE, WeCom, DingTalk; multi-account supported.
-- **Any ACP agent** — presets for Claude Code, Codex, and OpenCode, plus `custom`; route by platform, channel, user, or slash command.
+- **Any ACP agent, plus agy** — presets for Claude Code, Codex, OpenCode and Antigravity (`agy`), plus `custom`; route by platform, channel, user, or slash command.
 - **Native streaming** — in-place edits, live tool-call bubbles, lifecycle reactions, interrupt on new message.
 - **Chat actions** — the agent sends files, reacts, replies, opens threads, reads history, asks button questions.
 - **Attachments** — inbound images and files are downloaded and handed to the agent.
@@ -84,7 +84,7 @@ platforms:                    # named instances; the key is the instance id
 
 agents:                       # at least one; routing picks by id
   - id: claude
-    harness: claude           # claude|codex|opencode|custom
+    harness: claude           # claude|codex|opencode|agy|custom
     cwd: ~/projects/main
   - id: codex
     harness: codex
@@ -119,11 +119,38 @@ the YAML can be committed.
 | `claude` | bundled [claude-agent-acp](https://www.npmjs.com/package/@agentclientprotocol/claude-agent-acp) | none | `claude /login` or `ANTHROPIC_API_KEY` |
 | `codex` | bundled [codex-acp](https://www.npmjs.com/package/@zed-industries/codex-acp) | none | Codex CLI's login |
 | `opencode` | `opencode acp` | OpenCode CLI | OpenCode's login |
+| `agy` | `agy --input-format stream-json` | Antigravity CLI | `agy` Google sign-in (OS keyring) |
 | `custom` | your `command` + `args` | any ACP executable | your agent's |
 
 Each agent takes `cwd`, `env`, `args`, and a best-effort `model`. Sessions
-persist where the agent supports `session/load`; advertised slash commands
-become native platform commands. `doctor` verifies every configured harness.
+persist where the agent supports it; advertised slash commands become native
+platform commands. `doctor` verifies every configured harness.
+
+### Antigravity (`agy`)
+
+`agy` is the only preset that does not speak ACP — it has no ACP mode — so it is
+driven over its own documented
+[headless stream-json protocol](https://antigravity.google/docs/cli/headless/)
+instead. Streaming, tool bubbles, multi-turn context and post-restart resume all
+work the same as the ACP harnesses; two details differ:
+
+- **Its own slash commands are disabled.** In stream-json mode a CLI-answered
+  slash (`/model`, `/usage`) aborts the whole session, and chat users type `/…`
+  constantly — so the daemon launches it with `--disable-slash-commands`, which
+  turns such input into ordinary text. Pass
+  `args: ["--disable-slash-commands=false"]` to opt back in.
+- **`/new` starts a new conversation**, as with every harness. Interrupting a
+  turn restarts the child and resumes the same conversation, so context survives.
+
+Any of the daemon's default flags can be overridden through `args` (they are
+appended after the defaults, and agy's flag parsing is last-wins).
+
+> [!NOTE]
+> Google's FAQ states that accessing Antigravity with third-party tools violates
+> its Terms of Service and may lead to account suspension. This harness only
+> calls agy's own official headless interface and never handles your credentials
+> (sign-in stays entirely inside `agy`), but the daemon is still a non-Google
+> client driving your account — decide accordingly.
 
 ## Platforms
 

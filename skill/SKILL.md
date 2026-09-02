@@ -136,8 +136,8 @@ agent-anywhere doctor
 ```
 
 `doctor` is a read-only self-check: config validity, platform credentials, daemon
-socket liveness, and agent harness reachability (`claude` / `gemini` / `codex`
-binaries, auth mode). Run it first and report what it finds — it is always safe.
+socket liveness, and agent harness reachability (`claude` / `gemini` / `codex` /
+`agy` binaries, auth mode). Run it first and report what it finds — it is always safe.
 
 - **Config file**: `~/.config/agent-anywhere/config.yaml` by default; if
   `AGENT_ANYWHERE_CONFIG_FILE` is set in your environment, that file is the active

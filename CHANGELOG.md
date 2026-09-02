@@ -6,6 +6,22 @@ All notable changes to this project are documented here. The format is based on
 ## [Unreleased]
 
 ### Added
+- **`harness: agy` preset**: Google's Antigravity CLI (the Gemini CLI successor). Unlike every
+  other preset, `agy` has no ACP mode at all, so it is driven over its own documented headless
+  `stream-json` protocol by a sibling runtime (`daemon/agent-agy.ts`) implementing the same
+  `AgentFactory` contract — streaming, tool bubbles, multi-turn context, post-restart resume
+  (via `--conversation`) and interrupt all behave as they do for the ACP harnesses. Requires the
+  `agy` CLI on PATH; auth reuses its own Google sign-in from the OS keyring.
+
+  Its own slash commands are disabled by default (`--disable-slash-commands`): in stream-json
+  mode a CLI-answered slash such as `/model` aborts the entire session, which chat users would
+  trip constantly. Pass `args: ["--disable-slash-commands=false"]` to opt back in. All default
+  flags are overridable through `args`.
+
+  Note: Google's FAQ states that third-party access to Antigravity violates its Terms of
+  Service. This harness calls only agy's official headless interface and never handles
+  credentials, but the daemon is still a non-Google client driving the account.
+
 - **Text command routing**: `routing.pipeline` rules with `when.command` now match the leading
   `/name` of plain message text, so command routing works on every platform — no native
   slash-command support needed (previously `when.command` could never match: the command field

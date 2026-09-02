@@ -6,6 +6,7 @@ import { loadConfig, resolveSocketPath, configPath, readRawConfigIfExists, saveC
 import { ConfigSchema, accessUnrestricted, platformInstances, type Config } from '../config/schema.js';
 import { isLegacyConfig, migrateLegacyConfig } from '../config/migrate.js';
 import { resolveClaudeAdapterEntry, resolveCodexAdapterEntry } from '../daemon/agent-acp.js';
+import { AGY_COMMAND } from '../daemon/agent-agy.js';
 
 /**
  * Locate an executable: if it contains a path separator, check the file directly;
@@ -33,7 +34,7 @@ function locateCommand(cmd: string): string | null {
   return null;
 }
 
-/** Agent definition -> its harness's main executable name (doctor only checks reachability, same convention as agent-acp's resolveHarness). claude/codex are handled separately (local dependencies, not PATH). */
+/** Agent definition -> its harness's main executable name (doctor only checks reachability, same convention as agent-acp's resolveHarness / agent-agy's AGY_COMMAND). claude/codex are handled separately (local dependencies, not PATH). */
 function harnessCommand(def: import('../config/schema.js').AgentDef): string {
   switch (def.harness) {
     case 'claude':
@@ -44,6 +45,8 @@ function harnessCommand(def: import('../config/schema.js').AgentDef): string {
       return 'codex-acp';
     case 'opencode':
       return 'opencode';
+    case 'agy':
+      return AGY_COMMAND;
     case 'custom':
       return def.command ?? '(custom harness: no command configured)';
   }
@@ -62,9 +65,12 @@ function adapterResolves(resolve: () => string): boolean {
 /**
  * Auth-method note. harness=claude (claude-agent-acp) by default reuses this machine's
  * `claude /login` subscription session; if ANTHROPIC_API_KEY is set (via env or
- * environment) it uses an API key. Other harnesses aren't noted (own mechanisms).
+ * environment) it uses an API key. harness=agy reuses the Google sign-in `agy` cached in the OS
+ * keyring — headless runs never prompt, so a never-signed-in agy fails at the first turn, and
+ * saying so here is the only warning the operator gets. Other harnesses aren't noted (own mechanisms).
  */
 function authNote(def: import('../config/schema.js').AgentDef): string {
+  if (def.harness === 'agy') return ' [agy Google sign-in from the OS keyring; run `agy` once interactively if never signed in]';
   if (def.harness !== 'claude') return '';
   const hasKey = Boolean(def.env?.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY);
   return hasKey ? ' [API key]' : ' [claude /login subscription session]';

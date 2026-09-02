@@ -157,6 +157,16 @@ export async function createSatoriAdapter(
   const quoteAuthorName = (quote: Universal.Message | undefined): string | undefined =>
     quote?.user?.name ?? quote?.member?.name ?? quote?.member?.nick ?? undefined;
 
+  /**
+   * Routing/outbound channel key for an inbound session. Delegates to the profile when it
+   * needs to widen the adapter's channel.id into a complete send target (Telegram forum
+   * topics: bare topic_id → `<chatId>:<topicId>`); otherwise passes session.channelId
+   * through. Applied to EVERY inbound path (message / button / command), so one message's
+   * routing key and its reply target can never disagree.
+   */
+  const inboundChannel = (session: Session): string =>
+    profile.inboundChannelId?.(session) ?? session.channelId ?? '';
+
   /** session → InboundMessage. */
   const toInbound = (session: Session): InboundMessage => {
     const { text, attachments } = normalizeElements(session.elements);
@@ -167,7 +177,7 @@ export async function createSatoriAdapter(
     return {
       platform: instance.id,
       platformType: profile.type,
-      channelId: session.channelId ?? '',
+      channelId: inboundChannel(session),
       userId: session.userId ?? '',
       messageId: session.messageId ?? '',
       content: text || (session.content ?? ''),
@@ -236,8 +246,11 @@ export async function createSatoriAdapter(
   // Subscribe to inbound messages: 'message' fires on every received message.
   ctx.on('message', (session: Session) => {
     if (session.userId === session.selfId) return; // ignore own messages
-    if (!channelAllowed(session.channelId)) return; // allowlist filter
     const inbound = toInbound(session);
+    // Allowlist against the SAME id routing uses (inbound.channelId, composite where the
+    // profile widens it). Filtering on the raw session.channelId instead would make a
+    // configured Telegram topic id stop matching once the composite is in play.
+    if (!channelAllowed(inbound.channelId)) return; // allowlist filter
     const preview = inbound.content.slice(0, 50).replace(/\n/g, ' ');
     console.log(`[in] #${inbound.channelId} @${inbound.userId}: ${preview}`);
     onMsg?.(inbound);

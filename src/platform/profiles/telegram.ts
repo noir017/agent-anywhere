@@ -16,7 +16,7 @@
 //   POSTs directly; remove sends an empty array. emoji is restricted to a fixed allow-set.
 import { h } from '@satorijs/core';
 import TelegramAdapter from '@satorijs/adapter-telegram';
-import type { Session, Universal } from '@satorijs/core';
+import type { Bot, Session, Universal } from '@satorijs/core';
 
 import type { SlashCommandSpec } from '../../types.js';
 import type { PlatformCapabilities } from '../adapter.js';
@@ -156,6 +156,57 @@ export function decodeChannel(channelId: string): { chatId: string; topicId?: st
 }
 
 /**
+ * Composite-aware raw send (pure plumbing, shared by the sendMessage override and the
+ * slash-command receipt).
+ *
+ * MUST be used instead of `bot.sendMessage` / `sendForRef` for any channelId that may be
+ * composite: those call the adapter, which treats the whole `<chatId>:<topicId>` string as
+ * chat_id and either targets the wrong chat or errors out. Decoding here is what actually
+ * routes a message into a forum topic.
+ */
+async function sendComposite(
+  bot: Bot,
+  channelId: string,
+  text: string
+): Promise<{ channelId: string; messageId: string }> {
+  const { chatId, topicId } = decodeChannel(channelId);
+  const internal = bot.internal as unknown as TelegramInternal;
+  const msg = await internal.sendMessage({
+    chat_id: chatId,
+    ...(topicId != null ? { message_thread_id: Number(topicId) } : {}),
+    text: fragmentToTelegramHtml(renderTelegramMarkdown(text)),
+    parse_mode: 'HTML',
+  });
+  const messageId = msg?.message_id;
+  if (messageId == null) {
+    throw new Error(`[telegram] sendMessage did not return a message id (channel=${channelId})`);
+  }
+  // ref uses the real chatId so later edit/react take the chat_id+message_id path.
+  return { channelId: chatId, messageId: String(messageId) };
+}
+
+
+/**
+ * Whether an inbound session is a forum-topic message (pure, for unit testing).
+ *
+ * The adapter reports a topic message as channel.id = bare message_thread_id with
+ * guild.id = chat id, so guildId !== channelId and it is non-direct. A plain group
+ * message has channel.id == chat.id == guild.id (equal); DMs are isDirect.
+ *
+ * Single source of truth for both `isThread` and `inboundChannelId`: if these two
+ * disagreed, a message would be routed as a thread but replied to as a plain channel
+ * (or the reverse), which is exactly the bug the composite rebuild exists to fix.
+ */
+export function isTopicSession(session: {
+  guildId?: string;
+  channelId?: string;
+  isDirect?: boolean;
+}): boolean {
+  const { guildId, channelId } = session;
+  return Boolean(guildId && channelId && guildId !== channelId && !session.isDirect);
+}
+
+/**
  * Telegram reactions are limited to a fixed allow-set (setMessageReaction's reaction[].emoji only
  * accepts the emoji listed in the Bot API docs). Lifecycle ✅/❌ are not in the set, so map them
  * to the nearest allowed emoji. Unmapped emoji pass through and are rejected by the Bot API
@@ -252,14 +303,23 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
       // utils.ts decodeMessage). So a topic message has guildId(chat) !== channelId(bare topic_id)
       // and is non-direct; a normal group message has channel.id==chat.id==guild.id (equal), and
       // DMs are isDirect.
+      return isTopicSession(session);
+    },
+
+    inboundChannelId(session) {
+      // Rebuild the composite `<chatId>:<topicId>` for forum-topic messages.
       //
-      // Known limitation: inbound channelId is the BARE topic_id (not the composite
-      // `<chatId>:<topicId>`), so it does not align with the outbound composite model -- replying
-      // directly with session.channelId would target the wrong place (missing chat id). Rebuilding
-      // the composite is a structural change, deferred.
-      const guildId = session.guildId;
-      const channelId = session.channelId;
-      return Boolean(guildId && channelId && guildId !== channelId && !session.isDirect);
+      // This closes the gap that made topic replies land in the group's General channel: the
+      // adapter reports channel.id as the BARE message_thread_id, but sendMessage needs the
+      // chat id to address the API and the topic id to reach the topic. Echoing the bare id
+      // back used it as chat_id — a different chat entirely (or an API error). Emitting the
+      // composite here makes one id serve both routing and sending, and it round-trips through
+      // decodeChannel() which every outbound path already calls.
+      //
+      // Non-topic messages (DM, plain group) are returned unchanged: their channel.id is
+      // already a complete send target.
+      if (!isTopicSession(session)) return session.channelId ?? '';
+      return `${session.guildId}:${session.channelId}`;
     },
 
     attachmentMeta() {
@@ -309,20 +369,7 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
       // tags (<br/>, <code-block>) as literal HTML and drops newlines after a closing tag, both of
       // which Telegram rejects/garbles. Rendering to HTML ourselves (fragmentToTelegramHtml) and editing
       // via internal.editMessageText keeps the streaming first-send and subsequent-edits consistent.
-      const { chatId, topicId } = decodeChannel(channelId);
-      const internal = bot.internal as unknown as TelegramInternal;
-      const msg = await internal.sendMessage({
-        chat_id: chatId,
-        ...(topicId != null ? { message_thread_id: Number(topicId) } : {}),
-        text: fragmentToTelegramHtml(renderTelegramMarkdown(text)),
-        parse_mode: 'HTML',
-      });
-      const messageId = msg?.message_id;
-      if (messageId == null) {
-        throw new Error(`[telegram] sendMessage did not return a message id (channel=${channelId})`);
-      }
-      // ref uses the real chatId so later edit/react take the chat_id+message_id path.
-      return { channelId: chatId, messageId: String(messageId) };
+      return sendComposite(bot, channelId, text);
     },
 
     async addReaction(bot, ref, emoji) {
@@ -428,7 +475,12 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
     mountButtonEvents(ctx, emit) {
       // callback_query -> 'interaction/button'; adapter auto-answers the callback query.
       // session.event.button.id === callback_data (the encodeCallbackData'd id from send).
-      mountSatoriButtonInteraction(ctx, 'telegram', emit);
+      // channelId mirrors inboundChannelId so a click inside a forum topic resolves to the
+      // same channel key as the message that sent the buttons (see mountSatoriButtonInteraction).
+      mountSatoriButtonInteraction(ctx, 'telegram', emit, {
+        channelId: (session) =>
+          isTopicSession(session) ? `${session.guildId}:${session.channelId}` : session.channelId ?? '',
+      });
     },
 
     mountCommandEvents(ctx, emit) {
@@ -453,7 +505,12 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
         // Telegram slash is just a normal message, no followup token, so reply straight to the
         // channel. (This Satori version's Session has no .send; use bot.sendMessage.)
         const bot = session.bot;
-        const channelId = session.channelId ?? '';
+        // Same composite rebuild as inboundChannelId: a `/cmd` sent inside a forum topic arrives
+        // with the bare topic_id, so the receipt (and the routed message) must carry the composite
+        // or they land in the group's General channel instead of the topic.
+        const channelId = isTopicSession(session)
+          ? `${session.guildId}:${session.channelId}`
+          : session.channelId ?? '';
         emit({
           platform: 'telegram',
           channelId,
@@ -461,7 +518,7 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
           messageId: session.messageId ?? '',
           name,
           options,
-          reply: (text: string) => bot.sendMessage(channelId, text).then(() => undefined),
+          reply: (text: string) => sendComposite(bot, channelId, text).then(() => undefined),
         });
       });
     },

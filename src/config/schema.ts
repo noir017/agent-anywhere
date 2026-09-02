@@ -30,16 +30,20 @@ export const SessionScope = z.enum(['per_thread', 'per_channel', 'per_user', 'sh
 export type SessionScope = z.infer<typeof SessionScope>;
 
 /**
- * A single agent definition. harness is a preset (claude/gemini/codex/opencode); with custom,
+ * A single agent definition. harness is a preset (claude/gemini/codex/opencode/agy); with custom,
  * command points at any ACP-speaking executable. harness-specific switches (e.g.
  * claude's --setting-sources) go through args, not the generic schema.
+ *
+ * All presets except `agy` speak ACP (see daemon/agent-acp.ts). `agy` (Google Antigravity CLI) has
+ * no ACP mode at all and is driven over its own stream-json protocol by daemon/agent-agy.ts; the
+ * factory picks the runtime from this field.
  */
 export const AgentDefSchema = z
   .object({
     /** Unique id referenced by routing. */
     id: z.string().min(1),
     /** Preset; command is required when custom. */
-    harness: z.enum(['claude', 'gemini', 'codex', 'opencode', 'custom']),
+    harness: z.enum(['claude', 'gemini', 'codex', 'opencode', 'agy', 'custom']),
     /** Executable to launch the ACP agent when harness=custom; empty for presets (resolveHarness provides a default). */
     command: z.string().optional(),
     /** Extra args appended to the harness command (harness-specific switches go here). */

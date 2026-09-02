@@ -136,7 +136,7 @@ DMs always get a response regardless of `requireMention` (frozen behavior).
 
 ```yaml
 - id: claude            # unique; referenced by routing
-  harness: claude       # claude | gemini | codex | opencode | custom
+  harness: claude       # claude | gemini | codex | opencode | agy | custom
   command: /path/bin    # required only when harness: custom (any ACP-speaking executable)
   args: []              # extra CLI args appended to the harness command
                         # (harness-specific switches go here, e.g. claude's --setting-sources)
@@ -148,6 +148,13 @@ DMs always get a response regardless of `requireMention` (frozen behavior).
 
 Notes:
 - `harness: claude` with no API key reuses the machine's `claude /login` session.
+- `harness: agy` (Google Antigravity CLI) is the one preset that does not speak ACP —
+  it has no ACP mode — so it runs over agy's own headless `stream-json` protocol.
+  Needs `agy` on PATH (`agy install`) and one interactive sign-in; headless runs never
+  prompt. It launches with `--disable-slash-commands`, because in stream-json mode a
+  CLI-answered slash (`/model`, `/usage`) aborts the whole session; pass
+  `args: ["--disable-slash-commands=false"]` to opt back in. Every default flag is
+  overridable via `args` (appended after the defaults; agy's parsing is last-wins).
 - There is **no per-tool permission config**: the daemon auto-approves every tool
   request, so agents run with full tool access. The only gate is `access.allowFrom`.
 

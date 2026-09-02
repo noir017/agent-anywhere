@@ -1,9 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { Readable, Writable } from 'node:stream';
-import { mkdirSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { resolve, join, delimiter } from 'node:path';
 import { client, ndJsonStream, PROTOCOL_VERSION } from '@agentclientprotocol/sdk';
 import type {
   ActiveSession,
@@ -22,10 +19,18 @@ import type {
 import type { AgentDef, Config } from '../config/schema.js';
 import { findAgent } from '../config/schema.js';
 import type { AgentFactory, AgentSession, AgentStreamHandlers, RunTurnInput } from './agent.js';
-import { REVERSE_COMMANDS } from '../ipc/commands.js';
 import { looksLikeCommand } from './routing.js';
 import type { SessionStore } from './session-store.js';
-import { ensureReverseCliShim } from './reverse-cli-shim.js';
+import {
+  buildAgentEnv,
+  buildInputPreview,
+  buildReverseHint,
+  isNonEmptyObject,
+  killChildProcess,
+  resolveAgentCwd,
+  stripCode,
+  truncateToolName,
+} from './agent-common.js';
 
 /**
  * AgentFactory's ACP (Agent Client Protocol) implementation on the official @agentclientprotocol/sdk.
@@ -77,17 +82,6 @@ export function acpMcpServers(_def: AgentDef, _socketPath: string): McpServer[] 
   return [];
 }
 
-/** Reverse-command usage hint (single source REVERSE_COMMANDS, kept in sync with CLI registration). */
-function buildReverseHint(): string {
-  return [
-    '<system-reminder>',
-    'You are running inside the Agent Anywhere daemon; your plain-text replies stream back to the current IM conversation automatically — just reply normally. For actions beyond text, use Bash to call `agent-anywhere` (on PATH, defaults to the current conversation):',
-    ...REVERSE_COMMANDS.map((c) => `  - ${c.hint}`),
-    'Pass --channel <id> only to push proactively to a different channel.',
-    '</system-reminder>',
-  ].join('\n');
-}
-
 // ───────────────────────── harness preset → launch command ─────────────────────────
 
 /**
@@ -137,6 +131,11 @@ function resolveHarness(def: AgentDef): { command: string; args: string[] } {
     case 'custom':
       // refine already guarantees command exists.
       return { command: def.command!, args: [...def.args] };
+    case 'agy':
+      // Unreachable: agy has no ACP mode, so agent-factory routes it to the agent-agy runtime and
+      // this function is never called for it. Kept as an explicit arm so the switch stays exhaustive
+      // (a future preset then fails to compile here rather than falling through silently).
+      throw new Error('internal: harness "agy" is served by agent-agy.ts, not the ACP runtime');
   }
 }
 
@@ -325,9 +324,6 @@ function createAcpSession(
   /** Max wait for initialize + session/new after spawn; on timeout, treat spawn as failed (ENOENT etc.) instead of hanging. */
   const START_TIMEOUT_MS = 30_000;
 
-  /** Grace window after SIGTERM; if still alive, SIGKILL fallback (harness CLIs may ignore SIGTERM mid-turn). */
-  const KILL_GRACE_MS = 2_000;
-
   /**
    * Close the connection + terminate the child and reset handles. Shared by explicit dispose and
    * start-failure rollback. A short delayed SIGKILL backs up SIGTERM (best-effort, non-blocking); if the
@@ -342,21 +338,7 @@ function createAcpSession(
     } catch (e) {
       console.debug('[acp] dispose: ignoring error while closing connection:', e instanceof Error ? e.message : e);
     }
-    if (child && child.exitCode === null && child.signalCode === null) {
-      // Considered detached+kill(-pid) to kill the whole group, but detached changes
-      // stdio/process-group semantics and children would survive a daemon crash — risk over reward.
-      child.kill(); // SIGTERM
-      const grace = setTimeout(() => {
-        if (child.exitCode === null && child.signalCode === null) {
-          try {
-            child.kill('SIGKILL'); // fallback: the harness may not exit on SIGTERM
-          } catch (e) {
-            console.debug('[acp] SIGKILL fallback failed:', e instanceof Error ? e.message : e);
-          }
-        }
-      }, KILL_GRACE_MS);
-      grace.unref?.(); // don't let the fallback timer hold up process exit
-    }
+    if (child) killChildProcess(child);
     resetHandles();
     hintInjected = false;
   }
@@ -367,20 +349,7 @@ function createAcpSession(
 
     const { command, args } = resolveHarness(def);
 
-    // env: merge process.env (spawn replaces by default, so merge explicitly) + expanded def.env + per-session injections.
-    const env: Record<string, string | undefined> = { ...process.env };
-    // Strip the launcher's Claude Code session markers: otherwise, if the daemon itself was launched
-    // inside a Claude Code session, the child inherits CLAUDECODE/CLAUDE_CODE_* and the underlying Claude
-    // CLI refuses with "Claude Code cannot be launched inside another Claude Code session".
-    delete env.CLAUDECODE;
-    for (const k of Object.keys(env)) if (k.startsWith('CLAUDE_CODE')) delete env[k];
-    for (const [k, v] of Object.entries(def.env)) env[k] = expandEnv(v);
-    env.AGENT_ANYWHERE_TURN_TOKEN = sessionToken;
-    env.AGENT_ANYWHERE_SOCKET = socketPath;
-    // Guarantee the reverse CLI the hint promises: prepend the self-provisioned shim dir so
-    // `agent-anywhere` resolves to THIS daemon's own entry regardless of launch mode (see reverse-cli-shim).
-    const shimDir = ensureReverseCliShim();
-    if (shimDir) env.PATH = `${shimDir}${delimiter}${env.PATH ?? ''}`;
+    const env = buildAgentEnv(def, sessionToken, socketPath);
 
     const child = spawn(command, args, { cwd, env });
     // Record proc immediately so the 'exit' callback and start-failure dispose can match by reference and
@@ -821,29 +790,6 @@ function flushPendingTools(st: TurnState): void {
   st.toolLedger.clear();
 }
 
-/** Short summary of a tool's rawInput (ToolRenderer still truncates per previewLimit); empty object → "" (don't show "{}"). */
-function buildInputPreview(input: unknown): string {
-  if (input && typeof input === 'object') {
-    const obj = input as Record<string, unknown>;
-    if (Object.keys(obj).length === 0) return '';
-    for (const key of ['command', 'file_path', 'path', 'pattern', 'query', 'url', 'prompt']) {
-      const v = obj[key];
-      if (typeof v === 'string' && v.length > 0) return v;
-    }
-    try {
-      return JSON.stringify(obj);
-    } catch {
-      return '';
-    }
-  }
-  return typeof input === 'string' ? input : '';
-}
-
-/** Non-empty-object check (whether rawInput already carries params). */
-function isNonEmptyObject(v: unknown): boolean {
-  return !!v && typeof v === 'object' && Object.keys(v as object).length > 0;
-}
-
 /**
  * ACP `kind` → short display name (short, and aligned with default emojiMap keys to reuse emoji).
  * Falls back to the truncated title when kind is absent. This keeps long content (commands/paths) only
@@ -863,16 +809,8 @@ function toolLabel(kind?: string, title?: string): string {
     other: 'Tool',
   };
   if (kind && byKind[kind]) return byKind[kind];
-  if (title) {
-    const t = stripCode(title);
-    return t.length <= 32 ? t : t.slice(0, 31) + '…';
-  }
+  if (title) return truncateToolName(stripCode(title));
   return 'tool';
-}
-
-/** Strip markdown code backticks (claude-code-acp wraps command titles as `cmd`). */
-function stripCode(s?: string): string {
-  return (s ?? '').replace(/`/g, '').trim();
 }
 
 // ───────────────────────── utilities ─────────────────────────
@@ -880,39 +818,4 @@ function stripCode(s?: string): string {
 /** Runtime side-effect boundary that may read the clock directly. */
 function nowMs(): number {
   return Date.now();
-}
-
-/** Expand ${VAR} to its process.env value (missing → empty string, with one warn for diagnosis). */
-function expandEnv(v: string): string {
-  return v.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_, name: string) => {
-    const val = process.env[name];
-    if (val === undefined) {
-      console.warn(`[acp] env expansion: variable \${${name}} is undefined, treating as empty string (check the daemon launch environment)`);
-      return '';
-    }
-    return val;
-  });
-}
-
-/** Expand a leading ~ to the home directory. */
-function expandHome(p: string): string {
-  if (p === '~') return homedir();
-  if (p.startsWith('~/')) return join(homedir(), p.slice(2));
-  return p;
-}
-
-/**
- * Resolve an agent's working directory (ACP session/new cwd).
- *
- * - Explicit config `cwd`: used as-is (after ~ expansion) — the project you want the agent to act on;
- *   not auto-created (a missing dir likely means a typo, better surfaced than silently masked).
- * - Unset: each agent gets an isolated, auto-created workspace at ~/.agent-anywhere/agents/<id>. This keeps an
- *   unconfigured agent out of agent-anywhere's own source tree (the previous fallback) and gives it a clean,
- *   per-agent home that's stable across this agent's sessions.
- */
-function resolveAgentCwd(def: AgentDef): string {
-  if (def.cwd) return resolve(expandHome(def.cwd));
-  const dir = join(homedir(), '.agent-anywhere', 'agents', def.id);
-  mkdirSync(dir, { recursive: true });
-  return dir;
 }

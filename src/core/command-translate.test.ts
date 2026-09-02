@@ -110,6 +110,24 @@ describe('pickerCommandsFor', () => {
     const specs = pickerCommandsFor({ agents: [agent('x', 'custom'), agent('cc', 'claude')] });
     expect(specs.map((s) => s.name)).toEqual(['claude']);
   });
+
+  it('skips agy (it reports no commands, so the picker could only ever say "none yet")', () => {
+    const specs = pickerCommandsFor({ agents: [agent('g', 'agy'), agent('cc', 'claude')] });
+    expect(specs.map((s) => s.name)).toEqual(['claude']);
+  });
+});
+
+describe('translateCommand — agy', () => {
+  it('reports generic commands as unsupported rather than forwarding them', () => {
+    // agy answers /model itself and doing so aborts its stream-json session, so the daemon
+    // must reject the generic name instead of passing it through to the agent.
+    expect(translateCommand('model', 'agy')).toEqual({ kind: 'unsupported' });
+    expect(translateCommand('compact', 'agy')).toEqual({ kind: 'unsupported' });
+  });
+
+  it('still passes through a non-generic name (a skill or plugin command)', () => {
+    expect(translateCommand('some-skill', 'agy')).toEqual({ kind: 'passthrough' });
+  });
 });
 
 describe('pickerHarnessFor', () => {

@@ -81,6 +81,16 @@ const GENERIC_COMMANDS: Record<string, GenericCommand> = {
   },
 };
 
+/**
+ * Harnesses that get no `/<harness>` picker command.
+ *  - `custom`: the name carries no meaning to a reader, and a user-supplied executable
+ *    advertises no stable command set.
+ *  - `agy`: reports no command list at all, and is launched with --disable-slash-commands
+ *    (a CLI-answered slash kills the session — see daemon/agent-agy.ts), so the picker
+ *    could only ever answer "no command list yet".
+ */
+const HARNESSES_WITHOUT_PICKER = new Set<Harness>(['custom', 'agy']);
+
 /** Outcome of translating one leading `/name` for a target harness. */
 export type CommandTranslation =
   /** Not part of the generic vocabulary: forward untouched (power users can still type native names). */
@@ -138,11 +148,16 @@ export function genericNativeNames(harness: Harness | undefined): Set<string> {
  *
  * `custom` is skipped: its harness name carries no meaning to a reader, and the set
  * of commands a custom executable offers has no stable label to advertise.
+ *
+ * `agy` is skipped too, for a concrete reason: it reports no command list at all, and
+ * the daemon launches it with `--disable-slash-commands` anyway (a CLI-answered slash
+ * kills the session — see agent-agy.ts). A `/agy` entry could therefore only ever
+ * answer "no command list yet", so registering it would be a dead menu item.
  */
 export function pickerCommandsFor(cfg: Pick<Config, 'agents'>): SlashCommandSpec[] {
   const harnesses = new Set<Harness>();
   for (const agent of cfg.agents) {
-    if (agent.harness !== 'custom') harnesses.add(agent.harness);
+    if (!HARNESSES_WITHOUT_PICKER.has(agent.harness)) harnesses.add(agent.harness);
   }
   return [...harnesses]
     .sort((a, b) => a.localeCompare(b))
@@ -155,5 +170,5 @@ export function pickerHarnessFor(
   name: string
 ): Harness | undefined {
   const lower = name.toLowerCase();
-  return cfg.agents.find((a) => a.harness !== 'custom' && a.harness === lower)?.harness;
+  return cfg.agents.find((a) => !HARNESSES_WITHOUT_PICKER.has(a.harness) && a.harness === lower)?.harness;
 }

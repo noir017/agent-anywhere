@@ -12,26 +12,26 @@
 
 </div>
 
-一个网关守护进程，将聊天平台接入任何支持
-[Agent Client Protocol](https://agentclientprotocol.com) 的编码智能体——Claude
-Code、Codex、OpenCode。给机器人发消息，智能体在你自己的机器上运行，
-回答以流式写入同一条消息、原地编辑。
+一个网关守护进程，将聊天平台接入你的编码智能体——支持
+[Agent Client Protocol](https://agentclientprotocol.com) 的 Claude
+Code、Codex、OpenCode，以及 Google 的 Antigravity CLI。给机器人发消息，
+智能体在你自己的机器上运行，回答以流式写入同一条消息、原地编辑。
 
 ```text
  Discord ───┐
  Telegram ──┤     ┌──────────────────────┐
  Slack ─────┤     │        daemon        │       ┌─► claude
- Lark ──────┼────►│  routing · sessions  │◄─ACP─►├─► codex
+ Lark ──────┼────►│  routing · sessions  │◄─────►├─► codex
  QQ ────────┤     │  streaming · access  │       ├─► opencode
- LINE ──────┤     └──────────▲───────────┘       └─► custom
- WeCom ─────┤                │ unix socket
+ LINE ──────┤     └──────────▲───────────┘       ├─► agy
+ WeCom ─────┤                │ unix socket       └─► custom
  DingTalk ──┘                └─ agent-anywhere CLI (send-file / ask / react …)
 ```
 
 ## 特性
 
 - **八个平台，一个进程** —— Discord、Telegram、Slack、飞书、QQ、LINE、企业微信、钉钉；支持多账号。
-- **任意 ACP 智能体** —— 内置 Claude Code、Codex、OpenCode 预设，另有 `custom`；按平台、频道、用户或斜杠命令路由。
+- **任意 ACP 智能体，外加 agy** —— 内置 Claude Code、Codex、OpenCode 与 Antigravity（`agy`）预设，另有 `custom`；按平台、频道、用户或斜杠命令路由。
 - **原生流式体验** —— 消息原地编辑、工具调用气泡、生命周期回应表情、新消息打断。
 - **在聊天中行动** —— 智能体可发文件、加回应、引用回复、开子区、读历史、发按钮提问。
 - **附件处理** —— 收到的图片和文件自动下载并交给智能体。
@@ -83,7 +83,7 @@ platforms:                    # 命名实例；键即实例 id
 
 agents:                       # 至少一个；路由按 id 选取
   - id: claude
-    harness: claude           # claude|codex|opencode|custom
+    harness: claude           # claude|codex|opencode|agy|custom
     cwd: ~/projects/main
   - id: codex
     harness: codex
@@ -116,11 +116,34 @@ access:
 | `claude` | 内置 [claude-agent-acp](https://www.npmjs.com/package/@agentclientprotocol/claude-agent-acp) | 无 | `claude /login` 或 `ANTHROPIC_API_KEY` |
 | `codex` | 内置 [codex-acp](https://www.npmjs.com/package/@zed-industries/codex-acp) | 无 | Codex CLI 登录态 |
 | `opencode` | `opencode acp` | OpenCode CLI | OpenCode 登录态 |
+| `agy` | `agy --input-format stream-json` | Antigravity CLI | `agy` 的 Google 登录态（系统钥匙串） |
 | `custom` | 你的 `command` + `args` | 任意 ACP 可执行文件 | 由智能体自身决定 |
 
-每个智能体可设 `cwd`、`env`、`args` 及尽力传递的 `model`。支持 `session/load`
-的智能体，会话可跨重启恢复；智能体声明的斜杠命令会注册为平台原生命令。
+每个智能体可设 `cwd`、`env`、`args` 及尽力传递的 `model`。支持会话恢复
+的智能体，上下文可跨重启保留；智能体声明的斜杠命令会注册为平台原生命令。
 `doctor` 会逐一校验已配置的 harness。
+
+### Antigravity（`agy`）
+
+`agy` 是唯一不说 ACP 的预设——它根本没有 ACP 模式——因此改用它自带的
+[headless stream-json 协议](https://antigravity.google/docs/cli/headless/)驱动。
+流式输出、工具气泡、多轮上下文、重启续接都与 ACP 预设一致，只有两点不同：
+
+- **它自带的斜杠命令被禁用。** 在 stream-json 模式下，由 CLI 自己应答的斜杠
+  （`/model`、`/usage`）会直接中止整个会话，而聊天场景里用户频繁输入 `/…`——
+  所以守护进程启动时加了 `--disable-slash-commands`，此类输入会被当作普通文本。
+  想恢复原生行为可传 `args: ["--disable-slash-commands=false"]`。
+- **`/new` 开启新对话**，与其他 harness 一致。打断当轮会重启子进程并续接同一
+  对话，因此上下文不会丢失。
+
+守护进程的所有默认参数都可通过 `args` 覆盖（它们追加在默认值之后，而 agy 的
+参数解析是后者生效）。
+
+> [!NOTE]
+> Google 的 FAQ 声明：用第三方工具访问 Antigravity 违反其服务条款，可能导致
+> 账号封禁。本 harness 只调用 agy 官方自带的 headless 接口，且完全不接触你的
+> 凭据（登录全程在 `agy` 内部完成），但守护进程终究是一个非 Google 客户端在
+> 驱动你的账号——请自行判断。
 
 ## 平台
 

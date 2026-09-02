@@ -170,9 +170,14 @@ export function decodeChannel(channelId: string): { chatId: string; topicId?: st
  * MUST be used instead of `bot.sendMessage` / `sendForRef` for any channelId that may be
  * composite: those call the adapter, whose encoder computes `chat_id = session.guildId ||
  * channelId`. On an outbound-only send there is no inbound session, so the whole
- * `<chatId>:<topicId>` string becomes chat_id and Telegram answers 400 `chat not found`. That is
- * precisely how `ask` buttons went missing inside a topic: the send threw, and the daemon sat on
- * the pending ask until it timed out. Decoding here is what actually routes into a forum topic.
+ * `<chatId>:<topicId>` string is handed to the Bot API as chat_id. Verified live, the failure
+ * is worse than a clean error because it differs by chat type:
+ *   - private chat: Telegram parses the id LENIENTLY, truncating at the ':' — the send SUCCEEDS
+ *     (ok=true) but lands in the chat ROOT with no message_thread_id. Silently wrong place.
+ *   - group/supergroup: hard 400 `chat not found`.
+ * That is how `ask` buttons went missing from a topic: in a group the send threw and the daemon
+ * sat on the pending ask until timeout, while in a DM the buttons appeared — just outside the
+ * topic that asked. Decoding here is what actually routes into the topic.
  *
  * `extra` carries the per-caller payload (reply_to_message_id, reply_markup) so that adding a new
  * outbound kind means passing a field here, not writing a fresh send path that can forget to
@@ -546,10 +551,10 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
     },
 
     async sendButtons(bot, channelId, text, buttons) {
-      // THE reported bug: this used sendForRef -> bot.sendMessage, so inside a forum topic the
-      // composite key reached the adapter as a literal chat_id and Telegram rejected the send with
-      // 400. The `ask` message never appeared and the daemon blocked until the ask timed out —
-      // from the user's side, the options simply never showed up. Now posted through the same
+      // THE reported bug: this used sendForRef -> bot.sendMessage, so the composite key reached
+      // the adapter as a literal chat_id (see sendComposite for the two ways Telegram then
+      // mishandles it — silent chat-root delivery in a DM, hard 400 in a group). Either way the
+      // options never appeared in the topic that asked for them. Now posted through the same
       // decoding path as every other send, with the inline keyboard attached.
       return sendComposite(bot, channelId, text, { buttons });
     },

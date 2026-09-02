@@ -489,3 +489,36 @@ describe('decodeChannelKey round-trips with inboundChannelId', () => {
     }
   });
 });
+
+/**
+ * Private-chat topics are the SILENT half of the bug, so they get their own case.
+ *
+ * Verified against the live Bot API: for a private chat Telegram parses "5865716608:7529"
+ * leniently, truncating at the ':' — getChat returns the user and sendMessage answers ok=true
+ * with NO message_thread_id. So the old code posted the buttons to the DM root and reported
+ * success; nothing errored, the options were just in the wrong place. (A group composite,
+ * "-100...:99", hard-fails with 400 chat not found instead.)
+ *
+ * A test asserting only "does not throw" would therefore have passed against the bug. These
+ * assert the thread field explicitly.
+ */
+describe('private-chat topic buttons land in the topic, not the DM root', () => {
+  const profile = createTelegramProfile();
+
+  it('sendButtons carries message_thread_id for a private-chat topic', async () => {
+    const { bot, calls } = fakeBot();
+    await profile.sendButtons!(bot, '5865716608:7529', 'Pick', [{ id: 'ask:p:0', label: 'Yes' }]);
+    expect(calls.send[0]).toMatchObject({
+      chat_id: '5865716608',
+      message_thread_id: 7529, // the field whose absence made the old send silently wrong
+    });
+    expect(calls.send[0]!.reply_markup).toBeDefined();
+  });
+
+  it('the chat id is split, never passed through with the topic still attached', async () => {
+    const { bot, calls } = fakeBot();
+    await profile.sendButtons!(bot, '5865716608:7529', 'Pick', [{ id: 'a', label: 'A' }]);
+    // The exact old-code payload: a composite string as chat_id.
+    expect(calls.send[0]!.chat_id).not.toBe('5865716608:7529');
+  });
+});

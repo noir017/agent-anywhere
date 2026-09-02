@@ -45,6 +45,12 @@ All notable changes to this project are documented here. The format is based on
   mention gate honors). No edit/reaction/typing/buttons — streaming degrades to chunked sends,
   and `ask` is unavailable on this platform.
 
+- **Contributor documentation**: a root `AGENTS.md` (conventions, layering rules, security
+  invariants, and an index) plus a `README.md` per module — `src/config`, `src/core`,
+  `src/platform`, `src/daemon`, `src/ipc`, `src/commands`, `scripts`. Deliberately distributed
+  rather than one file: each module's contract, invariants and extension steps live next to the
+  code they describe, so a coding agent reading one module gets its rules without the other six.
+
 ### Fixed
 - **noEdit platforms never delivered any reply** (DingTalk/QQ/LINE/WeCom — every platform without
   in-place message editing): the StreamBuffer's degraded path recorded mid-stream accumulations as

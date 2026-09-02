@@ -203,6 +203,14 @@ npx skills add https://github.com/l0ng-ai/agent-anywhere/tree/main/skill -g
 All commands accept `-c, --config <path>` and print structured output to
 stdout.
 
+## Contributing
+
+[AGENTS.md](AGENTS.md) holds the conventions, layering rules, and security invariants,
+plus an index of the per-module docs ([config](src/config/README.md) ·
+[core](src/core/README.md) · [platform](src/platform/README.md) ·
+[daemon](src/daemon/README.md) · [ipc](src/ipc/README.md) ·
+[commands](src/commands/README.md)). Start there before changing code.
+
 ## License
 
 [MIT](LICENSE)

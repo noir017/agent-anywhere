@@ -1,0 +1,139 @@
+# `src/config/` — configuration
+
+Owns the config file: its schema, loading, validation, `${VAR}` expansion, and the
+v0→v1 migration. This is the bottom of the [dependency stack](../../AGENTS.md#layering) —
+it imports only `platform/config-schemas.ts` (the per-platform credential schemas) and
+nothing else from the project.
+
+## Files
+
+| File | Role |
+|---|---|
+| `schema.ts` | The zod schema, the frozen `EXPERIENCE` block, `Config` type, and accessor helpers |
+| `load.ts` | Path resolution (`configDir`/`configPath`/`defaultSocketPath`), `loadConfig`, `saveConfig` |
+| `env-expand.ts` | `${VAR}` expansion over the parsed tree + the `.env` sidecar loader |
+| `migrate.ts` | v0 (`platform:` object) → v1 (`platforms:` map). Disposable by design. |
+
+## The central design decision: a small user surface
+
+The config file has exactly five sections — `platforms`, `agents`, `routing`,
+`session`, `access` — plus an optional `display`. Everything else that *looks* like
+config (stream throttling, tool-bubble rendering, inbound merge windows, attachment
+limits, reaction emoji, the IPC socket) is **not** user-configurable. It lives in the
+frozen `EXPERIENCE` constant in `schema.ts` and is merged into every loaded `Config` at
+load time.
+
+```
+UserConfig  (what config.yaml can contain, validated by ConfigSchema)
+   + EXPERIENCE  (frozen constants, not in the file)
+   = Config      (what the runtime reads: cfg.stream.*, cfg.tools.*, cfg.inbound.*, …)
+```
+
+The runtime still reads `cfg.stream.charThreshold` as if it were configured — only the
+*file surface* dropped it. Changing one of those values is a **code change on purpose**.
+They were removed because nobody tuned them and exposing them only bloated the file.
+
+**So before adding a config field, ask which side of that line it falls on.** A
+per-deployment decision (a credential, which agent answers where, who is allowed) goes
+in `ConfigSchema`. A tuning knob for the streaming experience goes in `EXPERIENCE`.
+
+Two fields were deliberately promoted from `EXPERIENCE` to the user surface when they
+turned out to be per-deployment decisions after all: `freeResponseChannels` and
+`ignoredChannels` (now under `platforms.<id>.chat`) were dead config while frozen. The
+gating rules split accordingly — see [`core/inbound-gate.ts`](../core/README.md).
+
+`display.reactions.enabled` cannot live next to the emoji it controls: anything nested
+under a key `EXPERIENCE` owns gets overwritten by `withExperienceDefaults`. That is why
+the toggle is under `display` and the emoji stay in `inbound.reactions`.
+
+## Load pipeline
+
+Order matters and is fixed:
+
+```
+read file → YAML parse → v0 migration (in memory, warns)
+          → ${VAR} expansion  ← happens ONCE, here
+          → ConfigSchema.parse (zod, + superRefine cross-checks)
+          → withExperienceDefaults
+          → Config
+```
+
+Expansion sits after parse and before validation for a reason: `setup` and
+`saveConfig` operate on the **raw, unexpanded** object, so an expanded secret is never
+written back to disk. Do not move it.
+
+`${VAR}` resolves from `process.env` plus a `<configDir>/.env` sidecar (loaded without
+overriding existing env vars). `$${VAR}` escapes to a literal `${VAR}`. All missing
+variables are collected and thrown as **one** error listing every config path — the
+user fixes everything in one pass. Keep that aggregate style; it matches the zod error
+report.
+
+### Path resolution precedence
+
+`configDir()` / `configPath()` resolve, highest first:
+
+1. `AGENT_ANYWHERE_CONFIG_FILE` — an explicit file; its parent is the dir.
+2. `AGENT_ANYWHERE_CONFIG_DIR` — a directory containing `config.yaml`.
+3. `~/.config/agent-anywhere/`.
+
+The `--config <path>` flag works by *setting* `AGENT_ANYWHERE_CONFIG_FILE` on
+`process.env` (see `cli.ts`), so the agent subprocess inherits it and its reverse
+commands resolve the same config and socket. That is why the env var exists rather than
+threading a parameter.
+
+The config dir also holds `daemon.sock`, `sessions.json`, `attachments/`, and `bin/`
+(the reverse-CLI shim).
+
+## Validation is fail-fast
+
+`ConfigSchema.superRefine` enforces referential integrity at load, not at use:
+
+- `routing.default` and every `pipeline[].use.agent` must name a real agent id.
+- `pipeline[].when.platform` must name a real platform **instance** id (the `platforms`
+  map key), not a platform type.
+- Cross-field platform rules that a `discriminatedUnion` member cannot express:
+  `slack` with `protocol: http` requires `signing`; `lark` with `protocol: http`
+  requires `selfUrl`.
+
+Without these, a typo surfaces much later as an obscure runtime error in whichever code
+path first touches that id. Add new cross-field rules here, in `superRefine` — zod's
+`discriminatedUnion` requires plain `ZodObject` members, so they cannot go in
+`platform/config-schemas.ts`.
+
+## Helpers other modules use
+
+- `parseConfig(raw)` — validate + merge experience defaults. Used by tests.
+- `platformInstances(cfg)` — the `platforms` map as `(id + entry)` objects, which is
+  what the adapter factory consumes.
+- `findAgent(cfg, id)` — agent lookup.
+- `agentDisplayName(def, fallbackId)` — the **harness** name (`claude`, `opencode`),
+  not the config id. The id is an operator's typing shorthand (`cc`, `oc`) and means
+  nothing to someone reading the chat. `custom` falls back to the id, since its harness
+  name says nothing either.
+- `accessUnrestricted(cfg)` — the security signal. True when `allowFrom` is empty.
+  `loadConfig` and `doctor` both warn on it. See
+  [security invariants](../../AGENTS.md#security-invariants).
+
+## Migration (`migrate.ts`)
+
+v0 files had a single `platform:` object with Discord fields on the top level and other
+platforms' credentials in an untyped `options` pocket. v1 is the typed `platforms:` map.
+
+`loadConfig` migrates **in memory** with a one-line warning, so old files keep working.
+`agent-anywhere doctor --migrate-config` rewrites the file (backing up to
+`config.yaml.bak` first).
+
+This module is deliberately self-contained and **disposable**: delete it one major
+version after v1 lands. Migration layers that never die grow into a swamp. Do not let
+other code start depending on it.
+
+## Tests
+
+`display.test.ts`, `env-expand.test.ts`, `load.test.ts`, `migrate.test.ts`,
+`save-load.test.ts`, `security.test.ts`.
+
+`security.test.ts` pins `accessUnrestricted`, which gates the loudest warning in the
+product. `save-load.test.ts` pins the round-trip that must not leak expanded secrets.
+
+> Two tests in `load.test.ts` fail on Windows: they assert POSIX path separators.
+> Pre-existing, platform-specific.

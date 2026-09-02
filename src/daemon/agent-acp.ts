@@ -180,9 +180,17 @@ class TurnTimeoutError extends Error {}
  *
  * Shape (SessionConfigOption): the model selector is `{id:'model', type:'select', currentValue,
  * options}` where options are either flat SessionConfigSelectOption[] or grouped
- * SessionConfigSelectGroup[] ({group, options}). Prefer the matching option's human-readable `name`,
- * falling back to the raw `currentValue` id when the option isn't listed (an allowlisted-but-unlisted
- * model still reports a currentValue). Returns undefined when the agent exposes no model selector.
+ * SessionConfigSelectGroup[] ({group, options}). Returns undefined when the agent exposes no model
+ * selector; falls back to the raw `currentValue` when the option isn't listed at all (an
+ * allowlisted-but-unlisted model still reports a currentValue).
+ *
+ * Label choice: prefer the option's human-readable `name`, but only when it doesn't LOSE information
+ * the id carries. The claude harness is inconsistent here — its option list labels `sonnet[1m]` as
+ * "Sonnet 5 (1M context)" but `opus[1m]` as plain "Opus", so taking `name` verbatim would report a
+ * 1M-context Opus session as merely "Opus" while the footer's own context segment reads `/ 1M`.
+ * Since a bare number in the name ("Sonnet 5") is not the same claim as a context qualifier, the
+ * check is specifically for the id's bracketed suffix (`[1m]`), which is the part that changes what
+ * the model IS rather than how it's spelled.
  */
 export function liveModelName(options: SessionConfigOption[] | null | undefined): string | undefined {
   const opt = options?.find((o) => o.id === MODEL_CONFIG_ID);
@@ -193,8 +201,21 @@ export function liveModelName(options: SessionConfigOption[] | null | undefined)
   const flat = opt.options.flatMap((entry) =>
     'group' in entry ? entry.options : [entry]
   );
-  const match = flat.find((o) => o.value === current);
-  return match?.name || current;
+  const name = flat.find((o) => o.value === current)?.name;
+  if (!name) return current;
+  return nameKeepsQualifiers(name, current) ? name : current;
+}
+
+/**
+ * Whether `name` still conveys every bracketed qualifier present in the option `id` (e.g. `[1m]`).
+ * Compared loosely — bracket-free and case-insensitive — so "Sonnet 5 (1M context)" counts as
+ * carrying `[1m]`, while a bare "Opus" does not carry it for id `opus[1m]`.
+ */
+function nameKeepsQualifiers(name: string, id: string): boolean {
+  const haystack = name.toLowerCase().replace(/[[\]()\s]/g, '');
+  return [...id.matchAll(/\[([^\]]+)\]/g)].every((m) =>
+    haystack.includes(m[1]!.toLowerCase().replace(/\s/g, ''))
+  );
 }
 
 /** ACP's well-known id for the model selector among a session's config options. */

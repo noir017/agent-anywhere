@@ -274,3 +274,55 @@ describe('translateUpdate config_option_update (mid-session model switch)', () =
     expect(models).toEqual([]);
   });
 });
+
+/**
+ * Label choice when the harness's own option names are inconsistent.
+ *
+ * The option list below is the REAL one captured from claude-agent-acp with ANTHROPIC_MODEL=opus[1m]
+ * (currentValue "opus[1m]"). Note the inconsistency: `sonnet[1m]` is labelled "Sonnet 5 (1M context)"
+ * but `opus[1m]` is labelled plain "Opus". Reporting the bare name would show a 1M-context session as
+ * "Opus" while the footer's context segment simultaneously reads `/ 1M` — so the id wins whenever the
+ * name drops a bracketed qualifier.
+ */
+describe('liveModelName label choice (real claude-agent-acp option list)', () => {
+  const REAL_OPTIONS = [
+    { value: 'default', name: 'Default (recommended)' },
+    { value: 'opus[1m]', name: 'Opus' },
+    { value: 'sonnet', name: 'Sonnet' },
+    { value: 'sonnet[1m]', name: 'Sonnet 5 (1M context)' },
+    { value: 'haiku', name: 'Haiku' },
+  ];
+
+  const withCurrent = (currentValue: string): SessionConfigOption[] =>
+    [{ id: 'model', type: 'select', name: 'Model', currentValue, options: REAL_OPTIONS }] as SessionConfigOption[];
+
+  it('keeps the id when the name silently drops [1m] (the deployed case)', () => {
+    expect(liveModelName(withCurrent('opus[1m]'))).toBe('opus[1m]');
+  });
+
+  it('uses the friendly name when it already conveys the 1M qualifier', () => {
+    expect(liveModelName(withCurrent('sonnet[1m]'))).toBe('Sonnet 5 (1M context)');
+  });
+
+  it('uses the friendly name for ids with no qualifier at all', () => {
+    expect(liveModelName(withCurrent('sonnet'))).toBe('Sonnet');
+    expect(liveModelName(withCurrent('haiku'))).toBe('Haiku');
+    expect(liveModelName(withCurrent('default'))).toBe('Default (recommended)');
+  });
+
+  it('a name that spells the qualifier differently still counts as carrying it', () => {
+    // "[1m]" vs "1M context" vs "1m" — matching is bracket-insensitive and case-insensitive, so a
+    // harness rewording its labels does not silently flip us back to raw ids.
+    const opts = (name: string): SessionConfigOption[] =>
+      [{ id: 'model', type: 'select', name: 'Model', currentValue: 'opus[1m]', options: [{ value: 'opus[1m]', name }] }] as SessionConfigOption[];
+    expect(liveModelName(opts('Opus (1M)'))).toBe('Opus (1M)');
+    expect(liveModelName(opts('Opus 1m'))).toBe('Opus 1m');
+    expect(liveModelName(opts('Opus [1M] context'))).toBe('Opus [1M] context');
+  });
+
+  it('a bare version number in the name does not count as a context qualifier', () => {
+    // "Opus 5" says which model, not which context window — it must not satisfy [1m].
+    const opts = [{ id: 'model', type: 'select', name: 'Model', currentValue: 'opus[1m]', options: [{ value: 'opus[1m]', name: 'Opus 5' }] }] as SessionConfigOption[];
+    expect(liveModelName(opts)).toBe('opus[1m]');
+  });
+});

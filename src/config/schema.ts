@@ -126,12 +126,39 @@ const ExperienceSchema = z.object({
       maxFailuresBeforeFallback: z.number().int().positive().default(3),
       /** If the model replies with only this token, send no message. */
       silentToken: z.string().default('[SILENT]'),
-      /** Streaming-message footer (hermes "model/context/cwd" tagline). Off by default. */
+      /**
+       * Trailing runtime tagline on the final message of each turn, e.g.
+       * `cc · 18k / 1M (2%) · claude-opus-4-5`. Off by default.
+       */
       footer: z
         .object({
           enabled: z.boolean().default(false),
-          /** Fields and order: model / contextPct / cwd. contextPct excluded by default (SDK lacks a reliable limit). */
-          fields: z.array(z.enum(['model', 'contextPct', 'cwd'])).default(['model', 'cwd']),
+          /**
+           * Fields and order. `agent` = the agent id that answered (`cc`/`oc`), `model` = short
+           * model name, `context` = `18k / 1M (2%)`, `contextPct` = just the percentage,
+           * `cwd` = working dir.
+           *
+           * The context fields need the harness to report ACP `usage_update` (claude and opencode
+           * both do); one that doesn't renders no context segment instead of a guessed number.
+           */
+          fields: z
+            .array(z.enum(['agent', 'model', 'context', 'contextPct', 'cwd']))
+            .default(['agent', 'context', 'model']),
+        })
+        .default({}),
+      /**
+       * Standalone "which agent is answering" bubble, e.g. `🤖 cc · opus[1m]`, sent once per
+       * session the moment an accepted message arrives — before the agent starts, so it doubles as
+       * an immediate receipt. Reset by /clear and /new, so a cleared session announces itself again.
+       * Off by default.
+       *
+       * Its model is the CONFIGURED value (agent.model, or a /model override): at receipt time the
+       * ACP child may not exist yet, so the live model the footer reports isn't known. Header =
+       * what was asked for, footer = what actually ran.
+       */
+      header: z
+        .object({
+          enabled: z.boolean().default(false),
         })
         .default({}),
     })

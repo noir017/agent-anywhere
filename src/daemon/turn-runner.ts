@@ -3,7 +3,7 @@ import { findAgent } from '../config/schema.js';
 import { looksLikeCommand } from './routing.js';
 import type { AgentCommand, InboundMessage, SessionId } from '../types.js';
 import type { PlatformAdapter } from '../platform/adapter.js';
-import type { AgentFactory, AgentStreamHandlers } from './agent.js';
+import type { AgentFactory, AgentStreamHandlers, AgentUsage } from './agent.js';
 import { StreamBuffer } from '../core/stream-buffer.js';
 import { ToolRenderer } from '../core/tool-renderer.js';
 import { formatRuntimeFooter } from '../core/runtime-footer.js';
@@ -29,6 +29,29 @@ export interface TurnRunnerDeps {
   setActiveChannel(sessionId: SessionId, channelId: string, platformId: string): void;
   /** Clear this session's current-turn channel (delete at turn end). */
   deleteActiveChannel(sessionId: SessionId): void;
+}
+
+/**
+ * Turn-level mutable state shared between the runTurn body and the extracted stream callbacks
+ * (see the comment at its construction for why this is an object rather than bare locals).
+ */
+interface TurnRef {
+  /** Active text buffer, rotated at segment boundaries. */
+  stream: StreamBuffer;
+  /** Whether the turn emitted visible output (drives the command zero-output fallback). */
+  producedOutput: boolean;
+  /**
+   * Latest context snapshot the agent reported this turn (ACP `usage_update`). Overwritten on each
+   * update — the harness sends full snapshots, and the footer wants the value as of turn end.
+   * Absent when the harness reports no usage; the footer then omits the context segment.
+   */
+  usage?: AgentUsage;
+  /**
+   * Model the harness reports as actually serving this turn. Preferred over the configured value:
+   * an agent whose model comes from the environment (the `claude` harness reads ANTHROPIC_MODEL)
+   * has no `model` in config at all, and an alias like `opus[1m]` only the harness can resolve.
+   */
+  model?: string;
 }
 
 /**
@@ -89,13 +112,14 @@ export class TurnRunner {
     // fresh buffer per segment — trailing text below a tool bubble goes to a new message, not editing the prior one.
     const makeStream = (): StreamBuffer => this.makeStreamBuffer(platform, channelId);
 
-    // Turn-level mutable container: stream (active text buffer, rotated at segment boundaries) and
-    // producedOutput (whether the turn emitted visible output) are written by stream callbacks and read
-    // by the runTurn body. Wrapped in one object rather than two `let`s because the callbacks are
-    // extracted to buildStreamHandlers — across that function boundary a bare local's mutable binding
-    // can't be shared. Sharing the ref makes assignment (ref.stream = makeStream()) and reads mutually
+    // Turn-level mutable container: stream (active text buffer, rotated at segment boundaries),
+    // producedOutput (whether the turn emitted visible output) and usage (latest context snapshot
+    // the agent reported) are written by stream callbacks and read by the runTurn body. Wrapped in
+    // one object rather than separate `let`s because the callbacks are extracted to
+    // buildStreamHandlers — across that function boundary a bare local's mutable binding can't be
+    // shared. Sharing the ref makes assignment (ref.stream = makeStream()) and reads mutually
     // visible (never cache a ref.stream instance early).
-    const ref: { stream: StreamBuffer; producedOutput: boolean } = {
+    const ref: TurnRef = {
       stream: makeStream(),
       producedOutput: false,
     };
@@ -155,7 +179,7 @@ export class TurnRunner {
         console.log(`[turn] ${sessionId} turn interrupted (continuing with newer input)`);
       } else {
         // Final flush: footer only on the last stream (intermediate segments carry none).
-        await ref.stream.complete({ footer: this.buildFooter(sessionId) });
+        await ref.stream.complete({ footer: this.buildFooter(sessionId, ref) });
         // Command zero-output fallback: the agent ran a command but produced nothing displayable (often
         // harness-swallowed built-in stdout, or an unknown command); send a note instead of total silence. best-effort.
         if (isCommandTurn && !ref.producedOutput) {
@@ -197,7 +221,7 @@ export class TurnRunner {
    */
   private buildStreamHandlers(
     sessionId: SessionId,
-    ref: { stream: StreamBuffer; producedOutput: boolean },
+    ref: TurnRef,
     makeStream: () => StreamBuffer,
     tools: ToolRenderer,
     enqueue: (fn: () => Promise<void> | void) => void
@@ -230,6 +254,15 @@ export class TurnRunner {
         } catch (e) {
           console.error('[turn] onAvailableCommands hook failed:', e instanceof Error ? e.message : e);
         }
+      },
+      // Context snapshot: recorded straight onto the ref (not enqueued) — it renders nothing on its
+      // own, and the footer reads it only after the effects chain has drained at turn end.
+      onUsage: (usage) => {
+        ref.usage = usage;
+      },
+      // Same for the live model name (see TurnRef.model for why it beats the configured value).
+      onModel: (model) => {
+        ref.model = model;
       },
     };
   }
@@ -357,16 +390,25 @@ export class TurnRunner {
 
   /**
    * Compute the turn footer text (only when stream.footer.enabled; else empty string = no append).
-   * contextTokens/contextLength are best-effort: this SDK doesn't surface a reliable context limit, so
-   * neither is passed — formatRuntimeFooter skips the percentage and the footer degrades to `model · cwd`.
-   * No hardcoded unreliable context numbers.
+   *
+   * Everything reported by the agent wins over configuration, because configuration can be silent or
+   * merely an intent:
+   * - context numbers come from ACP `usage_update` (`used` is the harness's own tally, `size` the
+   *   window it learned from the live model), never from a guess. A harness that reports no usage
+   *   leaves both undefined and the context fields render nothing rather than an invented limit.
+   * - the model comes from the agent's session config when available; `agents[].model` is empty for
+   *   an env-pinned harness and at best an unresolved alias.
    */
-  private buildFooter(sessionId: SessionId): string {
+  private buildFooter(sessionId: SessionId, ref: TurnRef): string {
     if (!this.config.stream.footer.enabled) return '';
-    const def = findAgent(this.config, this.deps.agentIdOf(sessionId));
+    const agentId = this.deps.agentIdOf(sessionId);
+    const def = findAgent(this.config, agentId);
     return formatRuntimeFooter(
       {
-        model: this.deps.getModelOverride(sessionId) ?? def?.model,
+        agent: agentId,
+        model: ref.model ?? this.deps.getModelOverride(sessionId) ?? def?.model,
+        contextTokens: ref.usage?.used,
+        contextLength: ref.usage?.size,
         cwd: def?.cwd,
         homeDir: process.env.HOME,
       },

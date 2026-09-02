@@ -1,4 +1,5 @@
 import type { Config } from '../config/schema.js';
+import { findAgent } from '../config/schema.js';
 import { SessionTokenRegistry } from './session-token-registry.js';
 import { parseTextCommand, resolveRoute, routeInputFromMessage, sessionKey } from './routing.js';
 import type { AgentCommand, InboundMessage, SessionId } from '../types.js';
@@ -33,6 +34,12 @@ interface SessionState {
   activeChannel?: string;
   /** Active turn's platform instance id (set/cleared with activeChannel). */
   activePlatform?: string;
+  /**
+   * Whether this session already announced itself with the header bubble (stream.header.enabled).
+   * Once per session, so a long conversation isn't punctuated by a banner on every turn; cleared by
+   * resetSession so /clear and /new announce the fresh conversation again.
+   */
+  headerSent?: boolean;
 }
 
 /**
@@ -214,7 +221,35 @@ export class SessionRegistry {
     } else {
       state.platform = msg.platform; // shared-scope sessions may hop platform instances
     }
+    // Announce which agent is about to answer, before the turn starts (see sendHeader). Placed after
+    // every gate above so it can't become a probe: a message that isn't going to be answered gets no
+    // acknowledgement of any kind.
+    this.sendHeader(state, msg);
     void state.merger.ingest(msg);
+  }
+
+  /**
+   * Send the once-per-session header bubble (`🤖 cc · opus[1m]`) and mark the session announced.
+   *
+   * Sent on receipt rather than with the reply, so it doubles as an immediate "got it, working on
+   * it" — the agent subprocess may take seconds to spawn on the first turn. That timing is also why
+   * the model here is the CONFIGURED one: no ACP session exists yet, so the live model the footer
+   * reports isn't knowable. Header = which agent and what was asked for, footer = what actually ran.
+   *
+   * Best-effort: a send failure must never block the turn, so it's logged and dropped.
+   */
+  private sendHeader(state: SessionState, msg: InboundMessage): void {
+    if (!this.config.stream.header.enabled || state.headerSent) return;
+    // Mark before awaiting: two messages arriving inside the merge window would otherwise both see
+    // headerSent=false and send twice.
+    state.headerSent = true;
+    const def = findAgent(this.config, state.agentId);
+    const model = state.modelOverride ?? def?.model;
+    const text = model ? `🤖 ${state.agentId} · ${model}` : `🤖 ${state.agentId}`;
+    void this.platforms
+      .get(msg.platform)
+      ?.sendMessage(msg.channelId, text)
+      .catch((e) => console.warn('[session] failed to send header:', e instanceof Error ? e.message : e));
   }
 
   /** allowFrom access gate: empty = unrestricted; non-empty allows only allowlisted identities. */
@@ -279,11 +314,14 @@ export class SessionRegistry {
   /**
    * Reset session context (/new, /clear): dispose the agent subprocess and delete the persisted ACP
    * session id, so the next message starts a truly fresh session — including after a daemon restart.
-   * Keeps merger and modelOverride (reset clears only conversation context).
+   * Keeps merger and modelOverride (reset clears only conversation context), but clears headerSent so
+   * the fresh conversation announces its agent again.
    */
   resetSession(sessionId: SessionId): void {
     this.agents.dispose(sessionId);
     this.store?.delete(sessionId);
+    const state = this.sessions.get(sessionId);
+    if (state) state.headerSent = false;
   }
 
   /** Shutdown: release all mergers and agent sessions. */

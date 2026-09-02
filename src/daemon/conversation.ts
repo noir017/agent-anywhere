@@ -309,38 +309,31 @@ export class ConversationRegistry {
    * Point an auto-created thread's key at the conversation that opened it.
    *
    * Called by TurnRunner right after autoThread creates a thread and moves the turn into it. The
-   * alias is registered under the key that a message ARRIVING in that thread will compute, which
-   * depends on the scope in force for this conversation — so the lookup in route() is a plain map
-   * hit with no re-derivation.
+   * alias is registered under the key that a message ARRIVING in that thread will compute, so the
+   * lookup in route() is a plain map hit with no re-derivation.
    *
-   * A no-op under scopes where the thread would resolve to the same key anyway (per_user, shared,
-   * per_channel on a lane-style platform): the alias would be self-referential.
+   * Only location-dependent scopes need it. Under per_user and shared the key ignores where the
+   * message was written, so the thread already resolves to this same conversation — and building a
+   * key there would need the sender, which an outbound thread creation has no business inventing.
    */
   private adoptThread(
     id: ConversationId,
     address: ConversationAddress,
     platformId: string
   ): void {
-    const state = this.conversations.get(id);
-    if (!state) return;
-    // The thread's own identity, as an inbound message from inside it would report: same space and
-    // user are irrelevant to per_thread/per_channel keys, and those are the only scopes that can
-    // produce a different key here.
-    const scope = resolveScope(this.config, {
+    if (!this.conversations.has(id)) return;
+    const ref = {
       platform: platformId,
       channel: address.channel,
       ...(address.thread != null ? { thread: address.thread } : {}),
+      kind: 'thread' as const,
+      // Not part of a per_thread/per_channel key; the guard below keeps the other scopes out.
       user: '',
-      kind: 'thread',
-    });
-    const threadKey = conversationKey(scope, {
-      platform: platformId,
-      channel: address.channel,
-      ...(address.thread != null ? { thread: address.thread } : {}),
-      kind: 'thread',
-      user: '',
-    });
-    if (threadKey === id) return;
+    };
+    const scope = resolveScope(this.config, ref);
+    if (scope !== 'per_thread' && scope !== 'per_channel') return;
+    const threadKey = conversationKey(scope, ref);
+    if (threadKey === id) return; // e.g. per_channel on a lane-style platform: same channel
     this.threadAliases.set(threadKey, id);
     console.log(`[conversation] auto-thread ${formatAddress(address)} adopted by ${id}`);
   }

@@ -14,6 +14,11 @@
 //   `command + rest` and NO structured argv.options -- must split from content ourselves.
 // - reaction: adapter does not wrap setMessageReaction, but bot.http is exposed, so the profile
 //   POSTs directly; remove sends an empty array. emoji is restricted to a fixed allow-set.
+// - topics: decodeMessage only decodes them for groups. Its `chat.type === 'private'` branch
+//   returns chat.id and never reads message_thread_id, so Bot API 9.4 private-chat topics lose
+//   the thread before we see it; the raw update survives on session.telegram (setInternal), which
+//   is where rawTopicFields recovers it. Group topics arrive as a BARE message_thread_id in
+//   channel.id with the chat id in guild.id.
 import { h } from '@satorijs/core';
 import TelegramAdapter from '@satorijs/adapter-telegram';
 import type { Bot, Session, Universal } from '@satorijs/core';
@@ -185,7 +190,6 @@ async function sendComposite(
   return { channelId: chatId, messageId: String(messageId) };
 }
 
-
 /**
  * Raw inbound topic fields, read off the Satori session (pure, for unit testing).
  *
@@ -237,10 +241,17 @@ const TELEGRAM_GENERAL_TOPIC_ID = '1';
 /**
  * Routing/outbound channel key for an inbound session (pure, for unit testing).
  *
- * THE single implementation of the composite rebuild, shared by inboundChannelId and by
- * the button/command interaction paths. Those paths must agree with the message path:
- * a button clicked inside a topic has to resolve to the same channel key as the message
- * that posted the buttons, or a blocking `ask` never matches its pending request.
+ * Emits the composite `<chatId>:<topicId>` for topic messages, which is what every
+ * outbound path already decodes (decodeChannel) — so one id is valid for BOTH routing
+ * and sending. Without it a reply cannot address the topic: the adapter reports a group
+ * forum topic as the bare message_thread_id, and for a private-chat topic it drops the
+ * topic fields entirely. Non-topic messages (DM root, plain group) pass through
+ * unchanged; their channel.id is already a complete send target.
+ *
+ * THE single implementation, shared by inboundChannelId and by the button/command
+ * interaction paths. Those must agree with the message path: a button clicked inside a
+ * topic has to resolve to the same channel key as the message that posted the buttons,
+ * or a blocking `ask` never matches its pending request.
  */
 export function topicAwareChannelId(session: {
   guildId?: string;
@@ -257,7 +268,6 @@ export function topicAwareChannelId(session: {
   return `${session.guildId}:${session.channelId}`;
 }
 
-
 /**
  * Whether an inbound session is a topic message — group forum OR private-chat topic
  * (pure, for unit testing).
@@ -273,7 +283,7 @@ export function topicAwareChannelId(session: {
  * disagreed, a message would be routed as a thread but replied to as a plain channel
  * (or the reverse), which is exactly the bug the composite rebuild exists to fix.
  */
-export function isTopicSession(session: {
+function isTopicSession(session: {
   guildId?: string;
   channelId?: string;
   isDirect?: boolean;
@@ -306,10 +316,9 @@ export function mapTelegramReactionEmoji(emoji: string): string {
 export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig> {
   // reaction: adapter doesn't wrap setMessageReaction, but bot.http is exposed, so the profile
   //   POSTs raw http; emoji are mapped to the allow-set via mapTelegramReactionEmoji.
-  // thread: Telegram forum topic. A topic isn't a standalone channelId but a
-  //   `chat + message_thread_id` pair, carried in agent-anywhere's single-channelId model via the
-  //   composite `<chatId>:<topicId>` (see decodeChannel). Inbound isThread is constrained by the
-  //   adapter (channelId is a bare topic_id, see isThread).
+  // thread: Telegram topic (group forum or private chat). A topic isn't a standalone channelId
+  //   but a `chat + message_thread_id` pair, carried in agent-anywhere's single-channelId model
+  //   via the composite `<chatId>:<topicId>` (built by topicAwareChannelId, read by decodeChannel).
   // maxMessageLength=4096 (Telegram's real limit, counted on the ENTITY-PARSED visible text; HTML
   // tags do NOT count). renderTelegramMarkdown can expand the visible length (table -> bullets,
   // ~1.4x), which previously overflowed because chunking ran on raw chars. measureRendered (below)
@@ -377,26 +386,11 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
     },
 
     isThread(session) {
-      // Inbound forum-topic detection. The adapter sets a forum-topic message's channel.id to the
-      // BARE message_thread_id (dropping chat id) while guild.id stays the chat id (adapter
-      // utils.ts decodeMessage). So a topic message has guildId(chat) !== channelId(bare topic_id)
-      // and is non-direct; a normal group message has channel.id==chat.id==guild.id (equal), and
-      // DMs are isDirect.
+      // Group forum topic or private-chat topic; see isTopicSession for both shapes.
       return isTopicSession(session);
     },
 
     inboundChannelId(session) {
-      // Rebuild the composite `<chatId>:<topicId>` for topic messages.
-      //
-      // This closes the gap that made topic replies land outside the topic: the adapter
-      // reports a group-forum topic as the BARE message_thread_id, and drops the topic
-      // fields entirely for a private-chat topic — but sendMessage needs the chat id to
-      // address the API and the topic id to reach the lane. Emitting the composite here
-      // makes one id serve both routing and sending, and it round-trips through
-      // decodeChannel() which every outbound path already calls.
-      //
-      // Non-topic messages (DM root, plain group) are returned unchanged: their
-      // channel.id is already a complete send target.
       return topicAwareChannelId(session);
     },
 

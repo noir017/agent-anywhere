@@ -126,41 +126,6 @@ const ExperienceSchema = z.object({
       maxFailuresBeforeFallback: z.number().int().positive().default(3),
       /** If the model replies with only this token, send no message. */
       silentToken: z.string().default('[SILENT]'),
-      /**
-       * Trailing runtime tagline on the final message of each turn, e.g.
-       * `cc · 18k / 1M (2%) · claude-opus-4-5`. Off by default.
-       */
-      footer: z
-        .object({
-          enabled: z.boolean().default(false),
-          /**
-           * Fields and order. `agent` = the agent id that answered (`cc`/`oc`), `model` = short
-           * model name, `context` = `18k / 1M (2%)`, `contextPct` = just the percentage,
-           * `cwd` = working dir.
-           *
-           * The context fields need the harness to report ACP `usage_update` (claude and opencode
-           * both do); one that doesn't renders no context segment instead of a guessed number.
-           */
-          fields: z
-            .array(z.enum(['agent', 'model', 'context', 'contextPct', 'cwd']))
-            .default(['agent', 'context', 'model']),
-        })
-        .default({}),
-      /**
-       * Standalone "which agent is answering" bubble, e.g. `🤖 cc · opus[1m]`, sent once per
-       * session the moment an accepted message arrives — before the agent starts, so it doubles as
-       * an immediate receipt. Reset by /clear and /new, so a cleared session announces itself again.
-       * Off by default.
-       *
-       * Its model is the CONFIGURED value (agent.model, or a /model override): at receipt time the
-       * ACP child may not exist yet, so the live model the footer reports isn't known. Header =
-       * what was asked for, footer = what actually ran.
-       */
-      header: z
-        .object({
-          enabled: z.boolean().default(false),
-        })
-        .default({}),
     })
     .default({}),
 
@@ -303,6 +268,53 @@ export const ConfigSchema = z
          * fill this. loadConfig warns (does not block) when it is empty.
          */
         allowFrom: z.array(z.string()).default([]),
+      })
+      .default({}),
+
+    /**
+     * Reply decoration. The one part of the streaming experience an operator legitimately
+     * decides — everything else about outbound rendering (throttling, chunking, tool bubbles)
+     * stays in the frozen EXPERIENCE block, but whether replies are annotated with which agent
+     * and model answered is a deployment-visible preference, not a tuning knob. Both off by
+     * default, so behavior is unchanged unless asked for.
+     */
+    display: z
+      .object({
+        /**
+         * Standalone "which agent is answering" bubble, e.g. `🤖 cc · opus[1m]`, sent once per
+         * session the moment an accepted message arrives — before the agent starts, so it doubles
+         * as an immediate receipt while the subprocess spawns. /clear and /new re-arm it.
+         *
+         * Its model is the CONFIGURED value (agent.model, or a /model override): at receipt time
+         * no agent session exists yet, so the live model the footer reports isn't knowable.
+         * Header = what was asked for, footer = what actually ran.
+         */
+        header: z
+          .object({
+            enabled: z.boolean().default(false),
+          })
+          .default({}),
+        /**
+         * Trailing runtime tagline on the final message of each turn, e.g.
+         * `cc · 18k / 1M (2%) · claude-opus-4-5`.
+         */
+        footer: z
+          .object({
+            enabled: z.boolean().default(false),
+            /**
+             * Fields and order. `agent` = the agent id that answered (`cc`/`oc`), `model` = short
+             * model name, `context` = `18k / 1M (2%)`, `contextPct` = just the percentage,
+             * `cwd` = working dir.
+             *
+             * The context fields need the harness to report ACP `usage_update` (claude and
+             * opencode both do); one that doesn't renders no context segment rather than a
+             * guessed number.
+             */
+            fields: z
+              .array(z.enum(['agent', 'model', 'context', 'contextPct', 'cwd']))
+              .default(['agent', 'context', 'model']),
+          })
+          .default({}),
       })
       .default({}),
   })

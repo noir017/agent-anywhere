@@ -35,7 +35,7 @@ interface SessionState {
   /** Active turn's platform instance id (set/cleared with activeChannel). */
   activePlatform?: string;
   /**
-   * Whether this session already announced itself with the header bubble (stream.header.enabled).
+   * Whether this session already announced itself with the header bubble (display.header.enabled).
    * Once per session, so a long conversation isn't punctuated by a banner on every turn; cleared by
    * resetSession so /clear and /new announce the fresh conversation again.
    */
@@ -239,7 +239,7 @@ export class SessionRegistry {
    * Best-effort: a send failure must never block the turn, so it's logged and dropped.
    */
   private sendHeader(state: SessionState, msg: InboundMessage): void {
-    if (!this.config.stream.header.enabled || state.headerSent) return;
+    if (!this.config.display.header.enabled || state.headerSent) return;
     // Mark before awaiting: two messages arriving inside the merge window would otherwise both see
     // headerSent=false and send twice.
     state.headerSent = true;

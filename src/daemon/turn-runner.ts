@@ -389,7 +389,7 @@ export class TurnRunner {
   }
 
   /**
-   * Compute the turn footer text (only when stream.footer.enabled; else empty string = no append).
+   * Compute the turn footer text (only when display.footer.enabled; else empty string = no append).
    *
    * Everything reported by the agent wins over configuration, because configuration can be silent or
    * merely an intent:
@@ -400,7 +400,7 @@ export class TurnRunner {
    *   an env-pinned harness and at best an unresolved alias.
    */
   private buildFooter(sessionId: SessionId, ref: TurnRef): string {
-    if (!this.config.stream.footer.enabled) return '';
+    if (!this.config.display.footer.enabled) return '';
     const agentId = this.deps.agentIdOf(sessionId);
     const def = findAgent(this.config, agentId);
     return formatRuntimeFooter(
@@ -412,7 +412,7 @@ export class TurnRunner {
         cwd: def?.cwd,
         homeDir: process.env.HOME,
       },
-      this.config.stream.footer.fields
+      this.config.display.footer.fields
     );
   }
 

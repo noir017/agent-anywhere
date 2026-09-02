@@ -27,7 +27,7 @@ const baseConfig = {
   },
   // Present because route() reads it (header bubble). The real schema defaults this in, so only
   // hand-built stubs like this one have to spell it out.
-  stream: { header: { enabled: false }, footer: { enabled: false, fields: [] } },
+  display: { header: { enabled: false }, footer: { enabled: false, fields: [] } },
 } as unknown as Config;
 
 const stubPlatform = {
@@ -197,7 +197,7 @@ describe('SessionRegistry header bubble', () => {
         { id: 'oc', harness: 'opencode', model: 'anthropic/claude-opus-5', args: [], env: {} },
       ],
       routing: { default: 'cc', pipeline: [{ when: { command: 'oc' }, use: { agent: 'oc' } }] },
-      stream: { header: { enabled: true }, footer: { enabled: false, fields: [] } },
+      display: { header: { enabled: true }, footer: { enabled: false, fields: [] } },
       ...over,
     }) as unknown as Config;
 
@@ -305,7 +305,7 @@ describe('SessionRegistry header bubble', () => {
   });
 
   it('stays silent entirely when the header is disabled (the default)', () => {
-    const { sent, send } = rig(headerConfig({ stream: { header: { enabled: false }, footer: { enabled: false, fields: [] } } }));
+    const { sent, send } = rig(headerConfig({ display: { header: { enabled: false }, footer: { enabled: false, fields: [] } } }));
     send('hello');
     expect(headers(sent)).toEqual([]);
   });

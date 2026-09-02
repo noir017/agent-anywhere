@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { SessionRegistry } from './session.js';
+import { ConversationRegistry } from './conversation.js';
 import { parseConfig, type Config } from '../config/schema.js';
 import type { PlatformAdapter } from '../platform/adapter.js';
 import type { AgentFactory, AgentSession } from './agent.js';
-import type { InboundMessage, SessionId } from '../types.js';
+import type { ConversationId, InboundMessage } from '../types.js';
 
 /**
  * Generic-command interception in SessionRegistry.route().
@@ -49,6 +49,13 @@ const makeConfig = (over: Record<string, unknown> = {}): Config => {
 const baseConfig = makeConfig();
 
 /**
+ * The conversation every rig message belongs to. Note what is NOT in it: an agent id. Under the
+ * old scheme this was `cc:discord:c:c1` or `oc:discord:c:c1` depending on who answered, which is
+ * exactly why `/oc hi` followed by a plain message produced two conversations in one place.
+ */
+const KEY = 'discord#c1';
+
+/**
  * Real timers, with the merge window set to 0 in config below so a routed message dispatches on the
  * next tick. Firing every scheduled callback inline is not an option: the typing keep-alive
  * re-schedules itself, so it would recurse until the stack blew.
@@ -69,20 +76,20 @@ function rig(cfg: Config = baseConfig) {
   const prompts: Array<{ sessionId: string; prompt: string }> = [];
   const sessions = new Map<string, AgentSession>();
   const factory: AgentFactory = {
-    getOrCreate(sessionId) {
-      let s = sessions.get(sessionId);
+    getOrCreate(conversationId) {
+      let s = sessions.get(conversationId);
       if (!s) {
         s = {
-          sessionId,
+          conversationId,
           runTurn: async (input) => {
-            prompts.push({ sessionId, prompt: input.prompt });
+            prompts.push({ sessionId: conversationId, prompt: input.prompt });
           },
           abort: () => {},
           dispose: () => {},
         };
-        sessions.set(sessionId, s);
+        sessions.set(conversationId, s);
       }
-      return s;
+      return s!;
     },
     dispose: (id) => void sessions.delete(id),
   };
@@ -90,9 +97,9 @@ function rig(cfg: Config = baseConfig) {
   const sent: string[] = [];
   const platform = {
     capabilities: { thread: false, editMessage: true },
-    sendMessage: async (channelId: string, text: string) => {
+    sendMessage: async (address: { channel: string }, text: string) => {
       sent.push(text);
-      return { channelId, messageId: 'm1' };
+      return { address, messageId: 'm1' };
     },
     editMessage: async () => {},
     addReaction: async () => {},
@@ -101,14 +108,21 @@ function rig(cfg: Config = baseConfig) {
     measureRendered: (t: string) => t.length,
   } as unknown as PlatformAdapter;
 
-  const pickerCalls: Array<{ sessionId: SessionId; agentId: string }> = [];
-  const reg = new SessionRegistry(
+  const pickerCalls: Array<{ sessionId: ConversationId; agentId: string }> = [];
+  const reg = new ConversationRegistry(
     cfg,
     new Map([['discord', platform]]),
     factory,
     clock,
     { onPickerRequest: (sessionId, agentId) => void pickerCalls.push({ sessionId, agentId }) },
-    { get: () => undefined, set: () => {}, delete: () => {} } as never
+    // Store stub: no persisted bindings, and writes are ignored.
+    {
+      boundAgent: () => undefined,
+      bind: () => {},
+      agentSession: () => undefined,
+      setAgentSession: () => {},
+      clear: () => {},
+    } as never
   );
 
   let n = 0;
@@ -119,13 +133,11 @@ function rig(cfg: Config = baseConfig) {
    */
   const send = async (content: string): Promise<void> => {
     reg.route({
-      platform: 'discord',
-      channelId: 'c1',
-      userId: 'u1',
+      conversation: { platform: 'discord', channel: 'c1', kind: 'direct', user: 'u1' },
       messageId: `m${++n}`,
       content,
-      isDirect: true,
-    } as never);
+      timestamp: 0,
+    } as InboundMessage);
     await drain();
   };
 
@@ -157,7 +169,7 @@ describe('generic command translation in route()', () => {
     const { send, prompts } = rig();
     await send('/cc /compact');
     expect(prompts).toHaveLength(1);
-    expect(prompts[0]!.sessionId).toBe('cc:discord:c:c1');
+    expect(prompts[0]!.sessionId).toBe(KEY);
     expect(prompts[0]!.prompt).toContain('/compact');
   });
 
@@ -165,14 +177,14 @@ describe('generic command translation in route()', () => {
     const { send, prompts } = rig();
     await send('/compact');
     expect(prompts).toHaveLength(1);
-    expect(prompts[0]!.sessionId).toBe('cc:discord:c:c1'); // routing.default
+    expect(prompts[0]!.sessionId).toBe(KEY); // answered by routing.default, in the same conversation
   });
 
   it('passes through harness-specific commands typed directly', async () => {
     const { send, prompts } = rig();
     await send('/oc /customize-opencode');
     expect(prompts).toHaveLength(1);
-    expect(prompts[0]!.sessionId).toBe('oc:discord:c:c1');
+    expect(prompts[0]!.sessionId).toBe(KEY);
     expect(prompts[0]!.prompt).toContain('/customize-opencode');
   });
 
@@ -208,7 +220,7 @@ describe('harness picker in route()', () => {
   it('invoked in a session of that harness → hands off to the daemon with that session', async () => {
     const { send, pickerCalls, prompts } = rig();
     await send('/cc /claude');
-    expect(pickerCalls).toEqual([{ sessionId: 'cc:discord:c:c1', agentId: 'cc' }]);
+    expect(pickerCalls).toEqual([{ sessionId: KEY, agentId: 'cc' }]);
     expect(prompts).toEqual([]); // the picker is UI, never a prompt
   });
 
@@ -233,17 +245,16 @@ describe('harness picker in route()', () => {
   });
 });
 
-describe('dispatchToSession', () => {
-  it('delivers to the named session, bypassing routing', async () => {
+describe('dispatchTo', () => {
+  it('delivers to the named conversation, bypassing routing', async () => {
     const { reg, send, prompts } = rig();
-    await send('/oc hello'); // create oc's session
+    await send('/oc hello'); // bind this conversation to oc
     prompts.length = 0;
 
-    // A bare /init would route to routing.default (cc) — the misdelivery this design removes.
-    const ok = reg.dispatchToSession('oc:discord:c:c1', {
-      platform: 'discord',
-      channelId: 'c1',
-      userId: 'u1',
+    // A bare /init carries no agent prefix, so re-routing it would resolve against the pipeline
+    // instead of the conversation's bound agent — the misdelivery this path removes.
+    const ok = reg.dispatchTo(KEY, {
+      conversation: { platform: 'discord', channel: 'c1', kind: 'direct', user: 'u1' },
       messageId: 'click',
       content: '/init',
       timestamp: 0,
@@ -252,20 +263,73 @@ describe('dispatchToSession', () => {
     expect(ok).toBe(true);
     await drain(); // the merger dispatches on its own window, as for any inbound
     expect(prompts).toHaveLength(1);
-    expect(prompts[0]!.sessionId).toBe('oc:discord:c:c1'); // NOT cc
+    expect(prompts[0]!.sessionId).toBe(KEY);
     expect(prompts[0]!.prompt).toContain('/init');
   });
 
-  it('reports failure for an unknown session instead of dropping the message', async () => {
+  it('reports failure for an unknown conversation instead of dropping the message', async () => {
     const { reg } = rig();
-    const ok = reg.dispatchToSession('oc:discord:c:nope', {
-      platform: 'discord',
-      channelId: 'c1',
-      userId: 'u1',
+    const ok = reg.dispatchTo('discord#nope', {
+      conversation: { platform: 'discord', channel: 'c1', kind: 'direct', user: 'u1' },
       messageId: 'click',
       content: '/init',
       timestamp: 0,
     } as InboundMessage);
     expect(ok).toBe(false);
+  });
+});
+
+/**
+ * THE reported bug, pinned end to end.
+ *
+ * Screenshot: in one Telegram topic, `/oc hi` was answered by opencode and the very next plain
+ * message by claude. Cause: the agent id led the session key AND the pipeline was re-resolved on
+ * every message, so a follow-up that matched no rule fell through to routing.default and computed
+ * a different key — a different subprocess with empty context.
+ *
+ * These assert the two halves of the fix together: one conversation key throughout, and the bound
+ * agent answering until the user explicitly names another.
+ */
+describe('sticky agent binding (the reported bug)', () => {
+  it('a plain follow-up stays with the agent the conversation was bound to', async () => {
+    const { send, prompts } = rig();
+
+    await send('/oc hi');
+    await send('second turn');
+
+    expect(prompts).toHaveLength(2);
+    // Same conversation both times — this is what used to differ.
+    expect(prompts.map((p) => p.sessionId)).toEqual([KEY, KEY]);
+    // And the same agent process serves both, so the second turn has the first one's context.
+    expect(prompts[1]!.prompt).toContain('second turn');
+  });
+
+  it('an explicit /name rebinds, and the next plain message follows the NEW agent', async () => {
+    const { send, prompts, sent } = rig();
+
+    await send('/oc hi');
+    await send('/cc take over');
+    await send('still you');
+
+    expect(prompts.map((p) => p.sessionId)).toEqual([KEY, KEY, KEY]);
+    expect(sent.some((t) => t.includes('is answering this conversation now'))).toBe(true);
+  });
+
+  it('a bare /name is a binding instruction, not an empty prompt', async () => {
+    const { send, prompts, sent } = rig();
+    await send('/oc');
+    // No turn: there is nothing to say yet.
+    expect(prompts).toEqual([]);
+    expect(sent.some((t) => t.includes('answered by opencode'))).toBe(true);
+  });
+
+  it('the conversation key never contains an agent id', async () => {
+    const { send, prompts } = rig();
+    await send('/oc hi');
+    await send('/cc hi');
+    for (const p of prompts) {
+      expect(p.sessionId).toBe(KEY);
+      expect(p.sessionId).not.toMatch(/\b(oc|cc)\b/);
+    }
   });
 });

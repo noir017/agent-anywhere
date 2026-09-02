@@ -92,6 +92,17 @@ export function looksLikeCommand(text: string): boolean {
   return parseTextCommand(text) !== null;
 }
 
+/**
+ * Map a conversation kind to the `when.chat` vocabulary.
+ *
+ * The config says `private` (what an operator writing YAML calls a DM) while the domain type says
+ * `direct` (what every adapter calls it). Translating in one place keeps the user-facing word
+ * stable without letting the two spellings drift into a silent never-matches.
+ */
+function chatKindOf(kind: ConversationKind): 'private' | 'group' | 'thread' {
+  return kind === 'direct' ? 'private' : kind;
+}
+
 /** Whether a rule's `when` fully matches. Provided fields must all match; omitted = unrestricted. */
 function matchesWhen(when: Config['routing']['pipeline'][number]['when'], input: RouteInput): boolean {
   if (when.platform !== undefined && when.platform !== input.platform) return false;
@@ -102,7 +113,7 @@ function matchesWhen(when: Config['routing']['pipeline'][number]['when'], input:
   // its topics, which is what an operator writing a channel id means.
   if (when.channelId !== undefined && when.channelId !== input.channel) return false;
   if (when.userId !== undefined && when.userId !== input.user) return false;
-  if (when.chat !== undefined && when.chat !== input.kind) return false;
+  if (when.chat !== undefined && when.chat !== chatKindOf(input.kind)) return false;
   if (when.isBot !== undefined && when.isBot !== Boolean(input.isBot)) return false;
   // command: matches the message's leading /name (native slash commands arrive as `/name input` text too).
   if (when.command !== undefined) {

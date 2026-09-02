@@ -1,6 +1,7 @@
 import type { Config } from '../config/schema.js';
 import { agentDisplayName, findAgent } from '../config/schema.js';
 import { SessionTokenRegistry } from './session-token-registry.js';
+import { translateCommand, pickerHarnessFor } from '../core/command-translate.js';
 import { parseTextCommand, resolveRoute, routeInputFromMessage, sessionKey } from './routing.js';
 import type { AgentCommand, InboundMessage, SessionId } from '../types.js';
 import type { PlatformAdapter } from '../platform/adapter.js';
@@ -75,9 +76,12 @@ export class SessionRegistry {
     /**
      * Optional callback hooks. onAvailableCommands: fired when a session's agent reports its command
      * list (daemon aggregates and dynamically registers native slash). Absent = don't care (test/no-slash).
+     * onPickerRequest: fired when a harness picker command (`/claude`, `/opencode`) is invoked for a
+     * session of that harness; the daemon owns the button UI, the registry only resolves who it is for.
      */
     private readonly hooks?: {
-      onAvailableCommands?(sessionId: SessionId, cmds: AgentCommand[]): void;
+      onAvailableCommands?(sessionId: SessionId, agentId: string, cmds: AgentCommand[]): void;
+      onPickerRequest?(sessionId: SessionId, agentId: string, msg: InboundMessage): void;
     },
     /** Persistent sessionKey → ACP sessionId map; /new deletes the entry so context doesn't resurrect after restart. */
     private readonly store?: SessionStore
@@ -228,11 +232,83 @@ export class SessionRegistry {
     } else {
       state.platform = msg.platform; // shared-scope sessions may hop platform instances
     }
+
+    // Generic-command translation. Must sit here: it is the first point that knows WHICH agent
+    // will answer, and the last point at which the message can still be refused. Returns the
+    // message to forward, or undefined when the command was rejected (already answered).
+    const forwarded = this.applyCommandTranslation(key, state, msg);
+    if (!forwarded) return;
+    msg = forwarded;
+
     // Announce which agent is about to answer, before the turn starts (see sendHeader). Placed after
     // every gate above so it can't become a probe: a message that isn't going to be answered gets no
     // acknowledgement of any kind.
     this.sendHeader(state, msg);
     void state.merger.ingest(msg);
+  }
+
+  /**
+   * Rewrite a leading generic command into the target harness's native spelling, or refuse it.
+   *
+   * Native platform slash is global while agents are per-session, so the registered menu is a
+   * fixed generic vocabulary (see core/command-translate.ts) rather than the union of what each
+   * agent reports — a union cannot say who owns an entry, and an entry invoked from it routes to
+   * `routing.default` rather than to the agent that offered it.
+   *
+   * Returns the message to forward, or undefined when the command was rejected — in which case the
+   * user has been told why and NO turn runs. Refusing here (rather than forwarding and letting the
+   * agent puzzle over it) is the point: `/compact` on a harness with no compact is a mistake worth
+   * naming, not a prompt worth spending a turn on.
+   */
+  private applyCommandTranslation(
+    key: SessionId,
+    state: SessionState,
+    msg: InboundMessage
+  ): InboundMessage | undefined {
+    const parsed = parseTextCommand(msg.content);
+    if (!parsed) return msg;
+    const def = findAgent(this.config, state.agentId);
+    const name = agentDisplayName(def, state.agentId);
+
+    // Harness picker (`/claude`, `/opencode`): offers the agent's OWN commands, so it only means
+    // something in a session of that harness. Invoked elsewhere it is reported as inapplicable
+    // rather than forwarded — the target agent would not recognize it either.
+    const picker = pickerHarnessFor(this.config, parsed.name);
+    if (picker) {
+      if (def && def.harness === picker) {
+        this.hooks?.onPickerRequest?.(key, state.agentId, msg);
+      } else {
+        void this.platforms
+          .get(msg.platform)
+          ?.sendMessage(
+            msg.channelId,
+            `This session is answered by ${name}, so /${parsed.name} does not apply here.\nPrefix the message to reach that agent, e.g. \`/<agent> /${parsed.name}\`.`
+          )
+          .catch((e) => console.warn('[session] failed to report an inapplicable picker:', e instanceof Error ? e.message : e));
+      }
+      return undefined;
+    }
+
+    const result = translateCommand(parsed.name, def?.harness);
+    if (result.kind === 'passthrough') return msg;
+
+    if (result.kind === 'unsupported') {
+      void this.platforms
+        .get(msg.platform)
+        ?.sendMessage(
+          msg.channelId,
+          `${name} does not support /${parsed.name}.\nIts own commands are available under /${name}.`
+        )
+        .catch((e) => console.warn('[session] failed to report an unsupported command:', e instanceof Error ? e.message : e));
+      console.log(`[command] /${parsed.name} unsupported by ${state.agentId} (${name}); not forwarded`);
+      return undefined;
+    }
+
+    // Translated: rebuild the text with the native name, preserving any argument.
+    if (result.native === parsed.name) return msg;
+    const content = parsed.rest ? `/${result.native} ${parsed.rest}` : `/${result.native}`;
+    console.log(`[command] /${parsed.name} → /${result.native} for ${state.agentId} (${name})`);
+    return { ...msg, content };
   }
 
   /**
@@ -299,6 +375,26 @@ export class SessionRegistry {
    */
   sessionForToken(token: string): SessionId | undefined {
     return this.tokens.sessionFor(token);
+  }
+
+  /**
+   * Deliver a message straight to a known session, bypassing routing.
+   *
+   * For input whose owning session is already established — a harness picker click, where the
+   * session was recorded when the menu was sent. Re-routing it would be wrong: a bare `/init`
+   * carries no agent prefix, so `resolveRoute` would send it to `routing.default` and the command
+   * would land on a different agent than the one whose menu offered it. That misdelivery is the
+   * bug this whole change exists to fix, so the path that knows the answer must not ask again.
+   *
+   * Returns false when the session no longer exists (daemon restarted, or the menu outlived it),
+   * letting the caller say so rather than silently dropping the click.
+   */
+  dispatchToSession(sessionId: SessionId, msg: InboundMessage): boolean {
+    const state = this.sessions.get(sessionId);
+    if (!state) return false;
+    state.platform = msg.platform;
+    void state.merger.ingest(msg);
+    return true;
   }
 
   /** Get the session's fixed agent id (falls back to routing.default). */

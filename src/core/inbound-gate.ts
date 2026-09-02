@@ -53,9 +53,9 @@ export interface GateDecision {
  *  6. guild requires mention  → false 'no-mention' (when not mentioned)
  *  7. default allow           → true 'default'
  *
- * `authorIsBot/isDirect/isThread/mentionedSelf` are optional and tested with
- * `=== true`; undefined is treated as false (i.e. a missing mention counts as
- * "not mentioned", per step 6).
+ * `authorIsBot` and `mentionedSelf` are optional and tested with `=== true`; undefined
+ * is treated as false (i.e. a missing mention counts as "not mentioned", per step 6).
+ * DM and thread come from `conversation.kind`, which is always present.
  */
 export function shouldRespond(
   msg: InboundMessage,

@@ -234,7 +234,7 @@ describe('SessionRegistry header bubble', () => {
     const { sent, send } = rig(headerConfig());
     send('hello');
     // The model comes from env for this harness, so config has no `model` field to show.
-    expect(headers(sent)).toEqual(['🤖 cc']);
+    expect(headers(sent)).toEqual(['🤖 claude']);
   });
 
   it('never shows a model, even when the agent config carries one', () => {
@@ -243,7 +243,7 @@ describe('SessionRegistry header bubble', () => {
     // agents[].model and runs its own default). The footer reports the real one after the fact.
     const { sent, send } = rig(headerConfig());
     send('/oc hello');
-    expect(headers(sent)).toEqual(['🤖 oc']);
+    expect(headers(sent)).toEqual(['🤖 opencode']);
   });
 
   it('announces only once across many turns in the same session', () => {
@@ -251,7 +251,7 @@ describe('SessionRegistry header bubble', () => {
     send('one');
     send('two');
     send('three');
-    expect(headers(sent)).toEqual(['🤖 cc']);
+    expect(headers(sent)).toEqual(['🤖 claude']);
   });
 
   it('announces again after /clear resets the session', () => {
@@ -259,7 +259,7 @@ describe('SessionRegistry header bubble', () => {
     send('one');
     send('/clear');
     send('two');
-    expect(headers(sent)).toEqual(['🤖 cc', '🤖 cc']);
+    expect(headers(sent)).toEqual(['🤖 claude', '🤖 claude']);
   });
 
   it('a /model override does not appear either (same reason)', () => {
@@ -268,7 +268,7 @@ describe('SessionRegistry header bubble', () => {
     reg.setModelOverride('cc:discord:c:c1', 'claude-sonnet-4-5');
     reg.resetSession('cc:discord:c:c1'); // re-arm the header without clearing the override
     send('two');
-    expect(headers(sent)).toEqual(['🤖 cc', '🤖 cc']);
+    expect(headers(sent)).toEqual(['🤖 claude', '🤖 claude']);
   });
 
   it('separate channels each get their own announcement', () => {
@@ -319,7 +319,7 @@ describe('SessionRegistry header bubble', () => {
  *
  * Telegram delivers `/oc hi` as two inbounds: the empty text message the client sends alongside the
  * command, and the command event itself. The empty one has no `/oc`, so routing sent it to the
- * DEFAULT agent — the user saw `🤖 cc` appear before `🤖 oc`, and cc ran a turn nobody asked for.
+ * DEFAULT agent — the user saw `🤖 claude` appear before `🤖 opencode`, and cc ran a turn nobody asked for.
  */
 describe('SessionRegistry native slash produces one turn', () => {
   function rig() {
@@ -353,8 +353,8 @@ describe('SessionRegistry native slash produces one turn', () => {
     // Exactly what Telegram sends for one `/oc 你好`, in order.
     reg.route({ platform: 'discord', channelId: 'c1', userId: 'u1', messageId: 'm1', content: '', isDirect: true } as never);
     reg.route({ platform: 'discord', channelId: 'c1', userId: 'u1', messageId: 'm2', content: '/oc 你好', isDirect: true, mentionedSelf: true } as never);
-    // Before the fix this was ['🤖 cc', '🤖 oc'].
-    expect(headers(sent)).toEqual(['🤖 oc']);
+    // Before the fix this was ['🤖 claude', '🤖 opencode'].
+    expect(headers(sent)).toEqual(['🤖 opencode']);
   });
 
   it('a bare /oc still gets its usage ack (the gate must not eat it)', () => {

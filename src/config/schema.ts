@@ -401,6 +401,19 @@ export function findAgent(cfg: Config, id: string): AgentDef | undefined {
 }
 
 /**
+ * Human-readable name for an agent: its harness (`opencode`, `claude`, …) rather than the config id.
+ *
+ * The id is an operator's shorthand — `oc`, `cc`, whatever is quick to type after a slash — and
+ * means nothing to a reader of the conversation. The harness is the thing that actually answered,
+ * spelled the way its project spells it. For `harness: custom` the harness name says nothing
+ * either, so the id is the best available label.
+ */
+export function agentDisplayName(def: AgentDef | undefined, fallbackId: string): string {
+  if (!def || def.harness === 'custom') return fallbackId;
+  return def.harness;
+}
+
+/**
  * Whether access is unrestricted: allowFrom is empty, so anyone who can message the bot can
  * trigger an agent (which always runs with full tool access). Surfaced as a non-blocking warning
  * by loadConfig and doctor — fill access.allowFrom to lock it down in shared/public deployments.

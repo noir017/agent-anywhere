@@ -1,4 +1,5 @@
 import type { Config } from '../config/schema.js';
+import { agentDisplayName, findAgent } from '../config/schema.js';
 import { SessionTokenRegistry } from './session-token-registry.js';
 import { parseTextCommand, resolveRoute, routeInputFromMessage, sessionKey } from './routing.js';
 import type { AgentCommand, InboundMessage, SessionId } from '../types.js';
@@ -235,16 +236,15 @@ export class SessionRegistry {
   }
 
   /**
-   * Send the once-per-session header bubble (`🤖 cc`) and mark the session announced.
+   * Send the once-per-session header bubble (`🤖 opencode`) and mark the session announced.
    *
    * Sent on receipt rather than with the reply, so it doubles as an immediate "got it, working on
    * it" — the agent subprocess may take seconds to spawn on the first turn.
    *
-   * Deliberately shows the agent id ONLY, no model. At receipt time no agent session exists yet, so
-   * the model that will actually serve the turn is unknowable, and the configured value is not a
-   * safe stand-in: some harnesses ignore it outright (opencode runs its own default regardless of
-   * `agents[].model`), so printing it would state a falsehood in the most authoritative-looking
-   * place. The model belongs in the footer, where it is reported by the harness after the fact.
+   * Names the harness, not the config id: `oc` is an operator's typing shorthand and means nothing
+   * to a reader. Deliberately shows no model — at receipt time no agent session exists, so the
+   * model that will serve the turn is unknowable, and the configured value is not a safe stand-in
+   * (a harness may substitute its own). The model belongs in the footer, reported after the fact.
    *
    * Best-effort: a send failure must never block the turn, so it's logged and dropped.
    */
@@ -253,9 +253,10 @@ export class SessionRegistry {
     // Mark before awaiting: two messages arriving inside the merge window would otherwise both see
     // headerSent=false and send twice.
     state.headerSent = true;
+    const name = agentDisplayName(findAgent(this.config, state.agentId), state.agentId);
     void this.platforms
       .get(msg.platform)
-      ?.sendMessage(msg.channelId, `🤖 ${state.agentId}`)
+      ?.sendMessage(msg.channelId, `🤖 ${name}`)
       .catch((e) => console.warn('[session] failed to send header:', e instanceof Error ? e.message : e));
   }
 

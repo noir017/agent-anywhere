@@ -1,5 +1,5 @@
 import type { Config } from '../config/schema.js';
-import { findAgent } from '../config/schema.js';
+import { agentDisplayName, findAgent } from '../config/schema.js';
 import { looksLikeCommand } from './routing.js';
 import type { AgentCommand, InboundMessage, SessionId } from '../types.js';
 import type { PlatformAdapter } from '../platform/adapter.js';
@@ -398,6 +398,9 @@ export class TurnRunner {
    *   leaves both undefined and the context fields render nothing rather than an invented limit.
    * - the model comes from the agent's session config when available; `agents[].model` is empty for
    *   an env-pinned harness and at best an unresolved alias.
+   *
+   * The agent field names the harness, matching the header bubble — the config id is operator
+   * shorthand and means nothing to a reader of the conversation.
    */
   private buildFooter(sessionId: SessionId, ref: TurnRef): string {
     if (!this.config.display.footer.enabled) return '';
@@ -405,7 +408,7 @@ export class TurnRunner {
     const def = findAgent(this.config, agentId);
     return formatRuntimeFooter(
       {
-        agent: agentId,
+        agent: agentDisplayName(def, agentId),
         model: ref.model ?? this.deps.getModelOverride(sessionId) ?? def?.model,
         contextTokens: ref.usage?.used,
         contextLength: ref.usage?.size,

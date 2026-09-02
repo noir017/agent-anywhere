@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { parseConfig } from './schema.js';
+import { agentDisplayName, parseConfig } from './schema.js';
+import type { AgentDef } from './schema.js';
 
 /**
  * Reply-decoration toggles must survive parseConfig.
@@ -77,5 +78,31 @@ describe('display config survives the experience merge', () => {
     const cfg = parseConfig(raw({ header: { enabled: true } }));
     expect(cfg.stream.charThreshold).toBeGreaterThan(0);
     expect(cfg.stream.silentToken).toBe('[SILENT]');
+  });
+});
+
+/**
+ * Agent display name.
+ *
+ * The config id is operator shorthand — `oc`, `cc`, whatever is fast to type after a slash — and
+ * tells a reader of the conversation nothing. The harness name is what actually answered, spelled
+ * the way its own project spells it.
+ */
+describe('agentDisplayName', () => {
+  const def = (o: Record<string, unknown>): AgentDef => o as AgentDef;
+
+  it('uses the harness name, not the config id', () => {
+    expect(agentDisplayName(def({ id: 'oc', harness: 'opencode' }), 'oc')).toBe('opencode');
+    expect(agentDisplayName(def({ id: 'cc', harness: 'claude' }), 'cc')).toBe('claude');
+    expect(agentDisplayName(def({ id: 'x', harness: 'codex' }), 'x')).toBe('codex');
+    expect(agentDisplayName(def({ id: 'g', harness: 'gemini' }), 'g')).toBe('gemini');
+  });
+
+  it('falls back to the id for a custom harness, where the harness name says nothing', () => {
+    expect(agentDisplayName(def({ id: 'my-bot', harness: 'custom', command: '/x' }), 'my-bot')).toBe('my-bot');
+  });
+
+  it('falls back to the id when the agent is not in config at all', () => {
+    expect(agentDisplayName(undefined, 'ghost')).toBe('ghost');
   });
 });

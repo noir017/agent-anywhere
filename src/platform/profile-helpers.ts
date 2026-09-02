@@ -233,7 +233,7 @@ export function deferUntilLogin(
  * 'qqguild'). Discord / Slack / Lark have different button paths and implement their own.
  *
  * opts.channelId lets a profile widen the adapter's channel.id into a real send target
- * (Telegram forum topics: bare topic_id → `<chatId>:<topicId>`). It must match that
+ * (Telegram topics → `<chatId>:<topicId>`). It must match that
  * profile's inboundChannelId, or a button clicked inside a topic resolves to a different
  * channel than the message that produced it — for a blocking `ask`, the click would never
  * be matched back to its pending request.

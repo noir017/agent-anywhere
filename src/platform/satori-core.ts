@@ -159,8 +159,8 @@ export async function createSatoriAdapter(
 
   /**
    * Routing/outbound channel key for an inbound session. Delegates to the profile when it
-   * needs to widen the adapter's channel.id into a complete send target (Telegram forum
-   * topics: bare topic_id → `<chatId>:<topicId>`); otherwise passes session.channelId
+   * needs to widen the adapter's channel.id into a complete send target (Telegram
+   * topics → `<chatId>:<topicId>`); otherwise passes session.channelId
    * through. Applied to EVERY inbound path (message / button / command), so one message's
    * routing key and its reply target can never disagree.
    */

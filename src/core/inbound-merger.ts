@@ -19,6 +19,12 @@ export interface InboundMergerOptions {
   /** Whether a new message during a running turn interrupts it (default false: wait for natural end). */
   interruptOnNewMessage: boolean;
   reactions: { received: string; done: string; error: string };
+  /**
+   * Whether to mark the user's message with the lifecycle reactions at all (display.reactions.enabled).
+   * false = never call addReaction, so the user's own messages stay unmarked. Independent of the emoji
+   * above, which stay frozen in EXPERIENCE.
+   */
+  reactionsEnabled?: boolean;
 }
 
 export interface MergerDeps {
@@ -149,8 +155,13 @@ export class InboundMerger {
     this.deps.onIdle?.();
   }
 
-  /** Lifecycle reactions are best-effort markers; failures are swallowed, never escaping dispatch. */
+  /**
+   * Lifecycle reactions are best-effort markers; failures are swallowed, never escaping dispatch.
+   * The single choke point for all three (received/done/error), so the display.reactions.enabled
+   * gate lives here rather than at each call site.
+   */
   private async safeReaction(ref: MessageRef, emoji: string): Promise<void> {
+    if (this.opts.reactionsEnabled === false) return;
     try {
       await this.deps.addReaction(ref, emoji);
     } catch {

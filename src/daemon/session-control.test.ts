@@ -27,7 +27,7 @@ const baseConfig = {
   },
   // Present because route() reads it (header bubble). The real schema defaults this in, so only
   // hand-built stubs like this one have to spell it out.
-  display: { header: { enabled: false }, footer: { enabled: false, fields: [] } },
+  display: { header: { enabled: false }, footer: { enabled: false, fields: [] }, reactions: { enabled: true } },
 } as unknown as Config;
 
 const stubPlatform = {
@@ -197,7 +197,7 @@ describe('SessionRegistry header bubble', () => {
         { id: 'oc', harness: 'opencode', model: 'anthropic/claude-opus-5', args: [], env: {} },
       ],
       routing: { default: 'cc', pipeline: [{ when: { command: 'oc' }, use: { agent: 'oc' } }] },
-      display: { header: { enabled: true }, footer: { enabled: false, fields: [] } },
+      display: { header: { enabled: true }, footer: { enabled: false, fields: [] }, reactions: { enabled: true } },
       ...over,
     }) as unknown as Config;
 
@@ -308,7 +308,7 @@ describe('SessionRegistry header bubble', () => {
   });
 
   it('stays silent entirely when the header is disabled (the default)', () => {
-    const { sent, send } = rig(headerConfig({ display: { header: { enabled: false }, footer: { enabled: false, fields: [] } } }));
+    const { sent, send } = rig(headerConfig({ display: { header: { enabled: false }, footer: { enabled: false, fields: [] }, reactions: { enabled: true } } }));
     send('hello');
     expect(headers(sent)).toEqual([]);
   });
@@ -339,7 +339,7 @@ describe('SessionRegistry native slash produces one turn', () => {
         { id: 'oc', harness: 'opencode', args: [], env: {} },
       ],
       routing: { default: 'cc', pipeline: [{ when: { command: 'oc' }, use: { agent: 'oc' } }] },
-      display: { header: { enabled: true }, footer: { enabled: false, fields: [] } },
+      display: { header: { enabled: true }, footer: { enabled: false, fields: [] }, reactions: { enabled: true } },
     } as unknown as Config;
     const reg = new SessionRegistry(cfg, new Map([['discord', platform]]), factory, clock);
     // The header announcement is the observable proxy for "this agent got a turn".

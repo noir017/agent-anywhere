@@ -356,6 +356,7 @@ export class SessionRegistry {
         maxMergeWindowMs: this.config.inbound.maxMergeWindowMs,
         interruptOnNewMessage: this.config.inbound.interruptOnNewMessage,
         reactions: this.config.inbound.reactions,
+        reactionsEnabled: this.config.display.reactions.enabled,
       },
       {
         now: this.clock.now,

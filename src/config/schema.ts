@@ -315,6 +315,25 @@ export const ConfigSchema = z
               .default(['agent', 'context', 'model']),
           })
           .default({}),
+        /**
+         * Lifecycle reactions on the USER's inbound message: 👀 while the turn runs, then ✅ or ❌
+         * (per-platform mapped — Telegram's allow-set turns these into 👌/👎). Default true, i.e.
+         * the long-standing behavior.
+         *
+         * Worth turning off in a one-operator DM deployment: reactions exist to signal "seen" in a
+         * busy channel, but in a private chat the reply itself already proves it, so all they do is
+         * decorate every message the operator sends. Suppressing them costs no information — a
+         * failed turn still reports itself in-channel via the ❌ error notice.
+         *
+         * Only the on/off switch is here; the emoji themselves stay in the frozen EXPERIENCE block
+         * (`inbound.reactions`), which is why this toggle can't live next to them — anything nested
+         * under a key EXPERIENCE owns is overwritten at load (see withExperienceDefaults).
+         */
+        reactions: z
+          .object({
+            enabled: z.boolean().default(true),
+          })
+          .default({}),
       })
       .default({}),
   })

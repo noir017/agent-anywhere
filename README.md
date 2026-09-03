@@ -35,7 +35,7 @@ streams its answer into a single, live-edited message.
 - **Native streaming** — in-place edits, live tool-call bubbles, lifecycle reactions, interrupt on new message.
 - **Chat actions** — the agent sends files, reacts, replies, opens threads, reads history, asks button questions.
 - **Attachments** — inbound images and files are downloaded and handed to the agent.
-- **Topics are first-class** — a Telegram topic, Slack thread or Discord thread is its own conversation, with its own agent; sticky per conversation, `/oc` to switch.
+- **Topics are first-class** — a Telegram topic, Feishu topic (话题), Slack thread or Discord thread is its own conversation, with its own agent; sticky per conversation, `/oc` to switch.
 - **Persistent conversations** — survive restarts; reset via `/new`; scoped per thread, channel, user, or globally.
 - **Small config** — five sections, typed credentials, `${VAR}` and `.env` expansion.
 
@@ -162,7 +162,7 @@ appended after the defaults, and agy's flag parsing is last-wins).
 | Lifecycle reactions | ✓ | ✓ | ✓ | ✓ | ✓ | – | – | – |
 | Typing indicator | ✓ | ✓ | – | – | – | ✓ | – | – |
 | Native reply | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | – | – |
-| Threads / auto-thread | ✓ | ✓ | ✓ | – | – | – | – | – |
+| Threads / auto-thread | ✓ | ✓ | ✓ | ✓ | – | – | – | – |
 | Buttons (`ask`) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | – | – |
 | Slash commands | ✓ | ✓ | ✓ | – | – | – | – | – |
 

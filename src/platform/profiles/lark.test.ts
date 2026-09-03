@@ -5,6 +5,7 @@ import {
   buildLarkButtonCard,
   extractCardAction,
   larkReceiveIdType,
+  rememberBounded,
   createLarkProfile,
 } from './lark.js';
 
@@ -158,6 +159,28 @@ describe('larkReceiveIdType', () => {
     expect(larkReceiveIdType('oc_abc')).toBe('chat_id');
     expect(larkReceiveIdType('a@b.com')).toBe('email');
     expect(larkReceiveIdType('plainuser')).toBe('user_id');
+  });
+});
+
+describe('rememberBounded', () => {
+  it('evicts the least recently touched entry once past the limit', () => {
+    const m = new Map<string, number>();
+    rememberBounded(m, 'a', 1, 2);
+    rememberBounded(m, 'b', 2, 2);
+    rememberBounded(m, 'c', 3, 2);
+    expect([...m.keys()]).toEqual(['b', 'c']);
+  });
+
+  it('a rewrite counts as recent, so it is not the next eviction', () => {
+    const m = new Map<string, number>();
+    rememberBounded(m, 'a', 1, 2);
+    rememberBounded(m, 'b', 2, 2);
+    rememberBounded(m, 'a', 9, 2); // refreshes 'a', making 'b' oldest
+    rememberBounded(m, 'c', 3, 2);
+    expect([...m.entries()]).toEqual([
+      ['a', 9],
+      ['c', 3],
+    ]);
   });
 });
 

@@ -61,7 +61,7 @@ Three rules keep this from rotting:
 | `reaction` | ✓ | ✓ | ✓ | ✓ | ✓ | – | – | – |
 | `typing` | ✓ | ✓ | – | – | – | ✓ | – | – |
 | `reply` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | – | – |
-| `thread` | ✓ | ✓ | ✓ | – | – | – | – | – |
+| `thread` | ✓ | ✓ | ✓ | ✓ | – | – | – | – |
 | `buttons` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | – | – |
 | `slashCommands` | ✓ | ✓ | ✓ | – | – | – | – | – |
 | `maxMessageLength` | 2000 | 4096 | 3000 | 10000 | 1000 | 5000 | 2000 | 3500 |
@@ -103,6 +103,10 @@ resolveConversation(session): { channel, thread?, space?, kind }
   thread is `kind: 'thread'` with **no** `thread`.
 - `kind` is the sole thread/DM witness for routing and gating.
 
+Lark is the fourth: a Feishu topic (话题) is `(chat_id, thread_id)`. The adapter reports
+neither half as a lane — `channel.id` and `guild.id` are both the chat id — so the profile
+recovers `thread_id` from the referrer the adapter picks off the event (`larkThreadIdOf`).
+
 It replaced four methods (`isDirect`, `isThread`, `inboundChannelId`, `decodeChannelKey`)
 that were derived independently from the same session and could therefore disagree — a
 message routed as a thread but replied to as a plain channel, or the reverse. Telegram
@@ -127,6 +131,14 @@ A profile that reports a `thread` must implement the overrides that can carry it
 (`sendMessage`, `sendFile`, `typing`, …). If it doesn't, `satori-core`'s generic path
 **throws** rather than silently posting to the channel root — see the guard in
 `assertNoLane`.
+
+Telegram and Slack put the lane on the wire as a parameter (`message_thread_id`,
+`thread_ts`). **Lark cannot**: `im/v1/messages` has no `receive_id_type` for a topic, so the
+only documented way in is `im.message.reply(<a message in the topic>, { reply_in_thread })`.
+Its profile therefore keeps a `thread_id → message id` cache (`LarkTopicRouter`), fed by every
+inbound topic message and every send it makes, and falls back to the thread history API on a
+cold miss. A platform whose lane needs a *lookup* rather than a parameter should copy that
+shape rather than reach for an undocumented endpoint.
 
 ## Markdown: one converter per dialect
 

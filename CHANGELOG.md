@@ -5,6 +5,30 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **A Feishu topic (话题) is its own conversation.** Lark was the one platform with a real
+  thread model that agent-anywhere flattened: the profile reported no lane, so every topic in
+  a chat collapsed onto the chat root — one session, one agent binding, and every reply posted
+  outside the topic that asked for it. Topics now behave exactly like Telegram topics and Slack
+  threads: their own conversation key under `scope: per_thread`, their own `/oc` binding, the
+  participated-thread mention exemption, and an address (`<chat>/<thread>`) that
+  `chat.channels`, `freeResponseChannels` and `--channel` all accept.
+
+  Getting *into* one is the awkward part, and worth writing down: Feishu's send API has no
+  `receive_id_type` for a topic, so a message can only enter by replying to another message
+  already inside it. The profile therefore remembers a reply anchor per topic — learned from
+  every inbound message and refreshed by every send — and looks one up through the thread
+  history API only on a cold miss (a fresh daemon, or a reverse command aimed at a topic
+  nobody has spoken in yet). A topic with no reachable anchor raises an error naming it rather
+  than quietly posting the agent's answer to the whole chat. `sendFile` carries the lane twice
+  on purpose: the adapter's encoder posts the caption and the file separately and drops the
+  quote in between, so a single one would thread the caption and leak the file.
+
+  `autoThread: perTurn` works on Lark too. Unlike Telegram, Feishu cannot name an empty topic
+  — one exists only once a message opens it — so the thread name is posted as that opening
+  message.
+
 ## [0.4.0] - 2026-09-03
 
 ### Changed (breaking) — the registered command menu

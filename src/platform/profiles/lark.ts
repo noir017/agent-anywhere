@@ -7,6 +7,18 @@
 //   config's platform:'feishu'|'lark' only switches the **endpoint**
 //   (open.feishu.cn vs open.larksuite.com). satori-core finds bots by
 //   `b.platform === satoriPlatform`, so satoriPlatform **must** stay 'lark'.
+//
+// ⚠️ Topics (话题) are a lane you cannot address directly. A Feishu topic message
+//   carries `thread_id` (`omt_…`), but `im/v1/messages` accepts only
+//   open_id/user_id/union_id/email/chat_id as `receive_id_type` — there is no
+//   "send to this topic" call (verified against
+//   open.feishu.cn/document/server-docs/im-v1/message/create, 2026-09). The one
+//   documented way in is `im.message.reply(<any message in the topic>,
+//   { reply_in_thread: true })`, so every outbound path below resolves a reply
+//   ANCHOR first (see LarkTopicRouter.anchorFor). hermes-agent's Feishu adapter reaches
+//   for an undocumented `receive_id_type: 'thread_id'` on create instead; this
+//   profile stays on the documented reply route and keeps the anchor cached so it
+//   costs no extra round-trip.
 import { h } from '@satorijs/core';
 import LarkAdapter from '@satorijs/adapter-lark';
 import type { Bot } from '@satorijs/core';
@@ -16,7 +28,7 @@ import type { Context, Session } from '@satorijs/core';
 import type { MessageRef } from '../../types.js';
 import type { ConversationAddress } from '../../core/conversation.js';
 import type { PlatformCapabilities } from '../adapter.js';
-import type { PlatformProfile, ProfileButtonEvent } from '../profile.js';
+import type { PlatformProfile, ProfileButtonEvent, ResolvedConversation } from '../profile.js';
 import type { LarkPlatformConfig } from '../config-schemas.js';
 import { renderLarkMarkdown } from '../lark-markdown.js';
 import {
@@ -180,6 +192,107 @@ export function extractCardAction(body: unknown): {
 }
 
 /**
+ * Insert into a Map with an insertion-ordered cap, refreshing recency on rewrite.
+ *
+ * The two caches this profile keeps (topic reply anchors, card→address) are keyed by ids a
+ * chat can mint without limit, so an unbounded Map is a slow leak in a daemon that runs for
+ * weeks. Map iterates in insertion order, so deleting before setting makes a rewrite count
+ * as "recently touched" and `keys().next()` yields the least recently touched entry.
+ */
+export function rememberBounded<K, V>(map: Map<K, V>, key: K, value: V, limit: number): void {
+  map.delete(key);
+  map.set(key, value);
+  if (map.size > limit) {
+    const oldest = map.keys().next();
+    if (!oldest.done) map.delete(oldest.value);
+  }
+}
+
+/** How many topics / interactive cards each cache remembers before evicting the oldest. */
+const LARK_CACHE_LIMIT = 500;
+
+/**
+ * The topic (话题) id an inbound event belongs to, or undefined outside a topic. Pure, for tests.
+ *
+ * Feishu sets `thread_id` on a message **iff** that message lives in a topic
+ * (open.feishu.cn .../im-v1/message/events/receive, 2026-09: "不返回说明该消息非话题消息").
+ * The adapter never surfaces it as a session field — `adaptMessage` assigns both
+ * `session.channelId` and `session.guildId` the chat id — so without this every topic in a
+ * chat would collapse onto the chat root. That is the same silent mis-routing Telegram's
+ * private-chat topics had, and the reason `resolveConversation` exists at all.
+ *
+ * Two witnesses, in order:
+ *  1. `session.event.referrer.event.message.thread_id` — adaptSession explicitly
+ *     `pick`s `['message_id','thread_id']` into the referrer for `im.message.receive_v1`.
+ *     ⚠️ Hyrum's Law: an adapter internal, contract-tested in lark.contract.test.ts.
+ *  2. the raw event body stashed by `setInternal('lark', body)` (reachable as
+ *     `session.event._data`), which still carries the field if the referrer shape changes.
+ *
+ * ⚠️ `root_id` is deliberately NOT a fallback (hermes-agent's Feishu adapter uses one). Feishu
+ * sets root_id/parent_id on ANY reply, threaded or not, so a plain quoted reply in a group
+ * would be misread as its own conversation — and the "lane" it produced could not be addressed
+ * as a topic, since replying in-thread to a non-topic message CREATES a topic rather than
+ * continuing one.
+ */
+export function larkThreadIdOf(session: unknown): string | undefined {
+  const event = (
+    session as
+      | {
+          event?: {
+            referrer?: { event?: { message?: { thread_id?: unknown } } };
+            _data?: unknown;
+          };
+        }
+      | undefined
+  )?.event;
+  const fromReferrer = event?.referrer?.event?.message?.thread_id;
+  if (typeof fromReferrer === 'string' && fromReferrer !== '') return fromReferrer;
+  const body = event?._data as { event?: { message?: { thread_id?: unknown } } } | undefined;
+  const fromBody = body?.event?.message?.thread_id;
+  return typeof fromBody === 'string' && fromBody !== '' ? fromBody : undefined;
+}
+
+/**
+ * THE single Lark conversation resolver: chat id, optional topic lane, kind.
+ *
+ * A topic is a `(chat_id, thread_id)` PAIR — the chat id alone is still a complete API
+ * target (that is the ConversationRef contract), and the lane rides in `thread`. Outside a
+ * topic this is the flat DM/group shape every thread-less profile shares
+ * (`plainConversation`), so the two cases cannot drift apart.
+ *
+ * `space` is deliberately absent in the topic branch for the same reason plainConversation
+ * drops it: the adapter sets `guildId === channelId` for every Lark chat, so a "space" equal
+ * to the channel carries no information.
+ */
+export function larkConversation(session: Session): ResolvedConversation {
+  const thread = larkThreadIdOf(session);
+  if (thread == null) return plainConversation(session);
+  return { channel: session.channelId ?? '', thread, kind: 'thread' };
+}
+
+/**
+ * Pull `{ threadId, messageId }` out of a raw `im.message.receive_v1` body, or null when the
+ * event is not a topic message. Pure, for tests.
+ *
+ * Every inbound topic message is a usable reply anchor for that topic, and it costs nothing
+ * to remember — which is what keeps the documented reply route from needing a lookup call
+ * before each send (see LarkTopicRouter.anchorFor).
+ */
+export function extractThreadAnchor(
+  body: unknown
+): { threadId: string; messageId: string } | null {
+  const b = body as
+    | { type?: string; event?: { message?: { thread_id?: unknown; message_id?: unknown } } }
+    | undefined;
+  if (!b || b.type !== 'im.message.receive_v1') return null;
+  const threadId = b.event?.message?.thread_id;
+  const messageId = b.event?.message?.message_id;
+  if (typeof threadId !== 'string' || threadId === '') return null;
+  if (typeof messageId !== 'string' || messageId === '') return null;
+  return { threadId, messageId };
+}
+
+/**
  * Infer Lark receive_id_type from channelId (matches adapter's extractIdType).
  * ou→open_id / on→union_id / oc→chat_id / contains @→email / else→user_id.
  */
@@ -191,6 +304,151 @@ export function larkReceiveIdType(
   if (id.startsWith('oc')) return 'chat_id';
   if (id.includes('@')) return 'email';
   return 'user_id';
+}
+
+/**
+ * Everything needed to put a message INTO a Feishu topic, plus the two caches that keep it
+ * cheap. One instance per profile.
+ *
+ * Lifted out of `createLarkProfile` deliberately: the profile body should declare behavior,
+ * not also implement the trickiest part of it, and a standalone factory is unit-testable
+ * without standing up an adapter.
+ */
+export interface LarkTopicRouter {
+  /** Learn an anchor from a raw inbound event body; a non-topic event is ignored. */
+  rememberInbound(rawBody: unknown): void;
+  /** Record that a message (typically an interactive card) was posted to `address`. */
+  rememberCard(messageId: string, address: ConversationAddress): void;
+  /** Where a previously sent card lives, if this process sent it. */
+  cardAddress(messageId: string): ConversationAddress | undefined;
+  /** Record a known-good reply anchor for a topic. */
+  rememberAnchor(threadId: string, messageId: string): void;
+  /** A message id inside `threadId` that a reply can target. Throws if none can be found. */
+  anchorFor(bot: Bot, threadId: string): Promise<string>;
+  /** Send into `address`, threading the message when the address carries a topic lane. */
+  send(
+    bot: Bot,
+    address: ConversationAddress,
+    build: (anchor: string | undefined) => h[] | string,
+    op: string
+  ): Promise<MessageRef>;
+}
+
+export function createLarkTopicRouter(): LarkTopicRouter {
+  // topic id → a message id inside it, usable as a reply anchor. Written from every inbound
+  // topic message and from every successful outbound into a topic, so the common case reaches
+  // Feishu with no lookup call. A cold miss (fresh daemon, or a reverse command aimed at a
+  // topic nobody has spoken in this run) falls back to the messages API.
+  const anchors = new Map<string, string>();
+  // interactive-card message id → the address it was posted to. A card.action.trigger body
+  // reports only open_chat_id, so without this a click inside a topic would resolve to the
+  // chat root — the Telegram-topic bug the resolveConversation seam exists to prevent.
+  const cards = new Map<string, ConversationAddress>();
+
+  const rememberAnchor = (threadId: string, messageId: string): void => {
+    rememberBounded(anchors, threadId, messageId, LARK_CACHE_LIMIT);
+  };
+
+  /**
+   * Resolve a reply anchor for `threadId`, consulting the cache first.
+   *
+   * Cold miss ⇒ ask Feishu for the topic's FIRST message (`container_id_type: 'thread'`,
+   * documented for exactly this at open.feishu.cn/document/server-docs/im-v1/message/list,
+   * 2026-09: "获取话题回复中的所有消息"). Ascending order picks the topic's root: any message
+   * in a topic keeps a reply inside it, but the root is the least likely to be recalled.
+   *
+   * Throws with the topic named when nothing can anchor the send. Falling back to the chat
+   * root would put an agent's answer in front of the wrong people, which is exactly the
+   * silent mis-delivery the address refactor was written to end.
+   */
+  const anchorFor = async (bot: Bot, threadId: string): Promise<string> => {
+    const cached = anchors.get(threadId);
+    if (cached) return cached;
+    const api = larkMessageApi(bot);
+    if (api) {
+      for await (const item of api.list({
+        container_id_type: 'thread',
+        container_id: threadId,
+        sort_type: 'ByCreateTimeAsc',
+        page_size: 1,
+      })) {
+        if (item.message_id) {
+          rememberAnchor(threadId, item.message_id);
+          return item.message_id;
+        }
+      }
+    }
+    throw new Error(
+      `[lark] cannot address topic ${threadId}: no message in it to reply to (Feishu has no send-to-topic API; a topic is addressed by replying inside it)`
+    );
+  };
+
+  return {
+    rememberInbound(rawBody) {
+      const anchor = extractThreadAnchor(rawBody);
+      if (anchor) rememberAnchor(anchor.threadId, anchor.messageId);
+    },
+
+    rememberCard(messageId, address) {
+      rememberBounded(cards, messageId, address, LARK_CACHE_LIMIT);
+    },
+
+    cardAddress(messageId) {
+      return cards.get(messageId);
+    },
+
+    rememberAnchor,
+    anchorFor,
+
+    /**
+     * The lane is expressed as a leading `<quote id replyInThread>` element: the adapter's
+     * encoder turns a quote into `im.message.reply(id, { …, reply_in_thread })`, which is the
+     * documented way into a topic. `bot.sendMessage` cannot do it on its own — it has no
+     * inbound session to read a lane off, so it falls through to im.message.create and lands
+     * in the chat root with ok=true and nothing logged.
+     *
+     * `build` is a callback, not an array, because sendFile has to re-arm the quote MID
+     * fragment (see its comment) and the anchor is only known in here. A `string` body goes
+     * to the adapter verbatim outside a topic and through `h.parse` inside one — precisely
+     * what the adapter's own `h.normalize` does to a string, so both lanes put identical
+     * elements on the wire and prepending the quote is their only difference.
+     *
+     * A stale anchor (its message was recalled) is not a permanent break: the cache entry is
+     * dropped and the send retried once against a freshly listed anchor.
+     */
+    async send(bot, address, build, op) {
+      const thread = address.thread;
+      if (thread == null) return sendForRef(bot, address, build(undefined), 'lark', op);
+
+      const attempt = async (anchor: string): Promise<MessageRef> => {
+        const body = build(anchor);
+        const ref = await sendForRef(
+          bot,
+          address,
+          [
+            h('quote', { id: anchor, replyInThread: true }),
+            ...(typeof body === 'string' ? h.parse(body) : body),
+          ],
+          'lark',
+          op
+        );
+        // Keep the anchor fresh: the message just posted is itself in the topic.
+        rememberAnchor(thread, ref.messageId);
+        return ref;
+      };
+
+      const cached = anchors.get(thread);
+      try {
+        return await attempt(await anchorFor(bot, thread));
+      } catch (e) {
+        // Only a cached anchor is worth a second try; a freshly listed one that failed will
+        // fail the same way, and retrying would just double the latency of a real error.
+        if (!cached) throw e;
+        anchors.delete(thread);
+        return attempt(await anchorFor(bot, thread));
+      }
+    },
+  };
 }
 
 /**
@@ -216,6 +474,10 @@ export function larkReceiveIdType(
  * - `<quote id>` ⇒ im.message.reply ⇒ reply=true.
  * - adaptSession sets isDirect=(chat_type==='p2p'); mentions normalize to
  *   h.at(open_id,{name}) ⇒ detectMention scans at elements.
+ * - topics (话题): the inbound `thread_id` never reaches a session field, but adaptSession
+ *   picks it into `event.referrer` and stashes the whole body via setInternal, so
+ *   larkThreadIdOf can recover it. Outbound needs a reply anchor (see the file header),
+ *   which is why sendMessage/sendFile/sendButtons all have overrides here.
  * - No typing API, no programmatic slash registration; button clicks normalize as
  *   interaction/command ⇒ typing/slashCommands false (buttons handled specially).
  */
@@ -225,8 +487,10 @@ export function createLarkProfile(): PlatformProfile<LarkPlatformConfig> {
   // reaction=true: via the addReaction override seam over internal
   //   im.message.reaction.* (avoids the crashing generic createReaction). emoji
   //   mapped via mapLarkEmojiType; unmapped safely skipped.
-  // typing=false: no typing API. thread=false: thread is a send option
-  //   (reply_in_thread), no standalone createThread semantics. slashCommands=false.
+  // typing=false: no typing API. slashCommands=false.
+  // thread=true: a Feishu topic (话题) is a `(chat_id, thread_id)` lane, exactly the pair
+  //   ConversationRef models. It cannot be addressed directly — see the file header — so
+  //   every outbound path resolves a reply anchor and posts with reply_in_thread.
   // buttons=true: interactive-card buttons (send + receive).
   //   ⚠️ Bypasses the satori encoder (it drops button.id, only _satori_type:
   //   'command'); hand-builds schema 2.0 card JSON via im.message.create with
@@ -240,10 +504,12 @@ export function createLarkProfile(): PlatformProfile<LarkPlatformConfig> {
     typing: false,
     maxMessageLength: 10000,
     reply: true,
-    thread: false,
+    thread: true,
     buttons: true,
     slashCommands: false,
   };
+
+  const topics = createLarkTopicRouter();
 
   return {
     type: 'lark',
@@ -295,6 +561,14 @@ export function createLarkProfile(): PlatformProfile<LarkPlatformConfig> {
         protocol: platform.protocol,
         ...httpExtra,
       });
+
+      // Learn a reply anchor from every inbound topic message. Hooked on 'internal/session'
+      // (as mountButtonEvents is) rather than folded into resolveConversation: that method's
+      // contract is to DESCRIBE a location, it is called for interactions too, and core may
+      // call it more than once per event — none of which should imply a cache write.
+      ctx.on('internal/session', (session: Session) => {
+        topics.rememberInbound((session.event as { _data?: unknown } | undefined)?._data);
+      });
     },
 
     detectMention(session, selfId) {
@@ -304,10 +578,9 @@ export function createLarkProfile(): PlatformProfile<LarkPlatformConfig> {
     },
 
     resolveConversation(session) {
-      // adaptSession sets isDirect=true for chat_type==='p2p'. Lark's thread_id is a SEND
-      // option (reply_in_thread) with no inbound thread modeling, so no lane is reported —
-      // matching capabilities.thread=false.
-      return plainConversation(session);
+      // adaptSession sets isDirect=true for chat_type==='p2p'; a topic message additionally
+      // carries thread_id, which becomes the lane. See larkConversation.
+      return larkConversation(session);
     },
 
     attachmentMeta() {
@@ -316,15 +589,12 @@ export function createLarkProfile(): PlatformProfile<LarkPlatformConfig> {
       return {};
     },
 
-    // Override send/edit ONLY to pre-render CommonMark → Feishu subset; same
-    // conversion both sides ⇒ no send-vs-edit drift. See the profile doc-comment.
+    // send/edit are overridden to pre-render CommonMark → the Feishu subset; the same
+    // conversion on both sides ⇒ no send-vs-edit drift. See the profile doc-comment.
     async sendMessage(bot: Bot, address: ConversationAddress, text: string): Promise<MessageRef> {
-      const ids = await bot.sendMessage(address.channel, toLarkMarkdown(text));
-      const messageId = ids[0];
-      if (!messageId) {
-        throw new Error(`[lark] sendMessage did not return a message id (channel=${address.channel})`);
-      }
-      return { address, messageId };
+      // send() also carries the topic lane when the address has one (quote + reply_in_thread);
+      // without one this stays the plain create path it has always been.
+      return topics.send(bot, address, () => toLarkMarkdown(text), 'sendMessage');
     },
 
     async editMessage(bot: Bot, ref: MessageRef, text: string): Promise<void> {
@@ -332,16 +602,84 @@ export function createLarkProfile(): PlatformProfile<LarkPlatformConfig> {
     },
 
     async reply(bot: Bot, ref: MessageRef, text: string): Promise<MessageRef> {
-      // <quote> ⇒ encoder calls im.message.reply (native quote, auto
-      // reply_in_thread inside a thread). Returns the first message id. Convert the
-      // text to the Feishu markdown subset (same as send/edit) before quoting.
-      return sendForRef(
+      // <quote> ⇒ encoder calls im.message.reply (native quote). Convert the text to the
+      // Feishu markdown subset (same as send/edit) before quoting.
+      //
+      // The anchor is ref.messageId itself — the message being replied to — so no lookup is
+      // needed even in a topic. `replyInThread` is passed explicitly when the ref carries a
+      // lane: Feishu already threads a reply whose target sits in a topic ("若群聊已经是话题
+      // 模式，则自动回复该条消息所在的话题"), but saying so is free and keeps the wire call
+      // identical to the one LarkTopicRouter.send makes.
+      const thread = ref.address.thread;
+      const quote = h('quote', thread != null ? { id: ref.messageId, replyInThread: true } : { id: ref.messageId });
+      const sent = await sendForRef(
         bot,
         ref.address,
-        [h('quote', { id: ref.messageId }), h.text(toLarkMarkdown(text))],
+        [quote, h.text(toLarkMarkdown(text))],
         'lark',
         'reply'
       );
+      if (thread != null) topics.rememberAnchor(thread, sent.messageId);
+      return sent;
+    },
+
+    async sendFile(bot, address, file) {
+      // Mirrors satori-core's generic file path (a file:// URL the encoder uploads, caption
+      // as the message text) with one addition: the topic lane.
+      //
+      // ⚠️ Why TWO quote elements. The encoder posts the caption and the file as separate
+      // messages — its `flush()` runs before the file upload — and it clears `this.quote`
+      // after each post. One leading quote would therefore thread the caption and drop the
+      // file into the chat root. Re-arming the quote between them threads both, and the
+      // resulting id order (caption first) is exactly what the generic path returns.
+      const fileUrl = file.path.startsWith('file:') ? file.path : `file://${file.path}`;
+      return topics.send(
+        bot,
+        address,
+        (anchor) => {
+          const fragment: h[] = [];
+          if (file.caption) {
+            fragment.push(h.text(file.caption));
+            // Re-arm the quote the encoder is about to consume (see the note above).
+            if (anchor) fragment.push(h('quote', { id: anchor, replyInThread: true }));
+          }
+          fragment.push(h.file(fileUrl, file.name ? { title: file.name } : {}));
+          return fragment;
+        },
+        'sendFile'
+      );
+    },
+
+    async createThread(bot, ref, name) {
+      // Feishu has no "create an empty topic" call: a topic comes into being when a message
+      // is replied to with reply_in_thread, so `name` is posted as that opening message.
+      // This differs from Telegram's createForumTopic (which names a topic without posting)
+      // and from Slack (where a thread is just a message ts and nothing is sent) — it is the
+      // only shape the API offers, and autoThread's header text is a reasonable thing to say.
+      //
+      // ⚠️ If `ref` already sits in a topic, Feishu continues THAT topic instead of nesting a
+      // new one. Harmless here: autoThread only fires on kind:'group'.
+      const api = larkMessageApi(bot);
+      if (!api) {
+        throw new Error('[lark] im.message.reply is unavailable; cannot open a topic');
+      }
+      const res = await api.reply(ref.messageId, {
+        msg_type: 'text',
+        content: JSON.stringify({ text: name }),
+        reply_in_thread: true,
+      });
+      const threadId = res?.thread_id;
+      if (!threadId) {
+        // No thread_id means the reply landed as a plain quote (a chat whose settings forbid
+        // topics). Throw rather than return the bare channel: the caller (autoThread) already
+        // falls back to the original channel and logs it, and pretending a lane exists would
+        // send every later message of the turn through a lookup that cannot succeed.
+        throw new Error(
+          `[lark] reply_in_thread did not open a topic (channel=${ref.address.channel}); the chat may have topics disabled`
+        );
+      }
+      if (res.message_id) topics.rememberAnchor(threadId, res.message_id);
+      return { address: { channel: ref.address.channel, thread: threadId } };
     },
 
     async addReaction(bot: Bot, ref: MessageRef, emoji: string): Promise<void> {
@@ -390,24 +728,33 @@ export function createLarkProfile(): PlatformProfile<LarkPlatformConfig> {
       // im.message.create as msg_type='interactive'. Bypasses the satori
       // <button> encoder (it drops button.id, see buildLarkButtonCard).
       const card = buildLarkButtonCard(text, buttons);
-      const create = (
-        bot.internal as { im?: { message?: { create?: LarkInternalMessageCreate } } }
-      )?.im?.message?.create;
-      if (!create) {
+      const api = larkMessageApi(bot);
+      if (!api) {
         throw new Error('[lark] im.message.create is unavailable; cannot send interactive card');
       }
-      const res = await create(
-        {
-          receive_id: address.channel,
-          msg_type: 'interactive',
-          content: JSON.stringify(card),
-        },
-        { receive_id_type: larkReceiveIdType(address.channel) }
-      );
+      const content = JSON.stringify(card);
+      // A topic takes the reply route like every other outbound; create() cannot express the
+      // lane. Sent straight through im.message.reply rather than sendThreaded because the
+      // card must stay msg_type:'interactive' — routing it through the satori encoder would
+      // re-encode it as a post.
+      const res = address.thread != null
+        ? await api.reply(await topics.anchorFor(bot, address.thread), {
+            msg_type: 'interactive',
+            content,
+            reply_in_thread: true,
+          })
+        : await api.create(
+            { receive_id: address.channel, msg_type: 'interactive', content },
+            { receive_id_type: larkReceiveIdType(address.channel) }
+          );
       const messageId = res?.message_id;
       if (!messageId) {
         throw new Error(`[lark] sendButtons did not return a message id (channel=${address.channel})`);
       }
+      if (address.thread != null) topics.rememberAnchor(address.thread, messageId);
+      // Remember where this card lives so a click on it resolves to the same conversation the
+      // message path would give it (see mountButtonEvents).
+      topics.rememberCard(messageId, address);
       return { address, messageId };
     },
 
@@ -425,12 +772,20 @@ export function createLarkProfile(): PlatformProfile<LarkPlatformConfig> {
         const body = (session.event as { _data?: unknown } | undefined)?._data;
         const action = extractCardAction(body);
         if (!action) return;
+        // A card.action.trigger body reports open_chat_id and nothing about a topic, so the
+        // lane comes from what sendButtons recorded when it posted this card. Unknown card
+        // (a restart since it was sent, or a card this daemon never sent) ⇒ the chat root,
+        // which is where a card without a lane genuinely lives.
+        //
+        // kind is reported as 'group' outside a topic: the callback body distinguishes no
+        // chat type, and gating never re-reads it for a button click (the daemon resolves the
+        // conversation the buttons were sent to, and matches the click by button id).
+        const sentTo = topics.cardAddress(action.messageId);
         emit({
-          // The card callback carries only open_chat_id — Lark has no thread lane, so
-          // this is a complete conversation on its own. kind is reported as 'group':
-          // the callback body distinguishes no chat type, and gating never re-reads it
-          // for a button click (it resolves the conversation the buttons were sent to).
-          conversation: { channel: action.channelId, kind: 'group' },
+          conversation:
+            sentTo?.thread != null
+              ? { channel: sentTo.channel, thread: sentTo.thread, kind: 'thread' }
+              : { channel: action.channelId, kind: 'group' },
           user: action.userId,
           messageId: action.messageId,
           buttonId: action.id,
@@ -471,14 +826,38 @@ interface LarkInternalReaction {
 }
 
 /**
- * Minimal type for im.message.create internal (sending interactive cards).
- * Signatures verified against @satorijs/adapter-lark lib/types/im.d.ts.
+ * Minimal type for the im.message internal this profile calls directly (interactive cards,
+ * topic replies, topic history). Signatures verified against
+ * @satorijs/adapter-lark lib/types/im.d.ts.
+ *
+ * `create` deliberately has no `thread_id` in its receive_id_type union: Feishu does not
+ * accept one there (see the file header), which is why `reply` exists on this interface.
  */
-interface LarkInternalMessageCreate {
-  (
+interface LarkInternalMessage {
+  create(
     body: { receive_id: string; msg_type: string; content: string },
     query: { receive_id_type: 'open_id' | 'union_id' | 'chat_id' | 'email' | 'user_id' }
   ): Promise<{ message_id?: string }>;
+  reply(
+    messageId: string,
+    body: { msg_type: string; content: string; reply_in_thread?: boolean }
+  ): Promise<{ message_id?: string; thread_id?: string }>;
+  // Paginated<T> is a Promise AND an AsyncIterableIterator; only the iteration side is used.
+  list(query: {
+    container_id_type: 'chat' | 'thread';
+    container_id: string;
+    sort_type?: 'ByCreateTimeAsc' | 'ByCreateTimeDesc';
+    page_size?: number;
+  }): AsyncIterable<{ message_id?: string }>;
+}
+
+/**
+ * Narrow bot.internal to the im.message methods above. The adapter builds `internal` at
+ * runtime from a route table and LarkBot.internal is typed as `any`-ish, so every call site
+ * would otherwise repeat this cast.
+ */
+function larkMessageApi(bot: Bot): LarkInternalMessage | undefined {
+  return (bot.internal as { im?: { message?: LarkInternalMessage } } | undefined)?.im?.message;
 }
 
 // authorName note: inbound carries only sender_id.open_id, no display name. Fetching

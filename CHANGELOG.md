@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-09-03
+
 ### Fixed
 
 - **An agent command for a harness you never configured no longer dies silently.** `/agy hi`

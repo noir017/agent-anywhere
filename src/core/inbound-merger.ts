@@ -1,4 +1,5 @@
 import type { InboundMessage, MessageRef } from '../types.js';
+import { addressOf } from './conversation.js';
 
 /**
  * Inbound merger (one instance per session).
@@ -69,7 +70,7 @@ export class InboundMerger {
     // The "received" reaction is best-effort and must never gate the pipeline:
     // awaiting it would let a flaky platform REST / broken pool stall dispatch.
     void this.safeReaction(
-      { channelId: msg.channelId, messageId: msg.messageId },
+      { address: addressOf(msg.conversation), messageId: msg.messageId },
       this.opts.reactions.received
     );
 
@@ -120,13 +121,13 @@ export class InboundMerger {
       // Skip ✅ for an interrupted turn: the continuing batch will mark its own latest message.
       if (!this.interrupted) {
         await this.safeReaction(
-          { channelId: last.channelId, messageId: last.messageId },
+          { address: addressOf(last.conversation), messageId: last.messageId },
           this.opts.reactions.done
         );
       }
     } catch {
       await this.safeReaction(
-        { channelId: last.channelId, messageId: last.messageId },
+        { address: addressOf(last.conversation), messageId: last.messageId },
         this.opts.reactions.error
       );
     } finally {

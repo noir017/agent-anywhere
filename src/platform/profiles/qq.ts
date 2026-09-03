@@ -41,6 +41,7 @@ import {
   findAtMention,
   installHttpService,
   mountSatoriButtonInteraction,
+  plainConversation,
   resolveDefaultPlugin,
   sendForRef,
 } from '../profile-helpers.js';
@@ -207,14 +208,10 @@ export function createQQProfile(): PlatformProfile<QQPlatformConfig> {
       return findAtMention(session.elements, selfId);
     },
 
-    isDirect(session) {
-      // Adapter sets session.isDirect: C2C/channel-DM true, group/public false.
-      return session.isDirect ?? false;
-    },
-
-    isThread() {
-      // QQ has no thread concept.
-      return false;
+    resolveConversation(session) {
+      // QQ has no thread concept, and the adapter sets session.isDirect (C2C/channel-DM
+      // true, group/public false), so the shared thread-less shape is exact.
+      return plainConversation(session);
     },
 
     attachmentMeta(el) {
@@ -222,11 +219,11 @@ export function createQQProfile(): PlatformProfile<QQPlatformConfig> {
       return attrAttachmentMeta(el.attrs);
     },
 
-    async sendMessage(bot, channelId, text) {
+    async sendMessage(bot, address, text) {
       // Outbound send override: flatten CommonMark → plain text (QQ renders no
       // markdown by default), then defer to the generic send tail. Without this the
       // generic path would send the raw markdown verbatim.
-      return sendForRef(bot, channelId, toPlainText(text), 'qq', 'sendMessage');
+      return sendForRef(bot, address, toPlainText(text), 'qq', 'sendMessage');
     },
 
     async reply(bot, ref, text) {
@@ -237,7 +234,7 @@ export function createQQProfile(): PlatformProfile<QQPlatformConfig> {
       // Flatten the body first: QQ shows markdown markers as literal text.
       return sendForRef(
         bot,
-        ref.channelId,
+        ref.address,
         [
           h('passive', { messageId: ref.messageId }),
           h('quote', { id: ref.messageId }),
@@ -254,7 +251,7 @@ export function createQQProfile(): PlatformProfile<QQPlatformConfig> {
       // rejected. Map to `2:<emoji>` first. Unmapped ⇒ safe skip (best-effort).
       const emojiId = mapQQReactionEmoji(emoji);
       if (!emojiId) return;
-      await bot.createReaction(ref.channelId, ref.messageId, emojiId);
+      await bot.createReaction(ref.address.channel, ref.messageId, emojiId);
     },
 
     async removeReaction(bot: Bot, ref: MessageRef, emoji: string): Promise<void> {
@@ -262,10 +259,10 @@ export function createQQProfile(): PlatformProfile<QQPlatformConfig> {
       // Unmapped ⇒ safe skip.
       const emojiId = mapQQReactionEmoji(emoji);
       if (!emojiId) return;
-      await bot.deleteReaction(ref.channelId, ref.messageId, emojiId);
+      await bot.deleteReaction(ref.address.channel, ref.messageId, emojiId);
     },
 
-    async sendButtons(bot, channelId, text, buttons) {
+    async sendButtons(bot, address, text, buttons) {
       // <button-group> wraps one row (max 5/row, encoder auto-wraps). A <button>
       // without type ⇒ action.type=1 (callback), data=id; click returns
       // INTERACTION_CREATE with button.id===id. class 'primary' ⇒ style=1, else 0.
@@ -279,7 +276,7 @@ export function createQQProfile(): PlatformProfile<QQPlatformConfig> {
       );
       return sendForRef(
         bot,
-        channelId,
+        address,
         buildButtonMessageFragment(toPlainText(text), group),
         'qq',
         'sendButtons'
@@ -295,7 +292,7 @@ export function createQQProfile(): PlatformProfile<QQPlatformConfig> {
       //   on the **parent QQBot (platform='qq')**. Using 'qqguild' here would make
       //   every click get dropped. Only one QQ adapter runs in this process, so
       //   'qq' is both precise and safe.
-      mountSatoriButtonInteraction(ctx, 'qq', emit, { botPlatform: 'qq' });
+      mountSatoriButtonInteraction(ctx, plainConversation, emit, { botPlatform: 'qq' });
     },
 
     // —— Omitted optional methods (capability off for each) ——

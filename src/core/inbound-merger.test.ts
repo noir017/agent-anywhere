@@ -9,7 +9,12 @@ import type { InboundMessage } from '../types.js';
  */
 
 function msg(id: string): InboundMessage {
-  return { platform: 'discord', channelId: 'c', userId: 'u', messageId: id, content: id, timestamp: 0 };
+  return {
+    conversation: { platform: 'discord', channel: 'c', kind: 'group', user: 'u' },
+    messageId: id,
+    content: id,
+    timestamp: 0,
+  };
 }
 
 const reactions = { received: '👀', done: '✅', error: '❌' };

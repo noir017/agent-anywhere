@@ -33,6 +33,7 @@ import {
   installHttpService,
   installServerService,
   mountSatoriButtonInteraction,
+  plainConversation,
   resolveDefaultPlugin,
   sendForRef,
 } from '../profile-helpers.js';
@@ -194,14 +195,9 @@ export function createLineProfile(): PlatformProfile<LinePlatformConfig> {
       return false;
     },
 
-    isDirect(session) {
-      // isDirect = (source.type==='user'); group/room map to guildId+channelId.
-      return session.isDirect ?? false;
-    },
-
-    isThread() {
-      // LINE has no thread concept.
-      return false;
+    resolveConversation(session) {
+      // LINE has no thread concept; isDirect = (source.type==='user'), group/room otherwise.
+      return plainConversation(session);
     },
 
     attachmentMeta() {
@@ -210,11 +206,11 @@ export function createLineProfile(): PlatformProfile<LinePlatformConfig> {
       return {};
     },
 
-    async sendMessage(bot, channelId, text) {
+    async sendMessage(bot, address, text) {
       // Outbound send override: flatten CommonMark → plain text first (LINE shows
       // markup literally), then defer to the generic push tail. Without this the
       // generic path would push the raw markdown verbatim.
-      return sendForRef(bot, channelId, toPlainText(text), 'line', 'sendMessage');
+      return sendForRef(bot, address, toPlainText(text), 'line', 'sendMessage');
     },
 
     async reply(bot, ref, text) {
@@ -232,9 +228,9 @@ export function createLineProfile(): PlatformProfile<LinePlatformConfig> {
       // Both paths tolerate a missing message id (empty string). LINE downstream
       // doesn't consume messageId (no edit/reaction), so the fallback also skips
       // sendForRef's "no id ⇒ throw", matching the hit path's leniency.
-      const token = takeReplyToken(ref.channelId);
+      const token = takeReplyToken(ref.address.channel);
       if (token) {
-        replyTokens.delete(ref.channelId); // single-use: consume regardless of outcome
+        replyTokens.delete(ref.address.channel); // single-use: consume regardless of outcome
         const internal = (bot as Bot & { internal: LineInternal }).internal;
         const res = await internal.replyMessage({
           replyToken: token,
@@ -242,15 +238,15 @@ export function createLineProfile(): PlatformProfile<LinePlatformConfig> {
         });
         // LINE occasionally omits the id ⇒ fall back to empty string.
         const messageId = res?.sentMessages?.[0]?.id ?? '';
-        return { channelId: ref.channelId, messageId };
+        return { address: ref.address, messageId };
       }
       // Fallback: push to the context. Not via sendForRef (which throws on missing
       // first id); take first id manually, empty on miss, matching the hit path.
-      const ids = await bot.sendMessage(ref.channelId, plain);
-      return { channelId: ref.channelId, messageId: ids[0] ?? '' };
+      const ids = await bot.sendMessage(ref.address.channel, plain);
+      return { address: ref.address, messageId: ids[0] ?? '' };
     },
 
-    async sendButtons(bot, channelId, text, buttons) {
+    async sendButtons(bot, address, text, buttons) {
       // buttons template (degraded form): default <button> ⇒
       // {type:'postback', data:id}, click returns postback. On flush, buttons are
       // bundled into a separate "template/buttons" message (text fixed
@@ -264,27 +260,27 @@ export function createLineProfile(): PlatformProfile<LinePlatformConfig> {
       );
       return sendForRef(
         bot,
-        channelId,
+        address,
         buildButtonMessageFragment(toPlainText(text), group),
         'line',
         'sendButtons'
       );
     },
 
-    async typing(bot, channelId) {
+    async typing(bot, address) {
       // LINE loading animation accepts only a 1:1 user id; group/room always get
       // rejected. channelId comes from source id: 1:1 == userId ('U'), group 'C',
       // room 'R'. Cheap guard: only POST when channelId starts with 'U', else
       // return — avoids a doomed HTTP POST every typing interval. capabilities.
       // typing stays true (DM works); group/room is a no-op.
-      if (!channelId.startsWith('U')) return;
+      if (!address.channel.startsWith('U')) return;
       // Adapter doesn't define this route ⇒ use raw bot.http. Failures are
       // swallowed (pure UX, must not break the turn).
       const http = (bot as { http?: { post?: (url: string, body: unknown) => Promise<unknown> } })
         .http;
       try {
         await http?.post?.('/v2/bot/chat/loading/start', {
-          chatId: channelId,
+          chatId: address.channel,
           loadingSeconds: 5,
         });
       } catch {
@@ -297,7 +293,7 @@ export function createLineProfile(): PlatformProfile<LinePlatformConfig> {
       // data}, messageId = body.webhookEventId (LINE has no original message id).
       // No reply-token for postback ⇒ acks go via push. See
       // profile-helpers.ts mountSatoriButtonInteraction.
-      mountSatoriButtonInteraction(ctx, 'line', emit);
+      mountSatoriButtonInteraction(ctx, plainConversation, emit);
     },
   };
 }

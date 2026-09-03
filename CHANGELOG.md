@@ -5,6 +5,65 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed (breaking) — conversations, topics and agent binding
+
+- **A topic is now a conversation, and the agent answering it is sticky.**
+
+  The bug: in one Telegram topic, `/oc hi` was answered by opencode and the very next plain
+  message by claude — two agents, two empty contexts, one place. The agent id led the session
+  key (`<agentId>:<platform>:c:<channel>`) *and* `routing.pipeline` was re-resolved on every
+  message, so a follow-up matching no rule fell through to `routing.default` and computed a
+  different key. The agent was part of a conversation's identity rather than a property of it,
+  so a sticky binding was not expressible.
+
+  Now the key carries no agent. A `when.command` rule (`/oc …`) **binds** the conversation;
+  every plain message after it stays with that agent until someone types another `/<agent>`.
+  Config chooses a conversation's first agent, the user chooses it thereafter. A bare `/oc`
+  rebinds and says so instead of acking usage.
+
+- **Switching agents never restarts your work.** `conversations.json` records, per conversation,
+  the bound agent *and* each agent's own session id — so `/oc` → `/cc` → `/oc` resumes
+  opencode's existing thread rather than starting the task over. The gateway is a chat client in
+  front of the agent; only an explicit `/new` discards context, and it clears the whole
+  conversation. Pre-existing `sessions.json` is migrated on first start, so nothing in flight
+  restarts on upgrade.
+
+- **`session.scope` now defaults to `per_thread`** (was `per_channel`), and `per_thread` finally
+  does something: it was a verbatim copy of `per_channel`, differing only in a letter of the key.
+  A Telegram topic / Slack thread / Discord thread is its own conversation, with the channel root
+  separate. Set `scope: per_channel` for the old folding behavior.
+
+- **Conversation identity is a struct, not a string.** A topic is a `(channel, thread)` pair, but
+  the domain had one opaque `channelId`, so the pair was smuggled through as `"<chat>:<topic>"` —
+  built in 5 places, decoded in 17, validated in none. Every path that forgot to decode sent to
+  the wrong place, and because Telegram truncates a malformed `chat_id` leniently in private
+  chats, half those failures were silent successes. `ConversationRef`/`ConversationAddress`
+  replace it; the string form survives only for the `--channel` flag (`<channel>` or
+  `<channel>/<thread>`) and the store key, each with one validating parser.
+
+- **The platform seam is one method.** `isDirect`, `isThread`, `inboundChannelId` and
+  `decodeChannelKey` collapse into `resolveConversation`, called on all three inbound paths, so a
+  profile can no longer wire messages and forget button clicks, and the routing view cannot
+  disagree with the addressing.
+
+### Fixed (each previously reachable)
+
+- **Slack threads were invisible inbound.** `isThread()` hardcoded `false` while the outbound side
+  emitted thread addresses, so a reply typed inside a thread was routed as channel traffic — and
+  answered in the channel.
+- **`when.serverId` never matched.** `guildId` was never populated on the message path.
+- **A native slash could route differently from the same text typed by hand.** The synthesized
+  message carried no `isDirect`/`isThread`/`guildId`, so `when.chat` always read `group`.
+- **`when: {chat: private}` had stopped matching** during this refactor (config says `private`,
+  the domain says `direct`); caught by a ported test, fixed with an explicit mapping.
+- **Telegram `create-thread` from inside a topic** sent `chat_id: "-100123:99"` (400 in a group,
+  silent truncation in a DM) and returned a malformed triple whose lane parsed to `NaN`. It was
+  the one outbound path that never decoded, and had no test.
+- **`autoThread` opened a thread and abandoned it**: the user's first reply inside started a
+  fresh, empty conversation. The thread is now adopted by the conversation that opened it.
+- **`sendFile` received a decoded channel while every sibling received an undecoded one** — a
+  contract mismatch waiting to be got wrong.
+
 ### Added
 - **`harness: agy` preset**: Google's Antigravity CLI (the Gemini CLI successor). Unlike every
   other preset, `agy` has no ACP mode at all, so it is driven over its own documented headless
@@ -66,10 +125,12 @@ All notable changes to this project are documented here. The format is based on
   dependency, platform binary resolved directly); auth reuses the codex CLI's own login state.
 
 ### Changed
-- **Session keys are agent-qualified** (`<agentId>:<platform>:c:<channelId>` …): two agents
-  addressed in the same channel/user/thread scope keep separate conversations instead of the
-  first-created agent capturing the session forever. One-time effect on upgrade: previously
-  persisted sessions (`sessions.json`) no longer match and those conversations start fresh.
+- ~~**Session keys are agent-qualified** (`<agentId>:<platform>:c:<channelId>` …)~~ — superseded
+  within this same unreleased cycle, and never shipped. Agent-qualifying the key did stop one
+  agent from capturing a channel forever, but it made the agent part of a conversation's
+  *identity*: `/oc hi` and the plain message after it became two conversations in one place. The
+  conversation refactor above keeps the property that motivated it (two agents in one channel
+  don't share a context) while making the conversation, not the agent, the thing being named.
 
 ## [0.2.0] - 2026-07-10
 

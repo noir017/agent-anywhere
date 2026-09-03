@@ -1,3 +1,4 @@
+import type { ConversationAddress } from '../core/conversation.js';
 import type {
   ButtonInteraction,
   CommandInteraction,
@@ -10,6 +11,10 @@ import type {
  * Platform capability interface. One layer above Satori so the core classes depend only on
  * capabilities, not concrete platforms; missing capabilities degrade gracefully in the
  * implementation (see capabilities).
+ *
+ * Every outbound method addresses a ConversationAddress ({channel, thread?}) rather than a
+ * channel string, so a sub-lane (Telegram forum topic, Slack thread_ts) can never be lost in
+ * transit or smuggled through as a composite string that some path forgets to decode.
  */
 export interface PlatformAdapter {
   /** Platform INSTANCE id (the `platforms:` map key this adapter was built from). */
@@ -19,7 +24,7 @@ export interface PlatformAdapter {
   readonly capabilities: PlatformCapabilities;
 
   /** First send; the returned MessageRef is later used for editMessage. */
-  sendMessage(channelId: string, text: string): Promise<MessageRef>;
+  sendMessage(address: ConversationAddress, text: string): Promise<MessageRef>;
 
   /** In-place edit. When capabilities.editMessage is false the impl should throw, and the caller degrades to resending the whole segment. */
   editMessage(ref: MessageRef, text: string): Promise<void>;
@@ -34,7 +39,7 @@ export interface PlatformAdapter {
   deleteMessage(ref: MessageRef): Promise<void>;
 
   sendFile(
-    channelId: string,
+    address: ConversationAddress,
     file: { path: string; name?: string; caption?: string }
   ): Promise<MessageRef>;
 
@@ -43,11 +48,11 @@ export interface PlatformAdapter {
   removeReaction(ref: MessageRef, emoji: string): Promise<void>;
 
   /** Typing indicator; some platforms have no stop, the impl may be a no-op. */
-  startTyping(channelId: string): Promise<void>;
-  stopTyping(channelId: string): Promise<void>;
+  startTyping(address: ConversationAddress): Promise<void>;
+  stopTyping(address: ConversationAddress): Promise<void>;
 
   fetchHistory(
-    channelId: string,
+    address: ConversationAddress,
     opts: { limit?: number; before?: string }
   ): Promise<InboundMessage[]>;
 
@@ -59,16 +64,20 @@ export interface PlatformAdapter {
   /** True reply: send a platform-native reply targeting ref (Discord message_reference). */
   replyMessage(ref: MessageRef, text: string): Promise<MessageRef>;
 
-  /** Create a thread from a message; returns the thread channelId (used by later sendMessage). */
+  /**
+   * Create a thread from a message; returns the new thread's address, which later sends
+   * target directly. `{channel}` where a thread is a channel (Discord); `{channel, thread}`
+   * where it is a lane (Telegram topic, Slack thread_ts).
+   */
   createThread(
     ref: MessageRef,
     name: string,
     opts?: { autoArchiveMinutes?: 60 | 1440 | 4320 | 10080 }
-  ): Promise<{ threadId: string }>;
+  ): Promise<{ address: ConversationAddress }>;
 
   /** Send a message with buttons (used by clarify). */
   sendButtons(
-    channelId: string,
+    address: ConversationAddress,
     text: string,
     buttons: Array<{
       id: string;

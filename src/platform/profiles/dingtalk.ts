@@ -33,6 +33,7 @@ import DingtalkAdapter from '@satorijs/adapter-dingtalk';
 import type { Bot } from '@satorijs/core';
 
 import type { MessageRef } from '../../types.js';
+import type { ConversationAddress } from '../../core/conversation.js';
 import type { PlatformCapabilities } from '../adapter.js';
 import { renderDingtalkMarkdown } from '../dingtalk-markdown.js';
 import { flattenMarkdown } from '../plaintext-markdown.js';
@@ -41,6 +42,7 @@ import type { DingtalkPlatformConfig } from '../config-schemas.js';
 import {
   installHttpService,
   installServerService,
+  plainConversation,
   resolveDefaultPlugin,
 } from '../profile-helpers.js';
 
@@ -155,14 +157,10 @@ export function createDingtalkProfile(): PlatformProfile<DingtalkPlatformConfig>
       return !(session.isDirect ?? false);
     },
 
-    isDirect(session) {
-      // decodeMessage sets isDirect=true for conversationType '1'.
-      return session.isDirect ?? false;
-    },
-
-    isThread() {
-      // No thread concept.
-      return false;
+    resolveConversation(session) {
+      // No thread concept; decodeMessage sets isDirect=true for conversationType '1'
+      // (channel = senderStaffId), group otherwise (channel = openConversationId, 'cid…').
+      return plainConversation(session);
     },
 
     attachmentMeta() {
@@ -171,7 +169,7 @@ export function createDingtalkProfile(): PlatformProfile<DingtalkPlatformConfig>
       return {};
     },
 
-    async sendMessage(bot: Bot, channelId: string, text: string): Promise<MessageRef> {
+    async sendMessage(bot: Bot, address: ConversationAddress, text: string): Promise<MessageRef> {
       // Encoder bypass (see profile doc-comment): the adapter's encoder escapes
       // markdown-active characters, so agent CommonMark would surface mangled.
       // Send msgKey 'sampleMarkdown' directly via the same internal routes the
@@ -185,15 +183,16 @@ export function createDingtalkProfile(): PlatformProfile<DingtalkPlatformConfig>
         }),
         robotCode: selfId, // selfId = appkey (set in the bot constructor)
       };
-      const { processQueryKey } = channelId.startsWith('cid')
-        ? await internal.orgGroupSend({ ...base, openConversationId: channelId })
-        : await internal.batchSendOTO({ ...base, userIds: [channelId] });
+      const { channel } = address;
+      const { processQueryKey } = channel.startsWith('cid')
+        ? await internal.orgGroupSend({ ...base, openConversationId: channel })
+        : await internal.batchSendOTO({ ...base, userIds: [channel] });
       if (!processQueryKey) {
         throw new Error(
-          `[dingtalk] sendMessage did not return a message id (channel=${channelId})`
+          `[dingtalk] sendMessage did not return a message id (channel=${address.channel})`
         );
       }
-      return { channelId, messageId: processQueryKey };
+      return { address, messageId: processQueryKey };
     },
 
     // —— All other optional methods omitted (unsupported; satori-core degrades per capabilities) ——

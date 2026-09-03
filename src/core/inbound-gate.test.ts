@@ -6,16 +6,34 @@ import {
   type GateContext,
 } from './inbound-gate.js';
 
-/** Minimal InboundMessage; overrides set gating-relevant fields. */
-function makeMsg(overrides: Partial<InboundMessage> = {}): InboundMessage {
+/**
+ * Minimal InboundMessage; overrides set gating-relevant fields.
+ *
+ * The conversation-shaped fields (channel / lane / kind) are accepted in their old flat spelling
+ * so each case still reads as one line about the thing under test. `isDirect`/`isThread` map onto
+ * the single `kind` witness that replaced them.
+ */
+type MsgOverrides = Partial<Omit<InboundMessage, 'conversation'>> & {
+  channelId?: string;
+  thread?: string;
+  isDirect?: boolean;
+  isThread?: boolean;
+};
+
+function makeMsg(overrides: MsgOverrides = {}): InboundMessage {
+  const { channelId = 'C1', thread, isDirect, isThread, ...rest } = overrides;
   return {
-    platform: 'discord',
-    channelId: 'C1',
-    userId: 'U1',
+    conversation: {
+      platform: 'discord',
+      channel: channelId,
+      ...(thread != null ? { thread } : {}),
+      kind: isDirect ? 'direct' : isThread ? 'thread' : 'group',
+      user: 'U1',
+    },
     messageId: 'M1',
     content: 'hello',
     timestamp: 0,
-    ...overrides,
+    ...rest,
   };
 }
 

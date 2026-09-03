@@ -1,10 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import {
   mapTelegramReactionEmoji,
-  decodeChannel,
   specsToTelegramCommands,
   createTelegramProfile,
-  topicAwareChannelId,
+  telegramConversation,
   rawTopicFields,
 } from './telegram.js';
 
@@ -49,28 +48,6 @@ function fakeBot(): { bot: SendBot; calls: Captured } {
   const bot = { internal, sendMessage: guard, editMessage: guard } as unknown as SendBot;
   return { bot, calls };
 }
-
-describe('decodeChannel', () => {
-  it('splits a composite channelId into chatId and topicId on the first :', () => {
-    expect(decodeChannel('123:456')).toEqual({ chatId: '123', topicId: '456' });
-  });
-
-  it('splits a negative chat id correctly (the -100... prefix common to supergroups)', () => {
-    expect(decodeChannel('-1001234567890:42')).toEqual({
-      chatId: '-1001234567890',
-      topicId: '42',
-    });
-  });
-
-  it('splits only on the first : (the topicId segment keeps any remaining :, though it never occurs in practice)', () => {
-    expect(decodeChannel('123:456:789')).toEqual({ chatId: '123', topicId: '456:789' });
-  });
-
-  it('treats a non-composite channelId as the chatId verbatim, with topicId undefined', () => {
-    expect(decodeChannel('123')).toEqual({ chatId: '123' });
-    expect(decodeChannel('123').topicId).toBeUndefined();
-  });
-});
 
 describe('mapTelegramReactionEmoji', () => {
   it('maps lifecycle ✅/❌ to the nearest emoji in the allow-set', () => {
@@ -130,19 +107,23 @@ describe('telegram profile delivery contract (send/edit reach Telegram as valid 
 
   it('sendMessage posts rendered Telegram-HTML via internal.sendMessage with parse_mode=HTML', async () => {
     const { bot, calls } = fakeBot();
-    const ref = await profile.sendMessage!(bot, '123', '**hi**\nworld');
+    const ref = await profile.sendMessage!(bot, { channel: '123' }, '**hi**\nworld');
     expect(calls.send).toHaveLength(1);
     expect(calls.send[0]).toMatchObject({
       chat_id: '123',
       parse_mode: 'HTML',
       text: '<b>hi</b>\nworld',
     });
-    expect(ref).toEqual({ channelId: '123', messageId: '42' });
+    expect(ref).toEqual({ address: { channel: '123' }, messageId: '42' });
   });
 
   it('editMessage posts rendered Telegram-HTML via internal.editMessageText (never bot.editMessage)', async () => {
     const { bot, calls } = fakeBot();
-    await profile.editMessage!(bot, { channelId: '123', messageId: '7' }, '# Title\n```py\nx<y\n```');
+    await profile.editMessage!(
+      bot,
+      { address: { channel: '123' }, messageId: '7' },
+      '# Title\n```py\nx<y\n```'
+    );
     expect(calls.edit).toHaveLength(1);
     expect(calls.edit[0]).toMatchObject({
       chat_id: '123',
@@ -156,7 +137,7 @@ describe('telegram profile delivery contract (send/edit reach Telegram as valid 
     const { bot, calls } = fakeBot();
     await profile.editMessage!(
       bot,
-      { channelId: '1', messageId: '1' },
+      { address: { channel: '1' }, messageId: '1' },
       'line1\nline2\n\n| Name | Score |\n|------|-------|\n| Ada | 95 |'
     );
     const text = String(calls.edit[0]!.text);
@@ -170,84 +151,99 @@ describe('telegram profile delivery contract (send/edit reach Telegram as valid 
     const md = '**bold**\n- a\n- b\n```js\nconst x = 1;\n```\n> quote';
     const a = fakeBot();
     const b = fakeBot();
-    await profile.sendMessage!(a.bot, '1', md);
-    await profile.editMessage!(b.bot, { channelId: '1', messageId: '1' }, md);
+    await profile.sendMessage!(a.bot, { channel: '1' }, md);
+    await profile.editMessage!(b.bot, { address: { channel: '1' }, messageId: '1' }, md);
     expect(a.calls.send[0]!.text).toBe(b.calls.edit[0]!.text);
   });
 
-  it('forum-topic channelId routes message_thread_id and returns the real chatId', async () => {
+  it('an address with a lane routes message_thread_id', async () => {
     const { bot, calls } = fakeBot();
-    const ref = await profile.sendMessage!(bot, '-1001234567890:99', 'hi');
+    const address = { channel: '-1001234567890', thread: '99' };
+    const ref = await profile.sendMessage!(bot, address, 'hi');
     expect(calls.send[0]).toMatchObject({
       chat_id: '-1001234567890',
       message_thread_id: 99,
       parse_mode: 'HTML',
     });
-    expect(ref).toEqual({ channelId: '-1001234567890', messageId: '42' });
+    expect(ref).toEqual({ address, messageId: '42' });
+  });
+
+  it('editMessage addresses the chat only — the Bot API takes no thread there', async () => {
+    const { bot, calls } = fakeBot();
+    await profile.editMessage!(
+      bot,
+      { address: { channel: '-1001234567890', thread: '99' }, messageId: '7' },
+      'x'
+    );
+    expect(calls.edit[0]).toMatchObject({ chat_id: '-1001234567890', message_id: 7 });
+    expect(calls.edit[0]!.message_thread_id).toBeUndefined();
   });
 });
 
 /**
- * Inbound forum-topic identity.
+ * Inbound conversation identity: group forum topics.
  *
  * The bug these cover: the adapter reports a topic message's channel.id as the BARE
- * message_thread_id (chat id only in guild.id), and the inbound path echoed that straight
- * through. Replying with it used a topic id as chat_id, so answers surfaced in the group's
- * General channel while the topic itself stayed silent — visible in "All" but not in the
- * topic. inboundChannelId rebuilds the composite `<chatId>:<topicId>` that every outbound
- * path already decodes, making one id valid for both routing and sending.
+ * message_thread_id (the chat id lives only in guild.id), and the inbound path echoed that
+ * straight through. Replying with it used a topic id as chat_id, so answers surfaced in the
+ * group's General channel while the topic itself stayed silent — visible in "All" but not in
+ * the topic. resolveConversation recovers the real chat and reports the topic as its own lane,
+ * so one value is valid for both routing and sending.
  */
-describe('inboundChannelId (forum-topic composite rebuild)', () => {
+describe('resolveConversation (group forum topics)', () => {
   const profile = createTelegramProfile();
-  // Session shape used by isThread/inboundChannelId (the two fields plus isDirect).
   const sess = (o: Partial<{ guildId: string; channelId: string; isDirect: boolean }>) =>
-    o as unknown as Parameters<NonNullable<typeof profile.inboundChannelId>>[0];
+    o as unknown as Parameters<typeof profile.resolveConversation>[0];
 
-  it('rebuilds <chatId>:<topicId> for a topic message', () => {
-    const s = sess({ guildId: '-1001234567890', channelId: '99', isDirect: false });
-    expect(profile.inboundChannelId!(s)).toBe('-1001234567890:99');
-  });
-
-  it('round-trips through decodeChannel back to the real chat + topic', () => {
-    const s = sess({ guildId: '-1001234567890', channelId: '99', isDirect: false });
-    // This is the actual contract: whatever inbound emits must be decodable by the
-    // outbound path, or the reply lands in the wrong place.
-    expect(decodeChannel(profile.inboundChannelId!(s)!)).toEqual({
-      chatId: '-1001234567890',
-      topicId: '99',
+  it('recovers the chat from guildId and reports the topic as a lane', () => {
+    expect(
+      profile.resolveConversation(sess({ guildId: '-1001234567890', channelId: '99', isDirect: false }))
+    ).toEqual({
+      channel: '-1001234567890',
+      thread: '99',
+      space: '-1001234567890',
+      kind: 'thread',
     });
   });
 
-  it('leaves a DM channelId untouched (already a complete send target)', () => {
-    const s = sess({ channelId: '5865716608', isDirect: true });
-    expect(profile.inboundChannelId!(s)).toBe('5865716608');
+  it('leaves a DM alone (already a complete send target, no lane)', () => {
+    expect(profile.resolveConversation(sess({ channelId: '5865716608', isDirect: true }))).toEqual({
+      channel: '5865716608',
+      kind: 'direct',
+    });
   });
 
-  it('leaves a plain group channelId untouched (channel.id == chat.id == guild.id)', () => {
-    const s = sess({ guildId: '-100999', channelId: '-100999', isDirect: false });
-    expect(profile.inboundChannelId!(s)).toBe('-100999');
+  it('leaves a plain group alone (channel.id == chat.id == guild.id)', () => {
+    expect(
+      profile.resolveConversation(sess({ guildId: '-100999', channelId: '-100999', isDirect: false }))
+    ).toEqual({
+      channel: '-100999',
+      space: '-100999',
+      kind: 'group',
+    });
   });
 
-  it('agrees with isThread on every shape (they must never disagree)', () => {
+  it('reports kind and lane consistently — they can no longer disagree', () => {
+    // The old design derived isThread and the channel id independently, so a message could be
+    // routed as a thread but replied to as a plain channel. One method cannot contradict itself:
+    // a lane is present exactly when the kind is 'thread'.
     const shapes = [
       { guildId: '-100123', channelId: '99', isDirect: false }, // topic
       { guildId: '-100123', channelId: '-100123', isDirect: false }, // plain group
       { channelId: '55', isDirect: true }, // DM
     ];
     for (const raw of shapes) {
-      const s = sess(raw);
-      const isTopic = profile.isThread(s as never);
-      const rebuilt = profile.inboundChannelId!(s)!;
-      // A composite is emitted exactly when the message is a topic message.
-      expect(rebuilt.includes(':')).toBe(isTopic);
+      const c = profile.resolveConversation(sess(raw));
+      expect(c.thread != null).toBe(c.kind === 'thread');
     }
   });
 
   it('a topic reply targets the topic, not the group root (end-to-end of the fix)', async () => {
-    const s = sess({ guildId: '-1001234567890', channelId: '99', isDirect: false });
-    const routedChannelId = profile.inboundChannelId!(s)!;
+    const c = profile.resolveConversation(
+      sess({ guildId: '-1001234567890', channelId: '99', isDirect: false })
+    );
     const { bot, calls } = fakeBot();
-    await profile.sendMessage!(bot, routedChannelId, 'reply');
+    await profile.sendMessage!(bot, { channel: c.channel, thread: c.thread }, 'reply');
     // Before the fix this posted with chat_id='99' (a topic id used as a chat id).
     expect(calls.send[0]).toMatchObject({
       chat_id: '-1001234567890',
@@ -262,7 +258,7 @@ describe('inboundChannelId (forum-topic composite rebuild)', () => {
  * The bug: the adapter's decodeMessage picks channel.id from a `chat.type === 'private'`
  * branch that returns chat.id and never looks at message_thread_id — the topic branch is
  * group-only. So every topic in a DM collapsed onto the same bare chat id (one shared
- * session for all topics) and replies went to the DM root, leaving the asking topic silent.
+ * conversation for all topics) and replies went to the DM root, leaving the asking topic silent.
  *
  * The payloads below are the REAL shape captured from live getUpdates against this bot,
  * not a guess:
@@ -294,12 +290,17 @@ describe('private-chat topics (Bot API 9.4)', () => {
   });
 
   it('rawTopicFields also finds them on edited_message and callback_query', () => {
-    expect(rawTopicFields(dmSession({ threadId: 7353, isTopic: true, underKey: 'edited_message' })))
-      .toEqual({ threadId: '7353', isTopicMessage: true });
+    expect(
+      rawTopicFields(dmSession({ threadId: 7353, isTopic: true, underKey: 'edited_message' }))
+    ).toEqual({ threadId: '7353', isTopicMessage: true });
     const cbq = {
       telegram: {
         callback_query: {
-          message: { chat: { id: 1, type: 'private' }, message_thread_id: 7353, is_topic_message: true },
+          message: {
+            chat: { id: 1, type: 'private' },
+            message_thread_id: 7353,
+            is_topic_message: true,
+          },
         },
       },
     } as never;
@@ -311,46 +312,55 @@ describe('private-chat topics (Bot API 9.4)', () => {
     expect(rawTopicFields(undefined)).toEqual({ isTopicMessage: false });
   });
 
-  it('treats a DM topic message as a thread (the adapter reports isDirect with no guild)', () => {
-    expect(profile.isThread(dmSession({ threadId: 7353, isTopic: true }))).toBe(true);
+  it('reports a DM topic as a thread, with the chat from channelId rather than guildId', () => {
+    expect(telegramConversation(dmSession({ threadId: 7353, isTopic: true }))).toEqual({
+      channel: '5865716608',
+      thread: '7353',
+      kind: 'thread',
+    });
   });
 
-  it('builds <chatId>:<topicId> for a DM topic — chat id comes from channelId, not guildId', () => {
-    expect(topicAwareChannelId(dmSession({ threadId: 7353, isTopic: true }))).toBe(
-      '5865716608:7353'
-    );
-  });
-
-  it('keeps two topics in the same DM on SEPARATE ids (they used to collapse into one)', () => {
-    const a = topicAwareChannelId(dmSession({ threadId: 7353, isTopic: true }));
-    const b = topicAwareChannelId(dmSession({ threadId: 7364, isTopic: true }));
-    expect(a).not.toBe(b);
-    expect([a, b]).toEqual(['5865716608:7353', '5865716608:7364']);
+  it('keeps two topics in the same DM SEPARATE (they used to collapse into one)', () => {
+    const a = telegramConversation(dmSession({ threadId: 7353, isTopic: true }));
+    const b = telegramConversation(dmSession({ threadId: 7364, isTopic: true }));
+    expect(a.thread).not.toBe(b.thread);
+    expect(a.channel).toBe(b.channel);
   });
 
   it('leaves the DM root alone (no thread fields at all)', () => {
-    expect(topicAwareChannelId(dmSession({}))).toBe('5865716608');
-    expect(profile.isThread(dmSession({}))).toBe(false);
+    expect(telegramConversation(dmSession({}))).toEqual({ channel: '5865716608', kind: 'direct' });
   });
 
   it('treats the General lane (thread id 1) as the root, not a topic', () => {
-    // General would otherwise get a composite id that differs from the plain chat id,
-    // splitting one conversation into two sessions.
-    expect(topicAwareChannelId(dmSession({ threadId: 1, isTopic: true }))).toBe('5865716608');
-    expect(profile.isThread(dmSession({ threadId: 1, isTopic: true }))).toBe(false);
+    // General would otherwise get its own conversation, splitting the DM root in two.
+    expect(telegramConversation(dmSession({ threadId: 1, isTopic: true }))).toEqual({
+      channel: '5865716608',
+      kind: 'direct',
+    });
+  });
+
+  it('applies the General guard to a GROUP forum too, not only to DMs', () => {
+    // The guard used to sit only in the private branch; the group branch returned before it was
+    // evaluated. That was correct by accident (the adapter happens to report group General as
+    // channel.id == chat.id) rather than by intent, so it is asserted directly.
+    const groupGeneral = { guildId: '-100123', channelId: '-100123', isDirect: false } as never;
+    expect(telegramConversation(groupGeneral).kind).toBe('group');
   });
 
   it('ignores message_thread_id when is_topic_message is absent (a plain reply chain)', () => {
     // Telegram sets message_thread_id on ordinary reply chains too; without
     // is_topic_message it is not a topic and must not create a separate lane.
-    expect(topicAwareChannelId(dmSession({ threadId: 7353 }))).toBe('5865716608');
+    expect(telegramConversation(dmSession({ threadId: 7353 }))).toEqual({
+      channel: '5865716608',
+      kind: 'direct',
+    });
   });
 
   it('a DM topic reply carries chat_id=<chat> + message_thread_id=<topic> (end-to-end)', async () => {
-    const routed = topicAwareChannelId(dmSession({ threadId: 7353, isTopic: true }));
+    const c = telegramConversation(dmSession({ threadId: 7353, isTopic: true }));
     const { bot, calls } = fakeBot();
-    await profile.sendMessage!(bot, routed, 'reply');
-    // Before the fix this sent chat_id='5865716608' with NO thread → the DM root.
+    await profile.sendMessage!(bot, { channel: c.channel, thread: c.thread }, 'reply');
+    // Before the fix this sent chat_id='5865716608' with NO thread, i.e. the DM root.
     expect(calls.send[0]).toMatchObject({
       chat_id: '5865716608',
       message_thread_id: 7353,
@@ -359,29 +369,34 @@ describe('private-chat topics (Bot API 9.4)', () => {
 
   it('group forum still works (chat id from guildId) — no regression', () => {
     const group = { guildId: '-1001234567890', channelId: '99', isDirect: false } as never;
-    expect(topicAwareChannelId(group)).toBe('-1001234567890:99');
+    expect(telegramConversation(group)).toMatchObject({
+      channel: '-1001234567890',
+      thread: '99',
+    });
   });
 });
 
 /**
  * Outbound paths that were still handing the composite key to the ADAPTER.
  *
- * The topic fix converted sendMessage but not sendButtons or reply: both still went through
- * sendForRef -> bot.sendMessage. The adapter's encoder computes `chat_id = session.guildId ||
- * channelId`, and an outbound-only send has no session — so the whole "<chat>:<topic>" string
- * became chat_id and Telegram answered 400. For sendButtons that was the user-visible bug: the
- * `ask` never posted, and the daemon blocked on the pending ask until it timed out, so the
- * options simply never appeared inside the topic.
+ * The original topic fix converted sendMessage but not sendButtons or reply: both still went
+ * through sendForRef -> bot.sendMessage. The adapter's encoder computes `chat_id =
+ * session.guildId || channelId`, and an outbound-only send has no session — so the whole
+ * "<chat>:<topic>" string became chat_id and Telegram answered 400. For sendButtons that was the
+ * user-visible bug: the `ask` never posted, and the daemon blocked on the pending ask until it
+ * timed out, so the options simply never appeared inside the topic.
  *
- * fakeBot's guard() throws if a profile reaches for bot.* — the exact drift being fixed — so
- * these fail loudly rather than silently regressing.
+ * The lane is now a field rather than something spliced into an id, but the delivery contract is
+ * the same and still worth pinning. fakeBot's guard() throws if a profile reaches for bot.* — the
+ * exact drift that caused the original bug.
  */
-describe('outbound paths inside a topic (composite key must never reach the adapter)', () => {
+describe('outbound paths inside a topic', () => {
   const profile = createTelegramProfile();
+  const topic = { channel: '-1001234567890', thread: '99' };
 
   it('sendButtons posts into the topic with an inline keyboard (THE reported bug)', async () => {
     const { bot, calls } = fakeBot();
-    const ref = await profile.sendButtons!(bot, '-1001234567890:99', 'Pick **one**', [
+    const ref = await profile.sendButtons!(bot, topic, 'Pick **one**', [
       { id: 'ask:r1:0', label: 'Deploy' },
       { id: 'ask:r1:1', label: 'Cancel' },
     ]);
@@ -398,13 +413,13 @@ describe('outbound paths inside a topic (composite key must never reach the adap
         [{ text: 'Cancel', callback_data: 'ask:r1:1' }],
       ],
     });
-    // Ref carries the real chat id, so the daemon's later edit (strip buttons / mark chosen) works.
-    expect(ref).toEqual({ channelId: '-1001234567890', messageId: '42' });
+    // The ref keeps the lane, so a later reply to this message stays inside the topic.
+    expect(ref).toEqual({ address: topic, messageId: '42' });
   });
 
   it('sendButtons still works in a plain chat (no thread field invented)', async () => {
     const { bot, calls } = fakeBot();
-    await profile.sendButtons!(bot, '5865716608', 'Pick', [{ id: 'a', label: 'A' }]);
+    await profile.sendButtons!(bot, { channel: '5865716608' }, 'Pick', [{ id: 'a', label: 'A' }]);
     expect(calls.send[0]).toMatchObject({ chat_id: '5865716608' });
     expect(calls.send[0]!.message_thread_id).toBeUndefined();
   });
@@ -412,7 +427,7 @@ describe('outbound paths inside a topic (composite key must never reach the adap
   it('sendButtons hashes an over-long button id so callback_data stays within 64 bytes', async () => {
     const { bot, calls } = fakeBot();
     const longId = 'ask:' + 'x'.repeat(200) + ':0';
-    await profile.sendButtons!(bot, '1', 'p', [{ id: longId, label: 'Go' }]);
+    await profile.sendButtons!(bot, { channel: '1' }, 'p', [{ id: longId, label: 'Go' }]);
     const kb = calls.send[0]!.reply_markup as {
       inline_keyboard: Array<Array<{ callback_data: string }>>;
     };
@@ -422,7 +437,7 @@ describe('outbound paths inside a topic (composite key must never reach the adap
 
   it('reply targets the topic and carries reply_to_message_id', async () => {
     const { bot, calls } = fakeBot();
-    await profile.reply!(bot, { channelId: '-1001234567890:99', messageId: '7' }, 'pong');
+    await profile.reply!(bot, { address: topic, messageId: '7' }, 'pong');
     expect(calls.send[0]).toMatchObject({
       chat_id: '-1001234567890',
       message_thread_id: 99,
@@ -433,65 +448,67 @@ describe('outbound paths inside a topic (composite key must never reach the adap
   it('sendFile uploads into the topic via multipart (the generic encoder cannot)', async () => {
     const { bot, calls } = fakeBot();
     // A real file: sendFile reads it off disk, so point at one that exists.
-    const ref = await profile.sendFile!(bot, '-1001234567890', { path: 'package.json' }, '99');
+    const ref = await profile.sendFile!(bot, topic, { path: 'package.json' });
     expect(calls.upload).toHaveLength(1);
     const form = calls.upload[0]!;
     expect(form.get('chat_id')).toBe('-1001234567890');
     expect(form.get('message_thread_id')).toBe('99');
     expect(form.get('document')).toBe('attach://package.json');
-    expect(ref).toEqual({ channelId: '-1001234567890', messageId: '77' });
+    expect(ref).toEqual({ address: topic, messageId: '77' });
   });
 
   it('sendFile omits message_thread_id outside a topic (never the string "undefined")', async () => {
     const { bot, calls } = fakeBot();
-    await profile.sendFile!(bot, '123', { path: 'package.json' }, undefined);
+    await profile.sendFile!(bot, { channel: '123' }, { path: 'package.json' });
     // FormData stringifies undefined to "undefined", which Telegram rejects — the field must be absent.
     expect(calls.upload[0]!.has('message_thread_id')).toBe(false);
   });
+
+  it('rejects a non-integer lane instead of sending message_thread_id: NaN', async () => {
+    // The retired composite split could yield '99:5', and Number('99:5') is NaN — which Telegram
+    // answers with an opaque 400 far from the cause. Fail at the boundary, naming the value.
+    const { bot } = fakeBot();
+    await expect(
+      profile.sendMessage!(bot, { channel: '-1001234567890', thread: '99:5' }, 'hi')
+    ).rejects.toThrow('must be an integer');
+  });
 });
 
 /**
- * decodeChannelKey is the DECLARED inverse of inboundChannelId. satori-core's generic outbound
- * paths rely on it, so the round-trip is the contract: whatever routing emits must decode back to
- * the real chat, or a reply lands somewhere other than where it was asked.
+ * createThread from INSIDE a topic.
+ *
+ * This was the one outbound path that never decoded: an agent running `create-thread` while
+ * working in a topic sent chat_id "-100123:99" (400 in a group, silent truncation to the root in
+ * a DM) and returned the malformed triple "-100123:99:5", whose lane then parsed to NaN. With the
+ * lane in its own field the chat is always the chat, so the shape is correct by construction —
+ * pinned here because this path had no test at all.
  */
-describe('decodeChannelKey round-trips with inboundChannelId', () => {
+describe('createThread', () => {
   const profile = createTelegramProfile();
 
-  it('recovers chat + lane for a group forum topic', () => {
-    const s = { guildId: '-1001234567890', channelId: '99', isDirect: false } as never;
-    const key = profile.inboundChannelId!(s)!;
-    expect(profile.decodeChannelKey!(key)).toEqual({
-      channelId: '-1001234567890',
-      lane: '99',
-    });
-  });
-
-  it('recovers chat + lane for a private-chat topic (Bot API 9.4)', () => {
-    const s = {
-      channelId: '5865716608',
-      isDirect: true,
-      telegram: {
-        message: {
-          chat: { id: 5865716608, type: 'private' },
-          message_thread_id: 7353,
-          is_topic_message: true,
+  it('creates the topic on the real chat even when called from inside another topic', async () => {
+    const created: Array<Record<string, unknown>> = [];
+    const bot = {
+      internal: {
+        createForumTopic: (p: Record<string, unknown>) => {
+          created.push(p);
+          return Promise.resolve({ message_thread_id: 5, name: 'debug' });
         },
       },
-    } as never;
-    const key = profile.inboundChannelId!(s)!;
-    expect(profile.decodeChannelKey!(key)).toEqual({ channelId: '5865716608', lane: '7353' });
-  });
+    } as unknown as Parameters<NonNullable<typeof profile.createThread>>[0];
 
-  it('leaves a non-topic key alone, with no lane', () => {
-    for (const plain of ['5865716608', '-1001234567890']) {
-      expect(profile.decodeChannelKey!(plain)).toEqual({ channelId: plain, lane: undefined });
-    }
+    const out = await profile.createThread!(
+      bot,
+      { address: { channel: '-1001234567890', thread: '99' }, messageId: '7' },
+      'debug'
+    );
+    expect(created[0]).toEqual({ chat_id: '-1001234567890', name: 'debug' });
+    expect(out).toEqual({ address: { channel: '-1001234567890', thread: '5' } });
   });
 });
 
 /**
- * Private-chat topics are the SILENT half of the bug, so they get their own case.
+ * Private-chat topics are the SILENT half of the original bug, so they keep their own case.
  *
  * Verified against the live Bot API: for a private chat Telegram parses "5865716608:7529"
  * leniently, truncating at the ':' — getChat returns the user and sendMessage answers ok=true
@@ -499,26 +516,23 @@ describe('decodeChannelKey round-trips with inboundChannelId', () => {
  * success; nothing errored, the options were just in the wrong place. (A group composite,
  * "-100...:99", hard-fails with 400 chat not found instead.)
  *
- * A test asserting only "does not throw" would therefore have passed against the bug. These
- * assert the thread field explicitly.
+ * A test asserting only "does not throw" would therefore have passed against the bug. This one
+ * asserts the thread field explicitly.
  */
 describe('private-chat topic buttons land in the topic, not the DM root', () => {
   const profile = createTelegramProfile();
 
   it('sendButtons carries message_thread_id for a private-chat topic', async () => {
     const { bot, calls } = fakeBot();
-    await profile.sendButtons!(bot, '5865716608:7529', 'Pick', [{ id: 'ask:p:0', label: 'Yes' }]);
+    await profile.sendButtons!(bot, { channel: '5865716608', thread: '7529' }, 'Pick', [
+      { id: 'ask:p:0', label: 'Yes' },
+    ]);
     expect(calls.send[0]).toMatchObject({
       chat_id: '5865716608',
       message_thread_id: 7529, // the field whose absence made the old send silently wrong
     });
     expect(calls.send[0]!.reply_markup).toBeDefined();
-  });
-
-  it('the chat id is split, never passed through with the topic still attached', async () => {
-    const { bot, calls } = fakeBot();
-    await profile.sendButtons!(bot, '5865716608:7529', 'Pick', [{ id: 'a', label: 'A' }]);
-    // The exact old-code payload: a composite string as chat_id.
+    // The exact old-code payload was a composite string as chat_id; it can no longer be formed.
     expect(calls.send[0]!.chat_id).not.toBe('5865716608:7529');
   });
 });

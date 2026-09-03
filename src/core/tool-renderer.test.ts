@@ -17,7 +17,7 @@ function makeSink(opts: { withEdit: boolean }) {
     async sendBubble(text: string): Promise<MessageRef> {
       sends.push(text);
       counter += 1;
-      return { channelId: 'c', messageId: `m${counter}` };
+      return { address: { channel: 'c' }, messageId: `m${counter}` };
     },
   };
   if (opts.withEdit) {

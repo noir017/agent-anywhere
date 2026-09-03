@@ -36,15 +36,17 @@
 import SlackAdapter from '@satorijs/adapter-slack';
 import type { Bot, Context } from '@satorijs/core';
 
-import type { ButtonInteraction } from '../../types.js';
 import type { PlatformCapabilities } from '../adapter.js';
-import type { PlatformProfile } from '../profile.js';
+import type {
+  PlatformProfile,
+  ProfileButtonEvent,
+  ResolvedConversation,
+} from '../profile.js';
 import type { SlackPlatformConfig } from '../config-schemas.js';
 import {
   findAtMention,
   installHttpService,
   resolveDefaultPlugin,
-  splitCompositeChannel,
 } from '../profile-helpers.js';
 import { renderSlackMarkdown } from '../slack-markdown.js';
 
@@ -79,16 +81,46 @@ function slackAttachmentMeta(): { mime?: string; size?: number } {
 }
 
 /**
- * Decode a composite channelId (pure, for unit testing).
+ * Slack's conversation shape (pure, for unit testing).
  *
- * Threads carry the `channel + thread root` pair as `<channel>:<thread_ts>`. A Slack channel
- * (`C0123ABCD`) and thread_ts (`1234567890.123456`) contain no `:`, so splitting on the first `:`
- * is safe. Composite: real channel + thread_ts. Plain (no `:`): the whole string is channel,
- * threadTs undefined. edit/react only need channel + ts, so they use this just to get channel.
+ * -- Inbound thread detection ------------------------------------------------
+ * A Slack thread is `thread_ts`, and the adapter exposes no thread flag on the session. What it
+ * does do (lib/index.cjs adaptMessage) is:
+ *
+ *     if (data.thread_ts && data.thread_ts !== data.ts) {
+ *       message.quote = await bot.getMessage(payload.channel.id, data.thread_ts);
+ *     }
+ *
+ * — i.e. `quote` is populated ONLY for a genuine thread reply, and `quote.id` is the thread root's
+ * ts, which IS the thread_ts. (Slack has no separate "quote a message" primitive that could set it
+ * otherwise; quoting in the client posts a link unfurl, which lands in `attachments`.) So the quote
+ * is a reliable witness, not a heuristic.
+ *
+ * This profile used to give up here and hardcode "not a thread", while its OUTBOUND side happily
+ * emitted thread addresses — so a reply typed inside a thread was routed as if it were ordinary
+ * channel traffic, and answered in the channel.
  */
-export function decodeChannel(channelId: string): { channel: string; threadTs?: string } {
-  const { head, tail } = splitCompositeChannel(channelId);
-  return { channel: head, threadTs: tail };
+export function slackConversation(session: {
+  channelId?: string;
+  guildId?: string;
+  isDirect?: boolean;
+  quote?: { id?: string };
+}): ResolvedConversation {
+  const channel = session.channelId ?? '';
+  const threadTs = session.quote?.id;
+  if (threadTs) {
+    return {
+      channel,
+      thread: threadTs,
+      ...(session.guildId ? { space: session.guildId } : {}),
+      kind: 'thread',
+    };
+  }
+  return {
+    channel,
+    ...(session.guildId ? { space: session.guildId } : {}),
+    kind: session.isDirect === true ? 'direct' : 'group',
+  };
 }
 
 /**
@@ -134,10 +166,16 @@ export function buildButtonBlocks(
  *   { type:'interactive', envelope_id, payload:{ type:'block_actions',
  *     user:{id}, channel:{id}, message:{ts}, actions:[{action_id, value}] } }
  *
- * Normalization: one ButtonInteraction per action, buttonId === action.action_id (skip if missing).
+ * Normalization: one event per action, buttonId === action.action_id (skip if missing).
  * Non-interactive / non-block_actions / parse failure -> null (callback early-returns, no ACK).
+ *
+ * Structural limitation (not a bug): the click frame carries only the BARE channel in
+ * payload.channel.id -- Slack sends no thread_ts with it -- so a button clicked inside a thread
+ * resolves to the channel, and a reply to it lands there rather than in the thread. Preserving
+ * it would require encoding thread_ts into action_id (the daemon's `ask:<reqId>:<idx>` grammar
+ * does not). Reported honestly as kind 'group' rather than guessed.
  */
-export function parseSlackInteractiveFrame(raw: string): ButtonInteraction[] | null {
+export function parseSlackInteractiveFrame(raw: string): ProfileButtonEvent[] | null {
   let parsed: {
     type?: string;
     payload?: {
@@ -156,14 +194,13 @@ export function parseSlackInteractiveFrame(raw: string): ButtonInteraction[] | n
   if (parsed.type !== 'interactive') return null;
   const payload = parsed.payload;
   if (!payload || payload.type !== 'block_actions') return null;
-  const out: ButtonInteraction[] = [];
+  const out: ProfileButtonEvent[] = [];
   for (const a of payload.actions ?? []) {
     const buttonId = a.action_id;
     if (!buttonId) continue;
     out.push({
-      platform: 'slack',
-      channelId: payload.channel?.id ?? '',
-      userId: payload.user?.id ?? '',
+      conversation: { channel: payload.channel?.id ?? '', kind: 'group' },
+      user: payload.user?.id ?? '',
       messageId: payload.message?.ts ?? '',
       buttonId,
     });
@@ -174,6 +211,10 @@ export function parseSlackInteractiveFrame(raw: string): ButtonInteraction[] | n
 /** Normalized result of parseSlackSlashFrame (platform-agnostic core; reply closure added by the callback). */
 export interface SlackSlashParsed {
   name: string;
+  /**
+   * The invoking channel. Slack's slash frame carries no thread_ts either (same limitation as
+   * the interactive frame), so a slash typed inside a thread reports the channel.
+   */
   channelId: string;
   userId: string;
   options: Record<string, unknown>;
@@ -484,25 +525,8 @@ export function createSlackProfile(): PlatformProfile<SlackPlatformConfig> {
       return findAtMention(session.elements, selfId);
     },
 
-    isDirect(session) {
-      // utils.ts adaptMessage sets session.isDirect=true for channel_type==='im'.
-      return session.isDirect ?? false;
-    },
-
-    isThread() {
-      // Slack "thread" is expressed by thread_ts, but the adapter exposes no stable thread flag on
-      // the session: when thread_ts!==ts it only backfills the root into session.quote. So always
-      // return false (avoids mistaking "was replied to" for "in a thread" based on quote).
-      return false;
-    },
-
-    decodeChannelKey(channelId) {
-      // Slack carries the same composite shape as Telegram (`<channel>:<thread_ts>`, produced by
-      // createThread), so it inherits the same latent gap: satori-core's generic deleteMessage /
-      // fetchHistory / sendFile would otherwise pass the whole key to bot.* as a channel id.
-      // Declaring the inverse fixes all three at once — no Slack-specific work needed.
-      const { channel, threadTs } = decodeChannel(channelId);
-      return { channelId: channel, lane: threadTs };
+    resolveConversation(session) {
+      return slackConversation(session as Parameters<typeof slackConversation>[0]);
     },
 
     attachmentMeta() {
@@ -514,9 +538,8 @@ export function createSlackProfile(): PlatformProfile<SlackPlatformConfig> {
       // internal.chatPostMessage with PRE-RENDERED mrkdwn, NOT bot.sendMessage + <quote>: the Satori
       // encoder maps <quote id> to thread_ts (good) but its escape() would zero-width-space every
       // `*`/`_`/`~` and rewrite our `<url|text>` links as `&lt;...&gt;` (bad). Bypassing keeps reply
-      // formatting consistent with sendMessage/editMessage. ref.channelId may be composite
-      // (`channel:thread_ts`), so decode the real channel first.
-      const { channel } = decodeChannel(ref.channelId);
+      // formatting consistent with sendMessage/editMessage.
+      const channel = ref.address.channel;
       const sb = asSlackBot(bot);
       const res = await sb.internal.chatPostMessage(sb.config.botToken, {
         channel,
@@ -527,18 +550,20 @@ export function createSlackProfile(): PlatformProfile<SlackPlatformConfig> {
       if (!messageId) {
         throw new Error(`[slack] reply did not return a message ts (channel=${channel})`);
       }
-      return { channelId: channel, messageId };
+      // Replying starts (or continues) the target message's thread, so the resulting message lives
+      // in that thread -- the ref must say so, or a follow-up on it would leave the thread.
+      return { address: { channel, thread: ref.messageId }, messageId };
     },
 
     async createThread(bot, ref, _name) {
       // Slack has no "create sub-thread" concept: a thread is just "use a message's ts as
-      // thread_ts". So build the composite threadId `<channel>:<messageTs>` (name unused). Decode
-      // ref.channelId to the real channel to avoid double-concatenating an already-composite key.
-      const { channel } = decodeChannel(ref.channelId);
-      return { threadId: `${channel}:${ref.messageId}` };
+      // thread_ts", so no API call is needed (and `name` is unusable). ref.address.channel is
+      // always the real channel -- the lane has its own field, so an already-threaded ref can no
+      // longer be double-encoded.
+      return { address: { channel: ref.address.channel, thread: ref.messageId } };
     },
 
-    async sendMessage(bot, channelId, text) {
+    async sendMessage(bot, address, text) {
       // Outbound override: post via raw internal.chatPostMessage with PRE-RENDERED mrkdwn (text →
       // renderMrkdwn), deliberately bypassing the Satori MessageEncoder for BOTH composite and
       // non-composite channelIds. Two reasons:
@@ -548,29 +573,28 @@ export function createSlackProfile(): PlatformProfile<SlackPlatformConfig> {
       //  2. send/edit consistency: editMessage below has no Satori-generic path at all (it must use
       //     chatUpdate), so routing send through chatPostMessage too guarantees both produce
       //     byte-identical mrkdwn — no flicker when a streaming edit replaces the first send.
-      // Composite channelId (`channel:thread_ts`) additionally carries thread_ts (send into thread).
-      const { channel, threadTs } = decodeChannel(channelId);
+      // An address carrying a thread posts into it (thread_ts).
+      const { channel, thread } = address;
       const sb = asSlackBot(bot);
       const params: Record<string, unknown> = { channel, text: renderMrkdwn(text) };
-      if (threadTs) params.thread_ts = threadTs;
+      if (thread) params.thread_ts = thread;
       const res = await sb.internal.chatPostMessage(sb.config.botToken, params);
       const messageId = res.ts;
       if (!messageId) {
         throw new Error(`[slack] sendMessage did not return a message ts (channel=${channel})`);
       }
-      // Return the real channel (downstream edit/react use real channel + ts).
-      return { channelId: channel, messageId };
+      return { address, messageId };
     },
 
     async editMessage(bot, ref, text) {
       // True in-place edit via internal.chatUpdate (chat.update API) with PRE-RENDERED mrkdwn,
       // mirroring sendMessage so send and edit deliver identical formatting. token = Bot OAuth Token
-      // (xoxb-); channel = decoded real channel (in case ref.channelId is composite); ts = ref.messageId.
+      // (xoxb-); ts = ref.messageId. chat.update takes no thread parameter -- a message is
+      // identified by channel + ts wherever it lives.
       // Let failures throw: StreamBuffer's flood backoff covers it and core's edit sink try/catches.
-      const { channel } = decodeChannel(ref.channelId);
       const sb = asSlackBot(bot);
       await sb.internal.chatUpdate(sb.config.botToken, {
-        channel,
+        channel: ref.address.channel,
         ts: ref.messageId,
         text: renderMrkdwn(text),
       });
@@ -581,21 +605,19 @@ export function createSlackProfile(): PlatformProfile<SlackPlatformConfig> {
       // ‼️ reactions.add's name accepts only shortnames (no colons, no unicode); the adapter passes
       //   the string straight to reactionsAdd. daemon defaults to unicode (👀/✅/❌), which would
       //   trigger invalid_name -> silent failure, so normalize via toSlackReactionName first.
-      const { channel } = decodeChannel(ref.channelId);
-      await bot.createReaction(channel, ref.messageId, toSlackReactionName(emoji));
+      await bot.createReaction(ref.address.channel, ref.messageId, toSlackReactionName(emoji));
     },
 
     async removeReaction(bot, ref, emoji) {
       // Same decode + shortname normalization; clearReaction matches by reaction.name (Slack stores
       // shortnames), so emoji must also be a shortname.
-      const { channel } = decodeChannel(ref.channelId);
       const sb = bot as Bot & {
         clearReaction: (channel: string, ts: string, emoji?: string) => Promise<void>;
       };
-      await sb.clearReaction(channel, ref.messageId, toSlackReactionName(emoji));
+      await sb.clearReaction(ref.address.channel, ref.messageId, toSlackReactionName(emoji));
     },
 
-    async sendButtons(bot, channelId, text, buttons) {
+    async sendButtons(bot, address, text, buttons) {
       // Block Kit buttons: section(text) + actions(button elements). Decode the real channel +
       // thread_ts (buttons can be posted inside a thread).
       // ⚠️ Structural limitation (not a bug): even when posted in a thread, Slack's interactive
@@ -609,7 +631,7 @@ export function createSlackProfile(): PlatformProfile<SlackPlatformConfig> {
       // so `**bold**` must be converted to `*bold*` exactly like a normal message. The top-level
       // `text` field is only the notification/fallback string, but we reuse the rendered form for
       // consistency.
-      const { channel, threadTs } = decodeChannel(channelId);
+      const { channel, thread } = address;
       const rendered = renderMrkdwn(text);
       const blocks = buildButtonBlocks(rendered, buttons);
       const sb = asSlackBot(bot);
@@ -618,13 +640,13 @@ export function createSlackProfile(): PlatformProfile<SlackPlatformConfig> {
         text: rendered || ' ', // fallback for notification / no-blocks render; Slack requires non-empty.
         blocks,
       };
-      if (threadTs) params.thread_ts = threadTs;
+      if (thread) params.thread_ts = thread;
       const res = await sb.internal.chatPostMessage(sb.config.botToken, params);
       const messageId = res.ts;
       if (!messageId) {
         throw new Error(`[slack] sendButtons did not return a message ts (channel=${channel})`);
       }
-      return { channelId: channel, messageId };
+      return { address, messageId };
     },
 
     async registerCommands(_ctx, _getBot, _cmds) {
@@ -676,9 +698,10 @@ export function createSlackProfile(): PlatformProfile<SlackPlatformConfig> {
         ackEnvelope(ctx, envelopeId);
         const { name, channelId, userId, options } = parsed;
         emit({
-          platform: 'slack',
-          channelId,
-          userId,
+          // The slash frame carries no thread_ts (see SlackSlashParsed), so the command is
+          // reported as invoked in the channel itself.
+          conversation: { channel: channelId, kind: 'group' },
+          user: userId,
           messageId: '',
           name,
           options,

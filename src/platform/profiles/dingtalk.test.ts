@@ -54,9 +54,15 @@ describe('dingtalk profile inbound normalization', () => {
     expect(profile.detectMention({ isDirect: true } as Session, 'self')).toBe(false);
   });
 
-  it('isDirect mirrors session.isDirect', () => {
-    expect(profile.isDirect({ isDirect: true } as Session)).toBe(true);
-    expect(profile.isDirect({} as Session)).toBe(false);
+  it('resolveConversation mirrors session.isDirect and reports no thread lane', () => {
+    expect(profile.resolveConversation({ isDirect: true, channelId: 'u1' } as Session)).toEqual({
+      channel: 'u1',
+      kind: 'direct',
+    });
+    expect(profile.resolveConversation({ channelId: 'cid7' } as Session)).toEqual({
+      channel: 'cid7',
+      kind: 'group',
+    });
   });
 });
 
@@ -65,7 +71,7 @@ describe('dingtalk profile delivery contract (encoder bypass)', () => {
 
   it('DM channel → batchSendOTO with sampleMarkdown, converted text, robotCode=selfId', async () => {
     const { bot, batchSendOTO, orgGroupSend } = fakeBot();
-    const ref = await profile.sendMessage!(bot, 'staff123', MD);
+    const ref = await profile.sendMessage!(bot, { channel: 'staff123' }, MD);
 
     expect(orgGroupSend).not.toHaveBeenCalled();
     expect(batchSendOTO).toHaveBeenCalledTimes(1);
@@ -78,12 +84,12 @@ describe('dingtalk profile delivery contract (encoder bypass)', () => {
     expect(param.text).toContain('# Result'); // headings are in DingTalk's subset
     expect(param.text).not.toContain('|'); // table degraded to bullets
     expect(param.text).toContain('• Score: 95');
-    expect(ref).toEqual({ channelId: 'staff123', messageId: 'pqk-1' });
+    expect(ref).toEqual({ address: { channel: 'staff123' }, messageId: 'pqk-1' });
   });
 
   it("group channel ('cid' prefix) → orgGroupSend with openConversationId", async () => {
     const { bot, batchSendOTO, orgGroupSend } = fakeBot();
-    const ref = await profile.sendMessage!(bot, 'cidABC==', 'hello');
+    const ref = await profile.sendMessage!(bot, { channel: 'cidABC==' }, 'hello');
 
     expect(batchSendOTO).not.toHaveBeenCalled();
     expect(orgGroupSend).toHaveBeenCalledTimes(1);
@@ -95,7 +101,7 @@ describe('dingtalk profile delivery contract (encoder bypass)', () => {
 
   it('missing processQueryKey → throws the shared "did not return a message id" contract', async () => {
     const { bot } = fakeBot({});
-    await expect(profile.sendMessage!(bot, 'staff123', 'x')).rejects.toThrow(
+    await expect(profile.sendMessage!(bot, { channel: 'staff123' }, 'x')).rejects.toThrow(
       'did not return a message id'
     );
   });

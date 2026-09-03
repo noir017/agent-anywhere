@@ -46,19 +46,19 @@ describe('qq profile delivery contract (text is flattened before send)', () => {
 
   it('sendMessage flattens markdown: no **, no #, no raw table pipes', async () => {
     const { bot, sent } = fakeBot();
-    const ref = await profile.sendMessage!(bot, 'c1', MD);
+    const ref = await profile.sendMessage!(bot, { channel: 'c1' }, MD);
     const text = textOf(sent[0]!);
     expect(text).not.toMatch(/\*\*/);
     expect(text).not.toMatch(/^#/m);
     expect(text).not.toContain('|');
     expect(text).toContain('Title');
     expect(text).toContain('docs (https://x.com/a)');
-    expect(ref).toEqual({ channelId: 'c1', messageId: 'qq-1' });
+    expect(ref).toEqual({ address: { channel: 'c1' }, messageId: 'qq-1' });
   });
 
   it('reply flattens the body and keeps the passive/quote credentials', async () => {
     const { bot, sent } = fakeBot();
-    await profile.reply!(bot, { channelId: 'c1', messageId: 'm0' }, '**hi** there');
+    await profile.reply!(bot, { address: { channel: 'c1' }, messageId: 'm0' }, '**hi** there');
     const fragment = sent[0] as h[];
     // First two nodes are the passive + quote control elements; the text node follows.
     const types = fragment.map((n) => (typeof n === 'string' ? 'text' : n.type));
@@ -69,7 +69,7 @@ describe('qq profile delivery contract (text is flattened before send)', () => {
 
   it('sendButtons flattens the leading text', async () => {
     const { bot, sent } = fakeBot();
-    await profile.sendButtons!(bot, 'c1', '**click** below', [{ id: 'b1', label: 'Yes' }]);
+    await profile.sendButtons!(bot, { channel: 'c1' }, '**click** below', [{ id: 'b1', label: 'Yes' }]);
     expect(textOf(sent[0]!)).toContain('click below');
     expect(textOf(sent[0]!)).not.toMatch(/\*\*/);
   });

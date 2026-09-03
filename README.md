@@ -35,7 +35,8 @@ streams its answer into a single, live-edited message.
 - **Native streaming** — in-place edits, live tool-call bubbles, lifecycle reactions, interrupt on new message.
 - **Chat actions** — the agent sends files, reacts, replies, opens threads, reads history, asks button questions.
 - **Attachments** — inbound images and files are downloaded and handed to the agent.
-- **Persistent sessions** — survive restarts; reset via `/new`; scoped per thread, channel, user, or globally.
+- **Topics are first-class** — a Telegram topic, Slack thread or Discord thread is its own conversation, with its own agent; sticky per conversation, `/oc` to switch.
+- **Persistent conversations** — survive restarts; reset via `/new`; scoped per thread, channel, user, or globally.
 - **Small config** — five sections, typed credentials, `${VAR}` and `.env` expansion.
 
 ## Quick start
@@ -98,7 +99,7 @@ routing:
       use: { agent: codex }
 
 session:
-  scope: per_channel          # per_thread|per_channel|per_user|shared
+  scope: per_thread           # per_thread|per_channel|per_user|shared
 
 access:
   allowFrom: ["discord-main:123456"]   # <instanceId>:userId; empty = anyone

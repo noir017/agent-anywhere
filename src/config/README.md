@@ -81,7 +81,7 @@ The `--config <path>` flag works by *setting* `AGENT_ANYWHERE_CONFIG_FILE` on
 commands resolve the same config and socket. That is why the env var exists rather than
 threading a parameter.
 
-The config dir also holds `daemon.sock`, `sessions.json`, `attachments/`, and `bin/`
+The config dir also holds `daemon.sock`, `conversations.json`, `attachments/`, and `bin/`
 (the reverse-CLI shim).
 
 ## Validation is fail-fast

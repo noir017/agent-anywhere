@@ -15,12 +15,32 @@ platform capability, take it as a parameter or a DI interface — that is how
 `StreamBuffer` gets `StreamSink`, `ToolRenderer` gets `BubbleSink`, `InboundMerger` gets
 `MergerDeps`, and `ingestAttachments` gets `AttachmentIngestDeps`.
 
+## `conversation.ts` — what "where" means
+
+The type the whole gateway is organized around. A chat platform's location is not always
+one id: a Telegram topic and a Slack thread are a `(channel, lane)` **pair**, where the
+lane is a separate wire parameter. `ConversationRef` models that as a struct
+(`platform` / `channel` / `thread?` / `space?` / `kind` / `user`), and
+`ConversationAddress` is the subset an outbound call puts on the wire.
+
+It replaced a composite string (`"<chat>:<topic>"` stuffed into a single `channelId`)
+that was built in 5 places, decoded in 17, and validated in none — so any path that
+forgot to decode sent to the wrong place, silently in private chats. The string form now
+survives at exactly two boundaries, each with one tested formatter and one **validating**
+parser: the `--channel` CLI flag and the persisted store key.
+
+`conversationKey(scope, ref)` carries **no agent id**. That absence is deliberate and is
+the fix for the reported bug: when the agent led the key, `/oc hi` and the plain message
+after it were two conversations in one topic. Who answers is a mutable property *of* a
+conversation, not part of its name — see [`daemon/README.md`](../daemon/README.md).
+
 ## Files
 
 | File | Role |
 |---|---|
+| `conversation.ts` | Conversation identity: `ConversationRef` / `ConversationAddress`, the key function, the address parser |
 | `inbound-gate.ts` | "Should we respond to this message?" — a pure decision tree |
-| `inbound-merger.ts` | Per-session state machine: coalesce bursts, queue while busy, interrupt |
+| `inbound-merger.ts` | Per-conversation state machine: coalesce bursts, queue while busy, interrupt |
 | `stream-buffer.ts` | Outbound text: throttled in-place editing, chunking, backoff, degradation |
 | `tool-renderer.ts` | Tool-call bubbles: 4 modes × 2 grouping strategies |
 | `runtime-footer.ts` | The `cc · 18k / 1M (2%) · claude-opus-4-5` tagline |
@@ -46,13 +66,13 @@ Gating config is **split in two on purpose**:
 - The frozen half comes from `EXPERIENCE.inbound.gating`:
   `respondInDirect`, `threadParticipationExempt`.
 
-`SessionRegistry.gateFor(platformId)` assembles both into one `GateConfig`, per platform
+`ConversationRegistry.gateFor(platformId)` assembles both into one `GateConfig`, per platform
 instance. An unknown instance id falls back to "mention required" — the safe default.
 
 `GateContext.hasActiveSession` is a proxy for "the bot is already participating in this
 thread". The caller must read it **before** creating a merger, or it is always true once
 a session exists and the thread-participation exemption is distorted. That ordering
-constraint lives in `SessionRegistry.route`; do not move the read.
+constraint lives in `ConversationRegistry.route`; do not move the read.
 
 ## `inbound-merger.ts`
 

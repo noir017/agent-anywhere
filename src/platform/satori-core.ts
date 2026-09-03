@@ -19,6 +19,8 @@ import type {
   InboundMessage,
   SlashCommandSpec,
 } from '../types.js';
+import type { ConversationAddress, ConversationRef } from '../core/conversation.js';
+import { addressOf, describeConversation, formatAddress } from '../core/conversation.js';
 import type { PlatformAdapter } from './adapter.js';
 import type { PlatformProfile } from './profile.js';
 import { installProxy } from '../core/proxy.js';
@@ -41,10 +43,29 @@ export async function createSatoriAdapter(
   profile: PlatformProfile,
   instance: PlatformInstance
 ): Promise<PlatformAdapter> {
-  // Channel allowlist (empty = allow all). Set for fast lookup.
+  // Channel allowlist (empty = allow all). Matched against the textual address form, so an
+  // operator can allowlist either a whole chat (`5865716608`) or one topic in it
+  // (`5865716608/7353`) — a whole-chat entry deliberately does NOT admit its topics, since
+  // each topic is its own conversation.
   const allow = new Set(instance.chat.channels);
-  const channelAllowed = (channelId: string | undefined): boolean =>
-    allow.size === 0 || (channelId != null && allow.has(channelId));
+  const channelAllowed = (ref: ConversationRef): boolean =>
+    allow.size === 0 || allow.has(formatAddress(addressOf(ref)));
+
+  /**
+   * Guard for the Satori-GENERIC outbound paths: they hand the channel straight to `bot.*`,
+   * which cannot express a sub-lane. A lane reaching here means a profile declared a `thread`
+   * in resolveConversation but implemented no override to send it — previously that produced a
+   * message silently posted to the channel root (Telegram truncates a malformed chat_id
+   * leniently in private chats), which is the failure mode this refactor exists to end.
+   * Fail loudly instead.
+   */
+  const assertNoLane = (address: ConversationAddress, op: string): void => {
+    if (address.thread != null) {
+      throw new Error(
+        `[${profile.type}] ${op}: this profile reports a thread lane (${formatAddress(address)}) but implements no ${op} override to address it`
+      );
+    }
+  };
 
   let onMsg: ((m: InboundMessage) => void) | null = null;
   // Interaction callbacks may not be registered yet this round; safely ignore events until then.
@@ -158,27 +179,21 @@ export async function createSatoriAdapter(
     quote?.user?.name ?? quote?.member?.name ?? quote?.member?.nick ?? undefined;
 
   /**
-   * Routing/outbound channel key for an inbound session. Delegates to the profile when it
-   * needs to widen the adapter's channel.id into a complete send target (Telegram
-   * topics → `<chatId>:<topicId>`); otherwise passes session.channelId
-   * through. Applied to EVERY inbound path (message / button / command), so one message's
-   * routing key and its reply target can never disagree.
-   */
-  const inboundChannel = (session: Session): string =>
-    profile.inboundChannelId?.(session) ?? session.channelId ?? '';
-
-  /**
-   * Split an outbound routing key into the platform's real channel + optional sub-lane, via
-   * profile.decodeChannelKey (identity when the profile declares none).
+   * Resolve an inbound session to a full ConversationRef.
    *
-   * Applied to every Satori-GENERIC outbound path below, because those hand channelId straight
-   * to `bot.*` and the adapter treats the whole string as its chat id — a composite key
-   * (`<chat>:<topic>`) then reaches the API verbatim and is rejected. Profile overrides
-   * (sendMessage/editMessage/…) receive the key UNDECODED: decoding is their own business and
-   * they already do it, so decoding here too would strip the lane they need.
+   * The profile answers the platform-shaped half (channel / thread / space / kind) and core
+   * stamps the two fields it owns: the platform INSTANCE id (which the profile doesn't know —
+   * `platforms:` may hold the same type twice) and the sender.
+   *
+   * Applied to EVERY inbound path (message / button / command), so one event's routing key and
+   * its reply target can never disagree — the bug that made buttons clicked inside a Telegram
+   * topic resolve to the chat root.
    */
-  const outboundChannel = (channelId: string): { channelId: string; lane?: string } =>
-    profile.decodeChannelKey?.(channelId) ?? { channelId };
+  const inboundConversation = (session: Session): ConversationRef => ({
+    ...profile.resolveConversation(session),
+    platform: instance.id,
+    user: session.userId ?? '',
+  });
 
   /** session → InboundMessage. */
   const toInbound = (session: Session): InboundMessage => {
@@ -188,10 +203,8 @@ export async function createSatoriAdapter(
       | { name?: string; nick?: string; isBot?: boolean }
       | undefined;
     return {
-      platform: instance.id,
+      conversation: inboundConversation(session),
       platformType: profile.type,
-      channelId: inboundChannel(session),
-      userId: session.userId ?? '',
       messageId: session.messageId ?? '',
       content: text || (session.content ?? ''),
       // session.quote is the quoted message object (with id), present on replies.
@@ -201,29 +214,40 @@ export async function createSatoriAdapter(
       // ---- Platform-normalized fields (via profile) ----
       authorName: author?.name ?? author?.nick,
       authorIsBot: author?.isBot,
-      isDirect: profile.isDirect(session),
-      isThread: profile.isThread(session),
       mentionedSelf: profile.detectMention(session, session.selfId),
       quotedContent: flattenQuote(session.quote),
       quotedAuthor: quoteAuthorName(session.quote),
     };
   };
 
-  /** Universal.Message (from history) → InboundMessage. */
-  const messageToInbound = (channelId: string, msg: Universal.Message): InboundMessage => {
+  /**
+   * Universal.Message (from history) → InboundMessage.
+   *
+   * Replayed messages carry the address they were fetched for. History is per-channel on every
+   * platform here (no API filters by sub-lane), so a replayed message's conversation reports the
+   * kind of the place it was fetched from rather than guessing per message.
+   */
+  const messageToInbound = (
+    address: ConversationAddress,
+    kind: ConversationRef['kind'],
+    msg: Universal.Message
+  ): InboundMessage => {
     const { text, attachments } = normalizeElements(msg.elements as h[] | undefined);
     return {
-      platform: instance.id,
+      conversation: {
+        platform: instance.id,
+        channel: address.channel,
+        ...(address.thread != null ? { thread: address.thread } : {}),
+        kind,
+        user: msg.user?.id ?? '',
+      },
       platformType: profile.type,
-      channelId,
-      userId: msg.user?.id ?? '',
       messageId: msg.id ?? '',
       content: text || (msg.content ?? ''),
       quoteId: msg.quote?.id,
       timestamp: msg.createdAt ?? msg.timestamp ?? Date.now(),
       attachments,
-      // Fill what history allows; mentionedSelf/isDirect/isThread have no session context
-      // on replay, left undefined.
+      // Fill what history allows; mentionedSelf has no session context on replay.
       authorName: msg.user?.name ?? msg.user?.nick ?? msg.member?.name ?? msg.member?.nick,
       authorIsBot: msg.user?.isBot,
       quotedContent: flattenQuote(msg.quote),
@@ -260,24 +284,35 @@ export async function createSatoriAdapter(
   ctx.on('message', (session: Session) => {
     if (session.userId === session.selfId) return; // ignore own messages
     const inbound = toInbound(session);
-    // Allowlist against the SAME id routing uses (inbound.channelId, composite where the
-    // profile widens it). Filtering on the raw session.channelId instead would make a
-    // configured Telegram topic id stop matching once the composite is in play.
-    if (!channelAllowed(inbound.channelId)) return; // allowlist filter
+    // Allowlist against the SAME address routing uses, rendered in the documented textual
+    // form (`<channel>` or `<channel>/<thread>`), so an operator can allowlist a single
+    // Telegram topic and it keeps matching.
+    if (!channelAllowed(inbound.conversation)) return; // allowlist filter
     const preview = inbound.content.slice(0, 50).replace(/\n/g, ' ');
-    console.log(`[in] #${inbound.channelId} @${inbound.userId}: ${preview}`);
+    console.log(`[in] ${describeConversation(inbound.conversation)} @${inbound.conversation.user}: ${preview}`);
     onMsg?.(inbound);
   });
 
   // Interaction events mount via profile (event names/payloads differ per platform);
   // no mount = platform has no such interaction. Safely ignored if callback unregistered.
-  // Profiles stamp their TYPE on interaction events; overwrite with the instance id so
-  // downstream identity checks (allowFrom `platform:userId`) and routing see one namespace.
+  // Profiles report the platform-shaped conversation via the same resolveConversation as the
+  // message path; core stamps the instance id, so downstream identity checks (allowFrom
+  // `platform:userId`) and routing see one namespace.
   profile.mountButtonEvents?.(ctx, (ev) => {
-    onBtn?.({ ...ev, platform: instance.id });
+    onBtn?.({
+      conversation: { ...ev.conversation, platform: instance.id, user: ev.user },
+      messageId: ev.messageId,
+      buttonId: ev.buttonId,
+    });
   });
   profile.mountCommandEvents?.(ctx, (ev) => {
-    onCmd?.({ ...ev, platform: instance.id });
+    onCmd?.({
+      conversation: { ...ev.conversation, platform: instance.id, user: ev.user },
+      messageId: ev.messageId,
+      name: ev.name,
+      options: ev.options,
+      reply: ev.reply,
+    });
   });
 
   // Clear error on missing capability (second line of defense; daemon already gates via
@@ -319,9 +354,9 @@ export async function createSatoriAdapter(
       return profile.createThread(getBot(), ref, name, opts);
     },
 
-    async sendButtons(channelId, text, buttons) {
+    async sendButtons(address, text, buttons) {
       if (!profile.sendButtons) return unsupported('sendButtons');
-      return profile.sendButtons(getBot(), channelId, text, buttons);
+      return profile.sendButtons(getBot(), address, text, buttons);
     },
 
     async registerCommands(cmds: SlashCommandSpec[], opts) {
@@ -329,50 +364,48 @@ export async function createSatoriAdapter(
       await profile.registerCommands(ctx, getBot, cmds, opts);
     },
 
-    async sendMessage(channelId, text) {
-      // Outbound send override takes precedence: when a platform encodes extra dimensions
-      // (e.g. thread_ts / message_thread_id) into channelId, profile.sendMessage decodes the
-      // composite channelId before sending; otherwise fall back to generic
-      // bot.sendMessage(channelId, content).
+    async sendMessage(address, text) {
+      // Outbound send override takes precedence: a platform whose Satori encoder reads its
+      // thread parameter off the inbound session can't address a lane on an outbound-only
+      // send, so it posts via internal.* itself. Otherwise the generic bot.sendMessage is
+      // correct — those platforms never set address.thread.
       if (profile.sendMessage) {
-        return profile.sendMessage(getBot(), channelId, text);
+        return profile.sendMessage(getBot(), address, text);
       }
+      assertNoLane(address, 'sendMessage');
       // bot.sendMessage returns string[] (all message ids from this send); take the first.
-      const ids = await getBot().sendMessage(channelId, text);
+      const ids = await getBot().sendMessage(address.channel, text);
       const messageId = ids[0];
       if (!messageId) {
-        throw new Error(`[${profile.type}] sendMessage did not return a message id (channel=${channelId})`);
+        throw new Error(`[${profile.type}] sendMessage did not return a message id (channel=${address.channel})`);
       }
-      return { channelId, messageId };
+      return { address, messageId };
     },
 
     async editMessage(ref, text) {
       // Edit override takes precedence: when the platform adapter doesn't wrap editing as
       // generic bot.editMessage (e.g. Slack uses internal.chatUpdate), profile.editMessage
       // implements it; otherwise fall back to generic
-      // bot.editMessage(channelId, messageId, content).
+      // bot.editMessage(channelId, messageId, content). Editing addresses a message, not a
+      // lane, on every platform here — so the channel alone is the right argument.
       if (profile.editMessage) {
         await profile.editMessage(getBot(), ref, text);
       } else {
-        await getBot().editMessage(ref.channelId, ref.messageId, text);
+        await getBot().editMessage(ref.address.channel, ref.messageId, text);
       }
     },
 
     async deleteMessage(ref) {
-      // Generic path: decode first, or a composite key reaches the adapter as a literal chat id.
-      const { channelId } = outboundChannel(ref.channelId);
-      await getBot().deleteMessage(channelId, ref.messageId);
+      await getBot().deleteMessage(ref.address.channel, ref.messageId);
     },
 
-    async sendFile(channelId, file) {
-      // Decode before either path: the generic encoder can't parse a composite key, and the
-      // profile override wants the lane separated out.
-      const { channelId: chat, lane } = outboundChannel(channelId);
+    async sendFile(address, file) {
       // Profile override takes precedence: a sub-lane (Telegram forum topic) can't be expressed
       // through the generic encoder, which reads the thread only off an inbound session.
       if (profile.sendFile) {
-        return profile.sendFile(getBot(), chat, file, lane);
+        return profile.sendFile(getBot(), address, file);
       }
+      assertNoLane(address, 'sendFile');
       // Send a local file via Satori elements: a file:// URL points at a local path and the
       // encoder uploads it as an attachment. caption becomes the message text.
       const fileUrl = file.path.startsWith('file:') ? file.path : `file://${file.path}`;
@@ -380,12 +413,12 @@ export async function createSatoriAdapter(
       if (file.caption) fragment.push(h.text(file.caption));
       // h.file(url, attrs): title controls the displayed file name.
       fragment.push(h.file(fileUrl, file.name ? { title: file.name } : {}));
-      const ids = await getBot().sendMessage(chat, fragment);
+      const ids = await getBot().sendMessage(address.channel, fragment);
       const messageId = ids[0];
       if (!messageId) {
-        throw new Error(`[${profile.type}] sendFile did not return a message id (channel=${chat})`);
+        throw new Error(`[${profile.type}] sendFile did not return a message id (channel=${address.channel})`);
       }
-      return { channelId: chat, messageId };
+      return { address, messageId };
     },
 
     async addReaction(ref, emoji) {
@@ -396,7 +429,7 @@ export async function createSatoriAdapter(
       if (profile.addReaction) {
         await profile.addReaction(getBot(), ref, emoji);
       } else {
-        await getBot().createReaction(ref.channelId, ref.messageId, emoji);
+        await getBot().createReaction(ref.address.channel, ref.messageId, emoji);
       }
     },
 
@@ -406,29 +439,27 @@ export async function createSatoriAdapter(
       if (profile.removeReaction) {
         await profile.removeReaction(getBot(), ref, emoji);
       } else {
-        await getBot().deleteReaction(ref.channelId, ref.messageId, emoji);
+        await getBot().deleteReaction(ref.address.channel, ref.messageId, emoji);
       }
     },
 
-    async startTyping(channelId) {
+    async startTyping(address) {
       // typing goes through profile (platform-specific); no-op if not implemented.
-      if (profile.typing) await profile.typing(getBot(), channelId);
+      if (profile.typing) await profile.typing(getBot(), address);
     },
 
     async stopTyping() {
       // typing usually auto-expires; no explicit stop API, so no-op.
     },
 
-    async fetchHistory(channelId, opts) {
+    async fetchHistory(address, opts) {
       // bot.getMessageList(channelId, next?/messageId?, direction, limit?, order):
       // 2nd arg is the pagination anchor messageId; direction='before' fetches older history,
       // order='asc' returns data in chronological order. Returns { data: Universal.Message[], ... }.
-      // Generic path, so decode first (see outboundChannel). History is per-channel on every
-      // platform here — a sub-lane can't be filtered server-side, so the lane is dropped and
-      // results carry the decoded channel.
-      const { channelId: chat } = outboundChannel(channelId);
-      const res = await getBot().getMessageList(chat, opts.before, 'before', opts.limit, 'asc');
-      return res.data.map((m) => messageToInbound(chat, m));
+      // History is per-channel on every platform here — no API filters by sub-lane — so the lane
+      // is dropped for the fetch and the replayed messages report the channel they came from.
+      const res = await getBot().getMessageList(address.channel, opts.before, 'before', opts.limit, 'asc');
+      return res.data.map((m) => messageToInbound({ channel: address.channel }, 'group', m));
     },
 
     async start() {

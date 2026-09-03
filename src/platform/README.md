@@ -82,25 +82,51 @@ Three capability fields are easy to conflate:
 `maxSlashCommands` caps a registration batch; the excess is registered as nothing but
 **logged**, and still invokable by typing.
 
-## The composite channelId contract
+## `resolveConversation` — the one place a platform describes its thread model
 
-Some platforms need more than a channel id to address a message. Telegram forum topics
-report inbound `channel.id` as the bare `message_thread_id` (dropping the chat id) while
-`sendMessage` needs `<chatId>:<topicId>`. Slack threads need `thread_ts`.
+Some platforms need more than a channel id to address a message. A Telegram forum topic
+and a Slack thread are a `(channel, lane)` **pair**: the lane is a separate wire
+parameter (`message_thread_id`, `thread_ts`), not part of the channel id. A Discord
+thread is not — it has its own snowflake and every API call targets it directly.
 
-Two profile hooks handle this, and they are **declared inverses**:
+One method covers all three:
 
-- `inboundChannelId(session)` — build the composite routing/send key.
-- `decodeChannelKey(channelId)` — split it back into `{ channelId, lane }`.
+```ts
+resolveConversation(session): { channel, thread?, space?, kind }
+```
 
-`decodeChannelKey(inboundChannelId(s))` **must** recover the real channel, or a reply
-lands somewhere other than where it was asked. Declaring the inverse once lets
-`satori-core` decode for *all* generic outbound paths (`deleteMessage`, `fetchHistory`,
-`sendFile`). Previously each profile decoded by hand and any path that forgot — or was
-added later — silently broke.
+- `channel` **must** be a complete API target on its own. Telegram's adapter reports a
+  group topic's `channel.id` as the bare `message_thread_id` and puts the chat in
+  `guild.id`, so the profile has to swap them back — echoing `channel.id` would address a
+  nonexistent chat.
+- `thread` is set **only** when addressing needs an extra wire parameter. A Discord
+  thread is `kind: 'thread'` with **no** `thread`.
+- `kind` is the sole thread/DM witness for routing and gating.
 
-Absent both hooks ⇒ the key *is* the channel, which is correct for platforms that encode
-nothing extra.
+It replaced four methods (`isDirect`, `isThread`, `inboundChannelId`, `decodeChannelKey`)
+that were derived independently from the same session and could therefore disagree — a
+message routed as a thread but replied to as a plain channel, or the reverse. Telegram
+needed a dedicated test just to police the agreement, and Slack failed it silently
+(`isThread` hardcoded `false` while its outbound side emitted thread addresses). One
+method cannot contradict itself.
+
+`satori-core` calls it on **every** inbound path — message, button click, slash command —
+so a profile cannot wire it for messages and forget the interactions. That omission is
+why buttons clicked inside a Telegram topic used to resolve to the chat root, leaving a
+blocking `ask` unmatched until it timed out.
+
+### Addressing, outbound
+
+Every outbound method takes a `ConversationAddress` (`{ channel, thread? }`), never a
+string. The lane used to be smuggled through as `"<chat>:<topic>"` inside the channel id —
+built in 5 places, decoded in 17, validated in none — and every path that forgot to decode
+sent to the wrong place. Worse, Telegram truncates a malformed `chat_id` **leniently** in
+private chats: `ok=true`, message in the chat root, nothing logged.
+
+A profile that reports a `thread` must implement the overrides that can carry it
+(`sendMessage`, `sendFile`, `typing`, …). If it doesn't, `satori-core`'s generic path
+**throws** rather than silently posting to the channel root — see the guard in
+`assertNoLane`.
 
 ## Markdown: one converter per dialect
 
@@ -132,9 +158,10 @@ renderings between edits.
 ## `profile-helpers.ts`
 
 Collapses only **identical** decisions across profiles: outbound id extraction,
-attachment meta extraction, composite channelId split, button message fragments, Satori
-button-interaction mounting, and the CJS-default-import unwrap (`resolveDefaultPlugin`)
-that all seven adapters need.
+attachment meta extraction, the thread-less `resolveConversation` shape
+(`plainConversation`, shared by lark/qq/line/wecom/dingtalk), button message fragments,
+Satori button-interaction mounting, and the CJS-default-import unwrap
+(`resolveDefaultPlugin`) that all seven adapters need.
 
 Where platform SDKs genuinely differ — whether a reply carries a quote, `ts` validation
 on thread creation — each profile keeps its own. Prefer reusing a helper before

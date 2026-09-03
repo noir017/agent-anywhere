@@ -1,11 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { SessionRegistry } from './session.js';
+import { ConversationRegistry } from './conversation.js';
 import type { Config } from '../config/schema.js';
 import type { PlatformAdapter } from '../platform/adapter.js';
 import type { AgentFactory, AgentSession } from './agent.js';
+import type { InboundMessage } from '../types.js';
 
 /**
- * Unit tests for SessionRegistry session control (model override + reset).
+ * Unit tests for the ConversationRegistry control surface (model override + reset).
  * Minimal stub platform/agent; verifies public-method semantics directly, no real turns.
  */
 
@@ -40,22 +41,43 @@ const clock = {
   schedule: () => () => {},
 };
 
+/** A DM inbound in the one conversation these tests use. */
+function inbound(content: string, messageId: string): InboundMessage {
+  return {
+    conversation: { platform: 'discord', channel: 'c1', kind: 'direct', user: 'u1' },
+    messageId,
+    content,
+    timestamp: 0,
+  };
+}
+
+/** ConversationStore stub; `cleared` records which conversations were reset by /new. */
+function makeStore(cleared: string[] = []) {
+  return {
+    boundAgent: () => undefined,
+    bind: () => {},
+    agentSession: () => undefined,
+    setAgentSession: () => {},
+    clear: (k: string) => cleared.push(k),
+  };
+}
+
 function makeFactory(): { factory: AgentFactory; disposed: string[] } {
   const disposed: string[] = [];
   const sessions = new Map<string, AgentSession>();
   const factory: AgentFactory = {
-    getOrCreate(sessionId) {
-      let s = sessions.get(sessionId);
+    getOrCreate(conversationId) {
+      let s = sessions.get(conversationId);
       if (!s) {
         s = {
-          sessionId,
+          conversationId,
           runTurn: async () => {},
           abort: () => {},
           dispose: () => {},
         };
-        sessions.set(sessionId, s);
+        sessions.set(conversationId, s);
       }
-      return s;
+      return s!;
     },
     dispose(sessionId) {
       disposed.push(sessionId);
@@ -65,12 +87,12 @@ function makeFactory(): { factory: AgentFactory; disposed: string[] } {
   return { factory, disposed };
 }
 
-describe('SessionRegistry session control', () => {
-  it('resetSession calls agents.dispose to drop resume context', () => {
+describe('ConversationRegistry control surface', () => {
+  it('resetConversation calls agents.dispose to drop resume context', () => {
     const { factory, disposed } = makeFactory();
-    const reg = new SessionRegistry(baseConfig, stubPlatforms, factory, clock);
-    reg.resetSession('discord:c1');
-    expect(disposed).toEqual(['discord:c1']);
+    const reg = new ConversationRegistry(baseConfig, stubPlatforms, factory, clock);
+    reg.resetConversation('discord#c1');
+    expect(disposed).toEqual(['discord#c1']);
   });
 
   it('/new (and /clear, with @bot suffix) resets context: dispose + store.delete + channel ack, no agent turn', () => {
@@ -79,13 +101,13 @@ describe('SessionRegistry session control', () => {
     const deleted: string[] = [];
     const platform = {
       capabilities: { thread: false },
-      sendMessage: async (_ch: string, text: string) => {
+      sendMessage: async (address: { channel: string }, text: string) => {
         sent.push(text);
-        return { channelId: _ch, messageId: 'm1' };
+        return { address, messageId: 'm1' };
       },
     } as unknown as PlatformAdapter;
-    const store = { get: () => undefined, set: () => {}, delete: (k: string) => deleted.push(k) };
-    const reg = new SessionRegistry(
+    const store = makeStore(deleted);
+    const reg = new ConversationRegistry(
       baseConfig,
       new Map([['discord', platform]]),
       factory,
@@ -95,30 +117,14 @@ describe('SessionRegistry session control', () => {
     );
 
     for (const content of ['/new', '/clear', ' /new@mybot ']) {
-      reg.route({
-        platform: 'discord',
-        channelId: 'c1',
-        userId: 'u1',
-        messageId: `m-${content}`,
-        content,
-        isDirect: true,
-      } as never);
+      reg.route(inbound(content, `m-${content}`));
     }
 
-    expect(disposed).toEqual(['default:discord:c:c1', 'default:discord:c:c1', 'default:discord:c:c1']);
-    expect(deleted).toEqual(['default:discord:c:c1', 'default:discord:c:c1', 'default:discord:c:c1']);
+    expect(disposed).toEqual(['discord#c1', 'discord#c1', 'discord#c1']);
+    expect(deleted).toEqual(['discord#c1', 'discord#c1', 'discord#c1']);
     expect(sent).toHaveLength(3);
     // '/new stuff' is NOT a clear command; it must fall through to normal routing (merger created).
-    expect(() =>
-      reg.route({
-        platform: 'discord',
-        channelId: 'c1',
-        userId: 'u1',
-        messageId: 'm4',
-        content: '/new stuff',
-        isDirect: true,
-      } as never)
-    ).not.toThrow();
+    expect(() => reg.route(inbound('/new stuff', 'm4'))).not.toThrow();
     expect(disposed).toHaveLength(3); // unchanged — not intercepted
   });
 
@@ -128,12 +134,12 @@ describe('SessionRegistry session control', () => {
     const deleted: string[] = [];
     const platform = {
       capabilities: { thread: false },
-      sendMessage: async (_ch: string, text: string) => {
+      sendMessage: async (address: { channel: string }, text: string) => {
         sent.push(text);
-        return { channelId: _ch, messageId: 'm1' };
+        return { address, messageId: 'm1' };
       },
     } as unknown as PlatformAdapter;
-    const store = { get: () => undefined, set: () => {}, delete: (k: string) => deleted.push(k) };
+    const store = makeStore(deleted);
     const cfg = {
       ...(baseConfig as unknown as Record<string, unknown>),
       agents: [
@@ -142,40 +148,27 @@ describe('SessionRegistry session control', () => {
       ],
       routing: { default: 'default', pipeline: [{ when: { command: 'codex' }, use: { agent: 'codex' } }] },
     } as unknown as Config;
-    const reg = new SessionRegistry(cfg, new Map([['discord', platform]]), factory, clock, undefined, store as never);
+    const reg = new ConversationRegistry(cfg, new Map([['discord', platform]]), factory, clock, undefined, store as never);
 
-    // '/codex /new' — the /codex prefix is consumed by routing, so what remains ('/new') is
-    // intercepted as context clear, on codex's OWN session key (not the default agent's).
-    reg.route({
-      platform: 'discord',
-      channelId: 'c1',
-      userId: 'u1',
-      messageId: 'm1',
-      content: '/codex /new',
-      isDirect: true,
-    } as never);
-    expect(disposed).toEqual(['codex:discord:c:c1']);
-    expect(deleted).toEqual(['codex:discord:c:c1']);
+    // '/codex /new' — the /codex prefix is consumed as an explicit binding, so what remains
+    // ('/new') is intercepted as context clear. The key is the CONVERSATION, not the agent: a
+    // reset applies to this place, whoever happens to answer it.
+    reg.route(inbound('/codex /new', 'm1'));
+    expect(disposed).toEqual(['discord#c1']);
+    expect(deleted).toEqual(['discord#c1']);
 
-    // A bare '/codex' (nothing to say) is acked with usage instead of starting an empty turn.
-    reg.route({
-      platform: 'discord',
-      channelId: 'c1',
-      userId: 'u1',
-      messageId: 'm2',
-      content: '/codex',
-      isDirect: true,
-    } as never);
-    expect(sent.some((t) => t.includes('routed to agent "codex"'))).toBe(true);
+    // A bare '/codex' (nothing to say) acks the binding instead of starting an empty turn.
+    reg.route(inbound('/codex', 'm2'));
+    expect(sent.some((t) => t.includes('answered by codex'))).toBe(true);
     expect(disposed).toHaveLength(1); // no extra reset — the bare command never became a turn
   });
 
   it('set/clearModelOverride do not throw, and clear reverts to the default', () => {
     const { factory } = makeFactory();
-    const reg = new SessionRegistry(baseConfig, stubPlatforms, factory, clock);
-    expect(() => reg.setModelOverride('discord:c1', 'claude-opus-4-8')).not.toThrow();
-    expect(() => reg.clearModelOverride('discord:c1')).not.toThrow();
-    expect(() => reg.clearModelOverride('discord:c2')).not.toThrow(); // safe even if absent
+    const reg = new ConversationRegistry(baseConfig, stubPlatforms, factory, clock);
+    expect(() => reg.setModelOverride('discord#c1', 'claude-opus-4-8')).not.toThrow();
+    expect(() => reg.clearModelOverride('discord#c1')).not.toThrow();
+    expect(() => reg.clearModelOverride('discord#c2')).not.toThrow(); // safe even if absent
   });
 });
 
@@ -187,7 +180,7 @@ describe('SessionRegistry session control', () => {
  * repeat on every turn, and it must never fire for a message that isn't going to be answered — an
  * unconditional receipt would turn the bot into an identity/liveness oracle for unauthorized senders.
  */
-describe('SessionRegistry header bubble', () => {
+describe('ConversationRegistry header bubble', () => {
   /** Config with the header on, plus a second agent whose model is only in `env` (the cc shape). */
   const headerConfig = (over?: Record<string, unknown>): Config =>
     ({
@@ -206,24 +199,34 @@ describe('SessionRegistry header bubble', () => {
     const sent: Array<{ channelId: string; text: string }> = [];
     const platform = {
       capabilities: { thread: false },
-      sendMessage: async (channelId: string, text: string) => {
-        sent.push({ channelId, text });
-        return { channelId, messageId: 'm1' };
+      sendMessage: async (address: { channel: string }, text: string) => {
+        sent.push({ channelId: address.channel, text });
+        return { address, messageId: 'm1' };
       },
     } as unknown as PlatformAdapter;
-    const store = { get: () => undefined, set: () => {}, delete: () => {} };
-    const reg = new SessionRegistry(cfg, new Map([['discord', platform]]), factory, clock, undefined, store as never);
+    const store = makeStore();
+    const reg = new ConversationRegistry(cfg, new Map([['discord', platform]]), factory, clock, undefined, store as never);
     let n = 0;
-    const send = (content: string, over?: Record<string, unknown>): void =>
+    /** `over` sets conversation-shaped fields in their flat spelling, so cases stay one-liners. */
+    const send = (
+      content: string,
+      over: { channelId?: string; isDirect?: boolean; space?: string; userId?: string; mentionedSelf?: boolean } = {}
+    ): void => {
+      const { channelId = 'c1', isDirect = true, space, userId = 'u1', mentionedSelf } = over;
       reg.route({
-        platform: 'discord',
-        channelId: 'c1',
-        userId: 'u1',
+        conversation: {
+          platform: 'discord',
+          channel: channelId,
+          ...(space != null ? { space } : {}),
+          kind: isDirect ? 'direct' : 'group',
+          user: userId,
+        },
         messageId: `m${++n}`,
         content,
-        isDirect: true,
-        ...over,
+        timestamp: 0,
+        ...(mentionedSelf != null ? { mentionedSelf } : {}),
       } as never);
+    };
     return { reg, sent, send };
   }
 
@@ -265,8 +268,8 @@ describe('SessionRegistry header bubble', () => {
   it('a /model override does not appear either (same reason)', () => {
     const { reg, sent, send } = rig(headerConfig());
     send('one'); // creates the session
-    reg.setModelOverride('cc:discord:c:c1', 'claude-sonnet-4-5');
-    reg.resetSession('cc:discord:c:c1'); // re-arm the header without clearing the override
+    reg.setModelOverride('discord#c1', 'claude-sonnet-4-5');
+    reg.resetConversation('discord#c1'); // re-arm the header without clearing the override
     send('two');
     expect(headers(sent)).toEqual(['🤖 claude', '🤖 claude']);
   });
@@ -290,7 +293,7 @@ describe('SessionRegistry header bubble', () => {
   it('sends nothing when the response gate ignores the message', () => {
     // requireMention in a guild: an unmentioned message creates no turn, so it gets no header.
     const { sent, send } = rig(headerConfig());
-    send('hello', { isDirect: false, guildId: 'g1', mentionedSelf: false });
+    send('hello', { isDirect: false, space: 'g1', mentionedSelf: false });
     expect(headers(sent)).toEqual([]);
   });
 
@@ -298,7 +301,7 @@ describe('SessionRegistry header bubble', () => {
     const { sent, send } = rig(headerConfig());
     send('/oc');
     expect(headers(sent)).toEqual([]);
-    expect(sent.some((s) => s.text.includes('routed to agent "oc"'))).toBe(true);
+    expect(sent.some((s) => s.text.includes('answered by opencode'))).toBe(true);
   });
 
   it('/clear itself is acked but never announced', () => {
@@ -321,15 +324,15 @@ describe('SessionRegistry header bubble', () => {
  * command, and the command event itself. The empty one has no `/oc`, so routing sent it to the
  * DEFAULT agent — the user saw `🤖 claude` appear before `🤖 opencode`, and cc ran a turn nobody asked for.
  */
-describe('SessionRegistry native slash produces one turn', () => {
+describe('native slash produces one turn', () => {
   function rig() {
     const { factory } = makeFactory();
     const sent: string[] = [];
     const platform = {
       capabilities: { thread: false },
-      sendMessage: async (channelId: string, text: string) => {
+      sendMessage: async (address: { channel: string }, text: string) => {
         sent.push(text);
-        return { channelId, messageId: 'm1' };
+        return { address, messageId: 'm1' };
       },
     } as unknown as PlatformAdapter;
     const cfg = {
@@ -341,7 +344,7 @@ describe('SessionRegistry native slash produces one turn', () => {
       routing: { default: 'cc', pipeline: [{ when: { command: 'oc' }, use: { agent: 'oc' } }] },
       display: { header: { enabled: true }, footer: { enabled: false, fields: [] }, reactions: { enabled: true } },
     } as unknown as Config;
-    const reg = new SessionRegistry(cfg, new Map([['discord', platform]]), factory, clock);
+    const reg = new ConversationRegistry(cfg, new Map([['discord', platform]]), factory, clock);
     // The header announcement is the observable proxy for "this agent got a turn".
     return { reg, sent };
   }
@@ -351,8 +354,8 @@ describe('SessionRegistry native slash produces one turn', () => {
   it('the phantom empty message does not announce or route to the default agent', () => {
     const { reg, sent } = rig();
     // Exactly what Telegram sends for one `/oc 你好`, in order.
-    reg.route({ platform: 'discord', channelId: 'c1', userId: 'u1', messageId: 'm1', content: '', isDirect: true } as never);
-    reg.route({ platform: 'discord', channelId: 'c1', userId: 'u1', messageId: 'm2', content: '/oc 你好', isDirect: true, mentionedSelf: true } as never);
+    reg.route(inbound('', 'm1'));
+    reg.route({ ...inbound('/oc 你好', 'm2'), mentionedSelf: true });
     // Before the fix this was ['🤖 claude', '🤖 opencode'].
     expect(headers(sent)).toEqual(['🤖 opencode']);
   });
@@ -361,7 +364,7 @@ describe('SessionRegistry native slash produces one turn', () => {
     // `/oc` alone strips to empty content, but it is NOT an empty inbound — the user typed
     // something, so they get told how to use it rather than silence.
     const { reg, sent } = rig();
-    reg.route({ platform: 'discord', channelId: 'c1', userId: 'u1', messageId: 'm1', content: '/oc', isDirect: true } as never);
-    expect(sent.some((t) => t.includes('routed to agent "oc"'))).toBe(true);
+    reg.route(inbound('/oc', 'm1'));
+    expect(sent.some((t) => t.includes('answered by opencode'))).toBe(true);
   });
 });

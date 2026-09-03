@@ -13,15 +13,17 @@ import type { Bot } from '@satorijs/core';
 
 import type { Context, Session } from '@satorijs/core';
 
-import type { ButtonInteraction, MessageRef } from '../../types.js';
+import type { MessageRef } from '../../types.js';
+import type { ConversationAddress } from '../../core/conversation.js';
 import type { PlatformCapabilities } from '../adapter.js';
-import type { PlatformProfile } from '../profile.js';
+import type { PlatformProfile, ProfileButtonEvent } from '../profile.js';
 import type { LarkPlatformConfig } from '../config-schemas.js';
 import { renderLarkMarkdown } from '../lark-markdown.js';
 import {
   findAtMention,
   installHttpService,
   installServerService,
+  plainConversation,
   resolveDefaultPlugin,
   sendForRef,
 } from '../profile-helpers.js';
@@ -301,15 +303,11 @@ export function createLarkProfile(): PlatformProfile<LarkPlatformConfig> {
       return findAtMention(session.elements, selfId);
     },
 
-    isDirect(session) {
-      // adaptSession sets isDirect=true for chat_type==='p2p'.
-      return session.isDirect ?? false;
-    },
-
-    isThread() {
-      // Thread (thread_id) is a send option (reply_in_thread); inbound isn't
-      // modeled as threads. Matches capabilities.thread=false.
-      return false;
+    resolveConversation(session) {
+      // adaptSession sets isDirect=true for chat_type==='p2p'. Lark's thread_id is a SEND
+      // option (reply_in_thread) with no inbound thread modeling, so no lane is reported —
+      // matching capabilities.thread=false.
+      return plainConversation(session);
     },
 
     attachmentMeta() {
@@ -320,17 +318,17 @@ export function createLarkProfile(): PlatformProfile<LarkPlatformConfig> {
 
     // Override send/edit ONLY to pre-render CommonMark → Feishu subset; same
     // conversion both sides ⇒ no send-vs-edit drift. See the profile doc-comment.
-    async sendMessage(bot: Bot, channelId: string, text: string): Promise<MessageRef> {
-      const ids = await bot.sendMessage(channelId, toLarkMarkdown(text));
+    async sendMessage(bot: Bot, address: ConversationAddress, text: string): Promise<MessageRef> {
+      const ids = await bot.sendMessage(address.channel, toLarkMarkdown(text));
       const messageId = ids[0];
       if (!messageId) {
-        throw new Error(`[lark] sendMessage did not return a message id (channel=${channelId})`);
+        throw new Error(`[lark] sendMessage did not return a message id (channel=${address.channel})`);
       }
-      return { channelId, messageId };
+      return { address, messageId };
     },
 
     async editMessage(bot: Bot, ref: MessageRef, text: string): Promise<void> {
-      await bot.editMessage(ref.channelId, ref.messageId, toLarkMarkdown(text));
+      await bot.editMessage(ref.address.channel, ref.messageId, toLarkMarkdown(text));
     },
 
     async reply(bot: Bot, ref: MessageRef, text: string): Promise<MessageRef> {
@@ -339,7 +337,7 @@ export function createLarkProfile(): PlatformProfile<LarkPlatformConfig> {
       // text to the Feishu markdown subset (same as send/edit) before quoting.
       return sendForRef(
         bot,
-        ref.channelId,
+        ref.address,
         [h('quote', { id: ref.messageId }), h.text(toLarkMarkdown(text))],
         'lark',
         'reply'
@@ -387,7 +385,7 @@ export function createLarkProfile(): PlatformProfile<LarkPlatformConfig> {
       if (reactionId) await reaction.delete(ref.messageId, reactionId);
     },
 
-    async sendButtons(bot, channelId, text, buttons): Promise<MessageRef> {
+    async sendButtons(bot, address, text, buttons): Promise<MessageRef> {
       // Hand-built schema 2.0 card (id in button.behaviors[].value) sent via
       // im.message.create as msg_type='interactive'. Bypasses the satori
       // <button> encoder (it drops button.id, see buildLarkButtonCard).
@@ -400,20 +398,20 @@ export function createLarkProfile(): PlatformProfile<LarkPlatformConfig> {
       }
       const res = await create(
         {
-          receive_id: channelId,
+          receive_id: address.channel,
           msg_type: 'interactive',
           content: JSON.stringify(card),
         },
-        { receive_id_type: larkReceiveIdType(channelId) }
+        { receive_id_type: larkReceiveIdType(address.channel) }
       );
       const messageId = res?.message_id;
       if (!messageId) {
-        throw new Error(`[lark] sendButtons did not return a message id (channel=${channelId})`);
+        throw new Error(`[lark] sendButtons did not return a message id (channel=${address.channel})`);
       }
-      return { channelId, messageId };
+      return { address, messageId };
     },
 
-    mountButtonEvents(ctx: Context, emit: (ev: ButtonInteraction) => void): void {
+    mountButtonEvents(ctx: Context, emit: (ev: ProfileButtonEvent) => void): void {
       // ⚠️ Receive path (avoids an adapter pitfall): adapter-lark only normalizes
       // card.action.trigger into interaction/command when
       // action.value._satori_type==='command'; our value is { id } (no
@@ -428,9 +426,12 @@ export function createLarkProfile(): PlatformProfile<LarkPlatformConfig> {
         const action = extractCardAction(body);
         if (!action) return;
         emit({
-          platform: 'lark',
-          channelId: action.channelId,
-          userId: action.userId,
+          // The card callback carries only open_chat_id — Lark has no thread lane, so
+          // this is a complete conversation on its own. kind is reported as 'group':
+          // the callback body distinguishes no chat type, and gating never re-reads it
+          // for a button click (it resolves the conversation the buttons were sent to).
+          conversation: { channel: action.channelId, kind: 'group' },
+          user: action.userId,
           messageId: action.messageId,
           buttonId: action.id,
         });

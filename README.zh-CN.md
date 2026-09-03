@@ -35,6 +35,7 @@ Code、Codex、OpenCode，以及 Google 的 Antigravity CLI。给机器人发消
 - **原生流式体验** —— 消息原地编辑、工具调用气泡、生命周期回应表情、新消息打断。
 - **在聊天中行动** —— 智能体可发文件、加回应、引用回复、开子区、读历史、发按钮提问。
 - **附件处理** —— 收到的图片和文件自动下载并交给智能体。
+- **话题是一等公民** —— Telegram 话题、Slack 线程、Discord 子区各自是独立会话，各自绑定智能体；绑定粘在会话上，用 `/oc` 切换。
 - **持久会话** —— 重启不丢上下文；`/new` 重置；作用域可按子区、频道、用户或全局。
 - **精简配置** —— 五个部分，凭据按平台校验，支持 `${VAR}` 与 `.env` 展开。
 
@@ -97,7 +98,7 @@ routing:
       use: { agent: codex }
 
 session:
-  scope: per_channel          # per_thread|per_channel|per_user|shared
+  scope: per_thread           # per_thread|per_channel|per_user|shared
 
 access:
   allowFrom: ["discord-main:123456"]   # <实例id>:userId；留空 = 任何人

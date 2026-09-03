@@ -17,7 +17,7 @@ agent (Bash)
         │
         ▼  ipc/server.ts  → parseIpcRequest (zod, strict)
     daemon.resolveChannel(token)  → token → session → activeChannel
-    daemon.handleReverse(action, channelId)  → platform.sendFile(...)
+    daemon.handleReverse(action, address)    → platform.sendFile(...)
         │
         ▼  {ok: true, data} back as one JSON line → CLI prints TOON to stdout
 ```
@@ -54,6 +54,12 @@ The catalog: `send-message`, `reply`, `edit-message`, `send-file`, `react`, `del
 current conversation", which is the default an agent should almost always use — the
 `--channel` override exists for pushing proactively somewhere else.
 
+Its value is `<channel>` or `<channel>/<thread>`, so an agent can target one topic or
+thread rather than only a channel root. `server.ts` parses it through `parseAddress`,
+which **validates**: a malformed value fails at the boundary with the input named,
+instead of reaching a platform API as a garbled id (Telegram answers those with an opaque
+400 far from the cause).
+
 ## The trust boundary
 
 **The peer is an arbitrary short-lived process and its JSON is untrusted.** The agent
@@ -66,7 +72,9 @@ reject extra fields, narrowing the trusted input surface, and each arm maps one-
 an `IpcAction` variant — kept aligned at compile time via `z.infer`.
 
 Optional `channelId` is `z.string().min(1)` rather than plain optional: an empty string is
-illegal, not a synonym for unset.
+illegal, not a synonym for unset. It stays a *string* on the wire and is parsed into a
+`ConversationAddress` at dispatch — the protocol keeps one textual form, the daemon works
+in the domain type.
 
 Other hardening in `server.ts`:
 

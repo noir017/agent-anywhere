@@ -251,7 +251,7 @@ function makeSink(opts: { withDelete?: boolean; deleteThrows?: boolean } = {}): 
     deletes: [],
     async send(text: string): Promise<MessageRef> {
       sink.sends.push(text);
-      return { channelId: 'c', messageId: `m${++msgSeq}` };
+      return { address: { channel: 'c' }, messageId: `m${++msgSeq}` };
     },
     async edit(ref: MessageRef, text: string): Promise<void> {
       if (editFailRemaining > 0) {
@@ -631,7 +631,7 @@ describe('StreamBuffer dual-trigger and degradation', () => {
             resolveFirstSend = res;
           });
         }
-        return { channelId: 'c', messageId: `m${++msgSeq}` };
+        return { address: { channel: 'c' }, messageId: `m${++msgSeq}` };
       },
       async edit(ref: MessageRef, text: string): Promise<void> {
         edits.push({ ref, text });
@@ -656,7 +656,7 @@ describe('StreamBuffer dual-trigger and degradation', () => {
     const done = buf.complete();
     // Release the hung first send so the in-flight flush settles and the chain runs final.
     expect(resolveFirstSend).not.toBeNull();
-    resolveFirstSend!({ channelId: 'c', messageId: 'm-first' });
+    resolveFirstSend!({ address: { channel: 'c' }, messageId: 'm-first' });
     await done;
     await Promise.resolve();
 

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { decodeChannel, buildButtonBlocks, createSlackProfile } from './slack.js';
+import { slackConversation, buildButtonBlocks, createSlackProfile } from './slack.js';
 
 // ── Fake bot for delivery-contract tests ──────────────────────────────────────
 // These tests capture what the profile ACTUALLY sends to Slack's Web API, not just what the
@@ -43,21 +43,59 @@ function fakeBot(): { bot: SendBot; calls: Captured } {
   return { bot, calls };
 }
 
-describe('decodeChannel', () => {
-  it('splits a composite channelId into channel and thread_ts on the first :', () => {
-    expect(decodeChannel('C0123ABCD:1234567890.123456')).toEqual({
+/**
+ * Inbound thread detection — the asymmetry this refactor closed.
+ *
+ * Slack's adapter exposes no thread flag: it populates session.quote with the thread ROOT, and
+ * only when `thread_ts !== ts` — so the quote is a reliable witness of "this is a thread reply",
+ * and `quote.id` is the thread_ts itself. The profile used to give up there and hardcode "not a
+ * thread", while its OUTBOUND side happily emitted thread addresses — so a reply typed inside a
+ * thread was routed as ordinary channel traffic and answered in the channel.
+ */
+describe('slackConversation (inbound thread detection)', () => {
+  it('reads the thread root out of session.quote (the only witness the adapter leaves)', () => {
+    expect(
+      slackConversation({ channelId: 'C0123ABCD', guildId: 'T1', quote: { id: '1700000000.0001' } })
+    ).toEqual({
       channel: 'C0123ABCD',
-      threadTs: '1234567890.123456',
+      thread: '1700000000.0001',
+      space: 'T1',
+      kind: 'thread',
     });
   });
 
-  it('treats a non-composite channelId as the channel verbatim, with threadTs undefined', () => {
-    expect(decodeChannel('C0123ABCD')).toEqual({ channel: 'C0123ABCD' });
-    expect(decodeChannel('C0123ABCD').threadTs).toBeUndefined();
+  it('reports a plain channel message with no lane', () => {
+    expect(slackConversation({ channelId: 'C0123ABCD', guildId: 'T1' })).toEqual({
+      channel: 'C0123ABCD',
+      space: 'T1',
+      kind: 'group',
+    });
   });
 
-  it('splits only on the first : (the thread_ts segment has no :, but this is defensive)', () => {
-    expect(decodeChannel('C1:1.2:3')).toEqual({ channel: 'C1', threadTs: '1.2:3' });
+  it('reports a DM as direct', () => {
+    expect(slackConversation({ channelId: 'D9', isDirect: true })).toEqual({
+      channel: 'D9',
+      kind: 'direct',
+    });
+  });
+
+  it('keeps two threads in one channel separate', () => {
+    const a = slackConversation({ channelId: 'C1', quote: { id: '1.1' } });
+    const b = slackConversation({ channelId: 'C1', quote: { id: '2.2' } });
+    expect(a.channel).toBe(b.channel);
+    expect(a.thread).not.toBe(b.thread);
+  });
+
+  it('an inbound thread message answers back INTO the thread (end-to-end of the fix)', async () => {
+    const profile = createSlackProfile();
+    const c = slackConversation({ channelId: 'C0123ABCD', quote: { id: '1700000000.0001' } });
+    const { bot, calls } = fakeBot();
+    await profile.sendMessage!(bot, { channel: c.channel, thread: c.thread }, 'reply');
+    // Pre-fix this posted with no thread_ts at all, landing in the channel.
+    expect(calls.post[0]!.params).toMatchObject({
+      channel: 'C0123ABCD',
+      thread_ts: '1700000000.0001',
+    });
   });
 });
 
@@ -109,7 +147,7 @@ describe('slack profile delivery contract (send/edit reach Slack as valid mrkdwn
 
   it('sendMessage posts rendered mrkdwn via internal.chatPostMessage with the bot token', async () => {
     const { bot, calls } = fakeBot();
-    const ref = await profile.sendMessage!(bot, 'C0123ABCD', '**hi** [x](https://x.com/a)');
+    const ref = await profile.sendMessage!(bot, { channel: 'C0123ABCD' }, '**hi** [x](https://x.com/a)');
     expect(calls.post).toHaveLength(1);
     expect(calls.post[0]!.token).toBe('xoxb-test');
     expect(calls.post[0]!.params).toMatchObject({
@@ -117,23 +155,24 @@ describe('slack profile delivery contract (send/edit reach Slack as valid mrkdwn
       text: '*hi* <https://x.com/a|x>',
     });
     expect(calls.post[0]!.params.thread_ts).toBeUndefined();
-    expect(ref).toEqual({ channelId: 'C0123ABCD', messageId: '111.222' });
+    expect(ref).toEqual({ address: { channel: 'C0123ABCD' }, messageId: '111.222' });
   });
 
-  it('composite channelId routes thread_ts and returns the real channel', async () => {
+  it('an address with a lane routes thread_ts', async () => {
     const { bot, calls } = fakeBot();
-    const ref = await profile.sendMessage!(bot, 'C0123ABCD:1700000000.0001', 'plain');
+    const address = { channel: 'C0123ABCD', thread: '1700000000.0001' };
+    const ref = await profile.sendMessage!(bot, address, 'plain');
     expect(calls.post[0]!.params).toMatchObject({
       channel: 'C0123ABCD',
       thread_ts: '1700000000.0001',
       text: 'plain',
     });
-    expect(ref).toEqual({ channelId: 'C0123ABCD', messageId: '111.222' });
+    expect(ref).toEqual({ address, messageId: '111.222' });
   });
 
   it('editMessage posts rendered mrkdwn via internal.chatUpdate (never bot.editMessage)', async () => {
     const { bot, calls } = fakeBot();
-    await profile.editMessage!(bot, { channelId: 'C0123ABCD', messageId: '7.7' }, '# Title\n- a');
+    await profile.editMessage!(bot, { address: { channel: 'C0123ABCD' }, messageId: '7.7' }, '# Title\n- a');
     expect(calls.update).toHaveLength(1);
     expect(calls.update[0]!.token).toBe('xoxb-test');
     expect(calls.update[0]!.params).toMatchObject({
@@ -147,34 +186,57 @@ describe('slack profile delivery contract (send/edit reach Slack as valid mrkdwn
     const md = '**bold**\n- a\n- b\n```js\nconst x = 1;\n```\n> quote\n[l](https://x.com/a)';
     const a = fakeBot();
     const b = fakeBot();
-    await profile.sendMessage!(a.bot, 'C1', md);
-    await profile.editMessage!(b.bot, { channelId: 'C1', messageId: '1.1' }, md);
+    await profile.sendMessage!(a.bot, { channel: 'C1' }, md);
+    await profile.editMessage!(b.bot, { address: { channel: 'C1' }, messageId: '1.1' }, md);
     expect(a.calls.post[0]!.params.text).toBe(b.calls.update[0]!.params.text);
   });
 
   it('reply posts into the thread (thread_ts = ref.messageId) with rendered mrkdwn', async () => {
     const { bot, calls } = fakeBot();
-    const ref = await profile.reply!(bot, { channelId: 'C0123ABCD', messageId: '5.5' }, '*emph*');
+    const ref = await profile.reply!(
+      bot,
+      { address: { channel: 'C0123ABCD' }, messageId: '5.5' },
+      '*emph*'
+    );
     expect(calls.post[0]!.params).toMatchObject({
       channel: 'C0123ABCD',
       thread_ts: '5.5',
       text: '_emph_',
     });
-    expect(ref).toEqual({ channelId: 'C0123ABCD', messageId: '111.222' });
+    // The reply lives in the thread it just started, so the ref carries that lane — a follow-up
+    // on this message must not escape back to the channel.
+    expect(ref).toEqual({
+      address: { channel: 'C0123ABCD', thread: '5.5' },
+      messageId: '111.222',
+    });
   });
 
   it('sendButtons renders the section text to mrkdwn (mrkdwn section block must convert)', async () => {
     const { bot, calls } = fakeBot();
-    await profile.sendButtons!(bot, 'C0123ABCD', 'Pick **one**', [{ id: 'ask:r:0', label: 'Yes' }]);
+    await profile.sendButtons!(bot, { channel: 'C0123ABCD' }, 'Pick **one**', [
+      { id: 'ask:r:0', label: 'Yes' },
+    ]);
     const params = calls.post[0]!.params;
     expect(params.text).toBe('Pick *one*');
     const blocks = params.blocks as Array<Record<string, unknown>>;
     expect(blocks[0]).toMatchObject({ type: 'section', text: { type: 'mrkdwn', text: 'Pick *one*' } });
   });
 
+  it('createThread from inside a thread targets the real channel, never a doubled key', async () => {
+    // Slack has no create-thread API: a thread is "use a message ts as thread_ts". The old code
+    // had to decode ref.channelId to avoid concatenating onto an already-composite key; with the
+    // lane in its own field the channel is always the channel.
+    const out = await profile.createThread!(
+      fakeBot().bot,
+      { address: { channel: 'C0123ABCD', thread: '1.1' }, messageId: '9.9' },
+      'debug'
+    );
+    expect(out).toEqual({ address: { channel: 'C0123ABCD', thread: '9.9' } });
+  });
+
   it('never delivers a literal CommonMark bold marker (the asterisk bug this fixes)', async () => {
     const { bot, calls } = fakeBot();
-    await profile.sendMessage!(bot, 'C1', 'this is **important**');
+    await profile.sendMessage!(bot, { channel: 'C1' }, 'this is **important**');
     const text = String(calls.post[0]!.params.text);
     expect(text).not.toContain('**'); // would have shown literal asterisks pre-fix
     expect(text).toBe('this is *important*');

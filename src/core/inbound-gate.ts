@@ -7,6 +7,7 @@
  */
 
 import type { InboundMessage } from '../types.js';
+import { addressOf, formatAddress } from './conversation.js';
 
 /** Gating config (mirrors config.inbound.gating). */
 export interface GateConfig {
@@ -16,9 +17,12 @@ export interface GateConfig {
   respondInDirect: boolean;
   /** Responding to other bots: none / mentions (only when @-ed) / all. */
   allowBots: 'none' | 'mentions' | 'all';
-  /** Allowlist: these channels trigger without a mention. */
+  /**
+   * Allowlist: these channels trigger without a mention. Matched against the textual address, so
+   * an operator may name a whole chat (`123`) or one topic in it (`123/7353`).
+   */
   freeResponseChannels: string[];
-  /** Blocklist: these channels are fully ignored. */
+  /** Blocklist: these channels are fully ignored. Same address matching as freeResponseChannels. */
   ignoredChannels: string[];
   /** Whether already-participated threads are exempt from the mention requirement. */
   threadParticipationExempt: boolean;
@@ -26,7 +30,7 @@ export interface GateConfig {
 
 /** Runtime context for gating (injected by the caller; this module queries nothing). */
 export interface GateContext {
-  /** Whether this routing key has an active session — proxy for "bot already in this thread". */
+  /** Whether this conversation is already live — proxy for "bot already in this thread". */
   hasActiveSession: boolean;
 }
 
@@ -49,9 +53,9 @@ export interface GateDecision {
  *  6. guild requires mention  → false 'no-mention' (when not mentioned)
  *  7. default allow           → true 'default'
  *
- * `authorIsBot/isDirect/isThread/mentionedSelf` are optional and tested with
- * `=== true`; undefined is treated as false (i.e. a missing mention counts as
- * "not mentioned", per step 6).
+ * `authorIsBot` and `mentionedSelf` are optional and tested with `=== true`; undefined
+ * is treated as false (i.e. a missing mention counts as "not mentioned", per step 6).
+ * DM and thread come from `conversation.kind`, which is always present.
  */
 export function shouldRespond(
   msg: InboundMessage,
@@ -67,8 +71,10 @@ export function shouldRespond(
     return { respond: false, reason: 'empty' };
   }
 
+  const where = formatAddress(addressOf(msg.conversation));
+
   // 1) Blocklisted channel: highest priority among the real gates, ignore outright.
-  if (cfg.ignoredChannels.includes(msg.channelId)) {
+  if (cfg.ignoredChannels.includes(where)) {
     return { respond: false, reason: 'ignored-channel' };
   }
 
@@ -85,21 +91,21 @@ export function shouldRespond(
   }
 
   // 3) DM: separate switch, usually no mention required.
-  if (msg.isDirect === true) {
+  if (msg.conversation.kind === 'direct') {
     return cfg.respondInDirect
       ? { respond: true, reason: 'dm' }
       : { respond: false, reason: 'dm-disabled' };
   }
 
   // 4) Free-response channel: allowlisted, respond without a mention.
-  if (cfg.freeResponseChannels.includes(msg.channelId)) {
+  if (cfg.freeResponseChannels.includes(where)) {
     return { respond: true, reason: 'free-response' };
   }
 
   // 5) Participated-thread exemption: in a thread with an active session, treat as
   // "already participated" and skip the mention requirement.
   if (
-    msg.isThread === true &&
+    msg.conversation.kind === 'thread' &&
     cfg.threadParticipationExempt &&
     ctx.hasActiveSession
   ) {

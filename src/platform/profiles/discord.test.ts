@@ -38,16 +38,17 @@ describe('discord profile delivery contract (table → bullets on send/edit, res
 
   it('sendMessage bulletizes a GFM table before the raw createMessage call', async () => {
     const { bot, calls } = fakeBot();
-    const ref = await profile.sendMessage!(bot, '123', TABLE);
+    const ref = await profile.sendMessage!(bot, { channel: '123' }, TABLE);
     expect(calls.create).toHaveLength(1);
     expect(calls.create[0]!.content).toBe('**Ada**\n• Score: 95');
-    expect(ref).toEqual({ channelId: '123', messageId: 'm1' });
+    expect(ref).toEqual({ address: { channel: '123' }, messageId: 'm1' });
   });
 
   it('editMessage bulletizes a GFM table before the raw editMessage call', async () => {
     const { bot, calls } = fakeBot();
-    await profile.editMessage!(bot, { channelId: '123', messageId: '7' }, TABLE);
+    await profile.editMessage!(bot, { address: { channel: '123' }, messageId: '7' }, TABLE);
     expect(calls.edit).toHaveLength(1);
+    // The fake records the raw internal.editMessage args, hence channelId (not an address).
     expect(calls.edit[0]).toMatchObject({
       channelId: '123',
       messageId: '7',
@@ -58,14 +59,14 @@ describe('discord profile delivery contract (table → bullets on send/edit, res
   it('leaves non-table markdown byte-identical on send (Discord renders it natively)', async () => {
     const { bot, calls } = fakeBot();
     const md = '# Title\n\n**bold**, *italic*, `code`, [link](https://x.com)\n```js\nconst x = 1 | 2;\n```';
-    await profile.sendMessage!(bot, '1', md);
+    await profile.sendMessage!(bot, { channel: '1' }, md);
     expect(calls.create[0]!.content).toBe(md);
   });
 
   it('leaves non-table markdown byte-identical on edit', async () => {
     const { bot, calls } = fakeBot();
     const md = '- a\n- b | c\n> quote';
-    await profile.editMessage!(bot, { channelId: '1', messageId: '1' }, md);
+    await profile.editMessage!(bot, { address: { channel: '1' }, messageId: '1' }, md);
     expect(calls.edit[0]!.content).toBe(md);
   });
 
@@ -73,8 +74,8 @@ describe('discord profile delivery contract (table → bullets on send/edit, res
     const md = 'intro\n\n' + TABLE + '\n\noutro **bold**';
     const a = fakeBot();
     const b = fakeBot();
-    await profile.sendMessage!(a.bot, '1', md);
-    await profile.editMessage!(b.bot, { channelId: '1', messageId: '1' }, md);
+    await profile.sendMessage!(a.bot, { channel: '1' }, md);
+    await profile.editMessage!(b.bot, { address: { channel: '1' }, messageId: '1' }, md);
     expect(a.calls.create[0]!.content).toBe(b.calls.edit[0]!.content);
   });
 });

@@ -38,12 +38,13 @@ Daemon.onInbound ─── cross-event dedup (platform:address:message, 15 s TTL
 ConversationRegistry.route
    ├─ access gate        access.allowFrom — `platform:userId`
    ├─ conversationKey    scope + the message's ConversationRef → the conversation id
-   ├─ resolveAgent       routing.pipeline → { agentId, explicit }
+   ├─ resolveAgent       routing.pipeline, then HARNESS_COMMANDS → { agentId, explicit }
    ├─ response gate      core/inbound-gate shouldRespond
    ├─ /new · /clear      reset the conversation, drop every agent's id, ack. Never forwarded.
+   ├─ /help              the registered vocabulary, from core/command-translate. Never forwarded.
    ├─ bind or rebind     new conversation → bind; explicit `/oc` → rebind; else keep the bound agent
-   ├─ bare-command ack   `/codex` alone → binding ack, no turn
-   ├─ command translate  generic → native, or refuse; harness picker
+   ├─ bare command       `/oc` alone → its command menu, or a binding ack if it reports none
+   ├─ command translate  generic → native, or refuse
    ├─ header bubble      once per conversation, on receipt
    ▼
 InboundMerger.ingest ── merge window / queue / interrupt
@@ -84,8 +85,24 @@ wins, else `routing.default`. Match fields: `platform` (instance id), `serverId`
 works on every platform regardless of native slash support — `Daemon.onCommand`
 synthesizes native invocations into a full inbound message, so one code path covers both.
 
-**`explicit` is the hinge.** It is true only when the winning rule matched via
-`when.command` — i.e. the user *named* the agent. The registry then:
+**Agent commands resolve without a rule.** When no pipeline rule matched on `command`,
+`resolveAgent` falls back to `HARNESS_COMMANDS` (`/cc`, `/oc`, `/agy` — see
+[`core/command-translate.ts`](../core/README.md)) and selects the first configured agent
+of that harness. Those names are what gets registered in the platform menu, so without
+this a fresh install advertised commands the daemon did not recognise and forwarded them
+to the bound agent as literal text. Precedence:
+
+1. a pipeline rule that matched on `when.command` — hand-wired, so it wins (and can point
+   `/cc` at a *second* claude agent, or keep an alias the presets know nothing about);
+2. a built-in agent command;
+3. whatever rule matched on where the message came from — the initial binding;
+4. `routing.default`.
+
+Step 2 sits above step 3 because naming an agent is an instruction, while a rule matching
+on platform or channel only supplies that conversation's default answerer.
+
+**`explicit` is the hinge.** It is true when the user *named* the agent — via a
+`when.command` rule or a built-in agent command. The registry then:
 
 | situation | what happens |
 |---|---|
@@ -282,7 +299,8 @@ Launched with `--disable-slash-commands` by default: in stream-json mode a CLI-a
 slash (`/model`, `/usage`) **aborts the whole session**, and chat users type `/…`
 constantly. `args: ["--disable-slash-commands=false"]` opts back in; all default flags
 are overridable through `args`, since agy's flag parsing is last-wins. Consequently agy
-reports no command list and gets no picker entry.
+reports no command list, so `/agy` switches the conversation but its bare form acks the
+binding rather than posting an empty menu.
 
 ### `agent-common.ts`
 
@@ -312,16 +330,18 @@ caps `callback_data` at 64 bytes and a longer id degrades to a lossy hash. On re
 timeout the buttons are stripped and the message annotated. On shutdown every pending ask
 is resolved `null` so no caller hangs forever.
 
-**Harness pickers** (`/claude`, `/opencode`) post the agent's *reported* commands as
-buttons — never a guessed list. Names already reachable through the generic vocabulary
-are filtered out. Buttons are capped at 25 (Discord's components-per-message limit; the
-`claude` harness reports ~39, so this is reached in practice) and the remainder is
-**listed as text, not dropped**. A click is delivered straight back to the recorded
-conversation via `dispatchTo` — re-routing a bare `/init` would resolve it against the
-pipeline instead of the conversation's bound agent, landing on whichever agent config
-prefers rather than the one whose menu offered it. The clicker is re-checked
-against the allowlist, because a button in a shared channel can be pressed by someone
-other than the person who opened the menu.
+**Harness pickers** — the bare form of an agent command (`/cc`, `/oc`) — post the agent's
+*reported* commands as buttons, never a guessed list. Names already reachable through the
+generic vocabulary are filtered out. Buttons are capped at 25 (Discord's
+components-per-message limit; the `claude` harness reports ~39, so this is reached in
+practice) and the remainder is **listed as text, not dropped**. A click is delivered
+straight back to the recorded conversation via `dispatchTo` — re-routing a bare `/init`
+would resolve it against the pipeline instead of the conversation's bound agent, landing
+on whichever agent config prefers rather than the one whose menu offered it. The clicker
+is re-checked against the allowlist, because a button in a shared channel can be pressed
+by someone other than the person who opened the menu. A harness that reports no list
+(`agy`) acks the binding instead — see `HARNESS_COMMANDS` in
+[`core/command-translate.ts`](../core/README.md).
 
 **Inbound dedup.** On platforms where a slash *is* a normal message (Telegram), one
 `/cmd` fires both a message event and a command event with the same `messageId`; they are

@@ -49,13 +49,21 @@ describe('agentCommandToSpec', () => {
 });
 
 describe('buildRegisteredSpecs', () => {
-  it('registers daemon commands, the generic vocabulary, and one picker per harness', () => {
+  it('registers daemon commands, the generic vocabulary, and one agent command per harness', () => {
     const names = buildRegisteredSpecs(cfg(agent('cc', 'claude'), agent('oc', 'opencode'))).map((s) => s.name);
     // Daemon commands lead (intercepted before any agent).
-    expect(names.slice(0, 2)).toEqual(['new', 'clear']);
+    expect(names.slice(0, 3)).toEqual(['new', 'clear', 'help']);
     expect(names).toContain('compact'); // generic
-    expect(names).toContain('claude'); // picker
-    expect(names).toContain('opencode');
+    // Agent commands register under their short name, not the harness enum value.
+    expect(names).toContain('cc');
+    expect(names).toContain('oc');
+    expect(names).not.toContain('claude');
+    expect(names).not.toContain('opencode');
+  });
+
+  it('registers agy, which used to be skipped for having no command list', () => {
+    const names = buildRegisteredSpecs(cfg(agent('cc', 'claude'), agent('g', 'agy'))).map((s) => s.name);
+    expect(names).toContain('agy');
   });
 
   it('registers NO harness-specific commands', () => {

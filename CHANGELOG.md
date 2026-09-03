@@ -5,6 +5,47 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed (breaking) — the registered command menu
+
+- **Agent commands are short, and they work without config.** The per-harness entries
+  registered into the platform menu were the harness enum value leaking into the UI
+  (`/claude`, `/opencode`) — long to type on a phone, and *inert*: they only switched agents
+  if an operator had separately hand-written a `when: { command: oc }` rule, so on a fresh
+  install tapping one forwarded the literal text `/opencode` to whichever agent was bound.
+
+  They are now `/cc`, `/oc`, `/cx`, `/gm`, `/agy` (claude, opencode, codex, gemini,
+  Antigravity), and the daemon resolves them itself — each selects the first configured agent
+  of that harness. A hand-written `when.command` rule still outranks the built-in table, so
+  existing configs behave exactly as before. The full harness name (`/opencode`) is still
+  accepted when typed; it is simply no longer registered, so it costs no menu slot.
+
+- **A bare agent command now opens that harness's own command menu.** `/oc <prompt>` switches
+  and asks, as always; `/oc` alone switches and then lists opencode's own commands as buttons
+  — which is what `/opencode` used to do. This replaces two things with one: the old picker
+  refused to run unless the conversation was *already* on that harness, answering "does not
+  apply here, switch with `/<agent>` first" — advice the command itself can now just follow.
+  A harness that reports no command list (`agy`) confirms the binding instead of posting an
+  empty menu.
+
+  Supersedes 0.3.0's "a bare `/oc` rebinds and says so instead of acking usage".
+
+- **`/agy` is registered.** It had been skipped entirely on the grounds that it reports no
+  command list, which conflated "has a menu to show" with "is worth naming" — leaving the one
+  harness a user most needs to reach by name with no entry at all. Those are now separate
+  fields on the harness table.
+
+  Supersedes 0.3.0's note that agy "gets no `/agy` picker entry": it has a registered command
+  now, and only the menu half remains unavailable.
+
+### Added
+
+- **`/help`** — lists every command this gateway understands: its own (`/new`, `/clear`,
+  `/help`), one line per configured agent, and the generic vocabulary **filtered to what the
+  agent answering right now actually supports**, so it never advertises a `/compact` that the
+  next tap will refuse. Built from the same tables that drive registration, so the help text
+  and the platform menu cannot drift apart. Answered by the gateway; a harness's own `/help`
+  remains one tap away inside its agent-command menu.
+
 ## [0.3.0] - 2026-09-03
 
 ### Changed (breaking) — conversations, topics and agent binding

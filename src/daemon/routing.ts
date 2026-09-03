@@ -1,4 +1,5 @@
 import type { Config, SessionScope } from '../config/schema.js';
+import { agentForCommand } from '../core/command-translate.js';
 import type { ConversationRef, ConversationKind } from '../core/conversation.js';
 import type { InboundMessage } from '../types.js';
 
@@ -147,11 +148,26 @@ export function resolveScope(cfg: Config, input: RouteInput): SessionScope {
  * The caller (ConversationRegistry) decides what to do with a non-explicit answer: for an
  * existing conversation it is ignored in favour of the bound agent. That is the whole fix for
  * "`/oc hi` answered by opencode, the next message answered by claude".
+ *
+ * Precedence, and why each step sits where it does:
+ *  1. a pipeline rule that matched on `when.command` — the operator wired this name to this agent
+ *     by hand, so it outranks the built-in table (and lets a deployment point `/cc` at a second
+ *     claude agent, or keep an alias the presets know nothing about);
+ *  2. a built-in agent command (`/cc`, `/oc`, `/agy`) — the registered menu entries. Placed ABOVE
+ *     a non-command pipeline rule because naming an agent is an explicit instruction, while a
+ *     rule matching on platform/channel only supplies that conversation's default answerer;
+ *     without this step every registered agent command was inert unless the operator had also
+ *     written a matching pipeline rule, and reached the bound agent as the literal text "/oc";
+ *  3. whatever rule matched on where the message came from — the initial binding;
+ *  4. routing.default.
  */
 export function resolveAgent(cfg: Config, input: RouteInput): AgentChoice {
   const rule = firstMatch(cfg, input);
-  if (!rule) return { agentId: cfg.routing.default, explicit: false };
-  return { agentId: rule.use.agent, explicit: rule.when.command !== undefined };
+  if (rule?.when.command !== undefined) return { agentId: rule.use.agent, explicit: true };
+  const named = input.command ? agentForCommand(cfg, input.command) : undefined;
+  if (named) return { agentId: named, explicit: true };
+  if (rule) return { agentId: rule.use.agent, explicit: false };
+  return { agentId: cfg.routing.default, explicit: false };
 }
 
 /** Convenience for callers that need both (one pipeline walk each; the pipeline is tiny). */

@@ -155,11 +155,12 @@ the `claude` agent.
 
 The fix, three layers, all fixed at startup from config alone:
 
-1. Daemon commands (`/new`, `/clear`) — intercepted before any agent.
+1. `DAEMON_COMMANDS` (`/new`, `/clear`, `/help`) — intercepted before any agent.
 2. `GENERIC_COMMANDS` — a small fixed vocabulary meaning the same thing everywhere,
    translated to the target harness's native spelling at invocation time.
-3. One picker per configured harness (`/claude`, `/opencode`) — the escape hatch to that
-   agent's own commands, which are no longer registered globally.
+3. `HARNESS_COMMANDS` — one agent command per configured harness (`/cc`, `/oc`, `/agy`).
+   `/oc <prompt>` switches the conversation and asks; bare `/oc` switches and offers that
+   agent's own commands, which are the ones not registered globally.
 
 `translateCommand` returns `passthrough` (not generic — forward untouched, power users
 can type native names), `translated` (forward as the native name), or `unsupported`
@@ -172,9 +173,47 @@ Provenance of the table is documented per harness and must stay honest: `claude`
 misinterpret — strictly worse than telling the user it is unsupported.
 
 `custom` always passes through — nothing is known about a user-supplied executable, so
-rejecting its commands would break a working setup on a guess. `agy` gets no picker: it
-reports no command list and runs with `--disable-slash-commands`, so the entry could
-only ever be a dead menu item.
+rejecting its commands would break a working setup on a guess.
+
+### `HARNESS_COMMANDS`
+
+The single source for what each harness's command is called, which spellings resolve to
+it, and whether a bare invocation can show a menu.
+
+| harness | registered | also accepts | bare form |
+|---|---|---|---|
+| `claude` | `/cc` | `/claude` | its command menu |
+| `opencode` | `/oc` | `/opencode` | its command menu |
+| `codex` | `/cx` | `/codex` | its command menu |
+| `gemini` | `/gm` | `/gemini` | its command menu |
+| `agy` | `/agy` | — | binding ack |
+| `custom` | — | — | — |
+
+Short names because these are typed on a phone, mid-conversation, many times a day;
+`/opencode` was the harness enum value leaking into the UI. The full harness name stays
+as an unregistered alias so existing muscle memory and any `when: { command: opencode }`
+already in a config keep working — it simply costs no slot in the platform menu.
+
+**`name` and `picker` are separate fields on purpose.** Registering a command and having
+a command list to show are different questions, and `agy` is the case that proves it: it
+reports no command list and runs with `--disable-slash-commands`, so a bare `/agy` could
+only ever say "none yet" — but switching a conversation *to* agy is the useful half, and
+skipping registration entirely left the one harness a user most needs to reach by name
+with no menu entry at all. `custom` is absent from both: the harness name carries no
+meaning to a reader and the executable advertises no stable command set.
+
+`agentForCommand` resolves a command to the **first configured agent of that harness**,
+which is what lets a registered command work with no `routing.pipeline` entry. Before
+this, `/oc` meant something only because an operator had hand-written
+`when: { command: oc }`, so a fresh install registered a menu whose agent commands were
+inert and reached the bound agent as the literal text `/oc`. A pipeline rule still
+outranks the table — see `daemon/routing.ts` `resolveAgent`.
+
+`buildHelpText` renders `/help` from these same tables, so a command cannot reach the
+platform menu without reaching the help text. It filters the generic section to what the
+*currently bound* harness actually supports, because listing `/compact` to an opencode
+user who will be told "not supported" the moment they tap it is precisely the silent
+degradation this project avoids.
 
 ## `attachment-ingest.ts`
 

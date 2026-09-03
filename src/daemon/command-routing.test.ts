@@ -162,7 +162,10 @@ describe('generic command translation in route()', () => {
     const msg = sent.find((t) => t.includes('does not support'))!;
     // `oc` is an operator's typing shorthand and means nothing to a reader.
     expect(msg).toContain('opencode does not support /model');
-    expect(msg).toContain('/opencode');
+    // The hint names the REGISTERED command, which is the short form — pointing at `/opencode`
+    // would send the user to a name that is no longer in the menu.
+    expect(msg).toContain('/oc');
+    expect(msg).not.toContain('/opencode');
   });
 
   it('forwards a supported generic command to the routed agent', async () => {
@@ -216,23 +219,33 @@ describe('generic command translation in route()', () => {
   });
 });
 
-describe('harness picker in route()', () => {
-  it('invoked in a session of that harness → hands off to the daemon with that session', async () => {
+/**
+ * The bare form of an agent command.
+ *
+ * `/oc <prompt>` picks who answers; `/oc` alone has nothing to ask, so it doubles as the way into
+ * that harness's OWN commands — which are deliberately never registered globally, making this the
+ * only route to them. It replaces the old `/opencode` picker, whose name was the harness enum value
+ * leaking into the UI and which refused to work unless the conversation was already on that harness.
+ */
+describe('bare agent command → harness picker', () => {
+  it('hands off to the daemon with the conversation it was invoked for', async () => {
     const { send, pickerCalls, prompts } = rig();
-    await send('/cc /claude');
+    await send('/cc');
     expect(pickerCalls).toEqual([{ sessionId: KEY, agentId: 'cc' }]);
     expect(prompts).toEqual([]); // the picker is UI, never a prompt
   });
 
-  it('invoked in a session of a DIFFERENT harness → reports it does not apply, runs nothing', async () => {
-    const { send, sent, pickerCalls, prompts } = rig();
-    await send('/oc /claude');
-    expect(pickerCalls).toEqual([]);
-    expect(prompts).toEqual([]);
-    expect(sent.some((t) => t.includes('answered by opencode'))).toBe(true);
+  it('switches first when the conversation is on another harness, then offers ITS commands', async () => {
+    // The old picker answered "does not apply here, switch with /<agent> first" — advice the
+    // command itself can follow, since a bare `/oc` is also how you switch.
+    const { send, pickerCalls, prompts } = rig();
+    await send('/cc hello'); // bind to claude
+    await send('/oc');
+    expect(pickerCalls).toEqual([{ sessionId: KEY, agentId: 'oc' }]);
+    expect(prompts).toHaveLength(1); // only the first message ran a turn
   });
 
-  it('a picker for an unconfigured harness is not special (falls through as a normal command)', async () => {
+  it('an unconfigured harness name is not special (falls through as a normal command)', async () => {
     const cfg = {
       ...(baseConfig as unknown as Record<string, unknown>),
       agents: [{ id: 'cc', harness: 'claude', args: [], env: {} }],
@@ -242,6 +255,106 @@ describe('harness picker in route()', () => {
     await send('/opencode'); // opencode isn't configured here
     expect(pickerCalls).toEqual([]);
     expect(prompts).toHaveLength(1);
+  });
+
+  it('a harness that reports no command list acks the binding instead of an empty menu', async () => {
+    // agy runs with --disable-slash-commands and reports nothing, so a picker could only ever say
+    // "none yet". It still earns a command, because switching to it is the useful half.
+    const cfg = makeConfig({
+      agents: [
+        { id: 'cc', harness: 'claude' },
+        { id: 'g', harness: 'agy' },
+      ],
+      routing: { default: 'cc', pipeline: [] },
+    });
+    const { send, sent, pickerCalls, prompts } = rig(cfg);
+    await send('/agy');
+    expect(pickerCalls).toEqual([]);
+    expect(prompts).toEqual([]);
+    expect(sent.some((t) => t.includes('answered by agy'))).toBe(true);
+  });
+});
+
+/**
+ * Agent commands resolve from the harness table, not only from `routing.pipeline`.
+ *
+ * Registration is per configured harness, so before this a freshly installed deployment
+ * advertised `/cc` and `/oc` in the platform menu while the daemon knew nothing about them —
+ * tapping one forwarded the literal text "/oc" to whichever agent happened to be bound.
+ */
+describe('built-in agent command resolution', () => {
+  /** Same two harnesses as baseConfig, but with no command rules wired by hand. */
+  const noPipeline = makeConfig({ routing: { default: 'cc', pipeline: [] } });
+
+  it('routes to the harness the command names with no pipeline rule at all', async () => {
+    const { send, prompts, sent } = rig(noPipeline);
+    await send('/oc hello');
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]!.prompt).toContain('hello');
+    expect(prompts[0]!.prompt).not.toContain('/oc'); // the prefix is consumed, not forwarded
+    expect(sent.some((t) => t.includes('🤖 opencode'))).toBe(true);
+  });
+
+  it('the pre-rename full harness name still resolves when typed', async () => {
+    const { send, sent } = rig(noPipeline);
+    await send('/opencode hello');
+    expect(sent.some((t) => t.includes('🤖 opencode'))).toBe(true);
+  });
+
+  it('a hand-written pipeline command rule outranks the built-in table', async () => {
+    // An operator who points /oc at a second claude agent gets that, not the first opencode one.
+    const cfg = makeConfig({
+      agents: [
+        { id: 'cc', harness: 'claude' },
+        { id: 'oc', harness: 'opencode' },
+        { id: 'other', harness: 'claude' },
+      ],
+      routing: { default: 'cc', pipeline: [{ when: { command: 'oc' }, use: { agent: 'other' } }] },
+    });
+    const { send, sent } = rig(cfg);
+    await send('/oc hello');
+    expect(sent.some((t) => t.includes('🤖 claude'))).toBe(true);
+  });
+
+  it('an agent command outranks a rule that merely matched on where the message came from', async () => {
+    // The platform rule supplies the conversation's default answerer; naming an agent is an
+    // instruction, so it wins.
+    const cfg = makeConfig({
+      routing: { default: 'cc', pipeline: [{ when: { platform: 'discord' }, use: { agent: 'cc' } }] },
+    });
+    const { send, sent } = rig(cfg);
+    await send('/oc hello');
+    expect(sent.some((t) => t.includes('🤖 opencode'))).toBe(true);
+  });
+});
+
+/** `/help` is answered by the gateway: it is the only place the registered vocabulary is explained. */
+describe('/help', () => {
+  it('answers from the gateway and runs no turn', async () => {
+    const { send, sent, prompts } = rig();
+    await send('/help');
+    expect(prompts).toEqual([]);
+    const help = sent.find((t) => t.includes('/new'))!;
+    expect(help).toContain('/cc');
+    expect(help).toContain('/oc');
+    expect(help).toContain('/help');
+  });
+
+  it('reports the generic commands of the agent answering right now', async () => {
+    const { send, sent } = rig();
+    await send('/oc hello'); // bind to opencode
+    await send('/help');
+    const help = sent.find((t) => t.includes('/new'))!;
+    expect(help).toContain('Answering now: **opencode**');
+    // opencode has no compact, so listing it would be a promise the next tap breaks.
+    expect(help).not.toContain('/compact');
+  });
+
+  it('composes with an agent prefix, like /new does', async () => {
+    const { send, sent, prompts } = rig();
+    await send('/cc /help');
+    expect(prompts).toEqual([]);
+    expect(sent.some((t) => t.includes('Answering now: **claude**'))).toBe(true);
   });
 });
 
@@ -316,11 +429,12 @@ describe('sticky agent binding (the reported bug)', () => {
   });
 
   it('a bare /name is a binding instruction, not an empty prompt', async () => {
-    const { send, prompts, sent } = rig();
+    const { send, prompts, pickerCalls } = rig();
     await send('/oc');
     // No turn: there is nothing to say yet.
     expect(prompts).toEqual([]);
-    expect(sent.some((t) => t.includes('answered by opencode'))).toBe(true);
+    // It binds, then offers opencode's own commands — the bare form's whole job.
+    expect(pickerCalls).toEqual([{ sessionId: KEY, agentId: 'oc' }]);
   });
 
   it('the conversation key never contains an agent id', async () => {

@@ -1,10 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import {
+  agentCommandSpecs,
+  agentForCommand,
+  buildHelpText,
   genericCommandSpecs,
   genericNativeNames,
+  harnessCommandName,
+  harnessForCommand,
+  harnessHasPicker,
   isGenericCommand,
-  pickerCommandsFor,
-  pickerHarnessFor,
   translateCommand,
 } from './command-translate.js';
 import type { AgentDef } from '../config/schema.js';
@@ -98,22 +102,36 @@ describe('genericNativeNames', () => {
   });
 });
 
-describe('pickerCommandsFor', () => {
-  it('one picker per configured harness, deduped and stably ordered', () => {
-    const specs = pickerCommandsFor({
-      agents: [agent('cc', 'claude'), agent('oc', 'opencode'), agent('cc2', 'claude')],
+describe('agentCommandSpecs', () => {
+  it('one short command per configured harness, deduped and stably ordered', () => {
+    const specs = agentCommandSpecs({
+      agents: [agent('a', 'claude'), agent('b', 'opencode'), agent('c', 'claude')],
     });
-    expect(specs.map((s) => s.name)).toEqual(['claude', 'opencode']);
+    // The registered name is the short form, not the harness enum value that used to leak here.
+    expect(specs.map((s) => s.name)).toEqual(['cc', 'oc']);
   });
 
   it('skips custom harnesses (the name would mean nothing to a reader)', () => {
-    const specs = pickerCommandsFor({ agents: [agent('x', 'custom'), agent('cc', 'claude')] });
-    expect(specs.map((s) => s.name)).toEqual(['claude']);
+    const specs = agentCommandSpecs({ agents: [agent('x', 'custom'), agent('cc', 'claude')] });
+    expect(specs.map((s) => s.name)).toEqual(['cc']);
   });
 
-  it('skips agy (it reports no commands, so the picker could only ever say "none yet")', () => {
-    const specs = pickerCommandsFor({ agents: [agent('g', 'agy'), agent('cc', 'claude')] });
-    expect(specs.map((s) => s.name)).toEqual(['claude']);
+  it('registers agy, whose command switches agents even though it lists none', () => {
+    // The regression this pins: agy was skipped entirely because it reports no command list, so
+    // the one harness a user most needs to reach by name had no menu entry at all.
+    const specs = agentCommandSpecs({ agents: [agent('g', 'agy'), agent('cc', 'claude')] });
+    expect(specs.map((s) => s.name)).toEqual(['agy', 'cc']);
+    // …and its description does not promise a command list it cannot show.
+    expect(specs.find((s) => s.name === 'agy')!.description).not.toMatch(/lists/);
+    expect(specs.find((s) => s.name === 'cc')!.description).toMatch(/lists/);
+  });
+
+  it('every description fits the Discord 100-char cap', () => {
+    const specs = agentCommandSpecs({
+      agents: [agent('a', 'claude'), agent('b', 'opencode'), agent('c', 'codex'), agent('d', 'gemini'), agent('e', 'agy')],
+    });
+    expect(specs.map((s) => s.name)).toEqual(['agy', 'cc', 'cx', 'gm', 'oc']);
+    expect(specs.every((s) => s.description.length <= 100)).toBe(true);
   });
 });
 
@@ -130,12 +148,87 @@ describe('translateCommand — agy', () => {
   });
 });
 
-describe('pickerHarnessFor', () => {
-  it('resolves a picker name only when that harness is configured', () => {
-    const cfg = { agents: [agent('cc', 'claude')] };
-    expect(pickerHarnessFor(cfg, 'claude')).toBe('claude');
-    // Not configured here, so /opencode is not a picker in this deployment.
-    expect(pickerHarnessFor(cfg, 'opencode')).toBeUndefined();
-    expect(pickerHarnessFor(cfg, 'compact')).toBeUndefined();
+describe('harness command names', () => {
+  it('maps each harness to its registered short name', () => {
+    expect(harnessCommandName('claude')).toBe('cc');
+    expect(harnessCommandName('opencode')).toBe('oc');
+    expect(harnessCommandName('codex')).toBe('cx');
+    expect(harnessCommandName('gemini')).toBe('gm');
+    expect(harnessCommandName('agy')).toBe('agy');
+    // custom advertises no stable command set, so it gets no name.
+    expect(harnessCommandName('custom')).toBeUndefined();
+    expect(harnessCommandName(undefined)).toBeUndefined();
+  });
+
+  it('still resolves the pre-rename full harness names', () => {
+    // Not registered (they would cost a menu slot), but accepted when typed so existing muscle
+    // memory and any `when: { command: opencode }` already in a config keep working.
+    expect(harnessForCommand('opencode')).toBe('opencode');
+    expect(harnessForCommand('claude')).toBe('claude');
+    expect(harnessForCommand('oc')).toBe('opencode');
+    expect(harnessForCommand('CC')).toBe('claude'); // case-insensitive
+    expect(harnessForCommand('compact')).toBeUndefined();
+    expect(harnessForCommand('custom')).toBeUndefined();
+  });
+
+  it('separates "has a registered command" from "has a command list to show"', () => {
+    // agy earns a command (switching to it is useful) but can never fill a menu, so a bare
+    // invocation must ack the binding instead of posting an empty picker.
+    expect(harnessHasPicker('agy')).toBe(false);
+    expect(harnessHasPicker('custom')).toBe(false);
+    expect(harnessHasPicker('opencode')).toBe(true);
+    expect(harnessHasPicker(undefined)).toBe(false);
   });
 });
+
+describe('agentForCommand', () => {
+  it('selects the first configured agent of the harness the command names', () => {
+    const cfg = { agents: [agent('main', 'claude'), agent('side', 'claude'), agent('o', 'opencode')] };
+    expect(agentForCommand(cfg, 'cc')).toBe('main');
+    expect(agentForCommand(cfg, 'oc')).toBe('o');
+    expect(agentForCommand(cfg, 'opencode')).toBe('o'); // the full name resolves too
+  });
+
+  it('resolves nothing when that harness is not configured', () => {
+    // The command is registered per CONFIGURED harness, so this only happens for a typed name.
+    const cfg = { agents: [agent('cc', 'claude')] };
+    expect(agentForCommand(cfg, 'oc')).toBeUndefined();
+    expect(agentForCommand(cfg, 'compact')).toBeUndefined();
+  });
+});
+
+describe('buildHelpText', () => {
+  const cfg = { agents: [agent('cc', 'claude'), agent('oc', 'opencode'), agent('g', 'agy')] };
+
+  it('lists the daemon commands and every configured agent command', () => {
+    const text = buildHelpText(cfg, { agent: 'cc', harness: 'claude' });
+    for (const name of ['/new', '/clear', '/help', '/cc', '/oc', '/agy']) {
+      expect(text).toContain(name);
+    }
+    expect(text).toContain('Answering now: **claude**');
+  });
+
+  it('lists only the generic commands the current harness can actually run', () => {
+    // Listing /compact to an opencode user who will be told "not supported" the moment they tap
+    // it is exactly the silent degradation the help text exists to prevent.
+    const text = buildHelpText(cfg, { agent: 'oc', harness: 'opencode' });
+    expect(text).toContain('/init');
+    expect(text).toContain('/review');
+    expect(text).not.toContain('/compact');
+    expect(text).not.toContain('/usage');
+  });
+
+  it('drops the whole generic section for a harness that supports none of it', () => {
+    const text = buildHelpText(cfg, { agent: 'g', harness: 'agy' });
+    expect(text).not.toContain('Works on the current agent');
+    // The agent commands still list, because switching away is what a stuck user needs.
+    expect(text).toContain('/cc');
+  });
+
+  it('cannot drift from what gets registered', () => {
+    // Every agent command in the menu appears in the help, by construction (same table).
+    const text = buildHelpText(cfg);
+    for (const spec of agentCommandSpecs(cfg)) expect(text).toContain(`/${spec.name}`);
+  });
+});
+

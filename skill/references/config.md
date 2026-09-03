@@ -184,15 +184,24 @@ routing:
 `command` matches the leading `/name` of the message **text**, so it works on every
 platform — no native slash-command support needed (native slash invocations arrive as
 the same `/name input` text). When a rule matches via `command`, the router consumes
-the prefix: the agent receives only the rest (`/codex fix it` → codex gets `fix it`),
-and a bare `/name` with nothing after it is acked with a usage hint instead of
-starting a turn. Commands matching no rule pass through to the agent untouched
-(that's how agent-native commands like `/model` keep working).
+the prefix: the agent receives only the rest (`/cx fix it` → codex gets `fix it`).
+Commands matching no rule pass through to the agent untouched (that's how agent-native
+commands like `/model` keep working).
 
-A `when.command` rule also **binds** the conversation to that agent: `/codex fix the
+A `when.command` rule also **binds** the conversation to that agent: `/cx fix the
 tests` routes to codex, and every plain message after it stays with codex until someone
 types another `/<agent>`. Config chooses a conversation's *first* agent; the user
-chooses it thereafter. A bare `/codex` just rebinds and says so.
+chooses it thereafter.
+
+You do **not** need a rule to reach a configured harness by name. Each one already has a
+built-in command — `/cc` claude, `/oc` opencode, `/cx` codex, `/gm` gemini, `/agy`
+Antigravity (the full harness name is accepted too) — which selects the first configured
+agent of that harness. A bare `/oc` binds and then lists that agent's own commands; on a
+harness that reports none (`agy`) it just confirms the binding.
+
+Write a `when.command` rule when you want something the built-ins cannot express: an
+alias of your own, or pointing a name at a *second* agent of the same harness. A rule
+matching on `command` outranks the built-in table.
 
 Switching agents never discards context. Each conversation remembers every agent's own
 session separately, so `/codex` → `/claude` → `/codex` resumes codex where it left off.

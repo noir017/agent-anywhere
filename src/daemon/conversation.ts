@@ -1,7 +1,12 @@
 import type { Config } from '../config/schema.js';
 import { agentDisplayName, findAgent } from '../config/schema.js';
 import { SessionTokenRegistry } from './conversation-token-registry.js';
-import { translateCommand, pickerHarnessFor } from '../core/command-translate.js';
+import {
+  translateCommand,
+  buildHelpText,
+  harnessCommandName,
+  harnessHasPicker,
+} from '../core/command-translate.js';
 import { parseTextCommand, resolveAgent, resolveScope, routeInputFromMessage } from './routing.js';
 import {
   addressOf,
@@ -20,6 +25,9 @@ import type { ConversationStore } from './conversation-store.js';
 
 /** Daemon-level context-control commands (intercepted in route(), never forwarded to the agent). */
 const CONTEXT_CLEAR_RE = /^\/(new|clear)(@\S+)?$/;
+
+/** `/help` — answered by the gateway itself (see DAEMON_COMMANDS), never forwarded to the agent. */
+const HELP_RE = /^\/help(@\S+)?$/;
 
 /**
  * All per-conversation runtime state in one object. Consolidated so creation sets one object (no
@@ -104,8 +112,9 @@ export class ConversationRegistry {
     /**
      * Optional callback hooks. onAvailableCommands: fired when a conversation's agent reports its command
      * list (daemon aggregates and dynamically registers native slash). Absent = don't care (test/no-slash).
-     * onPickerRequest: fired when a harness picker command (`/claude`, `/opencode`) is invoked for a
-     * conversation of that harness; the daemon owns the button UI, the registry only resolves who it is for.
+     * onPickerRequest: fired when a bare agent command (`/cc`, `/oc`) is invoked for a conversation
+     * whose harness reports a command list; the daemon owns the button UI, the registry only
+     * resolves who it is for.
      */
     private readonly hooks?: {
       onAvailableCommands?(id: ConversationId, agentId: string, cmds: AgentCommand[]): void;
@@ -251,6 +260,16 @@ export class ConversationRegistry {
       return;
     }
 
+    // `/help` lists what THIS gateway understands, which is the vocabulary a chat user has no
+    // other way to discover — the platform menu shows names without saying who answers them, and
+    // the harness's own /help knows nothing about /new, /oc or the generic translation.
+    // Tested on the STRIPPED content, like /new above, so `/oc /help` composes: the agent prefix
+    // is consumed first and the rest is still a daemon command.
+    if (HELP_RE.test(msg.content.trim())) {
+      this.sendHelp(key, choice.agentId, conv.platform, address);
+      return;
+    }
+
     let state = this.conversations.get(key);
     if (!state) {
       // First sight of this conversation in THIS daemon run. Precedence:
@@ -280,21 +299,17 @@ export class ConversationRegistry {
       }
     }
 
-    // A bare `/oc` with nothing to say: it is a binding instruction, not a prompt. Ack the (possibly
-    // already-effective) binding instead of running an empty turn.
+    // A bare `/oc` with nothing to say: it is a binding instruction, not a prompt — the binding is
+    // already applied above, so no turn runs.
     if (bareCommand !== undefined) {
-      const name = agentDisplayName(findAgent(this.config, state.agentId), state.agentId);
-      void this.platforms
-        .get(conv.platform)
-        ?.sendMessage(address, `▸ this conversation is now answered by ${name} — just type to continue`)
-        .catch((e) => console.warn('[route] failed to ack the binding:', e instanceof Error ? e.message : e));
+      this.answerBareCommand(key, state, conv.platform, address, msg);
       return;
     }
 
     // Generic-command translation. Must sit here: it is the first point that knows WHICH agent
     // will answer, and the last point at which the message can still be refused. Returns the
     // message to forward, or undefined when the command was rejected (already answered).
-    const forwarded = this.applyCommandTranslation(key, state, msg);
+    const forwarded = this.applyCommandTranslation(state, msg);
     if (!forwarded) return;
     msg = forwarded;
 
@@ -382,6 +397,62 @@ export class ConversationRegistry {
   }
 
   /**
+   * Answer `/help` with this deployment's whole registered vocabulary.
+   *
+   * Built from the same tables that drive registration (core/command-translate.ts), so a command
+   * cannot appear in the platform menu without appearing here — the drift that makes a help text
+   * worse than none. Reported against the agent bound right now, because the generic half is
+   * harness-dependent: `/compact` is real on claude and a dead entry on opencode.
+   *
+   * `fallback` is the agent this message would route to, used only when the conversation has no
+   * binding yet (a `/help` as the very first thing said in a channel).
+   */
+  private sendHelp(
+    key: ConversationId,
+    fallback: string,
+    platformId: string,
+    address: ConversationAddress
+  ): void {
+    const agentId = this.conversations.get(key)?.agentId ?? this.store?.boundAgent(key) ?? fallback;
+    const def = findAgent(this.config, agentId);
+    console.log(`[command] /help answered for ${key} (agent ${agentId})`);
+    void this.platforms
+      .get(platformId)
+      ?.sendMessage(address, buildHelpText(this.config, { agent: agentId, harness: def?.harness }))
+      .catch((e) => console.warn('[conversation] failed to send help:', e instanceof Error ? e.message : e));
+  }
+
+  /**
+   * Answer a bare agent command (`/oc` with no prompt), whose binding route() has already applied.
+   *
+   * What it answers WITH depends on the harness:
+   *  - one that reports a command list gets its own menu, which is the ONLY way those commands are
+   *    reachable — they are deliberately not registered globally (core/command-translate.ts);
+   *  - one that reports none (agy) gets the binding ack, because an empty menu answers nothing.
+   *
+   * A rebind, when there was one, already announced itself in rebind(); this adds what was asked
+   * for rather than repeating who is answering.
+   */
+  private answerBareCommand(
+    key: ConversationId,
+    state: ConversationState,
+    platformId: string,
+    address: ConversationAddress,
+    msg: InboundMessage
+  ): void {
+    const def = findAgent(this.config, state.agentId);
+    if (harnessHasPicker(def?.harness) && this.hooks?.onPickerRequest) {
+      this.hooks.onPickerRequest(key, state.agentId, msg);
+      return;
+    }
+    const name = agentDisplayName(def, state.agentId);
+    void this.platforms
+      .get(platformId)
+      ?.sendMessage(address, `▸ this conversation is now answered by ${name} — just type to continue`)
+      .catch((e) => console.warn('[route] failed to ack the binding:', e instanceof Error ? e.message : e));
+  }
+
+  /**
    * Rewrite a leading generic command into the target harness's native spelling, or refuse it.
    *
    * Native platform slash is global while agents are bound per conversation, so the registered menu is a
@@ -389,13 +460,16 @@ export class ConversationRegistry {
    * agent reports — a union cannot say who owns an entry, and an entry invoked from it routes to
    * `routing.default` rather than to the agent that offered it.
    *
+   * Agent commands (`/cc`, `/oc`, `/agy`) never reach here: resolveAgent answers them explicitly,
+   * which consumes the prefix upstream — with a prompt they become that prompt, and bare they are
+   * handled as a binding + picker in route().
+   *
    * Returns the message to forward, or undefined when the command was rejected — in which case the
    * user has been told why and NO turn runs. Refusing here (rather than forwarding and letting the
    * agent puzzle over it) is the point: `/compact` on a harness with no compact is a mistake worth
    * naming, not a prompt worth spending a turn on.
    */
   private applyCommandTranslation(
-    key: ConversationId,
     state: ConversationState,
     msg: InboundMessage
   ): InboundMessage | undefined {
@@ -404,35 +478,19 @@ export class ConversationRegistry {
     const def = findAgent(this.config, state.agentId);
     const name = agentDisplayName(def, state.agentId);
 
-    // Harness picker (`/claude`, `/opencode`): offers the agent's OWN commands, so it only means
-    // something in a conversation of that harness. Invoked elsewhere it is reported as inapplicable
-    // rather than forwarded — the target agent would not recognize it either.
-    const picker = pickerHarnessFor(this.config, parsed.name);
-    if (picker) {
-      if (def && def.harness === picker) {
-        this.hooks?.onPickerRequest?.(key, state.agentId, msg);
-      } else {
-        void this.platforms
-          .get(msg.conversation.platform)
-          ?.sendMessage(
-            addressOf(msg.conversation),
-            `This conversation is answered by ${name}, so /${parsed.name} does not apply here.\nSwitch with \`/<agent>\` first, then run /${parsed.name}.`
-          )
-          .catch((e) => console.warn('[conversation] failed to report an inapplicable picker:', e instanceof Error ? e.message : e));
-      }
-      return undefined;
-    }
-
     const result = translateCommand(parsed.name, def?.harness);
     if (result.kind === 'passthrough') return msg;
 
     if (result.kind === 'unsupported') {
+      // Point at the agent command rather than the harness name: the menu registers `/oc`, not
+      // `/opencode`, and a harness that reports no list (agy) has nothing to point at at all.
+      const own = harnessCommandName(def?.harness);
+      const hint = harnessHasPicker(def?.harness) && own
+        ? `\nIts own commands are available under /${own}.`
+        : '';
       void this.platforms
         .get(msg.conversation.platform)
-        ?.sendMessage(
-          addressOf(msg.conversation),
-          `${name} does not support /${parsed.name}.\nIts own commands are available under /${name}.`
-        )
+        ?.sendMessage(addressOf(msg.conversation), `${name} does not support /${parsed.name}.${hint}`)
         .catch((e) => console.warn('[conversation] failed to report an unsupported command:', e instanceof Error ? e.message : e));
       console.log(`[command] /${parsed.name} unsupported by ${state.agentId} (${name}); not forwarded`);
       return undefined;

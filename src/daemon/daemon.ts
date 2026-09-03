@@ -2,9 +2,11 @@ import { randomUUID } from 'node:crypto';
 import type { Config } from '../config/schema.js';
 import { agentDisplayName, findAgent } from '../config/schema.js';
 import {
+  agentCommandSpecs,
+  DAEMON_COMMANDS,
   genericCommandSpecs,
   genericNativeNames,
-  pickerCommandsFor,
+  harnessCommandName,
 } from '../core/command-translate.js';
 import type { PlatformAdapter } from '../platform/adapter.js';
 import type {
@@ -35,13 +37,10 @@ const SLASH_NAME_RE = /^[a-z0-9_-]{1,32}$/;
 const SLASH_DESC_MAX = 100;
 
 /**
- * Daemon-level slash commands, registered ahead of the rest. Both are intercepted in
- * SessionRegistry.route (see CONTEXT_CLEAR_RE) and never reach the agent.
+ * Daemon-level slash commands are defined in core/command-translate.ts (DAEMON_COMMANDS), so
+ * registration and `/help` read the same list. All are intercepted in ConversationRegistry.route
+ * (see CONTEXT_CLEAR_RE / HELP_RE there) and never reach an agent.
  */
-const DAEMON_COMMANDS: SlashCommandSpec[] = [
-  { name: 'new', description: 'Start a fresh conversation (clears context)' },
-  { name: 'clear', description: 'Alias of /new: start a fresh conversation' },
-];
 
 /**
  * Inbound dedup TTL: on "slash-is-a-normal-message" platforms (e.g. Telegram), one `/cmd` fires
@@ -132,13 +131,13 @@ export function agentCommandToSpec(cmd: AgentCommand): SlashCommandSpec | null {
  * since each agent re-reports its full list every turn and the last reporter won the menu.
  *
  * Three layers, in registration order:
- *  - daemon commands (/new, /clear) — intercepted before any agent
+ *  - daemon commands (/new, /clear, /help) — intercepted before any agent
  *  - the generic vocabulary — translated per harness at invocation (core/command-translate.ts)
- *  - one picker per configured harness (/claude, /opencode) — the escape hatch to that agent's
- *    own commands, which are no longer registered globally
+ *  - one agent command per configured harness (/cc, /oc, /agy) — switches the conversation, and
+ *    bare is the escape hatch to that agent's own commands, which are not registered globally
  */
 export function buildRegisteredSpecs(cfg: Pick<Config, 'agents'>): SlashCommandSpec[] {
-  const specs = [...DAEMON_COMMANDS, ...genericCommandSpecs(), ...pickerCommandsFor(cfg)];
+  const specs = [...DAEMON_COMMANDS, ...genericCommandSpecs(), ...agentCommandSpecs(cfg)];
   // Dedup defensively: a harness named like a generic command (or a future daemon command) must not
   // register twice — Telegram rejects the whole setMyCommands batch on a duplicate name.
   const seen = new Set<string>();
@@ -539,8 +538,7 @@ export class Daemon {
   }
 
   /**
-   * A harness picker (`/claude`, `/opencode`) was invoked in a session of that harness: post the
-   * agent's own commands as buttons.
+   * A bare agent command (`/cc`, `/oc`) was invoked: post that agent's own commands as buttons.
    *
    * Only the commands the agent actually reported are offered — no guessed list. Ones already
    * reachable through the generic vocabulary are filtered out, since they have a top-level entry.
@@ -557,11 +555,16 @@ export class Daemon {
 
     const def = findAgent(this.config, agentId);
     const label = agentDisplayName(def, agentId);
+    // The command to name in a "try again" hint is the registered one, not the harness name.
+    const cmd = harnessCommandName(def?.harness) ?? label;
     const reported = this.agentCommands.get(agentId);
     if (!reported || reported.length === 0) {
       // Truthful about the cause rather than showing an empty menu: the list arrives over ACP once a
       // session exists, and spawning an agent subprocess merely to populate a menu is a worse trade.
-      send(`No command list from ${label} yet — send it a message first, then try /${label} again.`);
+      // Names the binding too, since a bare `/oc` is also how a user switches agents.
+      send(
+        `▸ this conversation is now answered by ${label}.\nNo command list from it yet — send it a message first, then /${cmd} again.`
+      );
       return;
     }
 

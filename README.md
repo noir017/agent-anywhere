@@ -124,8 +124,9 @@ the YAML can be committed.
 | `custom` | your `command` + `args` | any ACP executable | your agent's |
 
 Each agent takes `cwd`, `env`, `args`, and a best-effort `model`. Sessions
-persist where the agent supports it; advertised slash commands become native
-platform commands. `doctor` verifies every configured harness.
+persist where the agent supports it; the commands an agent advertises are
+reachable through its own `/<agent>` menu rather than registered globally (see
+[Chat commands](#chat-commands)). `doctor` verifies every configured harness.
 
 ### Antigravity (`agy`)
 
@@ -168,6 +169,42 @@ appended after the defaults, and agy's flag parsing is last-wins).
 Markdown is rendered per platform; missing capabilities degrade gracefully (no
 editing → chunked sends, no buttons → plain-text question). Slack, Lark, and
 DingTalk connect over WebSocket by default — no public callback URL needed.
+
+## Chat commands
+
+Registered as native slash commands where the platform supports them (Telegram,
+Discord, Slack), and equally usable as plain text everywhere else.
+
+| | |
+|---|---|
+| `/help` | everything below, for the agent currently answering |
+| `/new`, `/clear` | start a fresh conversation (clears context) |
+| `/cc`, `/oc`, `/cx`, `/gm`, `/agy` | one per configured harness — see below |
+| `/compact`, `/context`, `/model`, `/usage`, `/doctor`, `/mcp`, `/init`, `/review` | a generic vocabulary, translated to each harness's own spelling |
+
+An **agent command** is named after its harness — `/cc` claude, `/oc` opencode,
+`/cx` codex, `/gm` gemini, `/agy` Antigravity. Only the harnesses you configure
+are registered. It does two things:
+
+```
+/oc fix the failing test    →  switch this conversation to opencode, and ask it
+/oc                         →  switch, then list opencode's own commands as buttons
+```
+
+The binding is **sticky**: everything after `/oc` keeps going to opencode until
+you name someone else, and switching back resumes that agent's own thread rather
+than restarting it. The full harness name (`/opencode`) still works if you type
+it — it is just not registered, so it costs no slot in the platform menu.
+
+The bare form is the only way to reach a harness's *own* commands
+(`/customize-opencode`, and friends). They are deliberately not registered
+globally: native slash is per-bot while agents are per-conversation, so a merged
+menu could neither say who owned an entry nor route it to them. A harness that
+reports no command list (`agy`) simply confirms the switch.
+
+Generic commands are rewritten to the target harness's native spelling
+(`/compact` → gemini's `/compress`), and a harness with no equivalent says so
+instead of spending a turn on a prompt it will misread.
 
 ## Acting in the chat
 

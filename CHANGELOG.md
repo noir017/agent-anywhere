@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-03
+
 ### Changed (breaking) — the registered command menu
 
 - **Agent commands are short, and they work without config.** The per-harness entries

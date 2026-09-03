@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   agentCommandSpecs,
   agentForCommand,
+  unconfiguredHarnessCommand,
   buildHelpText,
   genericCommandSpecs,
   genericNativeNames,
@@ -141,6 +142,13 @@ describe('agentCommandSpecs', () => {
     expect(specs.find((s) => s.name === 'cc')!.description).toMatch(/lists/);
   });
 
+  it('describes every agent command with one phrasing', () => {
+    // agy read "Switch this conversation to agy" while its neighbours read "Switch to claude — …",
+    // so one menu described the same action two ways and agy looked like a different kind of entry.
+    const specs = agentCommandSpecs({ agents: [agent('g', 'agy'), agent('cc', 'claude')] });
+    for (const spec of specs) expect(spec.description).toMatch(/^Switch to [a-z]+(?: —|$)/);
+  });
+
   it('every description fits the Discord 100-char cap', () => {
     const specs = agentCommandSpecs({
       agents: [agent('a', 'claude'), agent('b', 'opencode'), agent('c', 'codex'), agent('d', 'gemini'), agent('e', 'agy')],
@@ -209,6 +217,24 @@ describe('agentForCommand', () => {
     const cfg = { agents: [agent('cc', 'claude')] };
     expect(agentForCommand(cfg, 'oc')).toBeUndefined();
     expect(agentForCommand(cfg, 'compact')).toBeUndefined();
+  });
+});
+
+describe('unconfiguredHarnessCommand', () => {
+  it('names the harness an agent command points at when nothing configures it', () => {
+    const cfg = { agents: [agent('cc', 'claude')] };
+    expect(unconfiguredHarnessCommand(cfg, 'agy')).toBe('agy');
+    expect(unconfiguredHarnessCommand(cfg, 'opencode')).toBe('opencode'); // the alias too
+  });
+
+  it('says nothing about a configured harness, or about any other word', () => {
+    const cfg = { agents: [agent('cc', 'claude'), agent('g', 'agy')] };
+    expect(unconfiguredHarnessCommand(cfg, 'agy')).toBeUndefined();
+    expect(unconfiguredHarnessCommand(cfg, 'cc')).toBeUndefined();
+    // Not an agent command at all: the generic vocabulary and a harness's own commands are
+    // someone else's business, and treating them as a missing agent would swallow them.
+    expect(unconfiguredHarnessCommand(cfg, 'compact')).toBeUndefined();
+    expect(unconfiguredHarnessCommand(cfg, 'customize-opencode')).toBeUndefined();
   });
 });
 

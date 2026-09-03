@@ -6,8 +6,15 @@ import {
   buildHelpText,
   harnessCommandName,
   harnessHasPicker,
+  unconfiguredHarnessCommand,
 } from '../core/command-translate.js';
-import { parseTextCommand, resolveAgent, resolveScope, routeInputFromMessage } from './routing.js';
+import {
+  parseTextCommand,
+  resolveAgent,
+  resolveScope,
+  routeInputFromMessage,
+  type AgentChoice,
+} from './routing.js';
 import {
   addressOf,
   conversationKey,
@@ -288,6 +295,11 @@ export class ConversationRegistry {
       return;
     }
 
+    // An agent command naming a harness this deployment doesn't run (`/agy` with no agy agent):
+    // answered here, never forwarded. Only reachable when resolveAgent declined the name, so a
+    // configured harness or a `when.command` rule always wins.
+    if (this.reportUnconfiguredHarness(choice, msg, address)) return;
+
     let state = this.conversations.get(key);
     if (!state) {
       // First sight of this conversation in THIS daemon run. Precedence:
@@ -412,6 +424,41 @@ export class ConversationRegistry {
           : `▸ ${name} is answering this conversation now`
       )
       .catch((e) => console.warn('[conversation] failed to ack the rebind:', e instanceof Error ? e.message : e));
+  }
+
+  /**
+   * Answer an agent command whose harness this deployment configures no agent for, and say so.
+   *
+   * Returns true when it did (the caller then runs no turn).
+   *
+   * Why this is not a fall-through: resolveAgent declined the name, so the `/agy` prefix was NOT
+   * consumed, and the message would reach whichever agent is bound still spelled `/agy hi`. That
+   * agent reads it as one of ITS own slash commands, finds nothing, and emits nothing — the user
+   * gets "ran a command, no output to display" and no hint that the command was never wired to
+   * anything. Naming the missing agent is the same trade the generic vocabulary already makes:
+   * an honest refusal beats a turn spent on a prompt the agent will misread.
+   *
+   * Scoped to agent commands only. A name outside that vocabulary may well be a harness's own
+   * command (`/customize-opencode`) or a user skill, and those must still pass through.
+   */
+  private reportUnconfiguredHarness(
+    choice: AgentChoice,
+    msg: InboundMessage,
+    address: ConversationAddress
+  ): boolean {
+    if (choice.explicit) return false; // something claimed the name: a rule, or a configured harness
+    const name = parseTextCommand(msg.content)?.name;
+    const missing = name ? unconfiguredHarnessCommand(this.config, name) : undefined;
+    if (!missing) return false;
+    console.log(`[command] /${name} names the unconfigured harness "${missing}"; not forwarded`);
+    void this.platforms
+      .get(msg.conversation.platform)
+      ?.sendMessage(
+        address,
+        `No ${missing} agent is configured here, so /${missing} selects nothing. Add one under \`agents:\` in config.yaml (\`harness: ${missing}\`) and restart the daemon; /help lists the agents this gateway does have.`
+      )
+      .catch((e) => console.warn('[conversation] failed to report an unconfigured harness:', e instanceof Error ? e.message : e));
+    return true;
   }
 
   /**

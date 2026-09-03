@@ -199,6 +199,10 @@ Antigravity (the full harness name is accepted too) — which selects the first 
 agent of that harness. A bare `/oc` binds and then lists that agent's own commands; on a
 harness that reports none (`agy`) it just confirms the binding.
 
+A command naming a harness you never configured (`/agy` with no `harness: agy` agent)
+is answered with that fact and runs no turn — it would otherwise reach the bound agent
+with its `/agy` prefix intact and be swallowed as an unknown command of that agent's own.
+
 Write a `when.command` rule when you want something the built-ins cannot express: an
 alias of your own, or pointing a name at a *second* agent of the same harness. A rule
 matching on `command` outranks the built-in table.

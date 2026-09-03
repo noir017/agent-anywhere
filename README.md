@@ -196,6 +196,12 @@ you name someone else, and switching back resumes that agent's own thread rather
 than restarting it. The full harness name (`/opencode`) still works if you type
 it — it is just not registered, so it costs no slot in the platform menu.
 
+A name whose harness you have **not** configured (`/agy` with no `harness: agy`
+agent) is answered with exactly that, and runs no turn — otherwise it reaches
+whichever agent is bound still spelled `/agy …`, which reads it as one of its own
+slash commands, finds nothing, and replies that a command ran and produced no
+output.
+
 The bare form is the only way to reach a harness's *own* commands
 (`/customize-opencode`, and friends). They are deliberately not registered
 globally: native slash is per-bot while agents are per-conversation, so a merged

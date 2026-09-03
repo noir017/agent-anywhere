@@ -3,6 +3,7 @@ import type { Config } from '../config/schema.js';
 import { agentDisplayName, findAgent } from '../config/schema.js';
 import {
   agentCommandSpecs,
+  agentForCommand,
   DAEMON_COMMANDS,
   genericCommandSpecs,
   genericNativeNames,
@@ -689,6 +690,14 @@ export class Daemon {
    */
   private async registerCommands(): Promise<void> {
     const all = buildRegisteredSpecs(this.config);
+    // Say which agent commands exist and who each one selects. Without this the only way to tell a
+    // harness apart from a missing one was to try it in chat: an unconfigured `/agy` is not
+    // registered, so it reaches the bound agent as plain text and dies as an unknown command of
+    // that agent's own (route() now answers it, but the log is where the cause is visible).
+    const agentCmds = agentCommandSpecs(this.config)
+      .map((s) => `/${s.name}→${agentForCommand(this.config, s.name) ?? '?'}`)
+      .join(' ');
+    console.log(`[slash] agent commands from config: ${agentCmds || '(none)'}`);
     for (const [id, adapter] of this.platforms) {
       if (!adapter.capabilities.slashCommands) continue; // no registration support: plain-text passthrough still works
       // slashCommands=true only means "can receive slash", not "can register at runtime". Platforms with

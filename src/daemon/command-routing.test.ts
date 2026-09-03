@@ -245,16 +245,44 @@ describe('bare agent command → harness picker', () => {
     expect(prompts).toHaveLength(1); // only the first message ran a turn
   });
 
-  it('an unconfigured harness name is not special (falls through as a normal command)', async () => {
-    const cfg = {
-      ...(baseConfig as unknown as Record<string, unknown>),
-      agents: [{ id: 'cc', harness: 'claude', args: [], env: {} }],
+  it('an agent command for an unconfigured harness names the gap instead of running a turn', async () => {
+    // The regression this pins: `/agy hi` in a deployment with no agy agent resolved to nobody, so
+    // the prefix survived and the message reached the BOUND agent spelled `/agy hi` — which it ran
+    // as one of its own slash commands, found nothing, and answered "ran a command, no output".
+    const cfg = makeConfig({
+      agents: [{ id: 'cc', harness: 'claude' }],
       routing: { default: 'cc', pipeline: [] },
-    } as unknown as Config;
-    const { send, pickerCalls, prompts } = rig(cfg);
-    await send('/opencode'); // opencode isn't configured here
+    });
+    const { send, sent, pickerCalls, prompts } = rig(cfg);
+    await send('/agy hi'); // agy isn't configured here
+    expect(sent.some((t) => t.includes('No agy agent is configured'))).toBe(true);
+    // The negatives that matter: no turn, and no picker for a harness that isn't there.
+    expect(prompts).toEqual([]);
     expect(pickerCalls).toEqual([]);
+  });
+
+  it('the bare form of an unconfigured harness is answered the same way', async () => {
+    const cfg = makeConfig({
+      agents: [{ id: 'cc', harness: 'claude' }],
+      routing: { default: 'cc', pipeline: [] },
+    });
+    const { send, sent, prompts } = rig(cfg);
+    await send('/opencode'); // the full-name alias, equally unconfigured
+    expect(sent.some((t) => t.includes('No opencode agent is configured'))).toBe(true);
+    expect(prompts).toEqual([]);
+  });
+
+  it('a `when.command` rule still outranks the unconfigured check', async () => {
+    // An operator may point any name at any agent; the check only covers names nothing claimed.
+    const cfg = makeConfig({
+      agents: [{ id: 'cc', harness: 'claude' }],
+      routing: { default: 'cc', pipeline: [{ when: { command: 'agy' }, use: { agent: 'cc' } }] },
+    });
+    const { send, sent, prompts } = rig(cfg);
+    await send('/agy hi');
+    expect(sent.some((t) => t.includes('is configured'))).toBe(false);
     expect(prompts).toHaveLength(1);
+    expect(prompts[0]!.prompt).toContain('hi');
   });
 
   it('a harness that reports no command list acks the binding instead of an empty menu', async () => {
@@ -314,6 +342,24 @@ describe('built-in agent command resolution', () => {
     const { send, sent } = rig(cfg);
     await send('/oc hello');
     expect(sent.some((t) => t.includes('🤖 claude'))).toBe(true);
+  });
+
+  it('`/agy <prompt>` reaches the agy agent with the prefix consumed', async () => {
+    // The user-reported case, end to end: agy has no picker, so this is the ONLY form that runs a
+    // turn on it, and a surviving `/agy` prefix is exactly what made it look inert.
+    const cfg = makeConfig({
+      agents: [
+        { id: 'cc', harness: 'claude' },
+        { id: 'g', harness: 'agy' },
+      ],
+      routing: { default: 'cc', pipeline: [] },
+    });
+    const { send, prompts, sent } = rig(cfg);
+    await send('/agy hi');
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]!.prompt).toContain('hi');
+    expect(prompts[0]!.prompt).not.toContain('/agy');
+    expect(sent.some((t) => t.includes('🤖 agy'))).toBe(true);
   });
 
   it('an agent command outranks a rule that merely matched on where the message came from', async () => {

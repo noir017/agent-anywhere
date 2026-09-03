@@ -237,6 +237,12 @@ this, `/oc` meant something only because an operator had hand-written
 inert and reached the bound agent as the literal text `/oc`. A pipeline rule still
 outranks the table — see `daemon/routing.ts` `resolveAgent`.
 
+`unconfiguredHarnessCommand` is the other side of that lookup: a name that IS in the
+vocabulary but selects nothing here, because this deployment configures no agent of that
+harness. `daemon/conversation.ts` answers it instead of forwarding — a declined name keeps
+its `/agy` prefix, so the bound agent would run it as one of its own slash commands, find
+nothing, and produce no output at all.
+
 `buildHelpText` renders `/help` from these same tables, so a command cannot reach the
 platform menu without reaching the help text. It filters the generic section to what the
 *currently bound* harness actually supports, because listing `/compact` to an opencode

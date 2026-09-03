@@ -204,6 +204,29 @@ export function agentForCommand(cfg: Pick<Config, 'agents'>, name: string): stri
   return cfg.agents.find((a) => a.harness === harness)?.id;
 }
 
+/**
+ * The harness an agent command names when this deployment configures NO agent for it — i.e. the
+ * command is a real name in the vocabulary but has nothing to select here (`/agy` with no
+ * `harness: agy` agent in config.yaml).
+ *
+ * Exists because the alternative is the failure this gateway is built to avoid: the name resolves
+ * to nobody, so the message keeps its `/agy` prefix and is forwarded verbatim to whichever agent is
+ * bound, which reads it as one of ITS own slash commands, finds nothing, and produces no output at
+ * all. The user sees a turn that ran and said nothing, with no hint that the command was never
+ * wired. Naming the missing agent costs one message and points straight at the config.
+ *
+ * Consulted only AFTER resolveAgent has declined the name, so both a `when.command` rule and a
+ * configured harness outrank it — an operator can still point `/gm` at anything they like.
+ */
+export function unconfiguredHarnessCommand(
+  cfg: Pick<Config, 'agents'>,
+  name: string
+): Harness | undefined {
+  const harness = harnessForCommand(name);
+  if (!harness) return undefined;
+  return cfg.agents.some((a) => a.harness === harness) ? undefined : harness;
+}
+
 /** Outcome of translating one leading `/name` for a target harness. */
 export type CommandTranslation =
   /** Not part of the generic vocabulary: forward untouched (power users can still type native names). */
@@ -276,11 +299,13 @@ export function agentCommandSpecs(cfg: Pick<Config, 'agents'>): SlashCommandSpec
     .sort((a, b) => a.cmd.name.localeCompare(b.cmd.name))
     .map(({ harness, cmd }) => ({
       name: cmd.name,
-      // Names what the command DOES, since the short name no longer says it. The bare form is
-      // only worth advertising on a harness that has a list to show.
+      // Names what the command DOES, since the short name no longer says it. One phrasing for
+      // every agent command — `Switch to <harness>` — because a menu whose entries describe the
+      // same action in two different sentences reads as two different features; the bare form is
+      // then advertised only on a harness that actually has a list to show.
       description: cmd.picker
         ? `Switch to ${harness} — alone, lists its own commands`
-        : `Switch this conversation to ${harness}`,
+        : `Switch to ${harness}`,
     }));
 }
 

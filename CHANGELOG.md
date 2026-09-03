@@ -5,6 +5,25 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **An agent command for a harness you never configured no longer dies silently.** `/agy hi`
+  in a deployment with no `harness: agy` agent resolved to nobody, so the prefix survived and
+  the message reached the *bound* agent still spelled `/agy hi` — which ran it as one of its
+  own slash commands, found nothing, and answered "ran a command, but there was no output to
+  display". The gateway now names the gap ("No agy agent is configured here…") and runs no
+  turn. A `when.command` rule and a configured harness both still outrank the check, so an
+  operator's own alias is untouched. Startup also logs the agent commands config produces and
+  the agent each selects, which is where the cause is visible.
+
+### Changed
+
+- **One phrasing for every agent command in the platform menu.** `/agy` read "Switch this
+  conversation to agy" while `/cc` and `/oc` read "Switch to claude — alone, lists its own
+  commands", so a single menu described the same action two ways. All of them now open with
+  `Switch to <harness>`, and only a harness that has a command list to show keeps the clause
+  about the bare form.
+
 ## [0.5.0] - 2026-09-03
 
 ### Added

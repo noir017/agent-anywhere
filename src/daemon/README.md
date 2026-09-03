@@ -42,6 +42,7 @@ ConversationRegistry.route
    ├─ response gate      core/inbound-gate shouldRespond
    ├─ /new · /clear      reset the conversation, drop every agent's id, ack. Never forwarded.
    ├─ /help              the registered vocabulary, from core/command-translate. Never forwarded.
+   ├─ unconfigured agent `/agy` with no agy agent → say so, run no turn. Never forwarded.
    ├─ bind or rebind     new conversation → bind; explicit `/oc` → rebind; else keep the bound agent
    ├─ bare command       `/oc` alone → its command menu, or a binding ack if it reports none
    ├─ command translate  generic → native, or refuse
@@ -66,6 +67,9 @@ Several orderings in `route()` are load-bearing and commented in place:
   will not be answered gets no acknowledgement of any kind.
 - **`/new` is intercepted before the merger**, so it works mid-turn (dispose aborts the
   in-flight turn).
+- **The unconfigured-harness check runs before binding**, and only on a name `resolveAgent`
+  declined — so a `when.command` rule or a configured harness always wins, and a name nobody
+  claimed never binds a conversation on its way to being refused.
 
 ## Routing, binding, and conversation keys
 

@@ -18,7 +18,13 @@ import type {
 } from '@agentclientprotocol/sdk';
 import type { AgentDef, Config } from '../config/schema.js';
 import { findAgent } from '../config/schema.js';
-import type { AgentFactory, AgentSession, AgentStreamHandlers, RunTurnInput } from './agent.js';
+import type {
+  AgentFactory,
+  AgentSession,
+  AgentStreamHandlers,
+  ModelSelector,
+  RunTurnInput,
+} from './agent.js';
 import { looksLikeCommand } from './routing.js';
 import type { ConversationStore } from './conversation-store.js';
 import {
@@ -239,9 +245,11 @@ const MODEL_CONFIG_ID = 'model';
 async function applyModelPreference(
   ctx: ClientContext,
   session: ActiveSession,
-  def: AgentDef
+  def: AgentDef,
+  /** Runtime choice for this conversation (`/model`); outranks the configured model when set. */
+  override?: string
 ): Promise<string | undefined> {
-  const want = def.model;
+  const want = override ?? def.model;
   if (!want) return undefined;
 
   const opt = (session.newSessionResponse?.configOptions ?? []).find((o) => o.id === MODEL_CONFIG_ID);
@@ -306,6 +314,22 @@ function createAcpSession(
    * to the configured value. Cleared on dispose so a rebuilt child re-reports.
    */
   let liveModel: string | undefined;
+  /**
+   * The session's config options as the harness last reported them (session/new, session/load,
+   * set_config_option, config_option_update). Kept whole rather than distilled to `liveModel`
+   * because `/model` needs the option's full choice list, and a resumed session (session/load)
+   * never populates `newSessionResponse` — reading the selector off that would make every
+   * post-restart conversation look like a harness with no model selector.
+   */
+  let liveConfigOptions: SessionConfigOption[] | undefined;
+  /**
+   * Model chosen at runtime for THIS conversation (`/model`), outranking `agents[].model`.
+   *
+   * Held here rather than in config so it survives what it must and no more: a child that crashes
+   * or is evicted rebuilds with the user's choice re-applied, while a new conversation starts from
+   * the configured default. Cleared on dispose along with the rest of the session.
+   */
+  let modelPreference: string | undefined;
 
   /**
    * Reset the three connection handles to undefined (without killing the process). Shared by the child
@@ -320,6 +344,7 @@ function createAcpSession(
     // The next child re-reports its own model; keeping a stale name would misattribute the footer
     // if the rebuilt session resolves a different one.
     liveModel = undefined;
+    liveConfigOptions = undefined;
   }
 
   /** Max wait for initialize + session/new after spawn; on timeout, treat spawn as failed (ENOENT etc.) instead of hanging. */
@@ -420,7 +445,8 @@ function createAcpSession(
           });
           active = resumed;
           // session/load reports the resumed session's config the same way session/new does.
-          liveModel = liveModelName(loaded?.configOptions);
+          liveConfigOptions = loaded?.configOptions ?? undefined;
+          liveModel = liveModelName(liveConfigOptions);
           console.log(`[acp] resumed persisted session for "${def.id}" (${persistedId})`);
         } catch (err) {
           // Stored id no longer loadable (history pruned, cwd moved, harness downgraded): start fresh.
@@ -443,10 +469,12 @@ function createAcpSession(
           })
           .start();
         active = session; // active set = "ready": assigned last so a half-ready session isn't reused
-        liveModel = liveModelName(session.newSessionResponse?.configOptions);
+        liveConfigOptions = session.newSessionResponse?.configOptions ?? undefined;
+        liveModel = liveModelName(liveConfigOptions);
         // _meta.model above is a hint some harnesses ignore (verified: opencode reports its own
-        // default regardless), so enforce the choice through the protocol's own setter.
-        liveModel = (await applyModelPreference(ctx, session, def)) ?? liveModel;
+        // default regardless), so enforce the choice through the protocol's own setter. A runtime
+        // /model choice outranks config, so a rebuilt child keeps answering as the user asked.
+        liveModel = (await applyModelPreference(ctx, session, def, modelPreference)) ?? liveModel;
         store?.setAgentSession(conversationId, def.id, session.sessionId); // for post-restart session/load resume
       } catch (err) {
         // session/new returning auth_required (un-logged-in harness) surfaces as an opaque reject. Build
@@ -576,6 +604,38 @@ function createAcpSession(
     abort(): void {
       aborting = true;
       if (conn && active) void conn.agent.notify('session/cancel', { sessionId: active.sessionId });
+    },
+
+    modelSelector(): ModelSelector | undefined {
+      const opt = liveConfigOptions?.find((o) => o.id === MODEL_CONFIG_ID);
+      if (!opt || opt.type !== 'select') return undefined;
+      // Options come flat or grouped by provider; flatten so the caller sees one list.
+      const options = opt.options
+        .flatMap((entry) => ('group' in entry ? entry.options : [entry]))
+        .map((o) => ({ value: o.value, name: o.name || o.value }));
+      return {
+        current: typeof opt.currentValue === 'string' ? opt.currentValue : undefined,
+        options,
+      };
+    },
+
+    async setModel(value: string): Promise<string> {
+      // No live session = no selector to set: the option list arrives with session/new, and the
+      // caller can say "send a message first" far more usefully than a spawn here could.
+      if (!conn || !active) {
+        throw new Error('no live session yet');
+      }
+      const res = await conn.agent.request('session/set_config_option', {
+        sessionId: active.sessionId,
+        configId: MODEL_CONFIG_ID,
+        value,
+      });
+      // Remember BEFORE trusting the echo: the choice must outlive this child either way.
+      modelPreference = value;
+      liveConfigOptions = res?.configOptions ?? liveConfigOptions;
+      liveModel = liveModelName(liveConfigOptions) ?? value;
+      console.log(`[acp] agent "${def.id}": model switched to "${value}" at runtime`);
+      return liveModel;
     },
 
     dispose(): void {

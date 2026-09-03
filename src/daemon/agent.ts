@@ -40,6 +40,21 @@ export interface AgentStreamHandlers {
   onModel?(model: string): void;
 }
 
+/**
+ * The session's model selector, as the harness exposes it (ACP session config option `model`).
+ *
+ * Read off the live session rather than from config: `agents[].model` is an intent a harness may
+ * ignore (opencode does — it reported its own default until the daemon set the option explicitly),
+ * and a harness that pins its model elsewhere (claude, via ANTHROPIC_MODEL) offers no selector at
+ * all, which is a different answer from "the list is empty".
+ */
+export interface ModelSelector {
+  /** The model serving this session right now. */
+  current?: string;
+  /** Selectable ids with the display names the harness gave them. May be empty. */
+  options: Array<{ value: string; name: string }>;
+}
+
 /** Live context usage from the agent (ACP UsageUpdate: `used` / `size`). */
 export interface AgentUsage {
   /** Tokens currently in context. */
@@ -70,6 +85,22 @@ export interface AgentSession {
   runTurn(input: RunTurnInput, handlers: AgentStreamHandlers): Promise<void>;
   /** Interrupt the current turn (for fresh-window continuation, skipping the aborted tool call). */
   abort(): void;
+  /**
+   * The live session's model selector, or undefined when there is no live session yet or the
+   * harness exposes none.
+   *
+   * Deliberately non-spawning: the selector arrives with session/new, and starting an agent child
+   * merely to populate a menu is a worse trade than telling the user to send a message first.
+   */
+  modelSelector?(): ModelSelector | undefined;
+  /**
+   * Switch the live session's model, returning the name the harness reports afterwards.
+   *
+   * Applies to the RUNNING session (ACP `session/set_config_option`), and is remembered so a later
+   * restart of the same conversation's child re-applies it instead of falling back to config.
+   * Rejects when there is no session, no selector, or the harness refuses the value.
+   */
+  setModel?(value: string): Promise<string>;
   /** Release the session: abort the running turn and drop continuation context (shut down the ACP child). Called on idle eviction / shutdown. */
   dispose(): void;
 }

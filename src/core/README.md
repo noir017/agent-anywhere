@@ -163,14 +163,42 @@ The fix, three layers, all fixed at startup from config alone:
    agent's own commands, which are the ones not registered globally.
 
 `translateCommand` returns `passthrough` (not generic — forward untouched, power users
-can type native names), `translated` (forward as the native name), or `unsupported`
-(**refuse with a message, run no turn**). Refusing is the feature: `/compact` on a
-harness with no compact is a mistake worth naming, not a prompt worth a turn on.
+can type native names), `translated` (forward as the native name), `local` (**the daemon
+answers it, no turn** — see below), or `unsupported` (**refuse with a message, run no
+turn**). Refusing is the feature: `/compact` on a harness with no compact is a mistake
+worth naming, not a prompt worth a turn on.
 
 Provenance of the table is documented per harness and must stay honest: `claude` and
 `opencode` were captured live over ACP; `gemini` is unverified; `codex` is deliberately
 **empty**, because inventing a native name would send a command the agent may silently
 misinterpret — strictly worse than telling the user it is unsupported.
+
+### The `local` fallback
+
+The table's only mechanism is TEXT: it rewrites `/x` and hands it to the agent as a
+prompt. So a capability the harness exposes over the **protocol** rather than as a slash
+command has no native name to translate to, and used to read as "not supported" — even
+though the gateway could answer it outright. Two do:
+
+| command | why it has no native name on opencode | what answers it |
+|---|---|---|
+| `/context` | opencode's `/compact`-family commands are TUI-only; ACP mode never sees them | the last `usage_update {used, size}` the agent sent, the same numbers the footer prints |
+| `/model` | ditto — but `session/new` reports a `model` select and `session/set_config_option` switches it | `ConversationRegistry.applyModelCommand` via `AgentSession.modelSelector()` / `setModel()` |
+
+Two rules keep this honest:
+
+- **A native spelling wins.** `/model` on claude still reaches claude's own model UI,
+  which knows more about claude than this gateway does. The fallback fills a hole; it
+  never covers a harness that solved the problem itself.
+- **`local` is a harness LIST, not a flag**, populated only from what was probed live.
+  `agy` speaks no ACP — it reports neither usage nor config options — so claiming a local
+  answer there would hand the user "no numbers yet, send a message first" forever. An
+  honest "not supported" beats an answer that never arrives.
+
+`/model` matches on any substring that picks exactly one model, because opencode offers
+93 of them: far past a button menu's 25 and past what is readable as a list, but
+`/model sonnet-5` is one thumb-typed token. An ambiguous query lists the candidates
+rather than guessing — picking one silently would change which model answers.
 
 `custom` always passes through — nothing is known about a user-supplied executable, so
 rejecting its commands would break a working setup on a guess.

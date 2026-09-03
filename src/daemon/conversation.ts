@@ -17,7 +17,8 @@ import {
 } from '../core/conversation.js';
 import type { AgentCommand, ConversationId, InboundMessage } from '../types.js';
 import type { PlatformAdapter } from '../platform/adapter.js';
-import type { AgentFactory } from './agent.js';
+import type { AgentFactory, AgentUsage } from './agent.js';
+import { formatRuntimeFooter, formatTokens } from '../core/runtime-footer.js';
 import { InboundMerger } from '../core/inbound-merger.js';
 import { shouldRespond, type GateConfig } from '../core/inbound-gate.js';
 import { TurnRunner } from './turn-runner.js';
@@ -25,6 +26,12 @@ import type { ConversationStore } from './conversation-store.js';
 
 /** Daemon-level context-control commands (intercepted in route(), never forwarded to the agent). */
 const CONTEXT_CLEAR_RE = /^\/(new|clear)(@\S+)?$/;
+
+/**
+ * Cap on how many models a `/model <query>` disambiguation lists. Past this the list stops being
+ * scannable on a phone, and the answer is a narrower query rather than a longer message.
+ */
+const MODEL_MATCH_MAX = 12;
 
 /** `/help` — answered by the gateway itself (see DAEMON_COMMANDS), never forwarded to the agent. */
 const HELP_RE = /^\/help(@\S+)?$/;
@@ -64,6 +71,13 @@ interface ConversationState {
    * exactly what the header reports).
    */
   headerSent?: boolean;
+  /**
+   * Latest context-usage snapshot the agent reported (ACP `usage_update`), kept past the turn.
+   *
+   * `/context` is asked BETWEEN turns, and the footer's copy lives on the per-turn ref, so without
+   * this the answer would have to guess a window size — the one thing the footer refuses to do.
+   */
+  lastUsage?: AgentUsage;
 }
 
 /**
@@ -134,6 +148,10 @@ export class ConversationRegistry {
         tokenFor: (id) => this.tokens.tokenFor(id),
         agentIdOf: (id) => this.agentIdOf(id),
         getModelOverride: (id) => this.conversations.get(id)?.modelOverride,
+        recordUsage: (id, usage) => {
+          const state = this.conversations.get(id);
+          if (state) state.lastUsage = usage;
+        },
         // During an active turn the state must exist, but handle absence robustly anyway.
         setActiveAddress: (id, address, platformId) => {
           const state = this.conversations.get(id);
@@ -309,7 +327,7 @@ export class ConversationRegistry {
     // Generic-command translation. Must sit here: it is the first point that knows WHICH agent
     // will answer, and the last point at which the message can still be refused. Returns the
     // message to forward, or undefined when the command was rejected (already answered).
-    const forwarded = this.applyCommandTranslation(state, msg);
+    const forwarded = this.applyCommandTranslation(key, state, msg);
     if (!forwarded) return;
     msg = forwarded;
 
@@ -470,6 +488,7 @@ export class ConversationRegistry {
    * naming, not a prompt worth spending a turn on.
    */
   private applyCommandTranslation(
+    key: ConversationId,
     state: ConversationState,
     msg: InboundMessage
   ): InboundMessage | undefined {
@@ -480,6 +499,13 @@ export class ConversationRegistry {
 
     const result = translateCommand(parsed.name, def?.harness);
     if (result.kind === 'passthrough') return msg;
+
+    if (result.kind === 'local') {
+      // No native spelling on this harness, but the gateway can answer from the live ACP session.
+      // Never a turn: these are questions about the session, not work for the model.
+      void this.answerLocalCommand(key, state, parsed.name, parsed.rest, msg);
+      return undefined;
+    }
 
     if (result.kind === 'unsupported') {
       // Point at the agent command rather than the harness name: the menu registers `/oc`, not
@@ -501,6 +527,111 @@ export class ConversationRegistry {
     const content = parsed.rest ? `/${result.native} ${parsed.rest}` : `/${result.native}`;
     console.log(`[command] /${parsed.name} → /${result.native} for ${state.agentId} (${name})`);
     return { ...msg, content };
+  }
+
+  /**
+   * Answer a generic command the bound harness has no native spelling for, from what the gateway
+   * already knows about the live ACP session.
+   *
+   * These exist because the translation table's only mechanism is TEXT: it rewrites `/x` and hands
+   * it to the agent as a prompt, so a capability the harness exposes over the protocol rather than
+   * as a slash command reads as "not supported". Usage and the model selector are both like that on
+   * opencode — the numbers already reach the footer, and `agents[].model` is already enforced
+   * through `session/set_config_option` — so answering here costs one message and no turn.
+   */
+  private async answerLocalCommand(
+    key: ConversationId,
+    state: ConversationState,
+    name: string,
+    rest: string | undefined,
+    msg: InboundMessage
+  ): Promise<void> {
+    const reply = (text: string): void => {
+      void this.platforms
+        .get(msg.conversation.platform)
+        ?.sendMessage(addressOf(msg.conversation), text)
+        .catch((e) =>
+          console.warn('[command] failed to answer locally:', e instanceof Error ? e.message : e)
+        );
+    };
+    console.log(`[command] /${name} answered locally for ${key} (${state.agentId})`);
+    try {
+      if (name === 'context') return reply(this.describeContext(state));
+      if (name === 'model') return reply(await this.applyModelCommand(state, key, rest));
+      reply(`/${name} has no local handler.`); // unreachable unless GENERIC_COMMANDS gains a `local` without one
+    } catch (e) {
+      reply(`Could not answer /${name}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  /** `/context`: the last usage snapshot, rendered exactly as the footer renders it. */
+  private describeContext(state: ConversationState): string {
+    const def = findAgent(this.config, state.agentId);
+    const usage = state.lastUsage;
+    if (!usage) {
+      return 'No context numbers yet — they arrive with the first reply. Send a message, then /context.';
+    }
+    const line = formatRuntimeFooter(
+      { contextTokens: usage.used, contextLength: usage.size },
+      ['context']
+    );
+    const left = Math.max(0, usage.size - usage.used);
+    return `Context: ${line}
+${formatTokens(left)} left before compaction — ${agentDisplayName(def, state.agentId)}`;
+  }
+
+  /**
+   * `/model`: show the live selector, or switch to a model named by id or by any substring that
+   * picks exactly one.
+   *
+   * Substring matching is the phone affordance: opencode offers 93 models, far past what a button
+   * menu can hold and past what is readable as a list, but `/model sonnet-5` is one thumb-typed
+   * token. Ambiguity lists the candidates instead of guessing — picking one for the user would
+   * silently change which model answers.
+   */
+  private async applyModelCommand(
+    state: ConversationState,
+    key: ConversationId,
+    rest: string | undefined
+  ): Promise<string> {
+    const session = this.agents.getOrCreate(key, state.agentId);
+    const selector = session.modelSelector?.();
+    if (!selector) {
+      return 'No model selector on this session yet — it arrives with the agent\'s first reply. Send a message, then /model.';
+    }
+    const query = rest?.trim();
+    if (!query) {
+      const current = selector.current ?? 'unknown';
+      return `Model: ${current}
+${selector.options.length} available — \`/model <part of a name>\` to switch (e.g. \`/model sonnet\`).`;
+    }
+
+    const exact = selector.options.find((o) => o.value === query);
+    const matches = exact
+      ? [exact]
+      : selector.options.filter(
+          (o) =>
+            o.value.toLowerCase().includes(query.toLowerCase()) ||
+            o.name.toLowerCase().includes(query.toLowerCase())
+        );
+    if (matches.length === 0) {
+      return `No model matches "${query}". \`/model\` alone shows the current one and how many are offered.`;
+    }
+    if (matches.length > 1) {
+      const shown = matches.slice(0, MODEL_MATCH_MAX);
+      const more = matches.length - shown.length;
+      const list = shown.map((o) => `\`/model ${o.value}\` — ${o.name}`).join('\n');
+      return `"${query}" matches ${matches.length} models:\n${list}${more > 0 ? `\n…and ${more} more` : ''}`;
+    }
+
+    if (!session.setModel) {
+      return 'This agent cannot switch models at runtime.';
+    }
+    const applied = await session.setModel(matches[0]!.value);
+    // Mirror it onto the conversation so the footer names the new model even before the harness's
+    // own config_option_update lands.
+    state.modelOverride = applied;
+    return `Model set to \`${applied}\` for this conversation.`;
   }
 
   /**

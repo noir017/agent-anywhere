@@ -7,6 +7,27 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **`/model` and `/context` now work on opencode**, answered by the gateway itself. Both
+  were in the generic vocabulary only to be *refused* there, because the translation layer's
+  single mechanism is text: it rewrites `/x` and hands it to the agent as a prompt, so a
+  capability the harness exposes over the protocol instead of as a slash command reads as
+  "not supported". Probed live against opencode 1.18.18, both are there — a
+  `usage_update {used, size}` on every turn, and a `model` select carrying its full 93-model
+  list that `session/set_config_option` switches.
+
+  `/context` prints the last snapshot the agent reported, in the same format the footer uses.
+  `/model` shows the live model, and `/model <substring>` switches it for that conversation —
+  93 models is far past a button menu's 25 and past what is readable as a list, but
+  `/model sonnet-5` is one thumb-typed token. An ambiguous query lists the candidates instead
+  of guessing. The choice survives the agent child being rebuilt — a crash or an idle eviction
+  re-applies it over `agents[].model` on the next `session/new` — and is cleared by `/new` or a
+  rebind to another agent, like the rest of that agent's per-conversation state.
+
+  A native spelling still wins: `/model` on claude reaches claude's own model UI. And the
+  fallback is a harness LIST rather than a flag, populated only from what was probed — `agy`
+  speaks no ACP, so it keeps the honest "not supported" instead of a "no numbers yet" that
+  would never resolve.
+
 - **A Feishu topic (话题) is its own conversation.** Lark was the one platform with a real
   thread model that agent-anywhere flattened: the profile reported no lane, so every topic in
   a chat collapsed onto the chat root — one session, one agent binding, and every reply posted

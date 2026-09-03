@@ -51,10 +51,29 @@ interface GenericCommand {
   /** Menu description, phrased for the generic meaning rather than any one harness. */
   description: string;
   /**
-   * Native name per harness. A MISSING key means that harness has no equivalent —
-   * the command is rejected, never forwarded.
+   * Native name per harness. A MISSING key means that harness has no equivalent — the command is
+   * then answered locally when `local` is set, and rejected otherwise. Never forwarded blind.
    */
   native: Partial<Record<Harness, string>>;
+  /**
+   * Harnesses where the DAEMON answers this itself, having no native spelling to translate to.
+   *
+   * These are not translations: they are questions the gateway can answer from what it already
+   * holds, so a harness that never implemented the command still gets a real reply instead of
+   * "not supported". Both current cases come off the ACP session rather than a slash command —
+   * live usage (`usage_update`) and the session's model selector (`session/set_config_option`) —
+   * which is exactly why they had no native name to translate to.
+   *
+   * A native spelling still WINS: `/model` on claude reaches claude's own model UI, which knows
+   * more about claude than this gateway does. The fallback fills a hole; it never covers a
+   * harness that solved the problem itself.
+   *
+   * A LIST rather than a flag, and populated only from what was probed live, for the same reason
+   * `native` is: `agy` speaks no ACP at all (it reports neither usage nor config options), so
+   * claiming a local answer there would hand the user "no numbers yet — send a message first"
+   * forever. An honest "not supported" beats an answer that never arrives.
+   */
+  local?: Harness[];
 }
 
 /**
@@ -70,10 +89,18 @@ const GENERIC_COMMANDS: Record<string, GenericCommand> = {
   context: {
     description: 'Show current context usage',
     native: { claude: 'context', gemini: 'stats' },
+    // Probed live against opencode 1.18.18: a turn emits `usage_update {used, size, cost}` exactly
+    // as claude's adapter does, so the numbers the footer already shows can answer this with no
+    // harness command involved.
+    local: ['opencode'],
   },
   model: {
     description: 'Show or change the model',
     native: { claude: 'model' },
+    // Probed live: opencode's session/new reports a `model` select with its full model list, and
+    // session/set_config_option switches it (the daemon already uses that path to enforce
+    // `agents[].model`). So the gateway can both show and change it without a slash command.
+    local: ['opencode'],
   },
   usage: {
     description: 'Show token usage and limits',
@@ -183,6 +210,8 @@ export type CommandTranslation =
   | { kind: 'passthrough' }
   /** Generic and supported: forward as this native name (may equal the generic one). */
   | { kind: 'translated'; native: string }
+  /** Generic, no native spelling, but the daemon can answer it: handle locally, do not run a turn. */
+  | { kind: 'local' }
   /** Generic but this harness has no equivalent: reject with a message, do not run a turn. */
   | { kind: 'unsupported' };
 
@@ -198,7 +227,8 @@ export function translateCommand(name: string, harness: Harness | undefined): Co
   if (!entry) return { kind: 'passthrough' };
   if (!harness || harness === 'custom') return { kind: 'passthrough' };
   const native = entry.native[harness];
-  return native ? { kind: 'translated', native } : { kind: 'unsupported' };
+  if (native) return { kind: 'translated', native };
+  return entry.local?.includes(harness) ? { kind: 'local' } : { kind: 'unsupported' };
 }
 
 /** Whether a name belongs to the generic vocabulary (i.e. is subject to translation). */

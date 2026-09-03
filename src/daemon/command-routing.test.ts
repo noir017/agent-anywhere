@@ -158,10 +158,10 @@ describe('generic command translation in route()', () => {
 
   it('names the harness (not the config id) and points at its own command list', async () => {
     const { send, sent } = rig();
-    await send('/oc /model');
+    await send('/oc /mcp');
     const msg = sent.find((t) => t.includes('does not support'))!;
     // `oc` is an operator's typing shorthand and means nothing to a reader.
-    expect(msg).toContain('opencode does not support /model');
+    expect(msg).toContain('opencode does not support /mcp');
     // The hint names the REGISTERED command, which is the short form — pointing at `/opencode`
     // would send the user to a name that is no longer in the menu.
     expect(msg).toContain('/oc');

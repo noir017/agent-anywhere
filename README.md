@@ -206,6 +206,12 @@ Generic commands are rewritten to the target harness's native spelling
 (`/compact` → gemini's `/compress`), and a harness with no equivalent says so
 instead of spending a turn on a prompt it will misread.
 
+Two of them the gateway answers itself where the harness has no command for it,
+because the capability is there over the protocol rather than as a slash:
+`/context` prints the last usage the agent reported, and `/model` shows the live
+model — `/model <part of a name>` switches it for that conversation, listing the
+candidates when the query is ambiguous rather than guessing.
+
 ## Acting in the chat
 
 Plain text streams back automatically. For everything else, the agent invokes

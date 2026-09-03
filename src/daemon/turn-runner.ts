@@ -39,6 +39,14 @@ export interface TurnRunnerDeps {
    * thread continues the conversation that opened it, agent and context intact.
    */
   adoptThread?(id: ConversationId, address: ConversationAddress, platformId: string): void;
+  /**
+   * Record the latest context-usage snapshot for a conversation.
+   *
+   * The footer reads usage off the per-turn ref, which dies with the turn — but `/context` is asked
+   * BETWEEN turns, so the last snapshot has to outlive the turn that produced it. Same numbers, one
+   * writer: the harness's own `usage_update`, never a guess.
+   */
+  recordUsage?(id: ConversationId, usage: AgentUsage): void;
 }
 
 /**
@@ -274,6 +282,7 @@ export class TurnRunner {
       // own, and the footer reads it only after the effects chain has drained at turn end.
       onUsage: (usage) => {
         ref.usage = usage;
+        this.deps.recordUsage?.(conversationId, usage);
       },
       // Same for the live model name (see TurnRef.model for why it beats the configured value).
       onModel: (model) => {

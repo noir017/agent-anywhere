@@ -34,11 +34,26 @@ describe('translateCommand', () => {
   });
 
   it('rejects a generic command the harness has no equivalent for', () => {
-    // Probed live: opencode reports only customize-opencode/init/review — no compact.
+    // ACP has no compaction method at all (session/cancel|close|fork|list|load|new|prompt|resume|
+    // set_config_option|set_mode) and opencode's is TUI-only, so there is nothing to answer with.
     expect(translateCommand('compact', 'opencode')).toEqual({ kind: 'unsupported' });
-    expect(translateCommand('model', 'opencode')).toEqual({ kind: 'unsupported' });
+    expect(translateCommand('mcp', 'opencode')).toEqual({ kind: 'unsupported' });
     // codex is intentionally unmapped rather than guessed.
     expect(translateCommand('compact', 'codex')).toEqual({ kind: 'unsupported' });
+  });
+
+  it('answers locally where the capability exists over ACP but not as a slash command', () => {
+    // opencode has no `/model` or `/context` command — but it reports usage_update every turn and
+    // exposes a `model` config option, so the gateway answers both itself rather than refusing.
+    expect(translateCommand('model', 'opencode')).toEqual({ kind: 'local' });
+    expect(translateCommand('context', 'opencode')).toEqual({ kind: 'local' });
+    // A native spelling still wins: claude's own model UI knows more about claude than we do.
+    expect(translateCommand('model', 'claude')).toEqual({ kind: 'translated', native: 'model' });
+    expect(translateCommand('context', 'gemini')).toEqual({ kind: 'translated', native: 'stats' });
+    // agy speaks no ACP: it reports neither usage nor config options, so a local answer there
+    // would be a promise that never arrives.
+    expect(translateCommand('model', 'agy')).toEqual({ kind: 'unsupported' });
+    expect(translateCommand('context', 'agy')).toEqual({ kind: 'unsupported' });
   });
 
   it('passes through anything outside the generic vocabulary', () => {

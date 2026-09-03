@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-03
+
 ### Changed (breaking) — conversations, topics and agent binding
 
 - **A topic is now a conversation, and the agent answering it is sticky.**

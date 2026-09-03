@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-03
+
 ### Added
 
 - **`/model` and `/context` now work on opencode**, answered by the gateway itself. Both

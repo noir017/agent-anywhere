@@ -343,6 +343,19 @@ by someone other than the person who opened the menu. A harness that reports no 
 (`agy`) acks the binding instead — see `HARNESS_COMMANDS` in
 [`core/command-translate.ts`](../core/README.md).
 
+Two things about a click are worth stating, because every way this path could fail used
+to be a silent `return` — indistinguishable, from the chat, from a dead button:
+
+- **The ack edits the MENU message**, whose ref is captured from the send, not the click
+  event's `messageId`. `ButtonInteraction.messageId` is contractually the message the
+  button is on, but Telegram's Satori adapter puts the `callback_query` id there — not a
+  message id at all — so editing it 400s and the caller swallows it. That was the whole
+  visible feedback for a click, and it never applied. The Telegram profile now corrects
+  the field at the source too (`rawCallbackMessageId`), which also restores the 👀/✅
+  lifecycle reactions on the resulting turn.
+- **An expired menu says so.** `pendingPicks` is in-memory and one-shot, so a second click
+  or a click after a daemon restart finds nothing — and used to answer nothing.
+
 **Inbound dedup.** On platforms where a slash *is* a normal message (Telegram), one
 `/cmd` fires both a message event and a command event with the same `messageId`; they are
 deduped by `platform:<address>:messageId` within 15 s. When `messageId` is empty (Slack

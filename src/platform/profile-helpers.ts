@@ -250,12 +250,17 @@ export function plainConversation(session: Session): ResolvedConversation {
  * button clicked inside a topic resolves to exactly the conversation the message path would give
  * it. When those disagreed, a blocking `ask` could never match its pending request and sat until
  * timeout.
+ *
+ * `opts.messageIdOf` overrides `session.messageId` for platforms whose adapter puts something else
+ * there on a click. ButtonInteraction.messageId is contractually "the message the button is on",
+ * and a caller that edits or reacts to it needs exactly that — see the Telegram profile, whose
+ * adapter reports the callback_query id instead.
  */
 export function mountSatoriButtonInteraction(
   ctx: Context,
   resolveConversation: (session: Session) => ResolvedConversation,
   emit: (ev: ProfileButtonEvent) => void,
-  opts?: { botPlatform?: string }
+  opts?: { botPlatform?: string; messageIdOf?: (session: Session) => string | undefined }
 ): void {
   ctx.on('interaction/button', (session: Session) => {
     if (opts?.botPlatform && session.bot.platform !== opts.botPlatform) return;
@@ -264,7 +269,7 @@ export function mountSatoriButtonInteraction(
     emit({
       conversation: resolveConversation(session),
       user: session.userId ?? '',
-      messageId: session.messageId ?? '',
+      messageId: opts?.messageIdOf?.(session) ?? session.messageId ?? '',
       buttonId,
     });
   });

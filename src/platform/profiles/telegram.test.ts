@@ -5,6 +5,7 @@ import {
   createTelegramProfile,
   telegramConversation,
   rawTopicFields,
+  rawCallbackMessageId,
 } from './telegram.js';
 
 // ── Fake bot for delivery-contract tests ──────────────────────────────────────
@@ -305,6 +306,27 @@ describe('private-chat topics (Bot API 9.4)', () => {
       },
     } as never;
     expect(rawTopicFields(cbq)).toEqual({ threadId: '7353', isTopicMessage: true });
+  });
+
+  it('rawCallbackMessageId returns the message the button is on, not the callback_query id', () => {
+    // The adapter puts callback_query.id in session.messageId (lib/index.cjs), which is not a
+    // message id: editing or reacting to it 400s, and every caller swallows that — so a picker
+    // click produced no visible change at all.
+    const cbq = {
+      telegram: {
+        callback_query: {
+          id: '4242424242424242',
+          message: { message_id: 987, chat: { id: 1, type: 'private' } },
+        },
+      },
+    } as never;
+    expect(rawCallbackMessageId(cbq)).toBe('987');
+  });
+
+  it('rawCallbackMessageId is undefined when there is no nested message to name', () => {
+    expect(rawCallbackMessageId({} as never)).toBeUndefined();
+    expect(rawCallbackMessageId(undefined)).toBeUndefined();
+    expect(rawCallbackMessageId({ telegram: { callback_query: { id: '1' } } } as never)).toBeUndefined();
   });
 
   it('rawTopicFields is safe on a session with no raw update at all', () => {

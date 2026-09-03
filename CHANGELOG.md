@@ -29,6 +29,27 @@ All notable changes to this project are documented here. The format is based on
   — one exists only once a message opens it — so the thread name is posted as that opening
   message.
 
+### Fixed
+
+- **Clicking a harness-picker button did nothing.** `/oc` posted opencode's commands as
+  buttons and a tap produced no reply, no reaction, and no change to the menu. Two causes,
+  both silent by construction:
+
+  Telegram's Satori adapter sets `session.messageId` to the **`callback_query` id** on a
+  click — not a message id at all — while `ButtonInteraction.messageId` is contractually the
+  message the button is on. The click ack (`→ /customize-opencode`) therefore edited a
+  non-existent message, 400ed, and was swallowed by the best-effort `catch`; the same bogus
+  id also killed the 👀/✅ lifecycle reactions on the resulting turn. So the command *did*
+  run, with every trace of it having run suppressed. The ack now edits the menu message
+  captured at send time, and the Telegram profile corrects the field at the source
+  (`rawCallbackMessageId`).
+
+  Second, a click on an expired menu — the one-shot already consumed, or the daemon restarted
+  since (`pendingPicks` is in-memory) — returned silently, which from the chat looks exactly
+  like a dead button. It now says so.
+
+  The whole click path had no test coverage; it does now (`daemon/picker-click.test.ts`).
+
 ## [0.4.0] - 2026-09-03
 
 ### Changed (breaking) — the registered command menu

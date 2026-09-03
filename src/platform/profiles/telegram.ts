@@ -264,6 +264,27 @@ export function rawTopicFields(session: unknown): {
 }
 
 /**
+ * The id of the message a clicked button sits on, read off the raw update.
+ *
+ * Why this is needed: the Satori adapter sets `session.messageId = callback_query.id` on a click
+ * (lib/index.cjs) — the id of the CALLBACK QUERY, not of any message. ButtonInteraction.messageId
+ * is contractually the message the button is on, and every caller that edits or reacts to it needs
+ * that. Feeding it a callback_query id makes editMessageText / setMessageReaction fail with a 400
+ * the callers swallow, so a picker click produced no visible change at all — the exact "I clicked
+ * and nothing happened" symptom. The real id is one level down in the update Satori stashes via
+ * setInternal('telegram', update).
+ *
+ * Returns undefined when the nested message is absent (very old callbacks, inline-mode queries),
+ * so the caller falls back to whatever the session carried.
+ */
+export function rawCallbackMessageId(session: unknown): string | undefined {
+  const tg = (session as { telegram?: Record<string, unknown> } | undefined)?.telegram;
+  const cq = tg?.callback_query as { message?: { message_id?: unknown } } | undefined;
+  const id = cq?.message?.message_id;
+  return typeof id === 'number' || typeof id === 'string' ? String(id) : undefined;
+}
+
+/**
  * Telegram's General/root topic id. A message in the root (outside any real topic) either
  * omits message_thread_id entirely or reports the General lane; treating General as a topic
  * would give the root its own conversation separate from the plain chat, splitting one
@@ -578,7 +599,11 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
       // The SAME resolver as the message path, so a click inside a forum topic resolves to the
       // conversation that posted the buttons — otherwise a blocking `ask` never matches its
       // pending request and sits until timeout.
-      mountSatoriButtonInteraction(ctx, telegramConversation, emit);
+      // messageIdOf: the adapter puts the CALLBACK QUERY id in session.messageId, which is not a
+      // message id at all — see rawCallbackMessageId.
+      mountSatoriButtonInteraction(ctx, telegramConversation, emit, {
+        messageIdOf: rawCallbackMessageId,
+      });
     },
 
     mountCommandEvents(ctx, emit) {

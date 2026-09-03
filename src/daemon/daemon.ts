@@ -178,6 +178,14 @@ interface PendingPick {
   names: string[];
   /** Where the menu was posted (origin of the click's synthesized message). */
   conversation: ConversationRef;
+  /**
+   * The menu message itself, captured from the send.
+   *
+   * The click ack edits THIS, never the click event's messageId: a platform is free to report
+   * something other than the message on a click (Telegram reports the callback_query id), and the
+   * ask path has always used its own captured ref for the same reason.
+   */
+  ref?: MessageRef;
 }
 
 /** Main daemon: wires platform, session registry, and IPC server together. `agent-anywhere start` constructs and run()s it. */
@@ -593,10 +601,18 @@ export class Daemon {
       prompt += `\n\n${overflow.length} more (type them directly): ${overflow.map((c) => `/${c.name}`).join(', ')}`;
     }
     const buttons = shown.map((c, i) => ({ id: `${PICK_PREFIX}${reqId}:${i}`, label: `/${c.name}` }));
-    void adapter.sendButtons(address, prompt, buttons).catch((e) => {
-      this.pendingPicks.delete(reqId);
-      console.error('[picker] failed to post the menu:', e instanceof Error ? e.message : e);
-    });
+    void adapter
+      .sendButtons(address, prompt, buttons)
+      .then((ref) => {
+        // Keep the menu's own ref: the click ack edits this message, and the click event's
+        // messageId is not a reliable stand-in on every platform.
+        const pending = this.pendingPicks.get(reqId);
+        if (pending) pending.ref = ref;
+      })
+      .catch((e) => {
+        this.pendingPicks.delete(reqId);
+        console.error('[picker] failed to post the menu:', e instanceof Error ? e.message : e);
+      });
   }
 
   /**
@@ -609,7 +625,21 @@ export class Daemon {
    */
   private onPickClick(ev: ButtonInteraction, parsed: { reqId: string; index: number }): void {
     const pick = this.pendingPicks.get(parsed.reqId);
-    if (!pick) return;
+    if (!pick) {
+      // A menu the daemon no longer knows about: it was already used (one-shot), or the daemon
+      // restarted since it was posted (pendingPicks is in-memory). Say so — returning silently is
+      // indistinguishable from a broken button, which is how this surfaced as "I click and nothing
+      // happens". Answered where the click happened, since the recorded conversation is gone too.
+      console.log(`[picker] click on an expired menu (${parsed.reqId})`);
+      void this.platforms
+        .get(ev.conversation.platform)
+        ?.sendMessage(
+          addressOf(ev.conversation),
+          'That menu has expired (already used, or the gateway restarted). Re-open it with the agent command (`/oc`, `/cc`, …), or /help for the full list.'
+        )
+        .catch(() => undefined);
+      return;
+    }
     const name = pick.names[parsed.index];
     if (name === undefined) return;
 
@@ -641,10 +671,13 @@ export class Daemon {
         .catch(() => undefined);
       return;
     }
+    // Ack on the menu message itself (captured at send). Falls back to the click's own messageId
+    // only when the send never reported one.
+    const ackRef = pick.ref ?? { address, messageId: ev.messageId };
     void this.platforms
       .get(platformId)
-      ?.editMessage({ address, messageId: ev.messageId }, `→ /${name}`)
-      .catch(() => undefined);
+      ?.editMessage(ackRef, `→ /${name}`)
+      .catch((e) => console.warn('[picker] click ack edit failed:', e instanceof Error ? e.message : e));
   }
 
   /**

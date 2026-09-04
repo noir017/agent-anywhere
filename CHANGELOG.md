@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-04
+
 ### Added
 
 - **`/setting` changes config.yaml from chat.** A handful of fields in that file are not

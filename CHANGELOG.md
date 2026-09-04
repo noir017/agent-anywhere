@@ -5,6 +5,28 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **`/model` now opens the menu on `claude` too, instead of forwarding to claude's own.** It looked
+  like the "a native spelling always wins" rule protecting claude's answer, and it was not: probed
+  live against claude-agent-acp 0.58.1, the adapter does not advertise `model` among its commands
+  at all, so a forwarded `/model` was a plain prompt — it spent a turn and printed
+  `Current model: Opus 4.8 (1M context) … Usage: /model <name>`, text you then had to type against.
+  The same session exposes the selector as a config option that `session/set_config_option`
+  switches, which is exactly what the gateway already does for opencode. So `/cc` conversations get
+  the same tap-to-switch menu, and no turn is spent. The trade: only the options the protocol lists
+  can be picked, while claude's prose names a few more aliases (`opusplan`, `best`, a full model
+  id) — those stay reachable through `agents[].env.ANTHROPIC_MODEL`.
+
+- **The footer names the model that is running, with its version.** It read `opus[1m]` — the alias
+  from `ANTHROPIC_MODEL`, which says which family answers but not which release, so it looked
+  identical before and after Opus 4.8 shipped. Neither the option id nor its display name ("Opus")
+  carries a version; the description does, verbatim: `Opus 4.8 with 1M context · …`. The footer now
+  reads `opus-4-8`. `[1m]` drops out with it and nothing is lost — the context segment beside it
+  already reads `/ 1M`, so the qualifier was saying twice what one number says. A `default` pin
+  resolves the same way, to whatever it currently points at rather than to the word "default".
+  Harnesses whose descriptions state no version (opencode writes none) keep the previous label.
+
 ## [0.6.0] - 2026-09-04
 
 ### Added

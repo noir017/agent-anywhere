@@ -48,8 +48,12 @@ describe('translateCommand', () => {
     // exposes a `model` config option, so the gateway answers both itself rather than refusing.
     expect(translateCommand('model', 'opencode')).toEqual({ kind: 'local' });
     expect(translateCommand('context', 'opencode')).toEqual({ kind: 'local' });
-    // A native spelling still wins: claude's own model UI knows more about claude than we do.
-    expect(translateCommand('model', 'claude')).toEqual({ kind: 'translated', native: 'model' });
+    // claude is the same case, found the same way: its adapter does not advertise `model` at all
+    // (so a forwarded /model is a prompt that costs a turn and prints text you then type against),
+    // while the session exposes the selector as a config option the daemon can switch directly.
+    expect(translateCommand('model', 'claude')).toEqual({ kind: 'local' });
+    // A native spelling still wins where the harness really does own the answer.
+    expect(translateCommand('context', 'claude')).toEqual({ kind: 'translated', native: 'context' });
     expect(translateCommand('context', 'gemini')).toEqual({ kind: 'translated', native: 'stats' });
     // agy speaks no ACP: it reports neither usage nor config options, so a local answer there
     // would be a promise that never arrives.

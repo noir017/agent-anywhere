@@ -216,6 +216,18 @@ describe('opening the menu', () => {
     expect(r.replies().at(-1)).toContain('8 available');
   });
 
+  it('opens for the claude agent too, which has no native /model to translate to', async () => {
+    // claude's adapter does not advertise `model` (probed live), so a forwarded /model was a prompt
+    // that cost a turn and printed text to type against. It exposes the selector over the protocol
+    // like opencode does, so it gets the same menu.
+    const r = rig();
+    await r.send('/cc');
+    await r.send('/model');
+    expect(r.buttonSends).toHaveLength(1);
+    await r.click(r.pickIds()[4]!);
+    expect(r.setModelCalls).toEqual(['newapi/GLM-5.2']);
+  });
+
   it('leaves `/model <query>` on the text path, opening no menu', async () => {
     const r = rig();
     await r.send('/model glm-4.7');

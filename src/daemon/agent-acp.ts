@@ -190,13 +190,19 @@ class TurnTimeoutError extends Error {}
  * selector; falls back to the raw `currentValue` when the option isn't listed at all (an
  * allowlisted-but-unlisted model still reports a currentValue).
  *
- * Label choice: prefer the option's human-readable `name`, but only when it doesn't LOSE information
- * the id carries. The claude harness is inconsistent here — its option list labels `sonnet[1m]` as
- * "Sonnet 5 (1M context)" but `opus[1m]` as plain "Opus", so taking `name` verbatim would report a
- * 1M-context Opus session as merely "Opus" while the footer's own context segment reads `/ 1M`.
- * Since a bare number in the name ("Sonnet 5") is not the same claim as a context qualifier, the
- * check is specifically for the id's bracketed suffix (`[1m]`), which is the part that changes what
- * the model IS rather than how it's spelled.
+ * Label choice, in order:
+ *
+ * 1. **The concrete model out of the option's `description`.** Neither the id nor the display name
+ *    carries a version on the claude harness — it offers `opus[1m]` / "Opus", which says which
+ *    family is running but not which release, so a footer reading `opus[1m]` never changed when the
+ *    model behind that alias did. The description is where the harness states it, verbatim:
+ *    "Opus 4.8 with 1M context · Best for everyday, complex tasks" (probed live against
+ *    claude-agent-acp 0.58.1). Parsed to `opus-4-8`, which is the model, spelled the way it is
+ *    everywhere else. `[1m]` drops out with it, and nothing is lost: the footer's own context
+ *    segment already reads `/ 1M` beside it, so the qualifier was saying twice what one number says.
+ * 2. The option's human-readable `name`, when it doesn't LOSE a qualifier the id carries — the
+ *    fallback for a harness whose descriptions carry no version (see nameKeepsQualifiers).
+ * 3. The raw `currentValue`, when the option isn't listed at all.
  */
 export function liveModelName(options: SessionConfigOption[] | null | undefined): string | undefined {
   const opt = options?.find((o) => o.id === MODEL_CONFIG_ID);
@@ -207,15 +213,40 @@ export function liveModelName(options: SessionConfigOption[] | null | undefined)
   const flat = opt.options.flatMap((entry) =>
     'group' in entry ? entry.options : [entry]
   );
-  const name = flat.find((o) => o.value === current)?.name;
+  const selected = flat.find((o) => o.value === current);
+  const concrete = concreteModelName(selected?.description);
+  if (concrete) return concrete;
+  const name = selected?.name;
   if (!name) return current;
   return nameKeepsQualifiers(name, current) ? name : current;
+}
+
+/**
+ * `<family>-<version>` pulled out of an option description, or undefined when it doesn't state one.
+ *
+ * The shape being read is the headline before the `·` separator — "Opus 4.8 with 1M context",
+ * "Sonnet 5", "Haiku 4.5", "Fable 5.1" — of which only the leading family and version are the
+ * model's identity; the rest is either a qualifier the footer already shows or marketing.
+ *
+ * Deliberately strict, and undefined on anything that doesn't match: this runs for every harness,
+ * and a description that is a sentence rather than a model name (opencode writes none at all) must
+ * fall through to the name/id path rather than yield a plausible-looking wrong answer.
+ */
+function concreteModelName(description: string | null | undefined): string | undefined {
+  if (!description) return undefined;
+  const headline = description.split('·')[0]!.trim();
+  const m = /^([A-Za-z][A-Za-z0-9]*)\s+(\d+(?:\.\d+)*)(?:\s|$)/.exec(headline);
+  if (!m) return undefined;
+  return `${m[1]!.toLowerCase()}-${m[2]!.replace(/\./g, '-')}`;
 }
 
 /**
  * Whether `name` still conveys every bracketed qualifier present in the option `id` (e.g. `[1m]`).
  * Compared loosely — bracket-free and case-insensitive — so "Sonnet 5 (1M context)" counts as
  * carrying `[1m]`, while a bare "Opus" does not carry it for id `opus[1m]`.
+ *
+ * Only reached when the description states no version. Where one is stated it wins outright, and
+ * the qualifier is dropped on purpose — see liveModelName.
  */
 function nameKeepsQualifiers(name: string, id: string): boolean {
   const haystack = name.toLowerCase().replace(/[[\]()\s]/g, '');

@@ -182,10 +182,10 @@ prompt. So a capability the harness exposes over the **protocol** rather than as
 command has no native name to translate to, and used to read as "not supported" — even
 though the gateway could answer it outright. Two do:
 
-| command | why it has no native name on opencode | what answers it |
+| command | why there is no native name to translate to | what answers it |
 |---|---|---|
-| `/context` | opencode's `/compact`-family commands are TUI-only; ACP mode never sees them | the last `usage_update {used, size}` the agent sent, the same numbers the footer prints |
-| `/model` | ditto — but `session/new` reports a `model` select and `session/set_config_option` switches it | `ConversationRegistry.applyModelCommand` via `AgentSession.modelSelector()` / `setModel()` |
+| `/context` (opencode) | opencode's `/compact`-family commands are TUI-only; ACP mode never sees them | the last `usage_update {used, size}` the agent sent, the same numbers the footer prints |
+| `/model` (opencode, claude) | neither advertises the command — opencode has none, and claude's adapter leaves `model` out of the list it reports — while both expose the selector as a `session/new` config option that `session/set_config_option` switches | `ConversationRegistry.applyModelCommand` via `AgentSession.modelSelector()` / `setModel()` |
 
 `/model` has two surfaces, both built from `model-menu.ts` so they cannot disagree about
 what happened. On a platform that can post buttons **and** edit them afterwards, a bare
@@ -200,9 +200,16 @@ forever. A text answer there is not a degraded menu; it is the whole answer.
 
 Two rules keep this honest:
 
-- **A native spelling wins.** `/model` on claude still reaches claude's own model UI,
+- **A native spelling wins.** `/context` on claude still reaches claude's own `/context`,
   which knows more about claude than this gateway does. The fallback fills a hole; it
-  never covers a harness that solved the problem itself.
+  never covers a harness that solved the problem itself. `/model` on claude looks like an
+  exception and is not: probed live, the adapter does not advertise `model` at all, so a
+  forwarded `/model` is a plain prompt — it spends a turn and prints
+  `Current model: … Usage: /model <name>`, i.e. text to type against — while the same
+  session exposes the selector as a config option the daemon can switch in one tap. The
+  cost is that only the options the protocol lists can be chosen; claude's prose names
+  more aliases (`opusplan`, `best`, a full model id), which stay reachable through
+  `agents[].env.ANTHROPIC_MODEL`.
 - **`local` is a harness LIST, not a flag**, populated only from what was probed live.
   `agy` speaks no ACP — it reports neither usage nor config options — so claiming a local
   answer there would hand the user "no numbers yet, send a message first" forever. An

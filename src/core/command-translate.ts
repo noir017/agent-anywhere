@@ -64,9 +64,20 @@ interface GenericCommand {
    * live usage (`usage_update`) and the session's model selector (`session/set_config_option`) —
    * which is exactly why they had no native name to translate to.
    *
-   * A native spelling still WINS: `/model` on claude reaches claude's own model UI, which knows
-   * more about claude than this gateway does. The fallback fills a hole; it never covers a
-   * harness that solved the problem itself.
+   * A native spelling still WINS where one exists — `/context` on claude reaches claude's own
+   * `/context`, which knows more about claude than this gateway does. The fallback fills a hole;
+   * it never covers a harness that solved the problem itself.
+   *
+   * `/model` on claude is the deliberate exception, and it is not a violation of that rule so much
+   * as a finding about what claude's own answer is. Probed live against claude-agent-acp 0.58.1:
+   * `model` is NOT among the commands the adapter advertises (getAvailableSlashCommands), and a
+   * forwarded `/model` is therefore just a prompt — it spends a turn and prints
+   * "Current model: Opus 4.8 (1M context) … Usage: /model <name>", i.e. text you then have to type
+   * against. Meanwhile the same session exposes the selector as a config option that
+   * `session/set_config_option` switches. So the gateway answers it: one tap, no turn. The cost is
+   * that only the five options the protocol lists can be chosen — claude's own prose names more
+   * aliases (`opusplan`, `best`, a full model id) — and those stay reachable through
+   * `agents[].env.ANTHROPIC_MODEL`, which is where this deployment pins its model anyway.
    *
    * A LIST rather than a flag, and populated only from what was probed live, for the same reason
    * `native` is: `agy` speaks no ACP at all (it reports neither usage nor config options), so
@@ -96,11 +107,14 @@ const GENERIC_COMMANDS: Record<string, GenericCommand> = {
   },
   model: {
     description: 'Show or change the model',
-    native: { claude: 'model' },
-    // Probed live: opencode's session/new reports a `model` select with its full model list, and
+    // No native spelling anywhere, on purpose — see the note on `local` above for why claude's own
+    // `/model` is not one worth translating to.
+    native: {},
+    // Probed live on both: session/new reports a `model` select with the full model list, and
     // session/set_config_option switches it (the daemon already uses that path to enforce
-    // `agents[].model`). So the gateway can both show and change it without a slash command.
-    local: ['opencode'],
+    // `agents[].model`). So the gateway can both show and change it without a slash command —
+    // and, where the platform allows, offer the list as a menu instead of a name to type.
+    local: ['opencode', 'claude'],
   },
   usage: {
     description: 'Show token usage and limits',

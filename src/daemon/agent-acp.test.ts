@@ -222,6 +222,75 @@ describe('liveModelName (model from ACP session config options)', () => {
     ).toBe('opus[1m]');
   });
 
+  it('reads the concrete model out of the description, dropping the [1m] alias', () => {
+    // The claude harness names neither the version in the id (`opus[1m]`) nor in the display name
+    // ("Opus"), so a footer built from either never changed when the model behind the alias did.
+    // The description is the only place it is stated. Shape probed live against
+    // claude-agent-acp 0.58.1. `[1m]` goes with it: the footer's context segment already reads / 1M.
+    expect(
+      liveModelName(
+        opts([
+          {
+            id: 'model',
+            type: 'select',
+            name: 'Model',
+            currentValue: 'opus[1m]',
+            options: [
+              {
+                value: 'opus[1m]',
+                name: 'Opus',
+                description: 'Opus 4.8 with 1M context · Best for everyday, complex tasks',
+              },
+              { value: 'sonnet', name: 'Sonnet', description: 'Sonnet 5 · Efficient for routine tasks' },
+              { value: 'haiku', name: 'Haiku', description: 'Haiku 4.5 · Fastest for quick answers' },
+            ],
+          },
+        ])
+      )
+    ).toBe('opus-4-8');
+  });
+
+  it('resolves `default` to whatever it currently points at, not to the word "default"', () => {
+    expect(
+      liveModelName(
+        opts([
+          {
+            id: 'model',
+            type: 'select',
+            name: 'Model',
+            currentValue: 'default',
+            options: [
+              {
+                value: 'default',
+                name: 'Default (recommended)',
+                description: 'Opus 4.8 with 1M context · Best for everyday, complex tasks',
+              },
+            ],
+          },
+        ])
+      )
+    ).toBe('opus-4-8');
+  });
+
+  it('falls back to the name when the description states no version', () => {
+    // opencode writes no description at all, and a prose one must not be mined for a model name.
+    expect(
+      liveModelName(
+        opts([
+          {
+            id: 'model',
+            type: 'select',
+            name: 'Model',
+            currentValue: 'newapi/GLM-5.2',
+            options: [
+              { value: 'newapi/GLM-5.2', name: 'GLM-5.2', description: 'Best for everyday tasks' },
+            ],
+          },
+        ])
+      )
+    ).toBe('GLM-5.2');
+  });
+
   it('ignores the other config options (mode / effort / fast)', () => {
     expect(
       liveModelName(

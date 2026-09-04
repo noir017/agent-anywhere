@@ -223,7 +223,8 @@ message, and tapping a model switches it for that conversation. On Discord,
 Telegram, Slack and Lark, which is where a message's buttons can be replaced —
 elsewhere it prints the same summary line as before. `/model <part of a name>`
 switches by substring on every platform, listing the candidates when the query is
-ambiguous rather than guessing.
+ambiguous rather than guessing. Both work on `opencode` and `claude`; neither
+advertises a `/model` command, and both expose the selector over ACP.
 
 ## Acting in the chat
 

@@ -41,6 +41,35 @@ function fakeBot(): { bot: SendBot; calls: Captured } {
   return { bot, calls };
 }
 
+/**
+ * Bot whose `internal.im.message` is captured — the card path never goes through bot.sendMessage /
+ * bot.editMessage (the satori encoder would re-encode a card as a post and drop the button ids).
+ */
+function fakeCardBot(): {
+  bot: SendBot;
+  calls: { patch: Array<{ messageId: string; content: string }> };
+} {
+  const calls = { patch: [] as Array<{ messageId: string; content: string }> };
+  const guard = (): never => {
+    throw new Error('the card path must use internal.im.message.*, not bot.*');
+  };
+  const bot = {
+    internal: {
+      im: {
+        message: {
+          patch: (messageId: string, body: { content: string }) => {
+            calls.patch.push({ messageId, content: body.content });
+            return Promise.resolve();
+          },
+        },
+      },
+    },
+    sendMessage: guard,
+    editMessage: guard,
+  } as unknown as SendBot;
+  return { bot, calls };
+}
+
 describe('mapLarkEmojiType', () => {
   it('maps lifecycle unicode to Lark emoji_type enum values', () => {
     expect(mapLarkEmojiType('👀')).toBe('GLANCE');
@@ -242,5 +271,46 @@ describe('lark profile delivery contract (send/edit reach Lark as converted mark
     await profile.sendMessage!(a.bot, { channel: 'oc_1' }, md);
     await profile.editMessage!(b.bot, { address: { channel: 'oc_1' }, messageId: 'om_1' }, md);
     expect(a.calls.send[0]!.content).toBe(b.calls.edit[0]!.content);
+  });
+});
+
+/**
+ * `editButtons` — the page-turn primitive for a paginated card menu.
+ *
+ * It must go to `im.message.patch` ("更新已发送的消息卡片"), NOT to the profile's own editMessage:
+ * that one posts `msg_type:'post'` through `im.message.update`, which cannot touch a card, so a
+ * menu edited that way would lose its buttons instead of gaining the next page.
+ */
+describe('lark editButtons (card patched in place)', () => {
+  const profile = createLarkProfile();
+
+  it('declares the capability, separately from editMessage', () => {
+    expect(profile.capabilities.editButtons).toBe(true);
+  });
+
+  it('patches the same message with a freshly built card', async () => {
+    const { bot, calls } = fakeCardBot();
+    await profile.editButtons!(bot, { address: { channel: 'oc_1' }, messageId: 'om_42' }, 'page 2', [
+      { id: 'mdp:r1:2', label: '▶' },
+    ]);
+    expect(calls.patch).toHaveLength(1);
+    expect(calls.patch[0]!.messageId).toBe('om_42');
+    const card = JSON.parse(calls.patch[0]!.content) as {
+      schema: string;
+      body: { elements: Array<Record<string, unknown>> };
+    };
+    expect(card.schema).toBe('2.0');
+    expect(card.body.elements[0]).toMatchObject({ tag: 'markdown', content: 'page 2' });
+    expect(card.body.elements[1]).toMatchObject({
+      tag: 'button',
+      behaviors: [{ type: 'callback', value: { id: 'mdp:r1:2' } }],
+    });
+  });
+
+  it('an empty button list leaves a text-only card (how a menu is retired)', async () => {
+    const { bot, calls } = fakeCardBot();
+    await profile.editButtons!(bot, { address: { channel: 'oc_1' }, messageId: 'om_42' }, 'done', []);
+    const card = JSON.parse(calls.patch[0]!.content) as { body: { elements: unknown[] } };
+    expect(card.body.elements).toHaveLength(1);
   });
 });

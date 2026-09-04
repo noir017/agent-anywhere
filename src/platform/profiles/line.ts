@@ -121,6 +121,10 @@ export function createLineProfile(): PlatformProfile<LinePlatformConfig> {
     reply: true, // passive reply on replyToken hit, else push fallback (see reply())
     thread: false,
     buttons: true,
+    // LINE has no message-edit API at all (editMessage above is false for the same reason), so a
+    // posted menu can never be advanced in place — and unlike QQ there is no delete to fall back
+    // on either. Callers degrade to a text answer.
+    editButtons: false,
     slashCommands: false,
   };
 

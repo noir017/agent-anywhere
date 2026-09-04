@@ -167,6 +167,9 @@ export function createQQProfile(): PlatformProfile<QQPlatformConfig> {
     reply: true,
     thread: false,
     buttons: true,
+    // QQ Guild exposes no message-edit endpoint (editMessage above is false), so buttons on a sent
+    // message are final. Callers degrade to a text answer.
+    editButtons: false,
     slashCommands: false,
   };
 

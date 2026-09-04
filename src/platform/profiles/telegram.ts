@@ -137,6 +137,10 @@ interface TelegramInternal {
     message_id: number;
     text: string;
     parse_mode?: string;
+    // Bot API accepts reply_markup here, which is what makes a paginated menu possible: the
+    // keyboard is replaced with the text in one call. Omitting the key LEAVES the old keyboard,
+    // so editButtons always sends it — an empty inline_keyboard is how buttons are cleared.
+    reply_markup?: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
   }): Promise<unknown>;
 }
 
@@ -376,6 +380,7 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
     reply: true,
     thread: true,
     buttons: true,
+    editButtons: true, // editMessageText carries reply_markup, so a menu can advance in place
     slashCommands: true,
     maxSlashCommands: 100, // Telegram setMyCommands limit (names allow only [a-z0-9_], see registerCommands)
   };
@@ -556,6 +561,26 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
       // options never appeared in the topic that asked for them. Now posted through the same
       // decoding path as every other send, with the inline keyboard attached.
       return sendComposite(bot, address, text, { buttons });
+    },
+
+    async editButtons(bot, ref, text, buttons) {
+      // Same payload as sendComposite's keyboard, on the edit endpoint. Deliberately NOT routed
+      // through sendComposite: editing addresses a message, and the Bot API's edit endpoints take
+      // no message_thread_id — the lane is already fixed by the message being edited.
+      const internal = bot.internal as unknown as TelegramInternal;
+      await internal.editMessageText({
+        chat_id: ref.address.channel,
+        message_id: Number(ref.messageId),
+        text: fragmentToTelegramHtml(renderTelegramMarkdown(text)),
+        parse_mode: 'HTML',
+        reply_markup: {
+          // One button per row, matching sendComposite: labels are long and Telegram squeezes a
+          // shared row into unreadable slivers. Sent even when empty — that is what clears them.
+          inline_keyboard: buttons.map((b) => [
+            { text: b.label, callback_data: encodeCallbackData(b.id) },
+          ]),
+        },
+      });
     },
 
     async typing(bot, address) {

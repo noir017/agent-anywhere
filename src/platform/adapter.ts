@@ -8,6 +8,19 @@ import type {
 } from '../types.js';
 
 /**
+ * One interactive button, as the daemon describes it before any platform encoding.
+ *
+ * Named rather than repeated inline because two methods now take the same list and they must not
+ * drift: a menu is posted with sendButtons and then advanced with editButtons, so a shape accepted
+ * by one and rejected by the other would only surface on the second page.
+ */
+export interface ButtonSpec {
+  id: string;
+  label: string;
+  style?: 'primary' | 'secondary' | 'success' | 'danger';
+}
+
+/**
  * Platform capability interface. One layer above Satori so the core classes depend only on
  * capabilities, not concrete platforms; missing capabilities degrade gracefully in the
  * implementation (see capabilities).
@@ -79,12 +92,21 @@ export interface PlatformAdapter {
   sendButtons(
     address: ConversationAddress,
     text: string,
-    buttons: Array<{
-      id: string;
-      label: string;
-      style?: 'primary' | 'secondary' | 'success' | 'danger';
-    }>
+    buttons: ButtonSpec[]
   ): Promise<MessageRef>;
+
+  /**
+   * Replace an existing message's text AND its buttons, in place.
+   *
+   * Not expressible through editMessage, which carries no component payload: on Discord a
+   * text-only PATCH drops the components entirely. That is exactly right for retiring a menu and
+   * exactly wrong for advancing one, and a paginated menu needs the message to keep working after
+   * the edit — otherwise every page turn is a new message and the old buttons stay live above it.
+   *
+   * An empty array strips the buttons and leaves plain text. Only call when
+   * capabilities.editButtons is true; the implementation throws otherwise.
+   */
+  editButtons(ref: MessageRef, text: string, buttons: ButtonSpec[]): Promise<void>;
 
   /**
    * Register slash commands (called once after the bot logs in).
@@ -114,6 +136,17 @@ export interface PlatformCapabilities {
   thread: boolean;
   /** Interactive buttons (send + receive). */
   buttons: boolean;
+  /**
+   * Whether an already-sent message's buttons can be REPLACED in place (editButtons).
+   *
+   * Deliberately its own flag rather than `editMessage && buttons`. Lark has both of those true
+   * and still needs a different endpoint here — its editMessage posts `msg_type:'post'` through
+   * `im.message.update`, which cannot touch a card, while buttons live on a card and are updated
+   * through `im.message.patch`. A derived predicate would be right about Lark by accident and
+   * wrong about the mechanism, and wrong about LINE/QQ for a third reason (no edit endpoint at
+   * all). Same reasoning as canRegisterSlashAtRuntime below.
+   */
+  editButtons: boolean;
   /** Slash commands (register + receive). */
   slashCommands: boolean;
   /**

@@ -14,6 +14,15 @@ describe('line profile capabilities', () => {
     expect(profile.capabilities.reply).toBe(true);
     expect(typeof profile.reply).toBe('function');
   });
+
+  it('editButtons is false and unimplemented — LINE has no message-edit API at all', () => {
+    // Not an oversight to be filled in later: LINE offers no edit endpoint (hence editMessage
+    // false too) and no delete either, so a posted menu cannot be advanced OR withdrawn. Callers
+    // degrade to a text answer; asserting both halves keeps a future "just add it" honest.
+    const profile = createLineProfile();
+    expect(profile.capabilities.editButtons).toBe(false);
+    expect(profile.editButtons).toBeUndefined();
+  });
 });
 
 describe('line reply push fallback (no cached replyToken)', () => {

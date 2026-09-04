@@ -140,6 +140,9 @@ export function buildButtonBlocks(
   if (text) {
     blocks.push({ type: 'section', text: { type: 'mrkdwn', text } });
   }
+  // An `actions` block with no elements is rejected by Slack (invalid_blocks), and clearing the
+  // buttons off a retired menu is exactly a zero-button call — so the block is omitted, not emptied.
+  if (buttons.length === 0) return blocks;
   blocks.push({
     type: 'actions',
     elements: buttons.map((b) => {
@@ -471,6 +474,10 @@ export function createSlackProfile(): PlatformProfile<SlackPlatformConfig> {
     // socket to read interactive frames (adapter ignores them by default; see file header). Only
     // Socket Mode receives them, but the send side always works, so true.
     buttons: true,
+    // chat.update takes the same `blocks` payload as chatPostMessage, so a posted menu can be
+    // advanced in place (see editButtons). Same Tier-3 rate limit as editMessage above; page
+    // clicks are nowhere near it.
+    editButtons: true,
     // slash: registerCommands is a no-op (Slack slash must be registered in the App panel, no
     // runtime API); receiving wraps the socket for slash_commands frames. Like buttons, Socket Mode only.
     slashCommands: true,
@@ -597,6 +604,21 @@ export function createSlackProfile(): PlatformProfile<SlackPlatformConfig> {
         channel: ref.address.channel,
         ts: ref.messageId,
         text: renderMrkdwn(text),
+      });
+    },
+
+    async editButtons(bot, ref, text, buttons) {
+      // editMessage's chat.update call plus the Block Kit payload sendButtons builds — the two are
+      // deliberately assembled from the same helpers so a page turn cannot render differently from
+      // the page it replaces. chat.update takes no thread parameter: channel + ts locate a message
+      // wherever it lives, including inside a thread.
+      const sb = asSlackBot(bot);
+      const rendered = renderMrkdwn(text);
+      await sb.internal.chatUpdate(sb.config.botToken, {
+        channel: ref.address.channel,
+        ts: ref.messageId,
+        text: rendered || ' ', // notification/fallback string; Slack requires it non-empty
+        blocks: buildButtonBlocks(rendered, buttons),
       });
     },
 

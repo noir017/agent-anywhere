@@ -73,6 +73,7 @@ export function createWecomProfile(): PlatformProfile<WecomPlatformConfig> {
     reply: false,
     thread: false,
     buttons: false,
+    editButtons: false, // no buttons to edit
     slashCommands: false,
   };
 

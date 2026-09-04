@@ -63,8 +63,17 @@ Three rules keep this from rotting:
 | `reply` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | – | – |
 | `thread` | ✓ | ✓ | ✓ | ✓ | – | – | – | – |
 | `buttons` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | – | – |
+| `editButtons` | ✓ | ✓ | ✓ | ✓ | – | – | – | – |
 | `slashCommands` | ✓ | ✓ | ✓ | – | – | – | – | – |
 | `maxMessageLength` | 2000 | 4096 | 3000 | 10000 | 1000 | 5000 | 2000 | 3500 |
+
+**`editButtons` is not `editMessage && buttons`.** It is its own field because the
+conjunction is right by accident and wrong in mechanism. Lark has both, yet its
+`editMessage` posts `msg_type:'post'` through `im.message.update`, which cannot touch a
+card — buttons live on a card and are replaced through `im.message.patch`. QQ and LINE
+have buttons and no edit endpoint at all (LINE has no delete either, so not even
+delete-and-repost is available). A caller that needs to advance a posted menu — the
+paginated `/model` picker — checks this field and degrades to a text answer otherwise.
 
 Three capability fields are easy to conflate:
 

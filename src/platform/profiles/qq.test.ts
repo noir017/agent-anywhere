@@ -74,3 +74,13 @@ describe('qq profile delivery contract (text is flattened before send)', () => {
     expect(textOf(sent[0]!)).not.toMatch(/\*\*/);
   });
 });
+
+describe('qq profile capabilities', () => {
+  it('editButtons is false and unimplemented — QQ Guild has no message-edit endpoint', () => {
+    // Same gap as editMessage: buttons on a sent message are final, so a paginated menu cannot
+    // advance in place and callers degrade to a text answer.
+    const profile = createQQProfile();
+    expect(profile.capabilities.editButtons).toBe(false);
+    expect(profile.editButtons).toBeUndefined();
+  });
+});

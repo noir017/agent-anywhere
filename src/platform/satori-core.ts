@@ -359,6 +359,13 @@ export async function createSatoriAdapter(
       return profile.sendButtons(getBot(), address, text, buttons);
     },
 
+    async editButtons(ref, text, buttons) {
+      // No generic fallback to offer, unlike editMessage below: no Satori Bot method carries a
+      // component payload, so a platform without its own implementation genuinely cannot do this.
+      if (!profile.editButtons) return unsupported('editButtons');
+      return profile.editButtons(getBot(), ref, text, buttons);
+    },
+
     async registerCommands(cmds: SlashCommandSpec[], opts) {
       if (!profile.registerCommands) return unsupported('registerCommands');
       await profile.registerCommands(ctx, getBot, cmds, opts);

@@ -13,7 +13,6 @@ import type { DiscordPlatformConfig } from '../config-schemas.js';
 import { renderDiscordMarkdown } from '../discord-markdown.js';
 import {
   attrAttachmentMeta,
-  buildButtonMessageFragment,
   deferUntilLogin,
   findAtMention,
   installHttpService,
@@ -61,6 +60,51 @@ function renderOrFallback(text: string): string {
     console.error('[discord] table rewrite failed, using raw text:', e instanceof Error ? e.message : e);
     return text;
   }
+}
+
+/** Discord button styles (message-components docs): the numeric wire values behind our style names. */
+const BUTTON_STYLE: Record<string, number> = { primary: 1, secondary: 2, success: 3, danger: 4 };
+
+/**
+ * Build Discord action rows for a button list.
+ *
+ * Hand-built rather than expressed as `h('button-group')` because both button paths here bypass
+ * the Satori encoder (see sendButtons), and because editing needs the raw `components` payload
+ * anyway — `Message.EditParams.components` is the only way to change a sent message's buttons.
+ *
+ * Rows hold at most 5 components and a message at most 5 rows (25 buttons); the caller decides
+ * what to show, this only chunks. Labels are capped at 80 chars by Discord — enforced by whoever
+ * composes them, so a too-long label surfaces as one clear 400 rather than being silently cut here.
+ */
+function buildActionRows(
+  buttons: Array<{ id: string; label: string; style?: string }>
+): Array<{ type: 1; components: Array<{ type: 2; style: number; label: string; custom_id: string }> }> {
+  const rows = [];
+  for (let i = 0; i < buttons.length; i += 5) {
+    rows.push({
+      type: 1 as const,
+      components: buttons.slice(i, i + 5).map((b) => ({
+        type: 2 as const,
+        style: BUTTON_STYLE[b.style ?? 'primary'] ?? BUTTON_STYLE.primary!,
+        label: b.label,
+        custom_id: b.id,
+      })),
+    });
+  }
+  return rows;
+}
+
+/** The raw-API surface both button paths and both text paths use (the Satori encoder is bypassed). */
+interface DiscordMessageApi {
+  createMessage: (
+    channelId: string,
+    params: { content: string; components?: unknown[] }
+  ) => Promise<{ id: string }>;
+  editMessage: (
+    channelId: string,
+    messageId: string,
+    params: { content: string; components?: unknown[] }
+  ) => Promise<unknown>;
 }
 
 /**
@@ -156,6 +200,7 @@ export function createDiscordProfile(): PlatformProfile<DiscordPlatformConfig> {
     reply: true,
     thread: true,
     buttons: true,
+    editButtons: true, // PATCH /channels/{c}/messages/{id} takes `components` (Message.EditParams)
     slashCommands: true,
     maxSlashCommands: 100, // Discord per-scope application command limit
     // The adapter auto-emits a DEFERRED interaction response on INTERACTION_CREATE; without a
@@ -238,20 +283,31 @@ export function createDiscordProfile(): PlatformProfile<DiscordPlatformConfig> {
     },
 
     async sendButtons(bot, address, text, buttons) {
-      // <button-group> wraps one row (max 5 per row; adapter's lastRow() auto-wraps).
-      // h('button',{ id, class }) without a type makes custom_id === id, unprefixed here.
-      const group = h(
-        'button-group',
-        {},
-        buttons.map((b) => h('button', { id: b.id, class: b.style ?? 'primary' }, b.label))
-      );
-      return sendForRef(
-        bot,
-        address,
-        buildButtonMessageFragment(text, group),
-        'discord',
-        'sendButtons'
-      );
+      // Raw API, for the same reason sendMessage below uses it: the Satori encoder backslash-escapes
+      // | * _ ` ~ ( ) [ ] in both the text and the button labels. That was invisible while the only
+      // menu was a list of `/command` names, but a model menu labels buttons "(nvidia) GLM-5.1" —
+      // which rendered as "\(nvidia\) GLM-5.1" — and its text would flip from escaped to unescaped
+      // the moment editButtons (raw) turned the first page. One path for both, so pages match.
+      const internal = bot.internal as DiscordMessageApi;
+      const msg = await internal.createMessage(address.channel, {
+        content: renderOrFallback(text),
+        components: buildActionRows(buttons),
+      });
+      const messageId = msg.id;
+      if (!messageId) {
+        throw new Error(`[discord] createMessage did not return a message id (channel=${address.channel})`);
+      }
+      return { address, messageId };
+    },
+
+    async editButtons(bot, ref, text, buttons) {
+      // An empty component array is how Discord clears buttons — sending no `components` key at
+      // all would LEAVE them, which is the difference between retiring a menu and orphaning one.
+      const internal = bot.internal as DiscordMessageApi;
+      await internal.editMessage(ref.address.channel, ref.messageId, {
+        content: renderOrFallback(text),
+        components: buildActionRows(buttons),
+      });
     },
 
     async sendMessage(bot, address, text) {
@@ -261,9 +317,7 @@ export function createDiscordProfile(): PlatformProfile<DiscordPlatformConfig> {
       //     after escaping -> Discord 400 "Must be 2000 or fewer";
       //  2. the agent's markdown renders as escaped literals (\| \*\* ...), losing all formatting.
       // Raw send fixes both (content is still bounded by Discord's 2000 limit via StreamBuffer).
-      const internal = bot.internal as {
-        createMessage: (channelId: string, params: { content: string }) => Promise<{ id: string }>;
-      };
+      const internal = bot.internal as DiscordMessageApi;
       // renderOrFallback rewrites GFM tables → bullets (see its definition for why only tables).
       const msg = await internal.createMessage(address.channel, { content: renderOrFallback(text) });
       const messageId = msg.id;
@@ -275,13 +329,7 @@ export function createDiscordProfile(): PlatformProfile<DiscordPlatformConfig> {
 
     async editMessage(bot, ref, text) {
       // Like sendMessage: edit content via raw API, bypassing markdown escaping.
-      const internal = bot.internal as {
-        editMessage: (
-          channelId: string,
-          messageId: string,
-          params: { content: string }
-        ) => Promise<unknown>;
-      };
+      const internal = bot.internal as DiscordMessageApi;
       await internal.editMessage(ref.address.channel, ref.messageId, { content: renderOrFallback(text) });
     },
 

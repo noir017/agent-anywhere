@@ -116,6 +116,14 @@ describe('buildButtonBlocks', () => {
     expect(blocks[0]).toMatchObject({ type: 'actions' });
   });
 
+  it('omits the actions block entirely when there are no buttons (Slack rejects an empty one)', () => {
+    // Clearing a retired menu is exactly a zero-button call; an `actions` block with no elements
+    // is invalid_blocks, so the block must be absent rather than empty.
+    const blocks = buildButtonBlocks('Model set', []);
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]).toMatchObject({ type: 'section' });
+  });
+
   it('encodes id into both button.action_id and value (round-trip consistency)', () => {
     const blocks = buildButtonBlocks('', [{ id: 'ask:r:2', label: 'L' }]);
     const actions = blocks[0] as { elements: Array<Record<string, unknown>> };
@@ -220,6 +228,27 @@ describe('slack profile delivery contract (send/edit reach Slack as valid mrkdwn
     expect(params.text).toBe('Pick *one*');
     const blocks = params.blocks as Array<Record<string, unknown>>;
     expect(blocks[0]).toMatchObject({ type: 'section', text: { type: 'mrkdwn', text: 'Pick *one*' } });
+  });
+
+  it('editButtons updates the same message through chat.update with the new blocks', async () => {
+    // The page-turn primitive: chat.update takes the same `blocks` payload chatPostMessage does,
+    // so a menu advances in place. No thread parameter — channel + ts locate a message wherever it
+    // lives — and the guard in fakeBot fails the test if the profile falls back to bot.editMessage.
+    const { bot, calls } = fakeBot();
+    await profile.editButtons!(
+      bot,
+      { address: { channel: 'C0123ABCD', thread: '5.5' }, messageId: '111.222' },
+      'Model: **x**',
+      [{ id: 'mdp:r1:2', label: '▶' }]
+    );
+    expect(calls.post).toHaveLength(0); // never a fresh post
+    expect(calls.update).toHaveLength(1);
+    const { token, params } = calls.update[0]!;
+    expect(token).toBe('xoxb-test');
+    expect(params).toMatchObject({ channel: 'C0123ABCD', ts: '111.222', text: 'Model: *x*' });
+    expect(params.thread_ts).toBeUndefined();
+    const blocks = params.blocks as Array<Record<string, unknown>>;
+    expect(blocks[1]).toMatchObject({ type: 'actions' });
   });
 
   it('createThread from inside a thread targets the real channel, never a doubled key', async () => {

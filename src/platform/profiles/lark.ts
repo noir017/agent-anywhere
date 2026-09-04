@@ -506,6 +506,10 @@ export function createLarkProfile(): PlatformProfile<LarkPlatformConfig> {
     reply: true,
     thread: true,
     buttons: true,
+    // im.message.patch ("更新已发送的消息卡片") replaces a card's content in place — the endpoint
+    // this capability is named for. NOT reachable through editMessage above, which goes to
+    // im.message.update with msg_type:'post' and cannot touch a card; see LarkInternalMessage.
+    editButtons: true,
     slashCommands: false,
   };
 
@@ -758,6 +762,17 @@ export function createLarkProfile(): PlatformProfile<LarkPlatformConfig> {
       return { address, messageId };
     },
 
+    async editButtons(bot, ref, text, buttons): Promise<void> {
+      // Same card sendButtons built, re-serialized onto the existing message. A card is patched
+      // whole — Feishu has no partial element update — so passing an empty button list simply
+      // yields a card with only its markdown element, which is how a menu is retired.
+      const api = larkMessageApi(bot);
+      if (!api) {
+        throw new Error('[lark] im.message.patch is unavailable; cannot update the interactive card');
+      }
+      await api.patch(ref.messageId, { content: JSON.stringify(buildLarkButtonCard(text, buttons)) });
+    },
+
     mountButtonEvents(ctx: Context, emit: (ev: ProfileButtonEvent) => void): void {
       // ⚠️ Receive path (avoids an adapter pitfall): adapter-lark only normalizes
       // card.action.trigger into interaction/command when
@@ -842,6 +857,15 @@ interface LarkInternalMessage {
     messageId: string,
     body: { msg_type: string; content: string; reply_in_thread?: boolean }
   ): Promise<{ message_id?: string; thread_id?: string }>;
+  /**
+   * 更新已发送的消息卡片 (im-v1/message/patch). The ONLY endpoint that can change a card in place.
+   *
+   * Not `update`: that one is what `bot.editMessage` reaches, it posts `msg_type:'post'`, and it
+   * cannot touch an interactive card — so a card edited through the normal edit path either fails
+   * or replaces the card with a post, losing the buttons. Verified signature against
+   * @satorijs/adapter-lark lib/types/im.d.ts (Message.Methods.patch, PatchRequest = { content }).
+   */
+  patch(messageId: string, body: { content: string }): Promise<void>;
   // Paginated<T> is a Promise AND an AsyncIterableIterator; only the iteration side is used.
   list(query: {
     container_id_type: 'chat' | 'thread';

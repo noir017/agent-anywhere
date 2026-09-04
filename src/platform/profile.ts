@@ -126,6 +126,17 @@ export interface PlatformProfile<P extends PlatformConfig = PlatformConfig> {
     buttons: Array<{ id: string; label: string; style?: string }>
   ): Promise<MessageRef>;
   /**
+   * Replace a sent message's text and buttons in place (paginated menus). Absent on a platform
+   * with no message-edit endpoint (LINE, QQ), which then declares capabilities.editButtons: false.
+   * An empty button list strips the buttons.
+   */
+  editButtons?(
+    bot: Bot,
+    ref: MessageRef,
+    text: string,
+    buttons: Array<{ id: string; label: string; style?: string }>
+  ): Promise<void>;
+  /**
    * Register slash commands. getBot lazily fetches the bot (may not be online yet; the
    * profile handles deferral/re-registration). ctx is also passed so the profile can use
    * ctx.on('login-updated') etc. to register after login.

@@ -111,6 +111,7 @@ export function createDingtalkProfile(): PlatformProfile<DingtalkPlatformConfig>
     reply: false,
     thread: false,
     buttons: false,
+    editButtons: false, // no buttons to edit
     slashCommands: false,
   };
 

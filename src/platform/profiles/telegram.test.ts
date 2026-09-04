@@ -457,6 +457,37 @@ describe('outbound paths inside a topic', () => {
     expect(Buffer.byteLength(data, 'utf8')).toBeLessThanOrEqual(64);
   });
 
+  /**
+   * editButtons is the page-turn primitive: the Bot API's editMessageText accepts reply_markup, so
+   * text and keyboard change in one call on the SAME message. Two things are easy to get wrong and
+   * are pinned here — the edit endpoint takes no message_thread_id (the lane is fixed by the
+   * message being edited, and passing one is a 400), and an omitted reply_markup LEAVES the old
+   * keyboard, so clearing must send an empty inline_keyboard rather than nothing.
+   */
+  it('editButtons rewrites text and keyboard on the same message, with no lane field', async () => {
+    const { bot, calls } = fakeBot();
+    await profile.editButtons!(bot, { address: topic, messageId: '42' }, 'page 2', [
+      { id: 'mdp:r1:2', label: '▶' },
+    ]);
+    expect(calls.send).toHaveLength(0); // never a fresh post
+    expect(calls.edit).toHaveLength(1);
+    expect(calls.edit[0]).toMatchObject({
+      chat_id: '-1001234567890',
+      message_id: 42,
+      parse_mode: 'HTML',
+    });
+    expect(calls.edit[0]!.message_thread_id).toBeUndefined();
+    expect(calls.edit[0]!.reply_markup).toEqual({
+      inline_keyboard: [[{ text: '▶', callback_data: 'mdp:r1:2' }]],
+    });
+  });
+
+  it('editButtons clears a keyboard with an EMPTY inline_keyboard, not an absent field', async () => {
+    const { bot, calls } = fakeBot();
+    await profile.editButtons!(bot, { address: { channel: '1' }, messageId: '2' }, 'done', []);
+    expect(calls.edit[0]!.reply_markup).toEqual({ inline_keyboard: [] });
+  });
+
   it('reply targets the topic and carries reply_to_message_id', async () => {
     const { bot, calls } = fakeBot();
     await profile.reply!(bot, { address: topic, messageId: '7' }, 'pong');

@@ -65,6 +65,7 @@ async function build(opts: { lane?: string; profileSendFile?: boolean } = {}): P
       reply: true,
       thread: true,
       buttons: true,
+      editButtons: false,
       slashCommands: false,
     },
     // Push our fake bot so getBot() resolves without a real connection.

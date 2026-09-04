@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-04
+
 ### Added
 
 - **`/stop` ends the current turn without ending the conversation.** Until now the only way to stop

@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-04
+
 ### Changed
 
 - **`/model` now opens the menu on `claude` too, instead of forwarding to claude's own.** It looked

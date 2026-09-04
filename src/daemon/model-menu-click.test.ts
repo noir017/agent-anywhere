@@ -100,6 +100,7 @@ function rig(opts: RigOptions = {}) {
       }
       return s;
     },
+    peek: (id) => sessions.get(id),
     dispose: (id) => void sessions.delete(id),
   };
 

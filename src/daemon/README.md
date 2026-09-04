@@ -41,6 +41,7 @@ ConversationRegistry.route
    ├─ resolveAgent       routing.pipeline, then HARNESS_COMMANDS → { agentId, explicit }
    ├─ response gate      core/inbound-gate shouldRespond
    ├─ /new · /clear      reset the conversation, drop every agent's id, ack. Never forwarded.
+   ├─ /stop              cancel the running turn and the queued backlog, ack. Never forwarded.
    ├─ /help              the registered vocabulary, from core/command-translate. Never forwarded.
    ├─ unconfigured agent `/agy` with no agy agent → say so, run no turn. Never forwarded.
    ├─ bind or rebind     new conversation → bind; explicit `/oc` → rebind; else keep the bound agent
@@ -66,7 +67,8 @@ Several orderings in `route()` are load-bearing and commented in place:
 - **The header is sent after every gate**, so it cannot become a probe — a message that
   will not be answered gets no acknowledgement of any kind.
 - **`/new` is intercepted before the merger**, so it works mid-turn (dispose aborts the
-  in-flight turn).
+  in-flight turn). `/stop` sits beside it for the same reason: a stop command that only
+  worked between turns would be useless exactly when it is wanted.
 - **The unconfigured-harness check runs before binding**, and only on a name `resolveAgent`
   declined — so a `when.command` rule or a configured harness always wins, and a name nobody
   claimed never binds a conversation on its way to being refused.
@@ -134,11 +136,10 @@ present but empty for a channel root, so a root and a topic can never collide.
 
 ## Conversation lifetime
 
-**Conversations live for the daemon's lifetime.** There is deliberately no automatic
-reclamation — evicting one would silently drop the agent's context and kill a resident
-subprocess, and the live set is naturally bounded by `access.allowFrom` in any sane
-deployment. A conversation's context ends only when the daemon stops or the user sends
-`/new`.
+**A conversation lives for the daemon's lifetime; its agent process does not.** The
+conversation ends only when the daemon stops or the user sends `/new`. The resident
+harness child under it is reclaimed after `session.idleTimeoutMs` of silence — see
+[Idle reclaim](#idle-reclaim) below.
 
 `ConversationState` is one object per conversation (previously parallel `Map`s). Creation
 sets it in one assignment (no half-init), release is one `delete` (no leak), and adding a
@@ -159,6 +160,13 @@ remembers *which* of its sessions belongs where, so a restarted daemon can `sess
 it (ACP) or pass `--conversation` (agy) rather than starting blank.
 
 A missing or corrupt file degrades to empty (bindings lost, agent histories untouched).
+`/stop` is the narrow sibling of `/new` and touches none of this: it cancels the running
+turn and drops the queued backlog through `InboundMerger.interrupt()`, leaving the
+context, the session ids, the binding and the child process exactly as they were. It
+deliberately does not reach the agent through `agents.getOrCreate` — building a session
+for a conversation that has none, in order to stop it, is backwards; the abort travels via
+the merger, which only fires it in the `running` phase where a session must exist.
+
 `/new` is the single context-destroying path in the system, and it clears **every**
 agent's id for that conversation: the topic *is* the conversation, so a reset that let
 another agent's history resurface on the next `/oc` would be a surprise rather than a
@@ -173,6 +181,45 @@ and the agent would answer its own follow-up from scratch. `TurnRunner` calls
 `deps.adoptThread`, and the registry aliases the thread's key to the conversation that
 opened it. The alias is in-memory only: after a restart such a thread becomes its own
 conversation, which is a self-correcting degradation, unlike discarding context.
+
+### Idle reclaim
+
+`scope: per_thread` means every topic anyone has ever messaged holds its own resident
+harness child, and a Claude Code process is hundreds of MB. So after
+`session.idleTimeoutMs` (user-facing, default 1 h, `0` disables) the registry's sweeper
+stops the child of a conversation nothing is happening in.
+
+**Reclaim is the restart path, applied one conversation at a time.** A daemon restart
+already kills every child and resumes each conversation from the session id in
+`conversations.json` — ACP `session/load`, agy `--conversation`. This does that to one
+idle conversation deliberately, to get its memory back. Nothing that identifies the
+conversation is touched: state, binding, reverse-command token and stored session ids all
+stay, and `AgentSession.dispose()` is called rather than `AgentFactory.dispose()` so the
+session HANDLE survives too — which is what keeps the conversation's runtime `/model`
+choice across the respawn. The only thing a user can perceive is that the next message
+waits a few seconds for the child to come back.
+
+That earlier paragraph in this file claiming reclaim would "silently drop the agent's
+context" predates `conversations.json`. It was true when the daemon held the only copy of
+which session belonged where.
+
+Four conditions, each protecting against a different way of being wrong:
+
+| gate | what it prevents |
+|---|---|
+| quiet longer than the deadline | — |
+| `merger.isIdle()` | killing work in flight. The clock starts when the last turn ENDED (the merger's `onIdle`), so a task that runs for hours — subagents included — is never a candidate while it runs |
+| `hooks.hasPendingWork(id)` | stranding a pending `ask`: a CLI process blocked on a button click is work this conversation is doing from outside any turn |
+| `AgentSession.reclaimState() === 'resumable'` | silently restarting the user's task on a harness that cannot reload a stored session |
+
+A reverse command also counts as activity (`handleReverse` → `registry.touch`), so an
+agent whose turn ended but whose background job is still reporting through
+`agent-anywhere send` keeps its child. A session that reports `unresumable` is left
+resident and said so once, not once a minute.
+
+Verified resumable on the three harnesses in use: `claude` (claude-agent-acp advertises
+`loadSession: true`), `opencode` 1.18.18 (same, plus `sessionCapabilities.resume`), and
+`agy` (`--conversation=<id>`, recorded as soon as its `init` event names one).
 
 ## `TurnRunner`
 
@@ -332,7 +379,9 @@ a click or timeout (default 120 s), then returns `{ chosen }` to the blocked CLI
 Button ids are `ask:<reqId>:<index>` — the **index**, not the label, because Telegram
 caps `callback_data` at 64 bytes and a longer id degrades to a lossy hash. On resolve or
 timeout the buttons are stripped and the message annotated. On shutdown every pending ask
-is resolved `null` so no caller hangs forever.
+is resolved `null` so no caller hangs forever. A pending ask also holds its conversation
+against idle reclaim (`hasPendingWork`): from the registry's side that conversation looks
+idle, while a CLI process sits blocked on a button nobody has pressed yet.
 
 **Harness pickers** — the bare form of an agent command (`/cc`, `/oc`) — post the agent's
 *reported* commands as buttons, never a guessed list. Names already reachable through the
@@ -428,12 +477,17 @@ back to whatever PATH offers.
 
 ## Tests
 
-Thirteen test files. `agent-acp.test.ts` and `agent-agy.test.ts` cover protocol
+Fourteen test files. `agent-acp.test.ts` and `agent-agy.test.ts` cover protocol
 translation; `routing.test.ts`, `command-routing.test.ts`, `session-control.test.ts`,
+`session-reclaim.test.ts`,
 `conversation-store.test.ts`, `conversation-token-registry.test.ts`,
 `multi-platform.test.ts`, `slash-register.test.ts`, `ask-button.test.ts`,
 `picker-click.test.ts`, `model-menu-click.test.ts`, `local-commands.test.ts`,
 `permission.test.ts`, and `attachment-io.test.ts` cover the rest.
+
+`session-reclaim.test.ts` is written almost entirely as negative assertions, for the same
+reason the click suites are: every gate that fails open produces an agent that silently
+forgot a task, and none of them announce themselves.
 
 Two suites are load-bearing for the design rather than for a function:
 `command-routing.test.ts`'s *sticky agent binding* block reproduces the reported bug

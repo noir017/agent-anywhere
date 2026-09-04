@@ -48,6 +48,32 @@ const CONTEXT_CLEAR_RE = /^\/(new|clear)(@\S+)?$/;
 /** `/help` — answered by the gateway itself (see DAEMON_COMMANDS), never forwarded to the agent. */
 const HELP_RE = /^\/help(@\S+)?$/;
 
+/** `/stop` — end the running turn without ending the conversation (the counterpart to `/new`). */
+const STOP_RE = /^\/stop(@\S+)?$/;
+
+/** What the merger was doing when `/stop` arrived. */
+type StopOutcome = 'running' | 'collecting' | 'idle';
+
+/**
+ * What `/stop` answers, per outcome. Three sentences rather than one ack, because the same words
+ * for "I stopped a 20-minute task" and "there was nothing to stop" teach the user to distrust the
+ * command — and a stop command nobody trusts is worse than none.
+ */
+const STOP_ACK: Record<StopOutcome, string> = {
+  running: '⏹ Stopped. The reply above is as far as it got — the conversation is kept, so just send the next message.',
+  collecting: '⏹ Dropped the message that was about to start a turn. Nothing reached the agent.',
+  idle: 'Nothing is running here.',
+};
+
+/**
+ * How often the idle sweeper looks for conversations to reclaim.
+ *
+ * Independent of session.idleTimeoutMs, and deliberately coarse: the deadline it enforces is
+ * measured in tens of minutes, so a minute of slack on either side is invisible, while a tighter
+ * interval would just wake the process up more often to find nothing.
+ */
+const SWEEP_INTERVAL_MS = 60_000;
+
 /**
  * All per-conversation runtime state in one object. Consolidated so creation sets one object (no
  * half-init), release is one delete (no leak), and adding a field touches only this interface.
@@ -58,6 +84,18 @@ const HELP_RE = /^\/help(@\S+)?$/;
 interface ConversationState {
   /** This conversation's inbound merger (state machine: idle/collecting/running). */
   merger: InboundMerger;
+  /**
+   * When this conversation last did anything, as the injected clock sees it. Drives idle reclaim.
+   *
+   * Bumped by an accepted inbound message, by the end of a turn (the merger's onIdle), and by a
+   * reverse command arriving over IPC. That third source is the one that is easy to miss and the
+   * reason the field is not simply "time of last message": an agent that finished its turn and left
+   * a background job reporting through `agent-anywhere send` is still working here, and reclaiming
+   * its child would cut the job off from the chat it is talking to.
+   *
+   * Ignored while the merger is busy — a turn in flight is not idle no matter what this says.
+   */
+  lastActivityAt: number;
   /**
    * The agent currently answering this conversation — the STICKY binding.
    *
@@ -97,10 +135,10 @@ interface ConversationState {
  *
  * - route(msg): identify the conversation, resolve/keep its agent, gate, deliver to the merger.
  * - Single-turn orchestration is extracted to TurnRunner; buildMerger's runTurn delegates to it.
- * - Lifetime is the daemon's: a conversation (and its resident agent subprocess) lives until
- *   shutdown or an explicit /new. There is deliberately no automatic reclamation — evicting a
- *   process would silently drop the agent's context, and the live set is naturally bounded by
- *   access.allowFrom in any sane deployment.
+ * - Lifetime: a CONVERSATION lives until shutdown or an explicit /new. Its resident agent
+ *   subprocess does not — after session.idleTimeoutMs of silence the sweeper stops the child and
+ *   keeps everything that identifies the conversation, so the next message respawns it and resumes
+ *   through the harness's own reload. See reclaimIdleSessions.
  */
 export class ConversationRegistry {
   /** The single per-conversation state table. */
@@ -128,6 +166,13 @@ export class ConversationRegistry {
    * the frozen half (respondInDirect/threadParticipationExempt) from EXPERIENCE.
    */
   private readonly gateConfigs = new Map<string, GateConfig>();
+  /** Cancels the idle sweeper's pending tick. Null when reclaim is disabled, or after dispose. */
+  private cancelSweep: (() => void) | null = null;
+  /**
+   * Conversations already reported as un-reclaimable, so the sweeper says it once instead of every
+   * minute for the life of the daemon. Cleared with the rest of the conversation's state.
+   */
+  private unresumableWarned = new Set<ConversationId>();
 
   constructor(
     private readonly config: Config,
@@ -154,6 +199,16 @@ export class ConversationRegistry {
         msg: InboundMessage,
         selector: ModelSelector
       ): void;
+      /**
+       * Whether the daemon is holding work for this conversation that lives OUTSIDE a turn — today,
+       * a pending `ask` whose IPC caller is blocked on a button click. The idle sweeper asks before
+       * reclaiming, because such a conversation looks idle from here (no turn, no messages) while
+       * something is very much waiting on it.
+       *
+       * A query rather than a pin/unpin pair on purpose: a leaked pin would keep one child resident
+       * forever, and nothing would ever notice.
+       */
+      hasPendingWork?(id: ConversationId): boolean;
     },
     /** Persistent conversation state (agent binding + each agent's own session id). */
     private readonly store?: ConversationStore
@@ -194,6 +249,94 @@ export class ConversationRegistry {
       },
       this.hooks
     );
+
+    this.startIdleSweeper();
+  }
+
+  /**
+   * Arm the idle sweeper: one self-rescheduling tick (the injected clock's schedule is one-shot,
+   * like the typing keep-alive in TurnRunner). Disabled entirely when idleTimeoutMs is 0, so a
+   * deployment that turns reclaim off pays no timer at all.
+   */
+  private startIdleSweeper(): void {
+    // Written as a positive test rather than `<= 0`: a hand-assembled Config that omits the field
+    // (tests, an older config object) then leaves reclaim OFF, which is the safe direction — the
+    // negative form would arm a sweeper that compares every conversation against NaN.
+    if (!(this.config.session.idleTimeoutMs > 0)) return;
+    const tick = (): void => {
+      this.reclaimIdleSessions();
+      this.cancelSweep = this.clock.schedule(tick, SWEEP_INTERVAL_MS);
+    };
+    this.cancelSweep = this.clock.schedule(tick, SWEEP_INTERVAL_MS);
+  }
+
+  /**
+   * Stop the resident agent child of every conversation that has gone quiet for longer than
+   * session.idleTimeoutMs, keeping the conversation itself intact.
+   *
+   * ── What reclaim is ───────────────────────────────────────────────────────────────────────────
+   * The restart path, applied to one conversation instead of all of them. A daemon restart already
+   * kills every child and resumes each conversation from the session id in conversations.json
+   * (ACP `session/load`, agy `--conversation`) — this does the same thing to one idle conversation,
+   * on purpose, to get its memory back. Nothing that identifies the conversation is touched: the
+   * binding, the state, the reverse-command token and the stored session ids all stay, and the
+   * session HANDLE stays too (so the runtime model choice a user made survives the respawn).
+   *
+   * ── The four gates, and what each is protecting ───────────────────────────────────────────────
+   * 1. quiet longer than the deadline — the clock only starts when the last turn ENDED, so a task
+   *    that runs for hours (subagents included) is never a candidate;
+   * 2. the merger is idle — no turn running, no batch collecting;
+   * 3. the daemon holds no out-of-turn work (a pending `ask`) for it;
+   * 4. the session says it can resume. A runtime that cannot say so keeps its child: silently
+   *    restarting someone's task is the one degradation this gateway refuses to make.
+   *
+   * Public because the timer is not the interesting part — the decision is, and the sweep is tested
+   * by calling it against a controlled clock.
+   */
+  reclaimIdleSessions(): void {
+    const idleMs = this.config.session.idleTimeoutMs;
+    if (!(idleMs > 0)) return; // disabled, or absent from a hand-built config (see startIdleSweeper)
+    const now = this.clock.now();
+    for (const [id, state] of this.conversations) {
+      if (now - state.lastActivityAt <= idleMs) continue;
+      if (!state.merger.isIdle()) continue;
+      if (this.hooks?.hasPendingWork?.(id)) continue;
+
+      const session = this.agents.peek(id);
+      if (!session) continue; // never started here: nothing resident to reclaim
+      const reclaim = session.reclaimState?.() ?? 'unresumable';
+      if (reclaim === 'no-child') continue; // already down (an earlier sweep, or a crash)
+      if (reclaim === 'unresumable') {
+        if (!this.unresumableWarned.has(id)) {
+          this.unresumableWarned.add(id);
+          console.warn(
+            `[reclaim] ${id} is idle but its agent cannot resume a stored session; leaving the child ` +
+              `resident (stopping it would silently restart the conversation)`
+          );
+        }
+        continue;
+      }
+
+      // dispose() on the SESSION, not on the factory: the factory would drop the handle as well,
+      // and with it this conversation's runtime /model choice. Both runtimes reset their handles
+      // and respawn on the next turn — the same self-healing path a crashed child takes.
+      session.dispose();
+      const idleMin = Math.round((now - state.lastActivityAt) / 60_000);
+      console.log(
+        `[reclaim] ${id} idle for ${idleMin}m — agent child stopped; the next message resumes it`
+      );
+    }
+  }
+
+  /**
+   * Mark a conversation as active now. Anything that means "work is happening here" calls this:
+   * an accepted message, the end of a turn, a reverse command arriving over IPC.
+   *
+   * A no-op for a conversation that has no state yet — creation stamps its own timestamp.
+   */
+  touch(id: ConversationId): void {
+    const state = this.conversations.get(id);
+    if (state) state.lastActivityAt = this.clock.now();
   }
 
   /** Gating rules for one platform instance (built on first use; config is immutable at runtime). */
@@ -284,6 +427,12 @@ export class ConversationRegistry {
       return;
     }
 
+    // Past every gate, so this message is one the gateway is answering: the conversation is alive,
+    // whatever it turns out to say. Placed before the daemon-command interceptions below so that
+    // typing /help or /stop keeps a conversation warm too — a user in the middle of driving one is
+    // the last person whose agent should be reclaimed out from under them.
+    this.touch(key);
+
     // Daemon-level context control: /new (alias /clear) discards this conversation's context —
     // dispose the resident agent AND drop every agent's persisted session id (else it resurrects on
     // restart) — then ack. Intercepted before the merger so it also works mid-turn (dispose aborts
@@ -296,6 +445,22 @@ export class ConversationRegistry {
         .get(conv.platform)
         ?.sendMessage(address, 'Context cleared — the next message starts a fresh conversation.')
         .catch((e) => console.warn('[conversation] failed to ack context clear:', e instanceof Error ? e.message : e));
+      return;
+    }
+
+    // Daemon-level turn control: /stop ends the RUNNING TURN and nothing else — the counterpart to
+    // /new, which ends the conversation. Intercepted here for the same reason /new is (before the
+    // merger, so it works mid-turn) and, like it, never forwarded: no harness has a slash command
+    // that could cancel the very turn carrying it.
+    //
+    // Tested on the STRIPPED content, so `/cc /stop` composes exactly as `/cc /new` does.
+    if (STOP_RE.test(msg.content.trim())) {
+      const outcome = this.stopConversation(key);
+      console.log(`[conversation] ${key} /stop by ${conv.platform}:${conv.user} → ${outcome}`);
+      void this.platforms
+        .get(conv.platform)
+        ?.sendMessage(address, STOP_ACK[outcome])
+        .catch((e) => console.warn('[conversation] failed to ack /stop:', e instanceof Error ? e.message : e));
       return;
     }
 
@@ -328,6 +493,7 @@ export class ConversationRegistry {
         merger: this.buildMerger(key),
         agentId,
         platform: conv.platform,
+        lastActivityAt: this.clock.now(),
       };
       this.conversations.set(key, state);
       this.store?.bind(key, agentId);
@@ -883,8 +1049,29 @@ ${formatTokens(left)} left before compaction — ${agentDisplayName(def, state.a
     }
   }
 
-  /** Shutdown: release all mergers and agent sessions. */
+  /**
+   * Stop what a conversation is doing (`/stop`), and report what that was.
+   *
+   * The narrow sibling of resetConversation: the running turn is cancelled and the queued backlog
+   * dropped, while the agent's context, its session ids, the binding and the child process are all
+   * left exactly as they are. Stopping a task and losing the conversation it belongs to are
+   * different asks, and until this existed only the second one had a command.
+   *
+   * No state means nothing has ever run here, so the answer is 'idle'. Deliberately NOT routed
+   * through agents.getOrCreate: building a session handle for a conversation that has none, in the
+   * name of stopping it, is exactly backwards. The abort reaches the agent through the merger,
+   * which only fires it in the `running` phase — where a session necessarily exists.
+   */
+  stopConversation(id: ConversationId): StopOutcome {
+    const state = this.conversations.get(id);
+    if (!state) return 'idle';
+    return state.merger.interrupt();
+  }
+
+  /** Shutdown: stop the sweeper, release all mergers and agent sessions. */
   dispose(): void {
+    this.cancelSweep?.();
+    this.cancelSweep = null;
     for (const key of [...this.conversations.keys()]) {
       this.releaseState(key);
       this.agents.dispose(key);
@@ -898,6 +1085,7 @@ ${formatTokens(left)} left before compaction — ${agentDisplayName(def, state.a
   private releaseState(id: ConversationId): void {
     this.conversations.delete(id);
     this.tokens.release(id);
+    this.unresumableWarned.delete(id);
   }
 
   private buildMerger(conversationId: ConversationId): InboundMerger {
@@ -918,6 +1106,10 @@ ${formatTokens(left)} left before compaction — ${agentDisplayName(def, state.a
         runTurn: (batch, signal) => this.turnRunner.runTurn(conversationId, batch, signal),
         abortTurn: () =>
           this.agents.getOrCreate(conversationId, this.agentIdOf(conversationId)).abort(),
+        // The turn ended and nothing is queued behind it: that instant, not the moment the message
+        // arrived, is when this conversation started being idle. Reclaim measures from here, which
+        // is why a task that runs for hours is never a candidate while it runs.
+        onIdle: () => this.touch(conversationId),
       }
     );
   }

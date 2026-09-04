@@ -101,7 +101,7 @@ export type RouteRule = z.infer<typeof RouteRuleSchema>;
  * here; it is a code change by design, not an operator knob.
  */
 const ExperienceSchema = z.object({
-  /** Session guardrails. Sessions live for the daemon's lifetime — no automatic reclamation (see SessionRegistry). */
+  /** Turn-level session guardrails. The idle-reclaim window is a deployment choice, so it lives in the user surface instead. */
   session: z
     .object({
       /** (reserved) per-thread concurrent session cap; one-session-per-scope-key model, not enforced yet. */
@@ -251,8 +251,8 @@ export const ConfigSchema = z
     }),
 
     /**
-     * Conversation scope. Conversations live for the daemon's lifetime (no automatic
-     * reclamation); guardrail params (turnTimeoutMs/…) stay frozen in EXPERIENCE.
+     * Conversation scope and idle reclaim. Turn-level guardrails (turnTimeoutMs/…) stay frozen in
+     * EXPERIENCE; these two are here because the right answer depends on the deployment.
      */
     session: z
       .object({
@@ -265,6 +265,30 @@ export const ConfigSchema = z
          * share an agent's context. Use per_channel to fold every lane of a channel together.
          */
         scope: SessionScope.default('per_thread'),
+        /**
+         * Stop a conversation's resident agent child after this long with nothing happening in it.
+         * 0 disables reclaim entirely (every child stays up until `/new` or shutdown).
+         *
+         * This is a knob because `scope: per_thread` makes it one: every topic anyone has ever
+         * messaged holds its own harness process (a Claude Code child is hundreds of MB), and how
+         * many of those a machine can carry is a property of the machine, not of this project.
+         *
+         * ── What it measures, and why it is safe ────────────────────────────────────────────────
+         * The clock counts SILENCE AFTER the last turn ended, not turn length — a task that runs for
+         * hours (subagents included) is never a candidate, because its conversation is not idle
+         * while it runs. Turn length is bounded separately by EXPERIENCE.session.turnTimeoutMs.
+         *
+         * Reclaim stops the process, not the conversation: the binding, the reverse-command token
+         * and every agent's own session id in conversations.json are all kept, so the next message
+         * respawns the child and resumes through the harness's own reload (ACP `session/load`, agy
+         * `--conversation`). That is the same path a daemon restart already takes for every
+         * conversation at once; this applies it one at a time. A session that cannot state it is
+         * resumable is never reclaimed (see AgentSession.reclaimState).
+         *
+         * The only cost the user can perceive is that the first message after a reclaim waits a few
+         * seconds for the respawn.
+         */
+        idleTimeoutMs: z.number().int().nonnegative().default(3_600_000),
       })
       .default({}),
 

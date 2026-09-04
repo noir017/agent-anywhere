@@ -10,6 +10,8 @@ import { addressOf } from './conversation.js';
  *   latest batch, never drops), starting as a fresh batch after the turn ends.
  * - On interrupt, the remaining input is merged into the next batch (the
  *   continuation/skip-aborted-tool logic lives in the agent layer).
+ * - `interrupt()` is the explicit half of that: a user who typed `/stop` gets the
+ *   turn cancelled and the backlog dropped, whatever interruptOnNewMessage says.
  * - Lifecycle reactions: received 👀 / done ✅ / error ❌.
  */
 
@@ -63,6 +65,40 @@ export class InboundMerger {
   /** Whether currently idle (lets the registry decide if it can reclaim safely). */
   isIdle(): boolean {
     return this.phase === 'idle';
+  }
+
+  /**
+   * Explicit user interrupt (`/stop`): stop whatever this conversation is doing, and report what
+   * that was so the caller can say something true rather than a generic ack.
+   *
+   * Deliberately does NOT consult `opts.interruptOnNewMessage`. That switch governs the IMPLICIT
+   * path — a newly arrived message cutting the running turn short — and a user who typed "stop" is
+   * not asking for that policy's opinion.
+   *
+   * The queued backlog is DROPPED rather than run next. Those messages were written for the turn
+   * being stopped, and "stop, then immediately start the thing I queued behind it" is not what stop
+   * means. Anything still wanted can be sent again.
+   */
+  interrupt(): 'running' | 'collecting' | 'idle' {
+    if (this.phase === 'running') {
+      this.interrupted = true; // dispatch then skips ✅: the turn did not finish, it was stopped
+      this.queued = [];
+      // Both halves, same as the implicit path: trip the turn's signal (the runner finalizes the
+      // partial reply cleanly — no cursor, no footer) *and* cancel the agent itself.
+      this.activeAbort?.abort();
+      this.deps.abortTurn?.();
+      return 'running';
+    }
+    if (this.phase === 'collecting') {
+      // Still inside the merge window: nothing has reached the agent, so cancelling the timer and
+      // dropping the buffer is the entire job — there is no turn to abort.
+      this.collectTimer?.();
+      this.collectTimer = null;
+      this.buffer = [];
+      this.toIdle();
+      return 'collecting';
+    }
+    return 'idle';
   }
 
   /** Entry: called once per inbound message. */

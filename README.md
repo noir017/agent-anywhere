@@ -36,7 +36,7 @@ streams its answer into a single, live-edited message.
 - **Chat actions** — the agent sends files, reacts, replies, opens threads, reads history, asks button questions.
 - **Attachments** — inbound images and files are downloaded and handed to the agent.
 - **Topics are first-class** — a Telegram topic, Feishu topic (话题), Slack thread or Discord thread is its own conversation, with its own agent; sticky per conversation, `/oc` to switch.
-- **Persistent conversations** — survive restarts; reset via `/new`; scoped per thread, channel, user, or globally.
+- **Persistent conversations** — survive restarts; reset via `/new`, interrupt a turn with `/stop`; scoped per thread, channel, user, or globally. Idle ones release their agent process and resume from it on the next message.
 - **Small config** — five sections, typed credentials, `${VAR}` and `.env` expansion.
 
 ## Quick start
@@ -100,6 +100,7 @@ routing:
 
 session:
   scope: per_thread           # per_thread|per_channel|per_user|shared
+  idleTimeoutMs: 3600000      # stop an idle conversation's agent process after 1h; 0 = never
 
 access:
   allowFrom: ["discord-main:123456"]   # <instanceId>:userId; empty = anyone
@@ -179,6 +180,7 @@ Discord, Slack), and equally usable as plain text everywhere else.
 |---|---|
 | `/help` | everything below, for the agent currently answering |
 | `/new`, `/clear` | start a fresh conversation (clears context) |
+| `/stop` | stop the current turn, keeping the conversation |
 | `/cc`, `/oc`, `/cx`, `/gm`, `/agy` | one per configured harness — see below |
 | `/compact`, `/context`, `/model`, `/usage`, `/doctor`, `/mcp`, `/init`, `/review` | a generic vocabulary, translated to each harness's own spelling |
 

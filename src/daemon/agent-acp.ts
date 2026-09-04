@@ -23,6 +23,7 @@ import type {
   AgentSession,
   AgentStreamHandlers,
   ModelSelector,
+  ReclaimState,
   RunTurnInput,
 } from './agent.js';
 import { looksLikeCommand } from './routing.js';
@@ -161,6 +162,9 @@ export function createAcpAgentFactory(cfg: Config, socketPath: string, store?: C
         sessions.set(sessionId, s);
       }
       return s;
+    },
+    peek(sessionId: string): AgentSession | undefined {
+      return sessions.get(sessionId);
     },
     dispose(sessionId: string): void {
       const s = sessions.get(sessionId);
@@ -340,6 +344,16 @@ function createAcpSession(
   /** Intentional-abort flag: set by abort(); used to return silently when prompt ends as cancelled. */
   let aborting = false;
   /**
+   * Whether the harness said it can reload a stored session (initialize → `agentCapabilities.
+   * loadSession`). Read once per child and NOT cleared by resetHandles: it describes the harness
+   * binary, not the process, and a rebuilt child re-reports the same answer.
+   *
+   * Only the idle sweeper consumes it (reclaimState below). Verified true on the two harnesses this
+   * deployment runs — claude-agent-acp 0.58.1 and opencode 1.18.18 — but asked rather than assumed,
+   * because a harness that cannot reload is exactly the one whose child must stay resident.
+   */
+  let loadSessionSupported = false;
+  /**
    * Model the harness reports as actually serving this session (from the session/new or session/load
    * config options). Undefined when the agent exposes no model selector; the footer then falls back
    * to the configured value. Cleared on dispose so a rebuilt child re-reports.
@@ -452,6 +466,7 @@ function createAcpSession(
         // Don't advertise fs/terminal: let the agent use its own tools (Bash → agent-anywhere); the client only receives the stream + answers permission.
         clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
       });
+      loadSessionSupported = initResult.agentCapabilities?.loadSession === true;
 
       // Resume persisted context first: the harness keeps conversation history on its own disk, so a
       // daemon restart only loses the process — session/load replays the stored ACP session into the
@@ -674,6 +689,18 @@ function createAcpSession(
       liveModel = liveModelName(liveConfigOptions) ?? value;
       console.log(`[acp] agent "${def.id}": model switched to "${value}" at runtime`);
       return liveModel;
+    },
+
+    reclaimState(): ReclaimState {
+      // `active` is this runtime's readiness signal everywhere else, so it is the honest test for
+      // "there is something here to reclaim" too.
+      if (!proc || !active) return 'no-child';
+      // Resumable only when BOTH halves of the restart path are in place: the harness can reload a
+      // session, and we know which session is this conversation's. Killing the child then costs a
+      // respawn — precisely what a daemon restart already does to every conversation at once.
+      return loadSessionSupported && store?.agentSession(conversationId, def.id)
+        ? 'resumable'
+        : 'unresumable';
     },
 
     dispose(): void {

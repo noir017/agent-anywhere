@@ -56,6 +56,8 @@ const stubAgents: AgentFactory = {
     abort: () => {},
     dispose: () => {},
   }),
+  // No session map in this stub: nothing here is ever reclaimed.
+  peek: () => undefined,
   dispose: () => {},
 };
 

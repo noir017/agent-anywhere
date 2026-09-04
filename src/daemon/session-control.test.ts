@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { ConversationRegistry } from './conversation.js';
-import type { Config } from '../config/schema.js';
+import { parseConfig, type Config } from '../config/schema.js';
 import type { PlatformAdapter } from '../platform/adapter.js';
 import type { AgentFactory, AgentSession } from './agent.js';
 import type { InboundMessage } from '../types.js';
@@ -79,6 +79,7 @@ function makeFactory(): { factory: AgentFactory; disposed: string[] } {
       }
       return s!;
     },
+    peek: (id) => sessions.get(id),
     dispose(sessionId) {
       disposed.push(sessionId);
       sessions.delete(sessionId);
@@ -366,5 +367,108 @@ describe('native slash produces one turn', () => {
     const { reg, sent } = rig();
     reg.route(inbound('/oc', 'm1'));
     expect(sent.some((t) => t.includes('answered by opencode'))).toBe(true);
+  });
+});
+
+/**
+ * `/stop` — end the running turn, keep the conversation.
+ *
+ * Every case here is about the ack. A stop command that answers the same way whether it stopped a
+ * 20-minute task or found nothing running teaches the user to distrust it, and the one below that
+ * would be genuinely expensive is the third: `/stop` in a conversation that has never run must not
+ * SPAWN an agent on its way to reporting that there was nothing to stop.
+ */
+describe('ConversationRegistry /stop', () => {
+  /** Real timers with a 1 ms merge window, so a routed message actually reaches the agent stub. */
+  const realClock = {
+    now: () => Date.now(),
+    schedule: (fn: () => void, ms: number) => {
+      const t = setTimeout(fn, ms);
+      return () => clearTimeout(t);
+    },
+  };
+  const drain = (): Promise<void> => new Promise((r) => setTimeout(r, 20));
+
+  function stopRig() {
+    const parsed = parseConfig({
+      platforms: { discord: { type: 'discord', token: 't' } },
+      agents: [{ id: 'cc', harness: 'claude' }],
+      routing: { default: 'cc', pipeline: [] },
+      display: { header: { enabled: false } },
+    });
+    const cfg: Config = { ...parsed, inbound: { ...parsed.inbound, mergeWindowMs: 1, maxMergeWindowMs: 1 } };
+
+    const sent: string[] = [];
+    const platform = {
+      capabilities: { thread: false, editMessage: true },
+      sendMessage: async (address: { channel: string }, text: string) => {
+        sent.push(text);
+        return { address, messageId: `s${sent.length}` };
+      },
+      editMessage: async () => {},
+      addReaction: async () => {},
+      startTyping: async () => {},
+      stopTyping: async () => {},
+    } as unknown as PlatformAdapter;
+
+    const created: string[] = [];
+    const aborts: string[] = [];
+    const sessions = new Map<string, AgentSession>();
+    // Turns never settle on their own: the point is to observe one being stopped mid-flight.
+    const factory: AgentFactory = {
+      getOrCreate(conversationId) {
+        created.push(conversationId);
+        let s = sessions.get(conversationId);
+        if (!s) {
+          s = {
+            conversationId,
+            runTurn: () => new Promise<void>(() => {}),
+            abort: () => void aborts.push(conversationId),
+            dispose: () => {},
+          };
+          sessions.set(conversationId, s);
+        }
+        return s;
+      },
+      peek: (id) => sessions.get(id),
+      dispose: (id) => void sessions.delete(id),
+    };
+
+    const reg = new ConversationRegistry(cfg, new Map([['discord', platform]]), factory, realClock);
+    return { reg, sent, created, aborts };
+  }
+
+  it('mid-turn: aborts the agent and says what it stopped', async () => {
+    const { reg, sent, aborts } = stopRig();
+    reg.route(inbound('long task', 'm1'));
+    await drain(); // the turn is now running and will never settle by itself
+
+    reg.route(inbound('/stop', 'm2'));
+    await drain();
+
+    expect(aborts).toEqual(['discord#c1#']); // per_thread key: the trailing field is the empty lane
+    expect(sent.some((t) => t.startsWith('⏹ Stopped.'))).toBe(true);
+  });
+
+  it('inside the merge window: drops the batch before it reaches the agent', async () => {
+    const { reg, sent, created } = stopRig();
+    reg.route(inbound('never mind', 'm1')); // still collecting — the window has not elapsed
+    reg.route(inbound('/stop', 'm2'));
+    await drain();
+
+    expect(sent.some((t) => t.includes('Dropped the message'))).toBe(true);
+    expect(created).toEqual([]); // no turn ran, so no session was ever built
+  });
+
+  it('nothing running: says so, and does not spawn an agent to find that out', async () => {
+    const { reg, sent, created } = stopRig();
+    reg.route(inbound('/stop', 'm1'));
+    await drain();
+
+    expect(sent).toEqual(['Nothing is running here.']);
+    // The regression this guards: reaching the abort through agents.getOrCreate would build a
+    // session (and, in the real runtime, eventually a child process) for a conversation whose
+    // whole problem is that it has none.
+    expect(created).toEqual([]);
   });
 });

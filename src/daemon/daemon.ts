@@ -291,6 +291,16 @@ export class Daemon {
       onAvailableCommands: (_id, agentId, cmds) => this.onAgentCommands(agentId, cmds),
       // A harness picker (/claude, /opencode) was invoked in a conversation of that harness.
       onPickerRequest: (id, agentId, msg) => this.onPickerRequest(id, agentId, msg),
+      // Idle reclaim asks before stopping a child: a pending `ask` is the daemon holding work for a
+      // conversation from OUTSIDE any turn, so the merger looks idle while a CLI process sits
+      // blocked on a button nobody has pressed yet. (This is the guard PendingAsk.conversationId is
+      // recorded for.)
+      hasPendingWork: (id) => {
+        for (const pending of this.pendingAsks.values()) {
+          if (pending.conversationId === id) return true;
+        }
+        return false;
+      },
       // A bare `/model` on a platform that can carry (and later edit) buttons.
       onModelMenuRequest: (id, agentId, msg, selector) =>
         this.onModelMenuRequest(id, agentId, msg, selector),
@@ -397,6 +407,11 @@ export class Daemon {
   private async handleReverse(action: IpcAction, address: ConversationAddress): Promise<unknown> {
     // Resolve BEFORE any await: the conversation scratch slot is only synchronously valid.
     const platform = this.reverseAdapter();
+    // A reverse command means the agent is still working for this conversation — even between turns,
+    // which is the case idle reclaim would otherwise get wrong: a turn that ended after starting a
+    // background job leaves that job reporting through this socket, into a conversation that from
+    // the registry's side looks like nobody has said anything in an hour.
+    if (this.lastResolvedConversationId) this.registry.touch(this.lastResolvedConversationId);
     switch (action.kind) {
       case 'send-message':
         return platform.sendMessage(address, action.text);

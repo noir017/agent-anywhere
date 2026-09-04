@@ -40,10 +40,17 @@ export type Harness = AgentDef['harness'];
  * `/help` deliberately shadows the harness's own `/help` (claude has one): from a chat client the
  * gateway's vocabulary is the one the user cannot discover any other way, while the harness's own
  * help is still one tap away inside its agent-command menu (`/cc`).
+ *
+ * `/stop` and `/new` are two commands rather than one because they answer two different asks. Both
+ * end the running turn; only `/new` also destroys the context. Before `/stop` existed, "make it
+ * stop" cost the user their whole conversation, since the only other interrupt was
+ * `inbound.interruptOnNewMessage` — which fires as a side effect of sending another message, not
+ * because anybody asked for it.
  */
 export const DAEMON_COMMANDS: SlashCommandSpec[] = [
   { name: 'new', description: 'Start a fresh conversation (clears context)' },
   { name: 'clear', description: 'Alias of /new: start a fresh conversation' },
+  { name: 'stop', description: 'Stop the current turn (keeps the conversation)' },
   { name: 'help', description: 'List the commands this gateway understands' },
 ];
 

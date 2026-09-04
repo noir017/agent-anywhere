@@ -5,6 +5,44 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **`/stop` ends the current turn without ending the conversation.** Until now the only way to stop
+  a running agent from chat was `/new`, which also destroys the context — so "stop, that's the wrong
+  file" cost you the whole conversation you were in the middle of. The only other interrupt,
+  `inbound.interruptOnNewMessage`, fires as a side effect of sending another message rather than
+  because anyone asked. Everything underneath was already there (`AgentSession.abort()`, the
+  per-turn `AbortController`, TurnRunner's interrupted branch that keeps the partial reply and drops
+  the footer); what was missing was a way to ask for it. `/stop` is intercepted before the merger,
+  like `/new`, so it works mid-turn, and it answers with what it actually stopped — a turn, a
+  message still inside the merge window, or nothing — because one ack for all three outcomes is how
+  a stop command earns a reputation for not stopping anything. The queued backlog is dropped rather
+  than promoted to the next turn: those messages were written for the turn being stopped.
+
+- **Idle conversations release their agent process (`session.idleTimeoutMs`, default 1 h).**
+  `scope: per_thread` means every topic anyone has ever messaged holds its own resident harness
+  child, and a Claude Code process is hundreds of MB; nothing ever reclaimed them, so the only
+  ways down were `/new` and restarting the daemon. The hooks for this had been sitting unused since
+  the beginning — `InboundMerger.onIdle` documented as "drives idle reclaim" and never wired,
+  `PendingAsk.conversationId` documented as an "eviction-guard anchor" with no eviction to guard
+  against.
+
+  What made it safe to finish is that reclaim is no longer a new risk: since `conversations.json`
+  started recording each agent's own session id per conversation, killing a child and resuming it is
+  exactly what a **daemon restart** already does to every conversation at once. This does it to one
+  idle conversation on purpose. The conversation, its binding, its token, its stored session ids and
+  even the session handle (and with it a runtime `/model` choice) all survive; the next message
+  respawns the child and resumes through the harness's own reload — verified available on all three
+  harnesses in use (claude and opencode advertise ACP `loadSession`, agy replays `--conversation`).
+
+  It fires only when the conversation is quiet past the deadline AND the merger is idle AND the
+  daemon holds no pending `ask` for it AND the session says it can resume. The second condition is
+  the one that matters most: the clock starts when the last turn ENDED, so a task that runs for
+  hours — subagents included — is never a candidate while it runs. A reverse command counts as
+  activity too, so an agent that finished its turn and left a background job reporting through
+  `agent-anywhere send` keeps its child. A harness that cannot reload a stored session is left
+  resident and said so once, rather than having its context quietly restarted.
+
 ## [0.7.0] - 2026-09-04
 
 ### Changed

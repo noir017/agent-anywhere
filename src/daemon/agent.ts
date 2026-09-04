@@ -90,9 +90,39 @@ export interface AgentSession {
    * Rejects when there is no session, no selector, or the harness refuses the value.
    */
   setModel?(value: string): Promise<string>;
-  /** Release the session: abort the running turn and drop continuation context (shut down the ACP child). Called on idle eviction / shutdown. */
+  /**
+   * Whether this session's resident child could be shut down right now without losing anything.
+   *
+   * Answers exactly one question, asked only by the registry's idle sweeper: is there a process
+   * worth reclaiming here, and would the NEXT turn be able to pick the conversation back up?
+   *
+   * Absent (a runtime that does not implement it) is read as `unresumable` — never reclaimed.
+   * Silently restarting a user's task is the one degradation this gateway refuses, so a runtime
+   * that cannot state its own resumability does not get guessed at.
+   */
+  reclaimState?(): ReclaimState;
+  /**
+   * Release the session: abort the running turn and drop continuation context (shut down the ACP
+   * child). Called on idle reclaim and on shutdown.
+   *
+   * Not a terminal operation on the handle: both runtimes reset their connection handles and
+   * respawn on the next turn (the same self-healing path a crashed child takes), which is what lets
+   * the sweeper reclaim a process while keeping the session object — and with it, the conversation's
+   * runtime model choice.
+   */
   dispose(): void;
 }
+
+/**
+ * Whether a session's resident child can be reclaimed (killed) without costing the user anything.
+ *
+ * - `no-child`   — nothing is running; reclaiming would free nothing.
+ * - `resumable`  — a child is up AND its context id is recorded where the next turn can replay it
+ *                  (ACP `session/load`, agy `--conversation`). Killing it costs a respawn, not a
+ *                  conversation. This is the same path a daemon restart already takes.
+ * - `unresumable`— a child is up but its context exists only inside that process. Never reclaimed.
+ */
+export type ReclaimState = 'no-child' | 'resumable' | 'unresumable';
 
 /**
  * Session factory. getOrCreate gets/builds a session by (sessionId, agentId) — agentId selects which
@@ -100,6 +130,13 @@ export interface AgentSession {
  */
 export interface AgentFactory {
   getOrCreate(sessionId: string, agentId: string): AgentSession;
-  /** Release and remove a session (called on idle eviction / shutdown); no-op if absent. */
+  /**
+   * The session serving this conversation, or undefined — WITHOUT creating one.
+   *
+   * getOrCreate would defeat its only caller: the idle sweeper asks "is there a child here worth
+   * stopping", and building a session handle in order to answer is the opposite of the question.
+   */
+  peek(sessionId: string): AgentSession | undefined;
+  /** Release and remove a session (called on shutdown / `/new`); no-op if absent. */
   dispose(sessionId: string): void;
 }

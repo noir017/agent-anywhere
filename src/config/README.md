@@ -42,6 +42,15 @@ turned out to be per-deployment decisions after all: `freeResponseChannels` and
 `ignoredChannels` (now under `platforms.<id>.chat`) were dead config while frozen. The
 gating rules split accordingly — see [`core/inbound-gate.ts`](../core/README.md).
 
+`session.idleTimeoutMs` was born on the user side for the same reason. It bounds how long
+an idle conversation keeps its resident agent process, and the right answer is a property
+of the machine, not of this project: `scope: per_thread` means every topic anyone has
+messaged holds its own harness child (a Claude Code process is hundreds of MB), so a NAS
+and a workstation genuinely want different numbers. The turn-level guardrail next to it
+(`session.turnTimeoutMs`, the per-turn silence watchdog) stays frozen — nobody tunes that
+per deployment. See [`daemon/README.md`](../daemon/README.md#conversation-lifetime) for
+what reclaim does and the four conditions it requires.
+
 `display.reactions.enabled` cannot live next to the emoji it controls: anything nested
 under a key `EXPERIENCE` owns gets overwritten by `withExperienceDefaults`. That is why
 the toggle is under `display` and the emoji stay in `inbound.reactions`.

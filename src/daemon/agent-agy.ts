@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import type { AgentDef, Config } from '../config/schema.js';
 import { findAgent } from '../config/schema.js';
-import type { AgentFactory, AgentSession, AgentStreamHandlers, RunTurnInput } from './agent.js';
+import type { AgentFactory, AgentSession, AgentStreamHandlers, ReclaimState, RunTurnInput } from './agent.js';
 import type { ConversationStore } from './conversation-store.js';
 import {
   buildAgentEnv,
@@ -105,6 +105,9 @@ export function createAgyAgentFactory(cfg: Config, socketPath: string, store?: C
         sessions.set(sessionId, s);
       }
       return s;
+    },
+    peek(sessionId: string): AgentSession | undefined {
+      return sessions.get(sessionId);
     },
     dispose(sessionId: string): void {
       const s = sessions.get(sessionId);
@@ -336,6 +339,16 @@ function createAgySession(
       // the run). The next turn respawns and resumes the same conversation via --conversation, so
       // context survives an interrupt.
       teardown('turn aborted');
+    },
+
+    reclaimState(): ReclaimState {
+      // `ready` (the child's `init` arrived) is this runtime's readiness signal, so it is also the
+      // honest test for "there is a live child worth reclaiming".
+      if (!proc || !ready) return 'no-child';
+      // agy replays a conversation with `--conversation=<id>` (buildAgyArgs), and the id is written
+      // to the store as soon as `init` names it — so a child that is ready has, in practice, already
+      // recorded one. Asked rather than assumed: without an id, a respawn would start agy blank.
+      return store?.agentSession(conversationId, def.id) ? 'resumable' : 'unresumable';
     },
 
     dispose(): void {

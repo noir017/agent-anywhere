@@ -36,7 +36,7 @@ Code、Codex、OpenCode，以及 Google 的 Antigravity CLI。给机器人发消
 - **在聊天中行动** —— 智能体可发文件、加回应、引用回复、开子区、读历史、发按钮提问。
 - **附件处理** —— 收到的图片和文件自动下载并交给智能体。
 - **话题是一等公民** —— Telegram 话题、飞书话题、Slack 线程、Discord 子区各自是独立会话，各自绑定智能体；绑定粘在会话上，用 `/oc` 切换。
-- **持久会话** —— 重启不丢上下文；`/new` 重置；作用域可按子区、频道、用户或全局。
+- **持久会话** —— 重启不丢上下文；`/new` 重置，`/stop` 打断当前轮；作用域可按子区、频道、用户或全局。闲置会话会释放智能体进程，下一条消息再从原处恢复。
 - **精简配置** —— 五个部分，凭据按平台校验，支持 `${VAR}` 与 `.env` 展开。
 
 ## 快速开始
@@ -99,6 +99,7 @@ routing:
 
 session:
   scope: per_thread           # per_thread|per_channel|per_user|shared
+  idleTimeoutMs: 3600000      # 闲置 1 小时后停掉该会话的智能体进程；0 = 从不
 
 access:
   allowFrom: ["discord-main:123456"]   # <实例id>:userId；留空 = 任何人
@@ -171,6 +172,7 @@ Markdown 按平台分别渲染；缺失的能力平滑降级（不能编辑 → 
 |---|---|
 | `/help` | 列出下面这些，并按当前作答的智能体过滤 |
 | `/new`、`/clear` | 开启新会话（清空上下文） |
+| `/stop` | 停掉当前这一轮，会话本身保留 |
 | `/cc`、`/oc`、`/cx`、`/gm`、`/agy` | 每个已配置 harness 一个，见下 |
 | `/compact`、`/context`、`/model`、`/usage`、`/doctor`、`/mcp`、`/init`、`/review` | 通用词表，按 harness 翻译成各自的原生拼写 |
 

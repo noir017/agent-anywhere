@@ -157,7 +157,9 @@ the `claude` agent.
 
 The fix, three layers, all fixed at startup from config alone:
 
-1. `DAEMON_COMMANDS` (`/new`, `/clear`, `/help`) — intercepted before any agent.
+1. `DAEMON_COMMANDS` (`/new`, `/clear`, `/stop`, `/help`) — intercepted before any agent.
+   `/new` and `/stop` are separate because they answer separate asks: both end the running turn,
+   only `/new` also ends the conversation.
 2. `GENERIC_COMMANDS` — a small fixed vocabulary meaning the same thing everywhere,
    translated to the target harness's native spelling at invocation time.
 3. `HARNESS_COMMANDS` — one agent command per configured harness (`/cc`, `/oc`, `/agy`).

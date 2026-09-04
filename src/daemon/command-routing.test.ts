@@ -91,6 +91,7 @@ function rig(cfg: Config = baseConfig, persistedAgent?: string) {
       }
       return s!;
     },
+    peek: (id) => sessions.get(id),
     dispose: (id) => void sessions.delete(id),
   };
 

@@ -199,3 +199,57 @@ describe('InboundMerger lifecycle reactions', () => {
     expect(h.reacted).toEqual(['👀', '✅']);
   });
 });
+
+/**
+ * Explicit interrupt (`/stop`).
+ *
+ * Two properties matter and neither is covered above. It must work with interruptOnNewMessage OFF —
+ * that flag governs the implicit path, and a user who typed "stop" is not asking for its opinion —
+ * and it must drop the queued backlog, or "stop" would mean "stop, then immediately start the next
+ * thing", which is how a stop command earns a reputation for not stopping anything.
+ */
+describe('InboundMerger.interrupt (/stop)', () => {
+  const emojis = (h: ReturnType<typeof harness>) =>
+    vi.mocked(h.deps.addReaction).mock.calls.map((c) => c[1]);
+
+  it('running: cancels the turn, drops the backlog, and marks no ✅ — with the implicit flag off', async () => {
+    const h = harness(false); // interruptOnNewMessage=false: /stop must not depend on it
+
+    await h.merger.ingest(msg('m1'));
+    h.clock.advance(1500); // turn dispatched, stays pending
+    await h.merger.ingest(msg('m2')); // queued behind it (no implicit interrupt)
+    expect(h.abortTurn).not.toHaveBeenCalled();
+
+    expect(h.merger.interrupt()).toBe('running');
+    expect(h.abortTurn).toHaveBeenCalledTimes(1);
+    expect(h.signals[0]?.aborted).toBe(true);
+
+    h.resolveFirst();
+    await tick();
+    // The backlog is gone rather than promoted to the next turn.
+    expect(h.deps.runTurn).toHaveBeenCalledTimes(1);
+    expect(h.merger.isIdle()).toBe(true);
+    // 👀 for each of the two messages, and no ✅: the turn was stopped, not completed.
+    expect(emojis(h)).toEqual(['👀', '👀']);
+  });
+
+  it('collecting: drops the batch before it ever reaches the agent', async () => {
+    const h = harness(false);
+
+    await h.merger.ingest(msg('m1')); // inside the merge window, nothing dispatched yet
+    expect(h.merger.interrupt()).toBe('collecting');
+
+    h.clock.advance(5000); // the window would have elapsed long ago
+    await tick();
+    expect(h.deps.runTurn).not.toHaveBeenCalled();
+    expect(h.abortTurn).not.toHaveBeenCalled(); // there was no turn to abort
+    expect(h.merger.isIdle()).toBe(true);
+  });
+
+  it('idle: reports idle and touches nothing', async () => {
+    const h = harness(false);
+    expect(h.merger.interrupt()).toBe('idle');
+    expect(h.abortTurn).not.toHaveBeenCalled();
+    expect(h.deps.runTurn).not.toHaveBeenCalled();
+  });
+});

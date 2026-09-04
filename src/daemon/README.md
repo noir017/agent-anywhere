@@ -344,6 +344,7 @@ Protocol mapping (verified empirically against agy 1.1.22):
 | text↔tool boundary | `onSegmentBreak` |
 | `event:"result"` | turn end (`SUCCESS`, else an error upstream) |
 | `init.conversation_id` | stored under `(conversation, agy)`, replayed via `--conversation` |
+| `init.model` | `onModel` — stored at spawn, replayed at the top of every turn |
 | SIGINT | abort (agy has no in-band cancel) |
 
 Launched with `--disable-slash-commands` by default: in stream-json mode a CLI-answered
@@ -352,6 +353,12 @@ constantly. `args: ["--disable-slash-commands=false"]` opts back in; all default
 are overridable through `args`, since agy's flag parsing is last-wins. Consequently agy
 reports no command list, so `/agy` switches the conversation but its bare form acks the
 binding rather than posting an empty menu.
+
+Models: agy names the one it is serving in `init` and nowhere else, so the footer can print
+it (`onModel` is replayed each turn, because the footer reads a per-turn record). There is
+no selector and no in-process switch — the model is fixed by `--model=` at spawn — so
+`modelSelector`/`setModel` stay unimplemented and `/model` is answered "not supported"
+rather than with a menu that could never apply.
 
 ### `agent-common.ts`
 

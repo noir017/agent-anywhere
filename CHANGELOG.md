@@ -5,6 +5,20 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **The footer now names the model on `agy` conversations.** agy reports the model it is serving
+  exactly once, in its `init` frame, and that field was being read for the conversation id and
+  thrown away — so the footer fell back to `agents[].model`, i.e. whatever the operator had typed
+  in config, and printed nothing at all when they had typed nothing. The value is now stored on the
+  session and replayed at the top of every turn (the footer reads a per-turn record, so one emit at
+  spawn would have named the model on the first turn and on no other). What the footer prints is
+  now agy's own resolved id, including the default nobody configured.
+
+  Still unsupported, and deliberately: `/model` on an agy conversation answers "not supported"
+  rather than opening the menu. agy exposes no model selector and no way to switch in-process — the
+  model is fixed by `--model=` at spawn — so a menu there could only offer a switch it cannot make.
+
 ## [0.8.0] - 2026-09-04
 
 ### Added

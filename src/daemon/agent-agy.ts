@@ -34,10 +34,17 @@ import {
  *   text↔tool boundary             ↔ onSegmentBreak
  *   event:"result"                 ↔ turn end (status SUCCESS, else an error for the upper layer)
  *   init.conversation_id           ↔ SessionStore entry, replayed via --conversation after a restart
+ *   init.model                     ↔ onModel (stored at spawn, replayed at the start of every turn)
  *   SIGINT                         ↔ abort (agy has no in-band cancel message)
  *
  * agy reports no command list (and slash expansion is deliberately disabled below), so
  * onAvailableCommands is never called and no native slash commands are registered for this harness.
+ *
+ * Models are half-supported, and the halves are worth naming. agy has no model SELECTOR and no
+ * in-process switch — the model is fixed by `--model=` at spawn — so `modelSelector`/`setModel` stay
+ * unimplemented and `/model` is answered "not supported" for this harness (GENERIC_COMMANDS in
+ * core/command-translate.ts). But it does name the model it is serving, once, in `init`, which is
+ * all the footer needs, so that one value is forwarded as onModel.
  */
 
 // ───────────────────────── launch command ─────────────────────────
@@ -140,6 +147,15 @@ function createAgySession(
    * (so a /new that clears the store is honored even if this child already knew an id).
    */
   let lastSeenConversationId: string | undefined;
+  /**
+   * The model agy named for this child (`init.model`), in agy's own spelling.
+   *
+   * Held on the session instead of being pushed straight to the handlers, for two reasons: `init`
+   * arrives inside ensureStarted, before the turn's sink exists, and the footer reads the model off
+   * a PER-TURN record (TurnRunner's TurnRef) — so a single emit at spawn would name the model on
+   * the first turn's footer and on no other. Stored here, replayed at the top of every turn.
+   */
+  let lastSeenModel: string | undefined;
   /** Whether the reverse-command hint was injected (once per child, like the ACP runtime). */
   let hintInjected = false;
   /** Intentional-abort flag: set by abort()/dispose() so a killed turn resolves silently. */
@@ -268,6 +284,9 @@ function createAgySession(
 
     if (msg.event === 'init') {
       rememberConversation(msg.init?.conversation_id ?? msg.conversation_id);
+      // Kept even when `--model=` asked for it: agy answers with its own resolved id, and with
+      // nothing configured this is the only place its default model is ever named.
+      if (msg.init?.model) lastSeenModel = msg.init.model;
       ready = true;
       for (const w of initWaiters) w.res();
       initWaiters.length = 0;
@@ -293,6 +312,8 @@ function createAgySession(
     async runTurn(input: RunTurnInput, handlers: AgentStreamHandlers): Promise<void> {
       aborting = false;
       await ensureStarted(input.sessionToken);
+      // Nothing renders from this; it only records which model to name in this turn's footer.
+      if (lastSeenModel) handlers.onModel?.(lastSeenModel);
 
       // Reverse-command hint: injected once per child, prepended to the first turn's text. Unlike the
       // ACP runtime there is no slash-command carve-out — slash expansion is disabled for this

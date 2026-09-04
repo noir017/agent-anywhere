@@ -37,7 +37,7 @@ streams its answer into a single, live-edited message.
 - **Attachments** — inbound images and files are downloaded and handed to the agent.
 - **Topics are first-class** — a Telegram topic, Feishu topic (话题), Slack thread or Discord thread is its own conversation, with its own agent; sticky per conversation, `/oc` to switch.
 - **Persistent conversations** — survive restarts; reset via `/new`, interrupt a turn with `/stop`; scoped per thread, channel, user, or globally. Idle ones release their agent process and resume from it on the next message.
-- **Small config** — five sections, typed credentials, `${VAR}` and `.env` expansion.
+- **Small config** — five sections, typed credentials, `${VAR}` and `.env` expansion; `/setting` edits the handful of fields worth changing from chat.
 
 ## Quick start
 
@@ -181,6 +181,7 @@ Discord, Slack), and equally usable as plain text everywhere else.
 | `/help` | everything below, for the agent currently answering |
 | `/new`, `/clear` | start a fresh conversation (clears context) |
 | `/stop` | stop the current turn, keeping the conversation |
+| `/setting` | change a saved setting in config.yaml — see below |
 | `/cc`, `/oc`, `/cx`, `/gm`, `/agy` | one per configured harness — see below |
 | `/compact`, `/context`, `/model`, `/usage`, `/doctor`, `/mcp`, `/init`, `/review` | a generic vocabulary, translated to each harness's own spelling |
 
@@ -227,6 +228,47 @@ elsewhere it prints the same summary line as before. `/model <part of a name>`
 switches by substring on every platform, listing the candidates when the query is
 ambiguous rather than guessing. Both work on `opencode` and `claude`; neither
 advertises a `/model` command, and both expose the selector over ACP.
+
+## Changing settings from chat
+
+`/setting` edits **config.yaml itself**, so a change outlives the conversation and
+the daemon — the counterpart to `/model`, which overrides one conversation until
+it is reset. The alternative it replaces is reaching the machine, editing YAML,
+and restarting, which stops every resident agent.
+
+| what | in config.yaml | accepts | takes effect |
+|---|---|---|---|
+| default agent | `routing.default` | any configured agent id | immediately |
+| an agent's default model | `agents[].model` | that agent's reported models, any name, or `-` to clear | its next agent session (`/new` starts one) |
+| idle reclaim window | `session.idleTimeoutMs` | `off`, `15m`, `4h`, … | immediately |
+| conversation scope | `session.scope` | `per_thread`, `per_channel`, `per_user`, `shared` | after a restart |
+
+```
+/setting                       →  the whole screen, as buttons where they work
+/setting idle                  →  what that one accepts, and its current value
+/setting idle 4h               →  set it, on any platform
+/setting model.cc opus         →  the model an agent starts its sessions with
+```
+
+Where buttons can be posted *and* replaced (Discord, Telegram, Slack, Lark) the
+bare form opens a two-level menu — tap a setting, tap a value, and the screen
+returns to the list with the new value on it. Everywhere else the same four
+commands work as text. A long list of models is paged, and a name your harness
+accepts but never advertised (`opusplan`) is taken as typed.
+
+Each answer says **when** the change lands, because they differ: the scope is
+written but not applied until a restart, since changing what counts as one
+conversation while conversations are open would silently re-identify all of them.
+
+The rest of the file stays hand-edited on purpose, and `/setting` says so by name
+rather than pretending the key does not exist. `access.allowFrom` is the one worth
+spelling out: one wrong value there locks you out of the very surface you would
+use to fix it.
+
+Writes go through the YAML document, so your comments, key order and `${VAR}`
+templates survive untouched, and a change is validated against the whole config
+before the file is written — `/setting` will not leave you a config.yaml that
+fails to load on the next restart.
 
 ## Acting in the chat
 

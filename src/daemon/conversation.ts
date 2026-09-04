@@ -36,6 +36,22 @@ import {
   modelSummaryText,
   type ModelChoiceResult,
 } from '../core/model-menu.js';
+import {
+  resolveSettingKey,
+  settingAckText,
+  settingDetailText,
+  settingOptions,
+  settingTypedOnlyHint,
+  settingUnknownKeyText,
+  settingsListText,
+  settingsMenuSurface,
+  settingsRows,
+  type SettingApplyResult,
+  type SettingOption,
+  type SettingRow,
+  type SettingsContext,
+} from '../core/settings.js';
+import { SettingsStore } from './settings-store.js';
 import { formatRuntimeFooter, formatTokens } from '../core/runtime-footer.js';
 import { InboundMerger } from '../core/inbound-merger.js';
 import { shouldRespond, type GateConfig } from '../core/inbound-gate.js';
@@ -50,6 +66,16 @@ const HELP_RE = /^\/help(@\S+)?$/;
 
 /** `/stop` — end the running turn without ending the conversation (the counterpart to `/new`). */
 const STOP_RE = /^\/stop(@\S+)?$/;
+
+/**
+ * Spellings of the settings command the gateway answers.
+ *
+ * Only `setting` is registered in the platform menu (see DAEMON_COMMANDS); the other two are
+ * accepted when typed but cost no menu slot — the same trade HARNESS_COMMANDS.aliases makes. They
+ * exist because `/settings` is what half the world types, and `/config` is what the thing is
+ * actually called on disk.
+ */
+const SETTING_NAMES = new Set(['setting', 'settings', 'config']);
 
 /** What the merger was doing when `/stop` arrived. */
 type StopOutcome = 'running' | 'collecting' | 'idle';
@@ -170,6 +196,13 @@ export class ConversationRegistry {
   /** Single-turn orchestrator; buildMerger's runTurn delegates to it (see class doc). */
   private readonly turnRunner: TurnRunner;
   /**
+   * The `/setting` writer: validates a value, patches config.yaml, applies it to this live Config.
+   *
+   * Owned here rather than by the daemon because the registry is the side that holds the Config and
+   * the agent sessions — the same reason applyModelChoice lives here. The daemon owns the buttons.
+   */
+  private readonly settings: SettingsStore;
+  /**
    * Per-instance gating rules (lazy cache): the deployment-facing half comes from that
    * instance's `chat` block (requireMention/freeResponseChannels/ignoredChannels/allowBots),
    * the frozen half (respondInDirect/threadParticipationExempt) from EXPERIENCE.
@@ -207,6 +240,22 @@ export class ConversationRegistry {
         agentId: string,
         msg: InboundMessage,
         selector: ModelSelector
+      ): void;
+      /**
+       * A `/setting` on a platform that can carry a menu. Same division of labour as the model
+       * menu: the registry resolves what the rows ARE (it holds the Config and the live sessions),
+       * the daemon posts, pages and acks the buttons.
+       *
+       * `open` is set when the user named a key (`/setting idle`), so the menu skips the list level
+       * and lands on that setting's values.
+       */
+      onSettingMenuRequest?(
+        id: ConversationId,
+        msg: InboundMessage,
+        menu: {
+          rows: SettingRow[];
+          open?: { row: SettingRow; options: SettingOption[]; hint?: string };
+        }
       ): void;
       /**
        * Whether the daemon is holding work for this conversation that lives OUTSIDE a turn — today,
@@ -263,6 +312,11 @@ export class ConversationRegistry {
       this.hooks
     );
 
+    // `/setting idle` has to re-arm the sweeper, not just change the number (see setIdleTimeout).
+    this.settings = new SettingsStore(this.config, {
+      onIdleTimeout: () => this.rearmIdleSweeper(),
+    });
+
     this.startIdleSweeper();
   }
 
@@ -281,6 +335,21 @@ export class ConversationRegistry {
       this.cancelSweep = this.clock.schedule(tick, SWEEP_INTERVAL_MS);
     };
     this.cancelSweep = this.clock.schedule(tick, SWEEP_INTERVAL_MS);
+  }
+
+  /**
+   * Re-arm the sweeper after `session.idleTimeoutMs` changed under it (`/setting idle`).
+   *
+   * Both directions need this, and neither is served by the value alone: when the timeout starts at
+   * 0 no timer is armed at all (startIdleSweeper returns early), so raising it from `off` would
+   * otherwise take a restart; and when it becomes 0 the armed timer keeps waking the process up to
+   * find reclaim disabled. Cancel-then-arm covers both, and the value itself is already written by
+   * the time this runs (SettingsStore.applyToConfig).
+   */
+  private rearmIdleSweeper(): void {
+    this.cancelSweep?.();
+    this.cancelSweep = null;
+    this.startIdleSweeper();
   }
 
   /**
@@ -446,46 +515,8 @@ export class ConversationRegistry {
     // the last person whose agent should be reclaimed out from under them.
     this.touch(key);
 
-    // Daemon-level context control: /new (alias /clear) discards this conversation's context —
-    // dispose the resident agent AND drop every agent's persisted session id (else it resurrects on
-    // restart) — then ack. Intercepted before the merger so it also works mid-turn (dispose aborts
-    // the in-flight turn). Deliberately not forwarded to the agent: this is the one place the
-    // gateway is allowed to reset an agent, and only because the user asked in so many words.
-    if (CONTEXT_CLEAR_RE.test(msg.content.trim())) {
-      this.resetConversation(key);
-      console.log(`[conversation] ${key} context cleared by ${conv.platform}:${conv.user}`);
-      void this.platforms
-        .get(conv.platform)
-        ?.sendMessage(address, 'Context cleared — the next message starts a fresh conversation.')
-        .catch((e) => console.warn('[conversation] failed to ack context clear:', e instanceof Error ? e.message : e));
-      return;
-    }
-
-    // Daemon-level turn control: /stop ends the RUNNING TURN and nothing else — the counterpart to
-    // /new, which ends the conversation. Intercepted here for the same reason /new is (before the
-    // merger, so it works mid-turn) and, like it, never forwarded: no harness has a slash command
-    // that could cancel the very turn carrying it.
-    //
-    // Tested on the STRIPPED content, so `/cc /stop` composes exactly as `/cc /new` does.
-    if (STOP_RE.test(msg.content.trim())) {
-      const outcome = this.stopConversation(key);
-      console.log(`[conversation] ${key} /stop by ${conv.platform}:${conv.user} → ${outcome}`);
-      void this.platforms
-        .get(conv.platform)
-        ?.sendMessage(address, STOP_ACK[outcome])
-        .catch((e) => console.warn('[conversation] failed to ack /stop:', e instanceof Error ? e.message : e));
-      return;
-    }
-
-    // `/help` lists what THIS gateway understands, which is the vocabulary a chat user has no
-    // other way to discover — the platform menu shows names without saying who answers them, and
-    // the harness's own /help knows nothing about /new, /oc or the generic translation.
-    // Tested on the STRIPPED content, like /new above, so `/oc /help` composes: the agent prefix
-    // is consumed first and the rest is still a daemon command.
-    if (HELP_RE.test(msg.content.trim())) {
-      this.sendHelp(key, choice.agentId, conv.platform, address);
-      return;
-    }
+    // Commands the gateway answers itself, before any agent sees them.
+    if (this.answerDaemonCommand(key, msg, address, choice.agentId)) return;
 
     // An agent command naming a harness this deployment doesn't run (`/agy` with no agy agent):
     // answered here, never forwarded. Only reachable when resolveAgent declined the name, so a
@@ -659,6 +690,72 @@ export class ConversationRegistry {
   }
 
   /**
+   * The commands this gateway answers itself (DAEMON_COMMANDS in core/command-translate.ts), all
+   * intercepted before the merger and none ever forwarded to an agent. Returns true when one of
+   * them answered, in which case no turn runs.
+   *
+   * Before the merger matters: it is what makes `/new` and `/stop` work MID-TURN, where a queued
+   * message would be useless. Every one of them is tested on the already-STRIPPED content, so
+   * `/cc /new` composes — the agent prefix is consumed upstream and the rest is still a command.
+   *
+   * `fallbackAgent` is the agent this message would route to, and is only consulted by the commands
+   * that need to name one for a conversation with no binding yet.
+   */
+  private answerDaemonCommand(
+    key: ConversationId,
+    msg: InboundMessage,
+    address: ConversationAddress,
+    fallbackAgent: string
+  ): boolean {
+    const text = msg.content.trim();
+    const conv = msg.conversation;
+    const ack = (what: string, body: string): void => {
+      void this.platforms
+        .get(conv.platform)
+        ?.sendMessage(address, body)
+        .catch((e) => console.warn(`[conversation] failed to ack ${what}:`, e instanceof Error ? e.message : e));
+    };
+
+    // /new (alias /clear) discards this conversation's context — dispose the resident agent AND
+    // drop every agent's persisted session id (else it resurrects on restart) — then ack.
+    // Deliberately not forwarded: this is the one place the gateway is allowed to reset an agent,
+    // and only because the user asked in so many words.
+    if (CONTEXT_CLEAR_RE.test(text)) {
+      this.resetConversation(key);
+      console.log(`[conversation] ${key} context cleared by ${conv.platform}:${conv.user}`);
+      ack('context clear', 'Context cleared — the next message starts a fresh conversation.');
+      return true;
+    }
+
+    // /stop ends the RUNNING TURN and nothing else — the counterpart to /new, which ends the
+    // conversation. Never forwarded either: no harness has a slash command that could cancel the
+    // very turn carrying it.
+    if (STOP_RE.test(text)) {
+      const outcome = this.stopConversation(key);
+      console.log(`[conversation] ${key} /stop by ${conv.platform}:${conv.user} → ${outcome}`);
+      ack('/stop', STOP_ACK[outcome]);
+      return true;
+    }
+
+    // `/help` lists what THIS gateway understands, which is the vocabulary a chat user has no other
+    // way to discover — the platform menu shows names without saying who answers them, and the
+    // harness's own /help knows nothing about /new, /oc or the generic translation.
+    if (HELP_RE.test(text)) {
+      this.sendHelp(key, fallbackAgent, conv.platform, address);
+      return true;
+    }
+
+    // `/setting` — the only one of these whose effect outlives the conversation: it writes
+    // config.yaml. Parsed rather than regex-matched because, unlike the rest, it takes arguments.
+    const setting = parseTextCommand(text);
+    if (setting && SETTING_NAMES.has(setting.name.toLowerCase())) {
+      this.handleSetting(key, setting.rest, fallbackAgent, address, msg);
+      return true;
+    }
+    return false;
+  }
+
+  /**
    * Answer `/help` with this deployment's whole registered vocabulary.
    *
    * Built from the same tables that drive registration (core/command-translate.ts), so a command
@@ -682,6 +779,130 @@ export class ConversationRegistry {
       .get(platformId)
       ?.sendMessage(address, buildHelpText(this.config, { agent: agentId, harness: def?.harness }))
       .catch((e) => console.warn('[conversation] failed to send help:', e instanceof Error ? e.message : e));
+  }
+
+  /**
+   * Answer `/setting`, in one of four shapes:
+   *
+   *   `/setting`                    → the whole screen (menu where buttons work, text otherwise)
+   *   `/setting <key>`              → that setting's values (menu) or what it accepts (text)
+   *   `/setting <key> <value>`      → write it, and say what took effect when
+   *   `/setting <not a setting>`    → refuse by name, pointing at the file
+   *
+   * The value form works identically on all eight platforms, which is why it exists alongside the
+   * menu rather than under it: a menu is the right answer to "what are my options" on a phone, and
+   * useless for setting a model name a harness never advertised.
+   *
+   * `fallbackAgent` is the agent this message would route to, used only when the conversation has
+   * no binding yet (a `/setting` as the very first thing said in a channel) — same as sendHelp.
+   */
+  private handleSetting(
+    key: ConversationId,
+    rest: string,
+    fallbackAgent: string,
+    address: ConversationAddress,
+    msg: InboundMessage
+  ): void {
+    const platformId = msg.conversation.platform;
+    const reply = (text: string): void => {
+      void this.platforms
+        .get(platformId)
+        ?.sendMessage(address, text)
+        .catch((e) => console.warn('[setting] failed to answer:', e instanceof Error ? e.message : e));
+    };
+    const ctx = this.settingsContext(key, fallbackAgent);
+    const caps = this.platforms.get(platformId)?.capabilities;
+    const canMenu =
+      caps !== undefined &&
+      settingsMenuSurface(caps) === 'menu' &&
+      this.hooks?.onSettingMenuRequest !== undefined;
+
+    const [rawKey = '', ...valueParts] = rest.trim().split(/\s+/);
+    if (!rawKey) {
+      console.log(`[setting] listing settings for ${key}`);
+      if (canMenu) this.hooks!.onSettingMenuRequest!(key, msg, { rows: settingsRows(this.config) });
+      else reply(settingsListText(this.config));
+      return;
+    }
+
+    const resolved = resolveSettingKey(rawKey, this.config, ctx);
+    if (resolved.kind === 'refused') {
+      console.log(`[setting] refused "${rawKey}" for ${key}`);
+      reply(resolved.text);
+      return;
+    }
+    if (resolved.kind === 'unknown') {
+      reply(settingUnknownKeyText(rawKey));
+      return;
+    }
+
+    const row = resolved.row;
+    const value = valueParts.join(' ').trim();
+    if (!value) {
+      if (canMenu) {
+        const { options, hint } = this.settingOptionsFor(key, row);
+        this.hooks!.onSettingMenuRequest!(key, msg, {
+          rows: settingsRows(this.config),
+          open: { row, options, ...(hint ? { hint } : {}) },
+        });
+      } else {
+        reply(settingDetailText(row, this.config, ctx));
+      }
+      return;
+    }
+    reply(settingAckText(this.applySetting(key, row, value)));
+  }
+
+  /**
+   * What the settings module needs to know about this conversation.
+   *
+   * The model list comes from `peek`, never `getOrCreate`: a settings screen must not spawn an
+   * agent child just to fill a menu — the same trade onPickerRequest makes, and the reason an
+   * absent list has its own sentence instead of a blank menu.
+   */
+  private settingsContext(key: ConversationId, fallbackAgent: string): SettingsContext {
+    const boundAgent =
+      this.conversations.get(key)?.agentId ?? this.store?.boundAgent(key) ?? fallbackAgent;
+    return {
+      boundAgent,
+      models: this.agents.peek(key)?.modelSelector?.()?.options ?? [],
+    };
+  }
+
+  /** Every row of the settings screen, read fresh from the live Config (the daemon rebuilds menus with this). */
+  settingRows(): SettingRow[] {
+    return settingsRows(this.config);
+  }
+
+  /** The values one row can offer right now, or the sentence explaining why it offers none. */
+  settingOptionsFor(
+    id: ConversationId,
+    row: SettingRow
+  ): { options: SettingOption[]; hint?: string } {
+    const ctx = this.settingsContext(id, this.config.routing.default);
+    const hint = settingTypedOnlyHint(row, this.config, ctx);
+    return { options: settingOptions(row, this.config, ctx), ...(hint ? { hint } : {}) };
+  }
+
+  /**
+   * Write one setting, from either surface.
+   *
+   * Public because the daemon calls it on a button click, exactly as it calls applyModelChoice —
+   * and for the same reason both live here: the registry is the only side holding the Config that
+   * has to be mutated and the sessions whose model list validates the value.
+   */
+  applySetting(id: ConversationId, row: SettingRow, raw: string): SettingApplyResult {
+    const state = this.conversations.get(id);
+    // A `/model` override outranks agents[].model (see agent-acp applyModelPreference), so writing
+    // the default while one is in force would look like it did nothing here. The ack says so.
+    const overridden =
+      row.id === 'model' && row.target === state?.agentId && state?.modelOverride !== undefined;
+    return this.settings.apply(
+      row,
+      raw,
+      this.settingsContext(id, this.config.routing.default),
+      overridden
+    );
   }
 
   /**

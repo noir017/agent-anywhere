@@ -10,7 +10,7 @@ nothing else from the project.
 | File | Role |
 |---|---|
 | `schema.ts` | The zod schema, the frozen `EXPERIENCE` block, `Config` type, and accessor helpers |
-| `load.ts` | Path resolution (`configDir`/`configPath`/`defaultSocketPath`), `loadConfig`, `saveConfig` |
+| `load.ts` | Path resolution (`configDir`/`configPath`/`defaultSocketPath`), `loadConfig`, `saveConfig`, `saveConfigPatch` |
 | `env-expand.ts` | `${VAR}` expansion over the parsed tree + the `.env` sidecar loader |
 | `migrate.ts` | v0 (`platform:` object) → v1 (`platforms:` map). Disposable by design. |
 
@@ -92,6 +92,30 @@ threading a parameter.
 
 The config dir also holds `daemon.sock`, `conversations.json`, `attachments/`, and `bin/`
 (the reverse-CLI shim).
+
+## Who writes the file
+
+Three writers, in increasing order of how much they claim:
+
+| writer | scope |
+|---|---|
+| `saveConfigPatch` | one path at a time, comments and everything else preserved (yaml Document API) |
+| `saveConfig` | a full rewrite — **drops comments**; only `doctor --migrate-config` uses it |
+| the `/setting` chat command | `saveConfigPatch`, one scalar per invocation |
+
+`/setting` is the one that changed the assumption that this file is only ever
+hand-edited: config.yaml is now written **while the daemon is running**, from a chat
+message. Four fields are reachable that way (`routing.default`, `agents[].model`,
+`session.idleTimeoutMs`, `session.scope`) and the rest are refused by name — see
+[`core/settings.ts`](../core/README.md#settingsts) for the table and
+[`daemon/settings-store.ts`](../daemon/README.md#settings-storets) for the order the write
+happens in. Two constraints from that path land here:
+
+- `saveConfigPatch` treats `value: undefined` as **delete this key**, not "write null". An
+  optional field serialized as `null` fails the next `ConfigSchema.parse`, so clearing
+  `agents[].model` had to remove it.
+- A write is validated against a candidate config *before* it touches the file. Nothing
+  should be able to write a config.yaml that the next `loadConfig` rejects.
 
 ## Validation is fail-fast
 

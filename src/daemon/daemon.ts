@@ -21,6 +21,18 @@ import {
   type ModelButtonClick,
   type ModelOption,
 } from '../core/model-menu.js';
+import {
+  buildSettingValueMenu,
+  buildSettingsMenu,
+  parseSettingButtonId,
+  settingAckText,
+  settingValuePage,
+  settingsMenuExpiredText,
+  settingsMenuSupersededText,
+  type SettingButtonClick,
+  type SettingOption,
+  type SettingRow,
+} from '../core/settings.js';
 import type { PlatformAdapter } from '../platform/adapter.js';
 import type {
   AgentCommand,
@@ -222,8 +234,33 @@ interface PendingModelMenu {
   ref?: MessageRef;
 }
 
-/** Main daemon: wires platform, session registry, and IPC server together. `agent-anywhere start` constructs and run()s it. */
-export class Daemon {
+/**
+ * A posted settings menu, awaiting clicks.
+ *
+ * Two levels in one message: `rows` is the list, `open` is the setting whose values are on screen
+ * right now (absent = the list is). Both lists are FROZEN snapshots that button indices point into,
+ * for the reason PendingModelMenu records — an index printed on one screen must not resolve against
+ * a rebuilt list. Identity comes from the snapshot; the VALUE shown is re-read from the live config
+ * every time the menu is redrawn, so a change made from the other surface is never stale here.
+ *
+ * Not one-shot, and not retired after a successful write: changing two settings in a row is the
+ * normal case, so a pick returns to the list with the new value visible on it. Bounded, like the
+ * model menus, by "at most one per conversation" rather than by a TTL — expiry should be caused by
+ * something the user did.
+ */
+interface PendingSettingsMenu {
+  conversationId: ConversationId;
+  /** Where the menu was posted (the ack and any error go back here). */
+  conversation: ConversationRef;
+  /** The settings list as it stood when the menu opened; a `stg:` index points into THIS. */
+  rows: SettingRow[];
+  /** The open setting, with the frozen option list its `stv:` indices point into. */
+  open?: { row: SettingRow; options: SettingOption[]; hint?: string };
+  /** The menu message itself, captured from the send — every level change edits it. */
+  ref?: MessageRef;
+}
+
+/** Main daemon: wires platform, session registry, and IPC server together. `agent-anywhere start` constructs and run()s it. */export class Daemon {
   private registry: ConversationRegistry;
   private ipc: IpcServer;
   /** Pending ask requests: reqId → wait handle. Resolved and deleted on click or timeout. */
@@ -250,6 +287,8 @@ export class Daemon {
    * entry; a failed one keeps it, so a retry is one tap rather than retyping /model.
    */
   private pendingModelMenus = new Map<string, PendingModelMenu>();
+  /** Live settings menus: reqId → the conversation, row snapshot and open level it was built for. */
+  private pendingSettingsMenus = new Map<string, PendingSettingsMenu>();
   /** Instances whose "slash must be registered out-of-band" skip notice was printed (log once each). */
   private skipRuntimeRegisterLogged = new Set<string>();
   /** Inbound dedup: `platform:channelId:messageId` → timestamp (see DEDUP_TTL_MS). */
@@ -304,6 +343,8 @@ export class Daemon {
       // A bare `/model` on a platform that can carry (and later edit) buttons.
       onModelMenuRequest: (id, agentId, msg, selector) =>
         this.onModelMenuRequest(id, agentId, msg, selector),
+      // A `/setting` on a platform that can carry (and later edit) buttons.
+      onSettingMenuRequest: (id, msg, menu) => this.onSettingMenuRequest(id, msg, menu),
     }, store);
     this.ipc = new IpcServer(socketPath, {
       // resolveAddress is also the sole capture point for the conversation owning this reverse
@@ -371,6 +412,7 @@ export class Daemon {
     }
     this.pendingPicks.clear();
     this.pendingModelMenus.clear();
+    this.pendingSettingsMenus.clear();
     // Clear pending asks after ipc/platform are down: no new clicks or asks can arrive now. Clear each
     // timer and resolve null ("no selection") so any caller still blocked on ask IPC gets a result
     // rather than hanging forever. Best-effort: never throw.
@@ -517,13 +559,18 @@ export class Daemon {
     });
   }
 
-  /** Button click: resolve the matching model menu, pending ask, or picker; otherwise ignore. */
+  /** Button click: resolve the matching model menu, settings menu, pending ask, or picker; otherwise ignore. */
   private onButton(ev: ButtonInteraction): void {
-    // Prefixes are pairwise non-prefixing (`mdl:`/`mpg:`/`cmd:`/`ask:`), so this order is for
-    // readability, not correctness.
+    // Prefixes are pairwise non-prefixing (`mdl:`/`mpg:`/`stg:`/`stv:`/`stp:`/`stb:`/`cmd:`/`ask:`),
+    // so this order is for readability, not correctness.
     const model = parseModelButtonId(ev.buttonId);
     if (model) {
       this.onModelClick(ev, model);
+      return;
+    }
+    const setting = parseSettingButtonId(ev.buttonId);
+    if (setting) {
+      this.onSettingClick(ev, setting);
       return;
     }
     const pick = parsePickButtonId(ev.buttonId);
@@ -927,7 +974,230 @@ export class Daemon {
     void this.platforms
       .get(ev.conversation.platform)
       ?.sendMessage(addressOf(ev.conversation), text)
-      .catch((e) => console.warn('[model] failed to answer a click:', e instanceof Error ? e.message : e));
+      .catch((e) => console.warn('[menu] failed to answer a click:', e instanceof Error ? e.message : e));
+  }
+
+  /**
+   * A `/setting` on a platform that can carry a menu: post the settings screen.
+   *
+   * `menu.open` lands straight on one setting's values, because `/setting idle` already said which
+   * one — making the user tap through a list to the thing they just named is a step for nothing.
+   */
+  private onSettingMenuRequest(
+    conversationId: ConversationId,
+    msg: InboundMessage,
+    menu: {
+      rows: SettingRow[];
+      open?: { row: SettingRow; options: SettingOption[]; hint?: string };
+    }
+  ): void {
+    const adapter = this.platforms.get(msg.conversation.platform);
+    if (!adapter) return;
+
+    // One live menu per conversation: retire the previous one before posting, so its buttons cannot
+    // keep writing config.yaml on behalf of a screen the user has moved on from.
+    this.retireSettingsMenusFor(conversationId);
+
+    const reqId = randomUUID().slice(0, 8);
+    const pending: PendingSettingsMenu = {
+      conversationId,
+      conversation: msg.conversation,
+      // Copied, not referenced: the caller built these from the live config and may rebuild them.
+      rows: [...menu.rows],
+      ...(menu.open ? { open: { ...menu.open, options: [...menu.open.options] } } : {}),
+    };
+    this.pendingSettingsMenus.set(reqId, pending);
+
+    const view = this.renderSettingsMenu(reqId, pending);
+    void adapter
+      .sendButtons(addressOf(msg.conversation), view.text, view.buttons)
+      .then((ref) => {
+        // Keep the menu's own ref: every level change edits THIS message, and the click event's
+        // messageId is not a reliable stand-in on every platform (Telegram reports the
+        // callback_query id there).
+        pending.ref = ref;
+      })
+      .catch((e) => {
+        this.pendingSettingsMenus.delete(reqId);
+        console.error('[setting] failed to post the menu:', e instanceof Error ? e.message : e);
+      });
+  }
+
+  /** The view for whichever level a settings menu is on, plus an optional line above it. */
+  private renderSettingsMenu(
+    reqId: string,
+    menu: PendingSettingsMenu,
+    page = 0,
+    prefix?: string
+  ): { text: string; buttons: Array<{ id: string; label: string }> } {
+    const view = menu.open
+      ? buildSettingValueMenu({
+          reqId,
+          row: menu.open.row,
+          options: menu.open.options,
+          page,
+          ...(menu.open.hint ? { hint: menu.open.hint } : {}),
+        })
+      : buildSettingsMenu({ reqId, rows: menu.rows });
+    return { text: prefix ? `${prefix}\n\n${view.text}` : view.text, buttons: view.buttons };
+  }
+
+  /** Retire every live settings menu of one conversation, saying so rather than going quiet. */
+  private retireSettingsMenusFor(conversationId: ConversationId): void {
+    for (const [reqId, menu] of this.pendingSettingsMenus) {
+      if (menu.conversationId !== conversationId) continue;
+      this.pendingSettingsMenus.delete(reqId);
+      this.editSettingsMenu(menu, settingsMenuSupersededText(), []);
+    }
+  }
+
+  /**
+   * Best-effort in-place edit of a settings menu. `void`-and-`catch` like every other cosmetic side
+   * effect here — a failed edit must never take down the click that caused it, and least of all
+   * after the write it was reporting already succeeded.
+   */
+  private editSettingsMenu(
+    menu: PendingSettingsMenu,
+    text: string,
+    buttons: Array<{ id: string; label: string }>
+  ): void {
+    const adapter = this.platforms.get(menu.conversation.platform);
+    if (!adapter) return;
+    if (!menu.ref) {
+      console.warn('[setting] menu has no message ref yet; skipping the edit');
+      return;
+    }
+    void adapter
+      .editButtons(menu.ref, text, buttons)
+      .catch((e) => console.warn('[setting] menu edit failed:', e instanceof Error ? e.message : e));
+  }
+
+  /**
+   * A settings-menu button was clicked: open a setting, write a value, turn a page, or go back.
+   *
+   * The clicker is re-checked against the allowlist first — a menu in a shared channel can be
+   * pressed by someone other than whoever opened it, and this one does not merely change what
+   * answers a conversation: it edits the operator's config.yaml.
+   *
+   * (Where `allowFrom` is empty there is nothing to check, and nothing new is granted either:
+   * agents already run with full tool access, so anyone who can message the bot can already edit
+   * that file directly. See AGENTS.md security invariant #1.)
+   */
+  private onSettingClick(ev: ButtonInteraction, click: SettingButtonClick): void {
+    const clicker = ev.conversation;
+    const allow = this.config.access.allowFrom;
+    if (allow.length > 0 && !allow.includes(`${clicker.platform}:${clicker.user}`)) {
+      console.log(`[access] denied settings-menu click from ${clicker.platform}:${clicker.user}`);
+      return;
+    }
+
+    const menu = this.pendingSettingsMenus.get(click.reqId);
+    if (!menu) {
+      // Superseded, or the daemon restarted (this map is in-memory). Answered where the click
+      // happened, since the recorded conversation may be gone too — a silent return is
+      // indistinguishable, from the chat, from a broken button.
+      console.log(`[setting] click on an expired menu (${click.reqId})`);
+      this.replyToClick(ev, settingsMenuExpiredText());
+      return;
+    }
+
+    switch (click.kind) {
+      case 'open':
+        this.openSettingLevel(click.reqId, menu, click.index);
+        return;
+      case 'choose':
+        this.chooseSettingValue(click.reqId, menu, click.index);
+        return;
+      case 'page':
+        this.editSettingsMenu(menu, ...this.viewParts(click.reqId, menu, click.page));
+        return;
+      case 'back':
+        delete menu.open;
+        menu.rows = this.registry.settingRows(); // values may have changed while the level was open
+        this.editSettingsMenu(menu, ...this.viewParts(click.reqId, menu));
+        return;
+      default: {
+        // Exhaustiveness guard: a new click kind missed here fails to compile.
+        const _exhaustive: never = click;
+        throw new Error(`unknown settings click: ${JSON.stringify(_exhaustive)}`);
+      }
+    }
+  }
+
+  /** renderSettingsMenu as positional args, so editSettingsMenu can be spread-called. */
+  private viewParts(
+    reqId: string,
+    menu: PendingSettingsMenu,
+    page = 0,
+    prefix?: string
+  ): [string, Array<{ id: string; label: string }>] {
+    const view = this.renderSettingsMenu(reqId, menu, page, prefix);
+    return [view.text, view.buttons];
+  }
+
+  /**
+   * Descend to one setting's values.
+   *
+   * Identity comes from the frozen row list (so a button always means the setting it was drawn for)
+   * while the value and the option list are read fresh — the same freeze-identity / re-read-value
+   * split the model menu uses, and the reason a menu left open across a change never shows a stale
+   * number.
+   */
+  private openSettingLevel(reqId: string, menu: PendingSettingsMenu, index: number): void {
+    const frozen = menu.rows[index];
+    if (!frozen) {
+      // Only reachable from a mangled id (Telegram hashes callback_data over 64 bytes). Ours are
+      // ~16 bytes, so this is defence, not an expected path — and it still gets an answer.
+      console.warn(`[setting] click index ${index} is outside the menu's ${menu.rows.length} rows`);
+      this.editSettingsMenu(menu, ...this.viewParts(reqId, menu));
+      return;
+    }
+    const rows = this.registry.settingRows();
+    const row = rows.find((r) => r.id === frozen.id && r.target === frozen.target) ?? frozen;
+    const { options, hint } = this.registry.settingOptionsFor(menu.conversationId, row);
+    menu.rows = rows;
+    menu.open = { row, options, ...(hint ? { hint } : {}) };
+    this.editSettingsMenu(
+      menu,
+      ...this.viewParts(reqId, menu, settingValuePage(row, options))
+    );
+  }
+
+  /**
+   * A value was clicked: write it, then say what happened.
+   *
+   * A successful write returns to the LIST level with the ack above it, so the new value is visible
+   * on the row that was just changed — a settings screen that keeps working is the point, and
+   * changing two things in a row is the normal case. Anything that did NOT write stays on the value
+   * level instead: retrying is one tap, and a level change would suggest something happened.
+   */
+  private chooseSettingValue(reqId: string, menu: PendingSettingsMenu, index: number): void {
+    const open = menu.open;
+    if (!open) {
+      this.editSettingsMenu(menu, ...this.viewParts(reqId, menu));
+      return;
+    }
+    const option = open.options[index];
+    if (!option) {
+      console.warn(`[setting] value index ${index} is outside ${open.options.length} options`);
+      this.editSettingsMenu(menu, ...this.viewParts(reqId, menu, 0, settingsMenuExpiredText()));
+      return;
+    }
+
+    const result = this.registry.applySetting(menu.conversationId, open.row, option.raw);
+    const ack = settingAckText(result);
+    console.log(`[setting] ${menu.conversationId}: ${open.row.label} ← ${option.raw} → ${result.kind}`);
+
+    if (result.kind !== 'saved') {
+      this.editSettingsMenu(
+        menu,
+        ...this.viewParts(reqId, menu, settingValuePage(open.row, open.options), ack)
+      );
+      return;
+    }
+    delete menu.open;
+    menu.rows = this.registry.settingRows();
+    this.editSettingsMenu(menu, ...this.viewParts(reqId, menu, 0, ack));
   }
 
   /**

@@ -1,0 +1,184 @@
+import { ConfigSchema, findAgent, type Config, type SessionScope } from '../config/schema.js';
+import { configPath, readRawConfigIfExists, saveConfigPatch } from '../config/load.js';
+import {
+  parseSettingValue,
+  readSettingValue,
+  settingLocation,
+  type SettingApplyResult,
+  type SettingRow,
+  type SettingsContext,
+} from '../core/settings.js';
+
+/**
+ * The write half of `/setting`: validate a chosen value, patch config.yaml, and apply it to the
+ * daemon that is already running.
+ *
+ * `core/settings.ts` owns WHAT is editable and what a value means; this owns the file and the live
+ * Config object. The split is the same one the model menu draws — the pure module decides, the
+ * daemon-side module touches the world.
+ *
+ * ── The order is fixed, and each step is load-bearing ─────────────────────────
+ * 1. parse the value (core), 2. skip a no-op write, 3. **validate a whole candidate config**,
+ * 4. resolve the on-disk path, 5. patch the file, 6. apply in memory.
+ *
+ * Step 3 is the one that earns its keep. `/setting` writes to the file the daemon needs in order to
+ * start, from a chat message, possibly from a phone: a value that parses but fails
+ * `ConfigSchema.superRefine` (say `routing.default` naming an agent that is not in `agents`) would
+ * leave a deployment that runs until it is restarted and then refuses to. Validating a candidate
+ * copy first turns that into a refusal in chat.
+ *
+ * ── Secrets ───────────────────────────────────────────────────────────────────
+ * The candidate copy holds `${VAR}`-expanded values, and it never reaches disk: only the single
+ * scalar the user chose is patched, through the Document API, which leaves every other line of the
+ * file — templates included — byte-identical. See AGENTS.md security invariant #4.
+ */
+
+/** What the store needs from the running daemon to make a change take effect now. */
+export interface SettingsLiveHooks {
+  /**
+   * `session.idleTimeoutMs` changed: re-arm the idle sweeper.
+   *
+   * A hook rather than a field write because the sweeper's TIMER, not just the number, has to
+   * change — it is not armed at all when the value starts at 0, and it keeps ticking after the
+   * value becomes 0. See ConversationRegistry.setIdleTimeout.
+   */
+  onIdleTimeout(ms: number): void;
+}
+
+export class SettingsStore {
+  constructor(
+    /** The LIVE runtime config — mutated in place for settings that take effect immediately. */
+    private readonly config: Config,
+    private readonly live: SettingsLiveHooks
+  ) {}
+
+  /**
+   * Set one setting. Never throws: every failure becomes a `SettingApplyResult` the caller turns
+   * into a sentence, because one of the two callers is a button click with nobody to re-prompt.
+   */
+  apply(
+    row: SettingRow,
+    raw: string,
+    ctx: SettingsContext,
+    /** Whether the asking conversation has a `/model` override shadowing what is being written. */
+    overridden = false
+  ): SettingApplyResult {
+    const parsed = parseSettingValue(row, raw, this.config, ctx);
+    if (parsed.kind === 'invalid') return { kind: 'invalid', row, reason: parsed.reason };
+
+    if (parsed.value === readSettingValue(row, this.config)) return { kind: 'unchanged', row };
+
+    // Validate a candidate config before writing anything (see the header). The clone is shallow
+    // but covers every branch applyToConfig can touch, so the live config is untouched if this
+    // fails — and `platforms` is shared by reference deliberately: nothing here writes to it.
+    const candidate: Config = {
+      ...this.config,
+      routing: { ...this.config.routing },
+      session: { ...this.config.session },
+      agents: this.config.agents.map((a) => ({ ...a })),
+    };
+    applyToConfig(candidate, row, parsed.value);
+    const check = ConfigSchema.safeParse(candidate);
+    if (!check.success) {
+      const first = check.error.issues[0];
+      const where = first?.path.join('.') || '(root)';
+      return {
+        kind: 'invalid',
+        row,
+        reason: `That would make config.yaml invalid (${where}: ${first?.message ?? 'unknown'}), so nothing was written.`,
+      };
+    }
+
+    const path = this.diskPath(row);
+    if (!path) {
+      return {
+        kind: 'failed',
+        row,
+        reason: `no \`agents:\` entry with id "${row.target}" in ${configPath()} — the file has changed since the daemon started; edit it directly`,
+      };
+    }
+
+    try {
+      saveConfigPatch([{ path, value: parsed.value }]);
+    } catch (e) {
+      return { kind: 'failed', row, reason: e instanceof Error ? e.message : String(e) };
+    }
+
+    // A restart-only setting is deliberately NOT applied in memory: for session.scope, applying it
+    // live would silently re-identify every existing conversation (the key function changes, so the
+    // next message in a topic lands in a brand-new conversation with no context) while the old
+    // agent children sit resident until reclaim. The file is the durable answer; the ack says so.
+    if (row.effect !== 'restart') {
+      applyToConfig(this.config, row, parsed.value);
+      if (row.id === 'idle') this.live.onIdleTimeout(Number(parsed.value));
+    }
+
+    console.log(
+      `[setting] ${row.label} → ${parsed.display} (${row.effect}) written to ${configPath()}`
+    );
+    return {
+      kind: 'saved',
+      row,
+      display: parsed.display,
+      ...(parsed.note ? { note: parsed.note } : {}),
+      ...(overridden ? { overridden } : {}),
+    };
+  }
+
+  /**
+   * The path to patch in the FILE.
+   *
+   * A per-agent setting is the reason this is not just `settingLocation().path`: `agents:` is a
+   * sequence, so the patch needs an index, and the index has to come from the file as it is right
+   * now. Using the runtime array's index would write to the wrong agent if anyone reordered
+   * `agents:` by hand since startup — a silent mis-write, which is the worst outcome available
+   * here. Returns null when the file has no entry with that id, and the caller says so.
+   */
+  private diskPath(row: SettingRow): Array<string | number> | null {
+    const location = settingLocation(row);
+    if (location.kind === 'path') return location.path;
+    const raw = readRawConfigIfExists();
+    const agents = raw?.['agents'];
+    if (!Array.isArray(agents)) return null;
+    const index = agents.findIndex(
+      (a) => typeof a === 'object' && a !== null && (a as { id?: unknown }).id === location.agentId
+    );
+    return index < 0 ? null : ['agents', index, location.key];
+  }
+}
+
+/**
+ * Write a parsed value onto a config object.
+ *
+ * Exhaustive on purpose: a new setting cannot be added without stating where it lands and, because
+ * the same function is used for the candidate and for the live object, without its live-apply
+ * behavior being considered at the same time.
+ */
+function applyToConfig(cfg: Config, row: SettingRow, value: string | number | undefined): void {
+  switch (row.id) {
+    case 'agent':
+      cfg.routing.default = String(value);
+      return;
+    case 'model': {
+      // The agent DEF is mutated in place, not replaced: findAgent returns the live array element,
+      // which is the very object each AgentSession captured at construction — so the next spawn of
+      // an already-running conversation reads the new model (agent-acp applyModelPreference /
+      // agent-agy's --model=) without anything having to re-resolve it.
+      const def = findAgent(cfg, row.target ?? '');
+      if (def) def.model = value === undefined ? undefined : String(value);
+      return;
+    }
+    case 'idle':
+      cfg.session.idleTimeoutMs = Number(value);
+      return;
+    case 'scope':
+      // Narrowed by parseSettingValue (only the four SessionScope literals reach here) and
+      // re-checked by the ConfigSchema pass in apply() before anything is written.
+      cfg.session.scope = value as SessionScope;
+      return;
+    default: {
+      const _exhaustive: never = row.id;
+      throw new Error(`no config location for setting ${String(_exhaustive)}`);
+    }
+  }
+}

@@ -1,5 +1,6 @@
 import type { ModelSelector } from '../types.js';
 import { formatButtonId, parseButtonId } from './button-id.js';
+import { PAGE_SIZE, pageCount, pageOf, pageSlice, truncateLabel, wrapPage } from './paging.js';
 
 /**
  * `/model` as data: page math, labels, button ids, matching, and every string either surface says.
@@ -21,18 +22,11 @@ import { formatButtonId, parseButtonId } from './button-id.js';
 export type ModelOption = ModelSelector['options'][number];
 
 /**
- * Models per page.
- *
- * Bounded from both sides. Discord allows 25 components per message, which is not the binding
- * constraint; Telegram is, because its profile puts ONE button per row (a shared row squeezes long
- * labels into unreadable slivers — see sendComposite), so a page costs `size + 2` rows on a phone
- * screen. Six keeps that at eight rows and still divides the deployment's 18 models into three
- * even pages. One constant to change if a menu ever wants to be denser.
+ * Models per page. The arithmetic is shared with the `/setting` menu (core/paging.ts), which has
+ * the same one-button-per-row Telegram constraint; this alias keeps the model-menu vocabulary
+ * reading as itself at the call sites.
  */
-export const MODEL_PAGE_SIZE = 6;
-
-/** Longest button label; longer names are ellipsised. Telegram is the tightest of the four. */
-const LABEL_MAX = 40;
+export const MODEL_PAGE_SIZE = PAGE_SIZE;
 
 /** Marks the model currently serving the session. A label, not a button style: styles vary per platform. */
 const CURRENT_MARK = '● ';
@@ -64,12 +58,12 @@ export interface ModelMenuView {
 
 /** How many pages a list of this size needs (at least one, so an empty list still renders). */
 export function modelPageCount(total: number): number {
-  return Math.max(1, Math.ceil(total / MODEL_PAGE_SIZE));
+  return pageCount(total);
 }
 
 /** The page a given index falls on. */
 export function modelPageOf(index: number): number {
-  return Math.floor(Math.max(0, index) / MODEL_PAGE_SIZE);
+  return pageOf(index);
 }
 
 /** Position of `value` in the list, or -1 — including when the harness reports a model it does not list. */
@@ -114,11 +108,6 @@ function labelFor(option: ModelOption, nameCounts: Map<string, number>): string 
   return unique ? name : option.value;
 }
 
-/** Ellipsise to the label budget. Never touches the id, which is what the click actually carries. */
-function truncateLabel(label: string): string {
-  return label.length <= LABEL_MAX ? label : `${label.slice(0, LABEL_MAX - 1)}…`;
-}
-
 /** Build a pick button's id (index is into the menu's frozen list, not into the page). */
 export function modelPickButtonId(reqId: string, index: number): string {
   return formatButtonId(MODEL_PICK_PREFIX, reqId, index);
@@ -159,9 +148,9 @@ export function buildModelMenu(menu: {
   page: number;
 }): ModelMenuView {
   const { reqId, options, current } = menu;
-  const pageCount = modelPageCount(options.length);
+  const pageTotal = modelPageCount(options.length);
   // Wrap into range, tolerating a negative or out-of-range request.
-  const page = ((Math.trunc(menu.page) % pageCount) + pageCount) % pageCount;
+  const page = wrapPage(menu.page, pageTotal);
 
   const nameCounts = new Map<string, number>();
   for (const o of options) {
@@ -169,18 +158,18 @@ export function buildModelMenu(menu: {
     nameCounts.set(name, (nameCounts.get(name) ?? 0) + 1);
   }
 
-  const start = page * MODEL_PAGE_SIZE;
-  const buttons = options.slice(start, start + MODEL_PAGE_SIZE).map((o, i) => ({
+  const { start, items } = pageSlice(options, page);
+  const buttons = items.map((o, i) => ({
     id: modelPickButtonId(reqId, start + i),
     label: truncateLabel(
       (o.value === current ? CURRENT_MARK : '') + labelFor(o, nameCounts)
     ),
   }));
 
-  if (pageCount > 1) {
+  if (pageTotal > 1) {
     buttons.push(
-      { id: modelPageButtonId(reqId, (page - 1 + pageCount) % pageCount), label: '◀ Prev' },
-      { id: modelPageButtonId(reqId, (page + 1) % pageCount), label: 'Next ▶' }
+      { id: modelPageButtonId(reqId, (page - 1 + pageTotal) % pageTotal), label: '◀ Prev' },
+      { id: modelPageButtonId(reqId, (page + 1) % pageTotal), label: 'Next ▶' }
     );
   }
 
@@ -188,10 +177,10 @@ export function buildModelMenu(menu: {
   // paging to it, and the page a user happens to be on is the one they will read.
   const text =
     `Model: ${current ?? 'unknown'}\n` +
-    `${options.length} available · page ${page + 1}/${pageCount} — tap one, ` +
+    `${options.length} available · page ${page + 1}/${pageTotal} — tap one, ` +
     'or `/model <part of a name>`.';
 
-  return { text, buttons, page, pageCount };
+  return { text, buttons, page, pageCount: pageTotal };
 }
 
 /** Outcome of resolving a `/model <query>` against the live list. */

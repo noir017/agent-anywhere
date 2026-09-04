@@ -12,9 +12,10 @@ session id, agy's conversation id). One conversation holds one session *per agen
 
 | File | Role |
 |---|---|
-| `daemon.ts` | Top-level wiring: platforms + conversation registry + IPC. Slash registration, `ask` buttons, harness pickers, the `/model` menu. |
+| `daemon.ts` | Top-level wiring: platforms + conversation registry + IPC. Slash registration, `ask` buttons, harness pickers, the `/model` and `/setting` menus. |
 | `routing.ts` | Pure: inbound → which agent (and whether the user *asked* for it) + which scope |
 | `conversation.ts` | `ConversationRegistry` — per-conversation state, agent binding, access + gating, command translation |
+| `settings-store.ts` | The write half of `/setting`: validate, patch config.yaml, apply to the live `Config` |
 | `turn-runner.ts` | One turn end to end: prompt, streaming, tools, footer, errors |
 | `agent.ts` | `AgentFactory` / `AgentSession` / `AgentStreamHandlers` interfaces. Dependency-free. |
 | `agent-factory.ts` | Dispatch: which runtime serves which agent |
@@ -440,6 +441,57 @@ The pure half — paging, labels, ids, matching, and every string either surface
 [`core/model-menu.ts`](../core/README.md), so the menu and `/model <query>` cannot answer
 differently.
 
+**The settings menu** — `/setting`, on the same capability test as the model menu, and built
+on the same three rules (not one-shot, at most one per conversation, frozen snapshot +
+re-read value). Two levels in one message: the row list, and one setting's values. It differs
+from the model menu in what a pick does and what it costs:
+
+- **A successful write returns to the LIST**, with the ack above it and the changed row
+  showing its new value. Changing two settings in a row is the normal case, so the screen
+  keeps working instead of retiring. Anything that did *not* write stays on the value level.
+- **The clicker is re-checked against `access.allowFrom`** — as on every menu, but here the
+  click does not merely change who answers a conversation: it edits the operator's
+  config.yaml. (Where the allowlist is empty nothing new is granted either — agents already
+  run with full tool access, so anyone who can message the bot can edit that file directly.
+  See [security invariant #1](../../AGENTS.md#security-invariants).)
+- **Row identity comes from the frozen list; the value is re-read every redraw.** So a menu
+  left open across a change from the other surface shows the current value, while a button
+  still means the setting it was drawn for.
+
+`ConversationRegistry` owns the writing (`applySetting`, `settingRows`, `settingOptionsFor`)
+for the same reason it owns `applyModelChoice`: it holds the `Config` that has to be mutated
+and the sessions whose model list validates a value. `daemon.ts` owns the buttons. The pure
+half is [`core/settings.ts`](../core/README.md); the file itself is written by
+`settings-store.ts` (below).
+
+## `settings-store.ts`
+
+Six steps, in a fixed order: parse the value (core), skip a no-op write, **validate a whole
+candidate config**, resolve the on-disk path, patch the file, apply in memory.
+
+Step three earns its keep on its own. `/setting` writes the file the daemon needs in order to
+*start*, from a chat message — so a value that parses but fails `ConfigSchema.superRefine`
+would leave a deployment that runs until someone restarts it and then refuses to. Validating
+a candidate copy first turns that into a refusal in chat. Nothing throws: every failure
+becomes a `SettingApplyResult`, because one of the two callers is a button click with nobody
+to re-prompt.
+
+Two details that are easy to get wrong:
+
+- **The `agents[]` index is resolved against the FILE**, not the runtime array
+  (`readRawConfigIfExists`). If anyone reordered `agents:` by hand since startup, patching by
+  the in-memory index would set the wrong agent's model — silently, which is the worst
+  outcome available here.
+- **Clearing a value deletes the key**, it does not write `null`. `agents[].model` is
+  `z.string().optional()`, so a `null` would fail the very next `loadConfig` — a write that
+  bricks the file it was clearing. `saveConfigPatch` treats `value: undefined` as a delete
+  for exactly this.
+
+Only the single scalar the user chose is patched, through the yaml Document API, so comments,
+key order, hand-edited siblings and `${VAR}` templates all survive byte-identical — the
+validated candidate, which holds *expanded* values, never reaches disk. See
+[security invariant #4](../../AGENTS.md#security-invariants).
+
 **Inbound dedup.** On platforms where a slash *is* a normal message (Telegram), one
 `/cmd` fires both a message event and a command event with the same `messageId`; they are
 deduped by `platform:<address>:messageId` within 15 s. When `messageId` is empty (Slack
@@ -493,13 +545,21 @@ back to whatever PATH offers.
 
 ## Tests
 
-Fourteen test files. `agent-acp.test.ts` and `agent-agy.test.ts` cover protocol
+Sixteen test files. `agent-acp.test.ts` and `agent-agy.test.ts` cover protocol
 translation; `routing.test.ts`, `command-routing.test.ts`, `session-control.test.ts`,
 `session-reclaim.test.ts`,
 `conversation-store.test.ts`, `conversation-token-registry.test.ts`,
 `multi-platform.test.ts`, `slash-register.test.ts`, `ask-button.test.ts`,
-`picker-click.test.ts`, `model-menu-click.test.ts`, `local-commands.test.ts`,
+`picker-click.test.ts`, `model-menu-click.test.ts`, `settings-command.test.ts`,
+`local-commands.test.ts`,
 `permission.test.ts`, and `attachment-io.test.ts` cover the rest.
+
+`settings-command.test.ts` is the only suite here that asserts against a real file on disk
+(`AGENT_ANYWHERE_CONFIG_FILE` pointed at a tmp dir), and deliberately so: its most valuable
+assertions are that a refusal leaves the file byte-identical, that clearing deletes a key
+rather than writing a `null`, that a `${VAR}` template is never expanded on the way through,
+and that `loadConfig()` still succeeds afterwards. Each of those, if it broke, would produce
+a deployment that runs fine until someone restarts it.
 
 `session-reclaim.test.ts` is written almost entirely as negative assertions, for the same
 reason the click suites are: every gate that fails open produces an agent that silently

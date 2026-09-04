@@ -46,11 +46,18 @@ export type Harness = AgentDef['harness'];
  * stop" cost the user their whole conversation, since the only other interrupt was
  * `inbound.interruptOnNewMessage` — which fires as a side effect of sending another message, not
  * because anybody asked for it.
+ *
+ * `/setting` is the only command in this list that writes to disk, and the only one whose effect
+ * outlives the conversation it was typed in: it edits config.yaml (see core/settings.ts for what it
+ * will and will not touch). Registered alongside the rest because the alternative — reaching the
+ * machine to edit YAML and restarting, which stops every resident agent — is the cost this gateway
+ * exists to remove.
  */
 export const DAEMON_COMMANDS: SlashCommandSpec[] = [
   { name: 'new', description: 'Start a fresh conversation (clears context)' },
   { name: 'clear', description: 'Alias of /new: start a fresh conversation' },
   { name: 'stop', description: 'Stop the current turn (keeps the conversation)' },
+  { name: 'setting', description: 'Change a saved setting (default agent, model, session)' },
   { name: 'help', description: 'List the commands this gateway understands' },
 ];
 

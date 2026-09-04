@@ -46,7 +46,9 @@ conversation, not part of its name — see [`daemon/README.md`](../daemon/README
 | `runtime-footer.ts` | The `cc · 18k / 1M (2%) · claude-opus-4-5` tagline |
 | `attachment-ingest.ts` | Inbound attachment orchestration (download/save injected) |
 | `command-translate.ts` | The generic slash vocabulary and its per-harness translation |
+| `settings.ts` | `/setting` as data: which config.yaml fields are editable, what they accept, when a change lands |
 | `model-menu.ts` | `/model` as data: paging, labels, button ids, matching, and every string it says |
+| `paging.ts` | The platform-imposed shape of a button menu: page size, page arithmetic, label budget |
 | `button-id.ts` | The `<prefix><reqId>:<n>` button id grammar every menu shares |
 | `proxy.ts` | The one impure file — see below |
 
@@ -164,9 +166,11 @@ the `claude` agent.
 
 The fix, three layers, all fixed at startup from config alone:
 
-1. `DAEMON_COMMANDS` (`/new`, `/clear`, `/stop`, `/help`) — intercepted before any agent.
-   `/new` and `/stop` are separate because they answer separate asks: both end the running turn,
-   only `/new` also ends the conversation.
+1. `DAEMON_COMMANDS` (`/new`, `/clear`, `/stop`, `/setting`, `/help`) — intercepted before any
+   agent. `/new` and `/stop` are separate because they answer separate asks: both end the running
+   turn, only `/new` also ends the conversation. `/setting` is the odd one out — it is the only
+   command whose effect outlives the conversation, because it writes config.yaml (see
+   [`settings.ts`](#settingsts)).
 2. `GENERIC_COMMANDS` — a small fixed vocabulary meaning the same thing everywhere,
    translated to the target harness's native spelling at invocation time.
 3. `HARNESS_COMMANDS` — one agent command per configured harness (`/cc`, `/oc`, `/agy`).
@@ -278,6 +282,56 @@ platform menu without reaching the help text. It filters the generic section to 
 user who will be told "not supported" the moment they tap it is precisely the silent
 degradation this project avoids.
 
+## `settings.ts`
+
+`/setting` as data. One `SETTINGS`-style table drives the menu rows, the text list, value
+validation, the config path that gets patched, and the ack sentence — so a settings screen
+cannot list a field it will not write, or write one it never listed.
+
+The editable set is deliberately four entries wide (`model` expands to one row per
+configured agent):
+
+| key | config path | accepts | takes effect |
+|---|---|---|---|
+| `agent` | `routing.default` | a configured agent id | **now** — `resolveAgent` re-reads it per message |
+| `model` / `model.<agent>` | `agents[<id>].model` | the agent's reported list, any name, or `-` to clear | **next agent session** — the value is read at spawn |
+| `idle` | `session.idleTimeoutMs` | `off`, `<n>m`, `<n>h` | **now** — the sweeper is re-armed |
+| `scope` | `session.scope` | the four `SessionScope` values | **on restart** — file only |
+
+`scope` is the one that is written but not applied, and that is the interesting decision.
+The scope decides how `conversationKey` is computed, so changing it live would silently
+re-identify every existing conversation: the next message in a topic would land in a brand
+new one with no context, while the old agent child sat resident until reclaim. Writing the
+durable answer and saying "on restart" is the honest version.
+
+`model` is the only per-target setting, and its option list has a condition worth
+remembering: a model list exists only on a **live ACP session**, and a conversation has at
+most one — so buttons are offered for the agent answering *here*, and any other agent's
+model is set by typing the name. The empty case gets a sentence naming which condition is
+missing (`settingTypedOnlyHint`), never a blank menu. An unrecognized name is **accepted**
+rather than refused: the selector is not the set of names a harness takes (claude documents
+`opusplan`, `best`, a full model id, none of which the ACP config option lists), so the ack
+says it was not advertised instead.
+
+What is **not** editable is refused *by name* (`NOT_EDITABLE`), with the reason, rather than
+answered "no such setting" — a real config key deserves better than being told it does not
+exist. `access.allowFrom` is out because one wrong value locks the operator out of the
+surface they would use to fix it; credentials because a chat log is the wrong place for
+them; `routing.pipeline` because a rule is a structure, not a value a picker can offer; and
+the `EXPERIENCE` knobs because they are not in the file at all.
+
+The write half lives in [`daemon/settings-store.ts`](../daemon/README.md) — this module
+decides, that one touches the file.
+
+## `paging.ts`
+
+Page size, page arithmetic and the label budget, shared by the `/model` and `/setting`
+menus. Both are bounded by the same platform facts: Discord allows 25 components per
+message, and Telegram's profile puts one button per row, so a page costs `size + 2` rows on
+a phone. Page navigation **wraps** rather than disappearing at the edges — hiding ◀ on the
+first page shifts every other button by one position between pages, and a disabled button
+does not exist on Telegram at all.
+
 ## `attachment-ingest.ts`
 
 Pure orchestration; `download` and `save` are injected (the real IO, including the SSRF
@@ -306,7 +360,7 @@ does not renders no context segment rather than a guessed number.
 
 ## Tests
 
-Eight test files, one per non-trivial file. This module carries the repo's only enforced
+One test file per non-trivial file here. This module carries the repo's only enforced
 coverage floor: **70%** statements/branches/functions/lines on `src/core/**`
 (`vitest.config.ts`). When you add logic here, add the test — the threshold will fail CI
 otherwise, and that is intended.

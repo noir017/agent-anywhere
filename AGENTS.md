@@ -79,6 +79,8 @@ get an explicit Hyrum's Law warning and a contract test.
 in many places. Extend the source, never a copy:
 - `ipc/commands.ts` `REVERSE_COMMANDS` → CLI registration, the agent-facing hint, docs.
 - `core/command-translate.ts` `GENERIC_COMMANDS` → the registered slash menu + translation.
+- `core/settings.ts` — the `/setting` table → the menu rows, the text list, value validation,
+  the config path patched, and the ack sentence.
 - `platform/config-schemas.ts` → validation, the setup wizard's prompts, doctor.
 - `types.ts` domain types → mirrored zod enums with `satisfies` so drift fails to compile.
 
@@ -161,6 +163,11 @@ Do not weaken these without saying so explicitly in the PR:
   frozen `EXPERIENCE` block instead: the user-facing surface is deliberately five
   sections, and tuning knobs nobody adjusts were removed on purpose.
   See [src/config/README.md](src/config/README.md).
+- **A `/setting` entry** → the table in `core/settings.ts`, plus an arm in
+  `applyToConfig` (`daemon/settings-store.ts`), which is exhaustive so the live-apply
+  behavior cannot be left undecided. Only fields where a chat-side edit is *safe* belong
+  there; the deliberate exclusions and their reasons are in the same file.
+  See [src/core/README.md](src/core/README.md#settingsts).
 
 ## Git
 

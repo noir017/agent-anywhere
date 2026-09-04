@@ -5,6 +5,36 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **`/setting` changes config.yaml from chat.** A handful of fields in that file are not
+  deployment plumbing at all but a decision someone makes on a Tuesday — which agent answers by
+  default, what model an agent should start with, how long an idle conversation keeps its process —
+  and they were paying the heaviest edit cost in the product: reach the machine, edit YAML, restart
+  the daemon, and lose every resident agent child in the process. Those are exactly the fields that
+  stayed on the user surface instead of being frozen into `EXPERIENCE`, so the cost was falling on
+  the values most likely to be adjusted.
+
+  Four are editable (`routing.default`, `agents[].model` per agent, `session.idleTimeoutMs`,
+  `session.scope`), as a two-level button menu where a message's buttons can be replaced, and as
+  `/setting <key> <value>` on every platform. Every answer states **when** the change lands,
+  because they differ: three take effect immediately, a model applies to the agent's next session,
+  and the scope is written but deliberately NOT applied — changing what counts as one conversation
+  while conversations are open would silently re-identify all of them, so the file is updated and
+  the restart is named.
+
+  What it will not touch is refused *by name*, with the reason, rather than answered "no such
+  setting": `access.allowFrom` (one wrong value locks you out of the surface you would use to fix
+  it), credentials (a chat log is the wrong place for them), `routing.pipeline` (a rule is a
+  structure, not a value a picker can offer), and the frozen `EXPERIENCE` knobs (not in the file at
+  all). A real config key deserves better than being told it does not exist.
+
+  Writes go through the YAML document, so comments, key order, hand-edited siblings and `${VAR}`
+  templates survive byte-identical, and a change is validated against the whole config *before* the
+  file is touched. That check is the point rather than a precaution: this is the only command that
+  writes the file the daemon needs in order to start, so a value that parses but fails the schema's
+  cross-checks would otherwise leave a deployment that runs until someone restarts it.
+
 ## [0.10.0] - 2026-09-04
 
 ### Changed

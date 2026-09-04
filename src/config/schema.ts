@@ -115,19 +115,28 @@ const ExperienceSchema = z.object({
     })
     .default({}),
 
-  /** Outbound streaming buffer params. */
+  /**
+   * Outbound streaming params.
+   *
+   * There is no "delivery mode" knob: how a reply is delivered follows from what the platform can
+   * do (capabilities.editMessage / maxMessageLength / maxEditsPerMessage), not from a preference.
+   * The `mode: auto|edit|chunk` field that used to sit here was read by nothing.
+   */
   stream: z
     .object({
-      /** Streaming delivery mode: auto (edit/chunk by platform capability) / edit (in-place) / chunk (sequential parts). */
-      mode: z.enum(['auto', 'edit', 'chunk']).default('auto'),
       /** Char trigger threshold: edit immediately after this many new chars accumulate. */
       charThreshold: z.number().int().positive().default(200),
       /** Time trigger interval (ms): flush once this long has passed since the last edit (~1/sec IM limit → 1200ms). */
       flushIntervalMs: z.number().int().positive().default(1200),
-      /** Rate-limit backoff cap. */
+      /** Rate-limit backoff cap for transient edit failures. */
       maxBackoffMs: z.number().int().positive().default(10_000),
-      /** Fall back to whole-message send after this many consecutive edit failures. */
-      maxFailuresBeforeFallback: z.number().int().positive().default(3),
+      /**
+       * Override the platform's per-message edit budget (PlatformCapabilities.maxEditsPerMessage).
+       * Set it only to work around a platform changing its cap on you: too high and the tail of
+       * every long reply is refused until the writer notices, too low and long replies fragment
+       * into more messages than necessary. Absent = trust the profile's declared value.
+       */
+      maxEditsPerMessage: z.number().int().positive().optional(),
       /** If the model replies with only this token, send no message. */
       silentToken: z.string().default('[SILENT]'),
     })

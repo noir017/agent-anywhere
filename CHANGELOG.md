@@ -5,6 +5,66 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **A long reply is no longer truncated where the platform stops accepting edits.** Feishu/Lark
+  caps in-place edits at 20 per message and then answers `230072` forever, and streaming a reply
+  spends one edit per flush — so any answer past roughly twenty flushes hit the cap mid-delivery.
+  What followed was worse than the cap itself: the buffer treated the rejection as a rate limit,
+  backed off, "degraded", and on the final flush — the one carrying the complete answer plus footer
+  — re-edited that same dead message, swallowed the error, and reported the turn complete. The user
+  was left with a reply cut off mid-sentence, a ✅ on it, and no indication anything was missing.
+  Observed twice in one evening on a 4.7k-character answer, of which 1.5k arrived.
+
+  The delivery layer now models **one logical reply as an ordered run of messages**, only the last
+  of which is still edited. A message is *sealed* — immutable, never touched again — when it fills
+  `maxMessageLength`, when its edit budget is spent, or when the platform refuses an edit; in all
+  three cases the sealed text counts as delivered and streaming continues into a fresh message.
+  Because the length limit and the edit budget are now the same concept ("this message can take no
+  more"), `sealedText + open.text` is always exactly what the user can see: nothing is re-sent and
+  nothing is lost. Overflow chunks also stream as they arrive instead of waiting for turn end.
+
+  Two things had to exist for that to work. Platforms declare their cap as a capability
+  (`maxEditsPerMessage`; Lark: 20), so a message is sealed *before* the platform starts refusing
+  rather than after a wasted round trip. And a rejection that means "this message is finished" is
+  now a distinct type (`MessageNotEditableError`, translated from Lark's `230072` in the profile)
+  instead of being indistinguishable from a rate limit — a distinction only the platform can draw,
+  and the one the old code was missing. Genuinely transient failures still back off and keep the
+  message open; the final flush, having no later flush to recover, seals and sends the remainder
+  rather than leaving the answer truncated.
+
+- **Tool bubbles no longer freeze mid-run on the same cap.** `accumulate` grouping spends an edit
+  per progress update, so a ten-tool turn is exactly Lark's twenty. Past that the bubble stopped
+  updating with no error in channel — a turn doing real work looked hung. Bubbles now seal on the
+  same rule, carrying the lines the frozen bubble doesn't already show (still running, or finished
+  since the last write) into a new bubble; lines already fully rendered are dropped rather than
+  repeated, so bubbles don't grow by the whole history.
+
+- **Outbound failures log their actual reason.** Satori's `MessageEncoder` throws an
+  `AggregateError` whose own `.message` is empty, with the real HTTP error inside `.errors`, so the
+  tool-bubble path printed `[turn] render side effect failed:` and nothing after the colon. The
+  unwrapping that the stream sink already did is now shared (`describeOutboundError`) and used
+  everywhere outbound errors are logged. A sealed message logs as ordinary bookkeeping rather than
+  as an error, since the writer continues in a new message.
+
+- **The config-path tests pass on a Windows checkout.** They asserted literal POSIX strings against
+  values built with `path.join`/`path.resolve`, so they only ever tested that the suite was running
+  on POSIX — and since `npm run release` gates on `npm test`, two green-elsewhere failures blocked
+  cutting a release from Windows entirely. The precedence rules they exist to pin are unchanged.
+
+### Removed
+
+- **`stream.maxFailuresBeforeFallback`** and the "degrade to whole-message send" path it drove.
+  Sealing replaces it, and it cannot express what the failure actually was. Configs carrying the
+  key are unaffected (unknown keys are ignored).
+- **`stream.mode`** (`auto` | `edit` | `chunk`) — read by nothing. How a reply is delivered follows
+  from what the platform can do (`editMessage`, `maxMessageLength`, `maxEditsPerMessage`), not from
+  a preference, and a knob that silently does nothing is worse than no knob.
+- **The streaming cursor** (`StreamBufferOptions.cursor`) and `StreamSink.delete`. The cursor had
+  already been hardcoded off; both existed only to service the degraded path's "delete the frozen
+  preview, or edit the cursor off it" cleanup, which no longer exists — a sealed message is
+  complete text, not a frozen preview needing repair.
+
 ## [0.11.0] - 2026-09-04
 
 ### Added

@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { MessageNotEditableError } from '../../core/outbound-errors.js';
 import {
   mapLarkEmojiType,
   mapLarkButtonType,
@@ -275,6 +276,59 @@ describe('lark profile delivery contract (send/edit reach Lark as converted mark
     await profile.sendMessage!(a.bot, { channel: 'oc_1' }, md);
     await profile.editMessage!(b.bot, { address: { channel: 'oc_1' }, messageId: 'om_1' }, md);
     expect(a.calls.send[0]!.content).toBe(b.calls.edit[0]!.content);
+  });
+});
+
+/**
+ * The per-message edit cap is the one Lark failure the streaming writers MUST tell apart from a
+ * rate limit: once 230072 comes back, that message is done forever, so the writer has to seal it
+ * and continue in a new one. Reported as a transient failure instead, it produced the truncated
+ * reply this classification exists to prevent.
+ */
+describe('lark edit-limit classification (230072 → MessageNotEditableError)', () => {
+  const profile = createLarkProfile();
+
+  /** Bot whose editMessage throws `err`. */
+  function throwingBot(err: unknown): SendBot {
+    return {
+      sendMessage: () => Promise.resolve(['om_1']),
+      editMessage: () => Promise.reject(err),
+    } as unknown as SendBot;
+  }
+
+  const ref = { address: { channel: 'oc_1' }, messageId: 'om_1' };
+
+  it('declares the cap as a capability so writers can spend it deliberately', () => {
+    expect(profile.capabilities.maxEditsPerMessage).toBe(20);
+  });
+
+  it('reads the code off the HTTP error body', async () => {
+    const http = Object.assign(new Error('Bad Request'), {
+      response: { data: { code: 230072, msg: 'The message has reached the number of times it can be edited.' } },
+    });
+    await expect(profile.editMessage!(throwingBot(http), ref, 'x')).rejects.toBeInstanceOf(
+      MessageNotEditableError
+    );
+  });
+
+  it('reads the code out of an AggregateError-wrapped message (how satori actually throws it)', async () => {
+    const inner = new Error(
+      'Bad Request (Lark error code 230072: The message has reached the number of times it can be edited.)'
+    );
+    await expect(
+      profile.editMessage!(throwingBot(new AggregateError([inner], '')), ref, 'x')
+    ).rejects.toBeInstanceOf(MessageNotEditableError);
+  });
+
+  it('leaves any other failure transient — a rate limit must not fragment the reply', async () => {
+    const rateLimited = Object.assign(new Error('Too Many Requests'), {
+      response: { data: { code: 99991400, msg: 'rate limited' } },
+    });
+    const thrown = await profile
+      .editMessage!(throwingBot(rateLimited), ref, 'x')
+      .catch((e: unknown) => e);
+    expect(thrown).toBe(rateLimited);
+    expect(thrown).not.toBeInstanceOf(MessageNotEditableError);
   });
 });
 

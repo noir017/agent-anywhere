@@ -36,7 +36,7 @@ export interface MergerDeps {
   /**
    * Hand the merged batch to the agent; resolve = turn ended. `signal` aborts when a newer message
    * interrupts this turn (interruptOnNewMessage) — the runner reads it to finalize the partial reply
-   * cleanly (drop the streaming cursor, no footer) instead of decorating it as a completed turn.
+   * cleanly (no footer) instead of decorating it as a completed turn.
    */
   runTurn(batch: InboundMessage[], signal?: AbortSignal): Promise<void>;
   addReaction(ref: MessageRef, emoji: string): Promise<void>;
@@ -84,7 +84,7 @@ export class InboundMerger {
       this.interrupted = true; // dispatch then skips ✅: the turn did not finish, it was stopped
       this.queued = [];
       // Both halves, same as the implicit path: trip the turn's signal (the runner finalizes the
-      // partial reply cleanly — no cursor, no footer) *and* cancel the agent itself.
+      // partial reply cleanly — no footer) *and* cancel the agent itself.
       this.activeAbort?.abort();
       this.deps.abortTurn?.();
       return 'running';

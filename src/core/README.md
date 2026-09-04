@@ -101,8 +101,8 @@ idle ──ingest──► collecting ──window elapsed──► running ─�
 - **Running**: new messages go to a single-slot queue holding the **latest batch** —
   never dropped, never unbounded.
 - **Interrupt** (`interruptOnNewMessage`, default true): a new message trips the turn's
-  `AbortSignal`. `TurnRunner` reads it to finalize the partial reply cleanly — drop the
-  streaming cursor, no footer, no ✅ — and the continuing batch starts a fresh turn that
+  `AbortSignal`. `TurnRunner` reads it to finalize the partial reply cleanly — no footer,
+  no ✅ — and the continuing batch starts a fresh turn that
   produces its own reply and its own reaction. The skip-✅-on-interrupt behavior matters:
   without it a user sees a ✅ on a turn that never finished.
 - **Lifecycle reactions**: 👀 received, ✅ done, ❌ error, gated by `reactionsEnabled`
@@ -111,30 +111,70 @@ idle ──ingest──► collecting ──window elapsed──► running ─�
 
 ## `stream-buffer.ts`
 
-The most subtle file in the module. It turns a token stream into one live-edited chat
-message.
+The most subtle file in the module. It turns a token stream into a live-edited chat
+message — or, when one message isn't enough, into a run of them.
+
+**Delivery model.** One logical reply is delivered as an ordered run of real messages,
+of which only the last is still edited:
+
+```
+[ sealed ][ sealed ][ open ]
+                       ↑ still edited in place
+```
+
+A message is **sealed** — immutable, never touched again — for one of three reasons, all
+handled identically:
+
+| reason | trigger |
+|---|---|
+| full | the text outgrew `maxMessageLength` |
+| budget spent | `maxEditsPerMessage` in-place edits used up |
+| not editable | the platform rejected an edit with `MessageNotEditableError` |
+
+Sealing is never a failure: the sealed text counts as delivered and the stream continues
+into a fresh message, so `sealedText + open.text` is always exactly what the user can
+see. Nothing is re-sent, nothing is lost.
+
+Folding the edit budget into the same concept as the length limit is what makes that
+invariant hold — both are just *"this message can take no more"*. The previous design
+had only "back off, then degrade to whole-message send", which could not express
+*permanently un-editable*: past Lark's 20-edit-per-message cap the final flush re-edited
+the dead message, swallowed the rejection, and reported the turn complete. Everything
+after the cap was lost, and the user saw a reply truncated mid-sentence with a ✅ on it.
 
 - **Dual-trigger throttle**: flush when `charThreshold` (200) chars accumulate **or**
-  `flushIntervalMs` (1200 ms) elapses since the last edit. 1200 ms tracks the ~1 edit/sec
+  `flushIntervalMs` (1200 ms) elapses since the last write. 1200 ms tracks the ~1 edit/sec
   rate limit most IM platforms impose.
-- **First push sends** (to obtain a `MessageRef`); later pushes **edit in place**. An
-  unchanged text skips the API call entirely.
-- **Cursor** trails the live text and is dropped on completion.
-- **Backoff and degradation**: on rate-limit the edit interval backs off exponentially
-  up to `maxBackoffMs`; after `maxFailuresBeforeFallback` (3) consecutive failures the
-  buffer *degrades* to whole-message sends. If the failure that tipped it over happened
-  on the final flush, `degradedFinalFlush` drops the frozen partial preview and re-sends
-  the full text — otherwise the user is left staring at a truncated message.
-- **`noEdit`** starts the buffer already degraded, for platforms with
-  `editMessage: false` (QQ, LINE, WeCom, DingTalk). It never sends, edits, or shows a
-  cursor mid-stream; it emits the accumulated text as new message(s) on `complete()`,
-  which fits those platforms' 1–2 message quota.
+- **First write sends** (to obtain a `MessageRef`); later writes **edit in place**. Text
+  already on screen verbatim skips the API call — and, importantly, does not spend budget.
+- **Transient failures** (rate limit, network) back the interval off exponentially up to
+  `maxBackoffMs` and keep the message open. Only the platform can say a failure is
+  permanent, which is what `MessageNotEditableError` is for (see `outbound-errors.ts`).
+- **The final flush never gives up**: with no later flush to recover, any failure it can
+  route around is routed around — it seals the open message and sends the remainder rather
+  than leaving the answer truncated.
+- **`noEdit`** platforms (`editMessage: false` — QQ, LINE, WeCom, DingTalk) write nothing
+  mid-stream and emit the accumulated text as new message(s) on `complete()`, which fits
+  those platforms' 1–2 message quota.
 - **Chunking** splits overflow without breaking code fences. Critically, it splits the
   **raw** text while the platform limit applies to the **rendered** output — so
   `measureLength` (wired to `PlatformAdapter.measureRendered`) reports the post-render
   length of a raw substring. A Telegram table→bullets rewrite expands ~1.4×; WeCom
   counts UTF-8 bytes, not chars. Without this a chunk overflows after rendering.
 - **`[SILENT]`** as the entire reply suppresses all output.
+
+## `outbound-errors.ts`
+
+The two-word vocabulary the delivery layer needs from the platforms: a failure is either
+**transient** (retry the same message) or **`MessageNotEditableError`** (that message is
+finished — seal it). Profiles translate their own codes: Lark maps `230072` in
+`lark.ts`. Everything else stays transient on purpose, so a rate limit never fragments a
+reply into extra messages.
+
+Also home to `describeOutboundError`, which walks `AggregateError.errors` — satori's
+MessageEncoder throws one whose own `.message` is empty, so logging `e.message` yielded a
+blank reason and failing tool bubbles logged as `[turn] render side effect failed: ` with
+nothing after the colon.
 
 ## `tool-renderer.ts`
 
@@ -147,6 +187,12 @@ Four modes: `off`, `all`, `new` (dedupe consecutive same-name calls), `verbose`
 - `accumulate` (default) — edit all progress into **one** bubble, multi-line, refreshed
   in place; `onToolFinish` updates the matching line to `✓/✗ + duration` using the
   event's `index`. Requires `editBubble`; degrades to `separate` when absent.
+
+`accumulate` spends one edit per update, so a ten-tool turn is 20 edits — exactly Lark's
+cap. The bubble is therefore **sealed** on the same rule as a message in `StreamBuffer`:
+stop editing it, carry the lines whose state it does not already show (still running, or
+finished since the last write) into a fresh bubble, and keep going. Lines already fully
+rendered are dropped rather than repeated, so bubbles don't grow by the whole history.
 
 The renderer owns **only** the bubbles. The message body belongs to `StreamBuffer`.
 `TurnRunner` coordinates the handoff: complete the current body buffer, emit the bubble,

@@ -137,6 +137,17 @@ export interface PlatformCapabilities {
   typing: boolean;
   /** Per-message text limit; StreamBuffer chunks by it. */
   maxMessageLength: number;
+  /**
+   * How many in-place edits ONE message accepts over its lifetime. Omit when the platform only
+   * rate-limits edits (Telegram/Discord/Slack) — that is the common case and means "unbounded".
+   *
+   * Lark declares 20: past that `im.message.update` answers 230072 permanently. StreamBuffer and
+   * ToolRenderer spend this budget deliberately and seal the message when it runs out, continuing
+   * in a fresh one. Declaring it is strictly better than waiting for the rejection — every rejected
+   * edit is a wasted round trip and a visibly frozen message — but the rejection path
+   * (MessageNotEditableError) still backs it up if a platform tightens the cap.
+   */
+  maxEditsPerMessage?: number;
   /** True reply (message_reference). */
   reply: boolean;
   /** Thread creation. */

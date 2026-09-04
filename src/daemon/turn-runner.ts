@@ -7,6 +7,7 @@ import type { PlatformAdapter } from '../platform/adapter.js';
 import type { AgentFactory, AgentStreamHandlers, AgentUsage } from './agent.js';
 import { StreamBuffer } from '../core/stream-buffer.js';
 import { ToolRenderer } from '../core/tool-renderer.js';
+import { describeOutboundError, MessageNotEditableError } from '../core/outbound-errors.js';
 import { formatRuntimeFooter } from '../core/runtime-footer.js';
 import { ingestAttachments, type AttachmentInput } from '../core/attachment-ingest.js';
 import { createAttachmentIngestDeps } from './attachment-io.js';
@@ -118,7 +119,7 @@ export class TurnRunner {
    *
    * `signal` (from the merger) trips when a newer message interrupts this turn (interruptOnNewMessage):
    * the agent is cancelled in parallel, and here it switches the final flush to a clean finalize —
-   * drop the streaming cursor with no footer and no command fallback, since the continuing batch
+   * finalize with no footer and no command fallback, since the continuing batch
    * produces its own reply (and its own ✅). Absent = never interrupted (treat as a normal turn).
    */
   async runTurn(conversationId: ConversationId, batch: InboundMessage[], signal?: AbortSignal): Promise<void> {
@@ -166,7 +167,11 @@ export class TurnRunner {
         previewLimit: this.config.tools.previewLimit,
         defaultEmoji: this.config.tools.defaultEmoji,
         emojiMap: this.config.tools.emojiMap,
+        // Same edit budget the body stream respects: a long tool run seals its bubble and opens a
+        // new one rather than freezing once the platform stops accepting edits.
+        maxEdits: this.editBudget(platform),
       },
+
       {
         sendBubble: (text) => platform.sendMessage(address, text),
         // accumulate mode flushes whole tool progress/completion into one bubble (address closure).
@@ -185,7 +190,7 @@ export class TurnRunner {
     let effects: Promise<void> = Promise.resolve();
     const enqueue = (fn: () => Promise<void> | void): void => {
       effects = effects.then(fn).catch((e) =>
-        console.error('[turn] render side effect failed:', e instanceof Error ? e.message : e)
+        console.error('[turn] render side effect failed:', describeOutboundError(e))
       );
     };
 
@@ -207,7 +212,7 @@ export class TurnRunner {
       await effects;                       // wait for all queued side effects to land
       if (signal?.aborted) {
         // Interrupted by a newer message: finalize the partial reply cleanly — drop the streaming
-        // cursor with no footer (it didn't finish), and skip the command fallback. The continuing
+        // reply with no footer (it didn't finish), and skip the command fallback. The continuing
         // batch starts a fresh turn and produces its own reply + ✅.
         await ref.stream.complete();
         console.log(`[turn] ${conversationId} turn interrupted (continuing with newer input)`);
@@ -369,12 +374,12 @@ export class TurnRunner {
       {
         charThreshold: this.config.stream.charThreshold,
         flushIntervalMs: this.config.stream.flushIntervalMs,
-        // Streaming cursor is no longer configurable; trailing-cursor decoration is off (empty).
-        cursor: '',
         maxBackoffMs: this.config.stream.maxBackoffMs,
-        maxFailuresBeforeFallback: this.config.stream.maxFailuresBeforeFallback,
         silentToken: this.config.stream.silentToken,
         maxMessageLength: platform.capabilities.maxMessageLength,
+        // Per-message edit budget: config overrides the profile's declared value (see the schema).
+        // Once spent, the buffer seals that message and streams on into a new one.
+        maxEditsPerMessage: this.editBudget(platform),
         // Chunk by the platform's RENDERED length (markdown rendering can expand/re-unit it), so a
         // chunk never overflows the platform after the profile renders it.
         measureLength: (s) => platform.measureRendered(s),
@@ -389,7 +394,7 @@ export class TurnRunner {
             console.log(`[out] send ok (${text.length} chars) → ${ref.messageId}`);
             return ref;
           } catch (e) {
-            console.error(`[out] send failed (${text.length} chars):`, describeError(e));
+            console.error(`[out] send failed (${text.length} chars):`, describeOutboundError(e));
             throw e;
           }
         },
@@ -398,13 +403,28 @@ export class TurnRunner {
             await platform.editMessage(ref, text);
             console.log(`[out] edit ok (${text.length} chars)`);
           } catch (e) {
-            console.error(`[out] edit failed (${text.length} chars):`, describeError(e));
+            // A sealed message is expected bookkeeping, not a fault: the caller continues in a new
+            // message. Logging it as an error made a working delivery look broken.
+            if (e instanceof MessageNotEditableError) {
+              console.log(`[out] ${e.message}; continuing in a new message`);
+            } else {
+              console.error(`[out] edit failed (${text.length} chars):`, describeOutboundError(e));
+            }
             throw e;
           }
         },
       }
     );
   }
+
+  /**
+   * Per-message edit budget for this platform: the config override when set, else what the profile
+   * declares (undefined = the platform doesn't cap edits, only rate-limits them).
+   */
+  private editBudget(platform: PlatformAdapter): number | undefined {
+    return this.config.stream.maxEditsPerMessage ?? platform.capabilities.maxEditsPerMessage;
+  }
+
 
   /**
    * Command zero-output fallback: the agent ran a command but produced nothing displayable (often
@@ -562,21 +582,4 @@ export class TurnRunner {
       return base;
     }
   }
-}
-
-/**
- * Unpack error detail for logging. Satori's MessageEncoder throws an `AggregateError` whose `.message`
- * is empty by default, with the real HTTP error in `.errors` — printing `e.message` alone yields blank,
- * so expand the inner errors too (e.g. `[400] Invalid Form Body …`).
- */
-function describeError(e: unknown): string {
-  if (e instanceof Error) {
-    const inner = (e as { errors?: unknown[] }).errors;
-    if (Array.isArray(inner) && inner.length > 0) {
-      const parts = inner.map((x) => (x instanceof Error ? x.message : JSON.stringify(x)));
-      return `${e.message || e.name}: ${parts.join(' | ')}`;
-    }
-    return e.message || e.name;
-  }
-  return String(e);
 }

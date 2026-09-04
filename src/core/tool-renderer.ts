@@ -1,4 +1,5 @@
 import type { MessageRef, ToolEvent, ToolFinishEvent, ToolMode } from '../types.js';
+import { MessageNotEditableError } from './outbound-errors.js';
 
 /**
  * Tool bubble renderer.
@@ -10,6 +11,13 @@ import type { MessageRef, ToolEvent, ToolFinishEvent, ToolMode } from '../types.
  * - separate: one new bubble per tool.
  * - accumulate: edit all progress into one bubble (multi-line in-place refresh);
  *   onToolFinish updates the matching line to "✓/✗ + duration".
+ *
+ * Accumulate spends one edit per progress update, so a long tool run collides with platforms that
+ * cap edits per message (Lark: 20, then 230072 forever — a ten-tool turn is start+finish = 20).
+ * Past the cap the bubble would freeze mid-run with no further progress and no error in channel.
+ * So the bubble is SEALED the same way StreamBuffer seals a message: stop editing it, carry the
+ * lines whose state hasn't been delivered yet into a fresh bubble, and keep going. `maxEdits`
+ * drives that proactively; a platform's own refusal (MessageNotEditableError) triggers it too.
  *
  * Note: the body is owned by StreamBuffer; this renderer only handles tool bubbles
  * and signals segment breaks. The daemon coordinates: it completes the current body
@@ -28,7 +36,13 @@ export interface ToolRendererOptions {
   previewLimit: number;
   defaultEmoji: string;
   emojiMap: Record<string, string>;
+  /**
+   * In-place edits one bubble accepts before it is sealed and progress continues in a new bubble.
+   * Undefined = unbounded. Wired from PlatformCapabilities.maxEditsPerMessage.
+   */
+  maxEdits?: number;
 }
+
 
 /**
  * Tool bubble send channel.
@@ -52,6 +66,12 @@ interface ToolLine {
   json?: string;
   /** Finish state: undefined = in progress; otherwise records ok and duration. */
   finish?: { ok: boolean; durationMs: number };
+  /**
+   * Whether the platform has actually shown this line's finish mark. Drives what a seal carries
+   * over: a line finished but not yet delivered must move to the new bubble, or its ✓ lands
+   * nowhere and the sealed bubble shows it as still running forever.
+   */
+  finishDelivered?: boolean;
 }
 
 export class ToolRenderer {
@@ -61,6 +81,8 @@ export class ToolRenderer {
   private lines: ToolLine[] = [];
   /** Bubble ref of the current segment (set after the first sendBubble). */
   private bubbleRef: MessageRef | null = null;
+  /** Edits spent on the current bubble; the initial send does not count. */
+  private bubbleEdits = 0;
 
   constructor(
     private readonly opts: ToolRendererOptions,
@@ -104,16 +126,7 @@ export class ToolRenderer {
 
     // accumulate: add the tool to the line set and re-render the whole bubble.
     this.lines.push({ index: evt.index, name: evt.name, body, json });
-
-    if (this.bubbleRef === null) {
-      // First in segment: send a new bubble to get a ref.
-      this.bubbleRef = await this.sink.sendBubble(this.renderBlock());
-      return true; // a bubble was sent → daemon triggers a segment break
-    }
-
-    // Subsequent in segment: edit the same bubble in place (not a new bubble).
-    await this.sink.editBubble!(this.bubbleRef, this.renderBlock());
-    return false;
+    return this.paint();
   }
 
   /**
@@ -121,7 +134,7 @@ export class ToolRenderer {
    *
    * separate trade-off: each tool is a separate bubble with no per-index ref, so
    * its bubble can't be edited afterward → safe no-op.
-   * accumulate: update the line set and editBubble to refresh the same bubble.
+   * accumulate: update the line set and repaint the bubble.
    */
   async onToolFinish(evt: ToolFinishEvent): Promise<void> {
     if (this.opts.mode === 'off') return;
@@ -131,9 +144,68 @@ export class ToolRenderer {
     if (!line) return; // no matching line (e.g. deduped by 'new'): ignore
 
     line.finish = { ok: evt.ok, durationMs: evt.durationMs };
+    line.finishDelivered = false;
 
     if (this.bubbleRef === null) return; // unreachable (a line implies a ref)
-    await this.sink.editBubble!(this.bubbleRef, this.renderBlock());
+    await this.paint();
+  }
+
+  /**
+   * Write the current line set out: edit the open bubble, or send a new one when there is none —
+   * because this is the segment's first tool, or because the previous bubble was sealed.
+   *
+   * Returns whether a NEW bubble was sent, which the daemon reads as "a bubble appeared, break the
+   * text segment". Sealing mid-segment therefore also breaks the segment, which is what you want:
+   * the trailing text belongs below the newest bubble, not the frozen one.
+   */
+  private async paint(): Promise<boolean> {
+    // Budget spent: stop editing this bubble before the platform starts refusing.
+    if (this.bubbleRef !== null && this.budgetSpent()) this.seal();
+
+    if (this.bubbleRef === null) {
+      this.bubbleRef = await this.sink.sendBubble(this.renderBlock());
+      this.bubbleEdits = 0;
+      this.markDelivered();
+      return true;
+    }
+
+    try {
+      await this.sink.editBubble!(this.bubbleRef, this.renderBlock());
+      this.bubbleEdits++;
+      this.markDelivered();
+      return false;
+    } catch (e) {
+      if (!(e instanceof MessageNotEditableError)) throw e;
+      // The platform refuses further edits to this bubble: seal it and repaint into a new one, so
+      // the progress this call carried still reaches the channel.
+      this.seal();
+      this.bubbleRef = await this.sink.sendBubble(this.renderBlock());
+      this.bubbleEdits = 0;
+      this.markDelivered();
+      return true;
+    }
+  }
+
+  private budgetSpent(): boolean {
+    const max = this.opts.maxEdits;
+    return max !== undefined && this.bubbleEdits >= max;
+  }
+
+  /**
+   * Freeze the current bubble and prepare a fresh one: keep only the lines whose current state the
+   * frozen bubble does NOT already show (still running, or finished since the last write). Lines
+   * fully rendered there are dropped — they stay readable above, and repeating them would grow every
+   * subsequent bubble by the whole history.
+   */
+  private seal(): void {
+    this.bubbleRef = null;
+    this.bubbleEdits = 0;
+    this.lines = this.lines.filter((l) => l.finish === undefined || l.finishDelivered !== true);
+  }
+
+  /** After a successful write, every finish mark in the line set is on screen. */
+  private markDelivered(): void {
+    for (const l of this.lines) if (l.finish) l.finishDelivered = true;
   }
 
   /**
@@ -144,7 +216,9 @@ export class ToolRenderer {
     this.lastToolName = null;
     this.lines = [];
     this.bubbleRef = null;
+    this.bubbleEdits = 0;
   }
+
 
   /** Locate the best matching unfinished line by index (preferred) or name (fallback). */
   private findLine(evt: ToolFinishEvent): ToolLine | undefined {

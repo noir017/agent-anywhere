@@ -37,6 +37,7 @@ import type { PlatformCapabilities } from '../adapter.js';
 import type { PlatformProfile, ProfileButtonEvent, ResolvedConversation } from '../profile.js';
 import type { LarkPlatformConfig } from '../config-schemas.js';
 import { renderLarkMarkdown } from '../lark-markdown.js';
+import { collectErrors, MessageNotEditableError } from '../../core/outbound-errors.js';
 import {
   findAtMention,
   installHttpService,
@@ -45,6 +46,48 @@ import {
   resolveDefaultPlugin,
   sendForRef,
 } from '../profile-helpers.js';
+
+/**
+ * In-place edits Lark grants one message. The 21st `im.message.update` on the same message returns
+ * 230072 and every later one does too — the limit is per message and permanent, not a rate limit.
+ */
+const LARK_MAX_EDITS_PER_MESSAGE = 20;
+
+/** Lark server error code for "this message has been edited as many times as it can be". */
+const LARK_EDIT_LIMIT_CODE = 230072;
+
+/**
+ * Lark server error codes carried by a thrown error, including ones nested in an AggregateError.
+ *
+ * Two places to look, because the adapter reports the same failure two ways: the HTTP error object
+ * carries `response.data.code`, and adapter-lark's MessageEncoder additionally appends
+ * "(Lark error code NNNNNN: …)" to the message text — while wrapping the whole thing in an
+ * AggregateError whose own message is empty. Reading only one of the two misses half the cases.
+ */
+function larkErrorCodes(e: unknown): number[] {
+  const codes: number[] = [];
+  for (const err of collectErrors(e)) {
+    const code = (err as { response?: { data?: { code?: unknown } } })?.response?.data?.code;
+    if (typeof code === 'number') codes.push(code);
+    const text = err instanceof Error ? err.message : '';
+    const m = /Lark error code (\d+)/.exec(text);
+    if (m) codes.push(Number(m[1]));
+  }
+  return codes;
+}
+
+/**
+ * Translate Lark's edit-limit rejection into the core's permanent-failure type so the writers seal
+ * the message and continue in a new one. Anything else passes through untouched — a transient
+ * failure must stay transient, or every rate limit would fragment the reply.
+ */
+function asEditLimitError(e: unknown): unknown {
+  if (!larkErrorCodes(e).includes(LARK_EDIT_LIMIT_CODE)) return e;
+  return new MessageNotEditableError(
+    `Lark accepts no further edits to this message (code ${LARK_EDIT_LIMIT_CODE}: per-message edit limit of ${LARK_MAX_EDITS_PER_MESSAGE} reached)`,
+    { cause: e }
+  );
+}
 
 /**
  * Convert agent CommonMark to the Feishu markdown subset, with graceful
@@ -761,11 +804,15 @@ export function createLarkProfile(): PlatformProfile<LarkPlatformConfig> {
   //   recovered through the internal/session hook. See sendButtons /
   //   mountButtonEvents / buildLarkButtonCard / extractCardAction.
   // maxMessageLength≈10000: Lark single-message content JSON is ~10000 chars.
+  // maxEditsPerMessage=20: measured on this tenant — the 21st im.message.update on one message
+  //   returns 230072 and never succeeds again. Declaring it lets the writers seal a message before
+  //   the platform starts refusing, instead of burning a round trip per rejected flush.
   const capabilities: PlatformCapabilities = {
     editMessage: true,
     reaction: true,
     typing: false,
     maxMessageLength: 10000,
+    maxEditsPerMessage: LARK_MAX_EDITS_PER_MESSAGE,
     reply: true,
     thread: true,
     buttons: true,
@@ -918,7 +965,11 @@ export function createLarkProfile(): PlatformProfile<LarkPlatformConfig> {
     },
 
     async editMessage(bot: Bot, ref: MessageRef, text: string): Promise<void> {
-      await bot.editMessage(ref.address.channel, ref.messageId, toLarkMarkdown(text));
+      try {
+        await bot.editMessage(ref.address.channel, ref.messageId, toLarkMarkdown(text));
+      } catch (e) {
+        throw asEditLimitError(e);
+      }
     },
 
     async reply(bot: Bot, ref: MessageRef, text: string): Promise<MessageRef> {

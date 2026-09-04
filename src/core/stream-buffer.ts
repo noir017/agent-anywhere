@@ -1,25 +1,50 @@
 import type { MessageRef } from '../types.js';
+import { MessageNotEditableError } from './outbound-errors.js';
 
 /**
- * Streaming buffer.
+ * Streaming buffer: turns a token stream into a live-edited chat message.
  *
- * Dual-trigger throttle: flush when charThreshold chars accumulate OR
- * flushIntervalMs elapses since the last edit. A cursor trails the live text and
- * is dropped on completion. Edits one message in place (first push sends to get a
- * ref, later pushes edit). Skips the call when text is unchanged. On rate-limit,
- * edit interval backs off exponentially; after repeated failures it degrades to
- * whole-message send. Overflow text is split into chunks without breaking code
- * fences. [SILENT] suppresses all output.
+ * DELIVERY MODEL — one logical reply, delivered as an ordered run of real messages:
+ *
+ *     [ sealed ][ sealed ][ open ]
+ *                            ↑ the only one still edited in place
+ *
+ * A message is SEALED — immutable, never touched again — for one of three reasons, and the buffer
+ * treats all three identically:
+ *
+ *   - **full**: the text outgrew `maxMessageLength`, so the remainder continues in a new message.
+ *   - **budget spent**: `maxEditsPerMessage` in-place edits have been used (Lark allows 20 per
+ *     message, then refuses forever).
+ *   - **not editable**: the platform said so mid-stream (`MessageNotEditableError`).
+ *
+ * Sealing is never a failure. The sealed text counts as delivered and streaming continues into a
+ * fresh message, so `sealedText + open.text` is always EXACTLY what the user can see: nothing is
+ * re-sent, nothing is lost. Folding the edit budget into the same concept as the length limit is
+ * what makes that invariant hold — both are just "this message can take no more".
+ *
+ * This replaced a "back off, then degrade to whole-message send" path that could not express
+ * "permanently un-editable": past Lark's edit cap the final flush re-edited the dead message,
+ * swallowed the rejection, and reported the turn complete, losing every character after the cap.
+ *
+ * Dual-trigger throttle: flush when `charThreshold` chars accumulate OR `flushIntervalMs` elapses
+ * since the last write. Transient failures (rate limit, network) back the interval off
+ * exponentially and keep the open message. The final flush refuses to leave text undelivered behind
+ * a failure it can route around — it seals and sends the remainder instead. Overflow is split
+ * without breaking code fences. `[SILENT]` as the whole reply suppresses all output.
  */
 
 export interface StreamBufferOptions {
   charThreshold: number;
   flushIntervalMs: number;
-  cursor: string;
   maxBackoffMs: number;
-  maxFailuresBeforeFallback: number;
   silentToken: string;
   maxMessageLength: number;
+  /**
+   * In-place edits one delivered message accepts before the buffer seals it and continues in a new
+   * one. Undefined = unbounded (most platforms only rate-limit edits). Wired from
+   * `PlatformCapabilities.maxEditsPerMessage`; Lark declares 20.
+   */
+  maxEditsPerMessage?: number;
   /**
    * Rendered-length measure for chunking. The chunker splits the RAW text but the platform limit
    * (maxMessageLength) applies to the RENDERED output, which markdown rendering can expand (table→
@@ -28,10 +53,9 @@ export interface StreamBufferOptions {
    */
   measureLength?: (text: string) => number;
   /**
-   * Set on platforms without in-place edit (editMessage=false, e.g. QQ/LINE/WeCom).
-   * The buffer then starts already degraded: never send/edit/cursor mid-stream,
-   * only emit the accumulated text as new message(s) on complete(). Fits the
-   * 1-2-message quota of constrained platforms.
+   * Set on platforms without in-place edit (editMessage=false, e.g. QQ/LINE/WeCom/DingTalk).
+   * Nothing is written mid-stream; the accumulated text is emitted as new message(s) on
+   * `complete()`, which fits those platforms' 1-2 message quota.
    */
   noEdit?: boolean;
 }
@@ -44,25 +68,26 @@ export interface StreamSink {
   now(): number;
   /** Throttle timer; returns a cancel fn. */
   schedule(fn: () => void, ms: number): () => void;
-  /**
-   * Delete a sent message (optional). On degraded final flush, removes the frozen
-   * cursor preview before re-sending the full text. Falls back to cursor-strip
-   * when the platform doesn't implement/inject it (see degraded final branch).
-   */
-  delete?(ref: MessageRef): Promise<void>;
+}
+
+/** The tail of the run: the one message still open for in-place edits. */
+interface OpenMessage {
+  ref: MessageRef;
+  /** Exactly the text the platform currently shows for this message. */
+  text: string;
+  /** Edits spent on it so far; the initial send does not count. */
+  edits: number;
 }
 
 export class StreamBuffer {
   private acc = '';                 // full accumulated text
-  private lastRenderedBody = '';    // last successfully written body (no cursor)
-  private lastEditAt = 0;
-  private primaryRef: MessageRef | null = null;
+  /** Text already delivered in sealed messages: immutable, never re-sent. */
+  private sealedText = '';
+  private open: OpenMessage | null = null;
+  private lastWriteAt = 0;
   private currentBackoff: number;
-  private consecutiveFailures = 0;
-  private degraded = false;         // degraded to whole-message send
   private cancelTimer: (() => void) | null = null;
   private aborted = false;          // no more output once the turn is interrupted
-  private overflowSent = false;     // whether final overflow chunks (2..N) were sent (guards against duplicates)
   // Serialize flushes: chain each onto the previous so complete()'s final flush
   // runs only after any in-flight flush settles, instead of being dropped by a
   // re-entrancy guard during that in-flight flush.
@@ -76,10 +101,6 @@ export class StreamBuffer {
     private readonly sink: StreamSink
   ) {
     this.currentBackoff = opts.flushIntervalMs;
-    // noEdit: start degraded. Reuses the degraded path — never send/edit/cursor
-    // mid-stream, only whole-send on complete(final). primaryRef stays null, so
-    // degradedFinalFlush goes straight to sendChunks (no delete/strip).
-    if (opts.noEdit) this.degraded = true;
   }
 
   /** Receive a text delta. */
@@ -90,7 +111,7 @@ export class StreamBuffer {
   }
 
   /**
-   * End of turn: final flush, drop the cursor.
+   * End of turn: deliver whatever is still undelivered.
    *
    * opts.footer: optional runtime footer (model · ctx% · cwd). Appended as
    * `\n\n${footer}` only when this buffer has visible body (non-silent, non-empty
@@ -125,8 +146,8 @@ export class StreamBuffer {
   private maybeFlush(): void {
     if (this.aborted) return;
     if (this.isSilent()) return;
-    const pendingChars = this.acc.length - this.lastRenderedBody.length;
-    const elapsed = this.sink.now() - this.lastEditAt;
+    const pendingChars = this.acc.length - this.deliveredLength();
+    const elapsed = this.sink.now() - this.lastWriteAt;
 
     if (pendingChars >= this.opts.charThreshold || elapsed >= this.currentBackoff) {
       void this.flush(false);
@@ -150,204 +171,119 @@ export class StreamBuffer {
     return this.flushChain;
   }
 
+  /** Everything the user can currently see from this buffer. */
+  private deliveredLength(): number {
+    return this.sealedText.length + (this.open?.text.length ?? 0);
+  }
+
   /**
-   * Actual write-out. final=true drops the cursor and handles chunking.
-   * Never throws: all send/edit failures go through onEditFailure so the
-   * flushChain stays clean.
+   * Deliver whatever is not on screen yet.
+   *
+   * Never throws: a failure it cannot route around is absorbed (backoff) so the flushChain stays
+   * clean. Each loop iteration either completes the write or seals the open message and retries
+   * with the remainder — strictly shorter every time, so it terminates.
+   *
+   * `final=true` appends the footer and, because there is no later flush to recover, refuses to
+   * leave text undelivered behind a failure: it seals the open message and sends the rest.
    */
   private async doFlush(final: boolean): Promise<void> {
     if (this.aborted) return;
     this.cancelTimer?.();
     this.cancelTimer = null;
+    // noEdit platforms write nothing mid-stream (see StreamBufferOptions.noEdit).
+    if (this.opts.noEdit && !final) return;
 
-    // Append footer only on final with visible body. Mid-stream never carries a
-    // footer and keeps the cursor.
-    const body = final && this.footer ? this.acc + '\n\n' + this.footer : this.acc;
-    const rendered = final ? body : this.acc + this.opts.cursor;
+    // The footer joins only the final render; mid-stream is the raw accumulation.
+    const rendered = final && this.footer ? this.acc + '\n\n' + this.footer : this.acc;
+    if (rendered === '') return; // never pushed / empty body → don't send an empty message
 
-    // Nothing to write (never pushed / empty body) → don't send an empty message.
-    if (rendered === '') return;
-
-    const chunks = this.splitIntoChunks(rendered);
-
-    // Early-exit decision delegated to pure shouldSkipFlush (see bottom of file).
-    // unchanged is also reused below to skip a redundant first send.
-    const unchanged = rendered === this.lastRenderedBody;
-    if (
-      shouldSkipFlush({
-        rendered,
-        lastRenderedBody: this.lastRenderedBody,
-        final,
-        overflowSent: this.overflowSent,
-        chunkCount: chunks.length,
-      })
-    ) {
-      return;
+    // `acc` only grows and the footer is a suffix, so the sealed text stays a prefix of `rendered`.
+    // If a caller ever breaks that, re-deliver from scratch: a duplicated message beats a silently
+    // dropped reply. Unreachable through push()/complete().
+    if (!rendered.startsWith(this.sealedText)) {
+      this.sealedText = '';
+      this.open = null;
     }
 
-    if (this.degraded) {
-      // Degraded: no more edits, whole-send only on final (avoid flooding).
-      if (final) {
-        await this.degradedFinalFlush(chunks);
-        this.lastRenderedBody = rendered;
-      }
-      // Non-final: nothing is written here, so lastRenderedBody must NOT advance —
-      // it records what was actually delivered. Advancing it made the final flush
-      // see rendered === lastRenderedBody and skip the whole-send entirely, so
-      // noEdit platforms (DingTalk/QQ/LINE/WeCom) never delivered any reply.
-      return;
-    }
+    for (;;) {
+      if (this.aborted) return;
+      const tail = rendered.slice(this.sealedText.length);
+      if (tail === '') return;              // sealed messages already carry the whole render
+      if (this.open?.text === tail) return; // unchanged → skip the API call entirely
 
-    try {
-      // Primary = first chunk; edit/send it only when changed (or never sent).
-      // When unchanged we're here only to emit final overflow chunks.
-      const head = chunks[0];
-      if (this.aborted || head === undefined) return;
-      if (!unchanged || !this.primaryRef) {
-        if (!this.primaryRef) {
-          this.primaryRef = await this.sink.send(head);
-        } else {
-          await this.sink.edit(this.primaryRef, head);
-        }
-      }
-      // Overflow chunks are appended on final only (no edit storm mid-stream), once.
-      if (final && !this.overflowSent) {
-        for (let i = 1; i < chunks.length; i++) {
-          if (this.aborted) return;
-          await this.sink.send(chunks[i]!);
-        }
-        this.overflowSent = true;
+      // Budget spent: seal deliberately and continue in a new message. Not a failure path.
+      if (this.open && this.budgetSpent(this.open)) {
+        this.seal();
+        continue;
       }
 
-      this.onEditSuccess(rendered);
-    } catch (err) {
-      this.onEditFailure(err);
-      // If this failure tipped us into degraded on a final flush, take the
-      // degraded finish path: drop the frozen preview, then whole-send the full
-      // text (avoids "frozen-cursor remnant + full message" coexisting).
-      if (this.degraded && final) {
-        await this.degradedFinalFlush(chunks);
-      }
-    }
-  }
-
-  /**
-   * Degraded final finish: emit the full (chunked) text as fresh message(s) and
-   * clean up the message frozen at `...<cursor>`, so a stale-cursor remnant never
-   * coexists with the full message.
-   *
-   * Strategy:
-   *  - No primaryRef (never sent): nothing to clean up, just whole-send.
-   *  - delete available: best-effort delete the frozen preview, then whole-send.
-   *  - No delete, or delete throws: fall back to editing primary to the
-   *    cursor-stripped text and treat that edited primary as the final content
-   *    (one message, no whole-send) to avoid "half primary + full new message".
-   *  - All delete/edit/send are best-effort: errors are swallowed, never throw to
-   *    doFlush or pollute the flushChain.
-   *  - Honors aborted: no write/delete after abort.
-   */
-  private async degradedFinalFlush(chunks: string[]): Promise<void> {
-    if (this.aborted) return;
-
-    // No primaryRef: no frozen preview to clean up, whole-send directly.
-    if (!this.primaryRef) {
-      await this.sendChunks(chunks);
-      return;
-    }
-
-    if (this.sink.delete) {
+      const chunks = this.splitIntoChunks(tail);
+      const head = chunks[0]!; // splitIntoChunks never returns an empty list
       try {
-        await this.sink.delete(this.primaryRef);
-      } catch {
-        await this.stripCursorFallback(chunks);
+        await this.write(head);
+      } catch (err) {
+        // The open message won't take this text. Sealing costs one extra message and keeps the
+        // reply whole; on the final flush that trade is always worth it.
+        if (this.open && (final || err instanceof MessageNotEditableError)) {
+          this.seal();
+          continue;
+        }
+        this.onTransientFailure();
         return;
       }
-      if (this.aborted) return;
-      await this.sendChunks(chunks);
+      this.onWriteSuccess();
+      if (chunks.length === 1) return;
+      // The head filled this message to the platform limit: it is final content now.
+      this.seal();
+    }
+  }
+
+  /** Whether the open message has spent its edit budget. */
+  private budgetSpent(open: OpenMessage): boolean {
+    const max = this.opts.maxEditsPerMessage;
+    return max !== undefined && open.edits >= max;
+  }
+
+  /** Send (nothing open yet) or edit the open message in place. */
+  private async write(text: string): Promise<void> {
+    if (!this.open) {
+      const ref = await this.sink.send(text);
+      this.open = { ref, text, edits: 0 };
       return;
     }
-
-    // sink has no delete: strip fallback.
-    await this.stripCursorFallback(chunks);
+    // Already on screen verbatim: happens when the text has outgrown this message, so the head
+    // chunk is exactly what it already shows. Spending an edit from the budget to write the same
+    // characters would be pure waste.
+    if (this.open.text === text) return;
+    await this.sink.edit(this.open.ref, text);
+    this.open.text = text;
+    this.open.edits++;
   }
 
   /**
-   * Fallback: edit primary in place to the cursor-stripped first chunk and treat
-   * the edited primary as the final content (no whole-send, avoids duplication).
-   * Best-effort: edit errors are swallowed.
+   * Close the open message: its text joins the immutable delivered prefix and the next write starts
+   * a new message. No-op when nothing is open.
    */
-  private async stripCursorFallback(chunks: string[]): Promise<void> {
-    if (this.aborted || !this.primaryRef || chunks[0] === undefined) return;
-    try {
-      await this.sink.edit(this.primaryRef, chunks[0]);
-    } catch {
-      // best-effort: stop here, never throw.
-    }
+  private seal(): void {
+    if (!this.open) return;
+    this.sealedText += this.open.text;
+    this.open = null;
   }
 
-  /** Best-effort sequential chunk send; any error swallowed, flushChain stays clean. */
-  private async sendChunks(chunks: string[]): Promise<void> {
-    try {
-      for (const c of chunks) {
-        if (this.aborted) return;
-        await this.sink.send(c);
-      }
-    } catch {
-      // best-effort: swallow to avoid polluting the serial chain.
-    }
-  }
-
-  private onEditSuccess(rendered: string): void {
-    this.lastRenderedBody = rendered;
-    this.lastEditAt = this.sink.now();
-    this.consecutiveFailures = 0;
+  private onWriteSuccess(): void {
+    this.lastWriteAt = this.sink.now();
     this.currentBackoff = this.opts.flushIntervalMs; // reset backoff on success
   }
 
-  private onEditFailure(_err: unknown): void {
-    this.consecutiveFailures++;
-    // Exponential backoff, capped at maxBackoffMs.
+  /** Rate limit / network: keep the message open and retry later, more slowly. */
+  private onTransientFailure(): void {
     this.currentBackoff = Math.min(this.currentBackoff * 2, this.opts.maxBackoffMs);
-    if (this.consecutiveFailures >= this.opts.maxFailuresBeforeFallback) {
-      this.degraded = true;
-    }
   }
+
 
   private splitIntoChunks(text: string): string[] {
     return splitByMeasure(text, this.opts.maxMessageLength, this.opts.measureLength);
   }
-}
-
-// ============================================================================
-// flush early-exit decision (pure: no side effects, no clock, no class state)
-// ============================================================================
-
-/**
- * Whether doFlush should return early and skip this write. Extracted from doFlush
- * so the unchanged/final/overflow combination is unit-testable.
- *
- * Rules (strictly equivalent to the former inline logic):
- *  - Text unchanged since last write (rendered === lastRenderedBody):
- *    · non-final → skip (avoid redundant edit).
- *    · final → overflow chunks (2..N) are only appended on final, so early-exit
- *      here would drop them forever; skip only when overflow was already sent or
- *      there's a single chunk. Typically hit when cursor='' makes the streaming
- *      and final renders identical.
- *  - Text changed → never skip.
- */
-export function shouldSkipFlush(args: {
-  rendered: string;
-  lastRenderedBody: string;
-  final: boolean;
-  overflowSent: boolean;
-  chunkCount: number;
-}): boolean {
-  const { rendered, lastRenderedBody, final, overflowSent, chunkCount } = args;
-  const unchanged = rendered === lastRenderedBody;
-  if (!unchanged) return false;
-  if (!final) return true;
-  // final and unchanged: continue only if overflow chunks are still pending.
-  return overflowSent || chunkCount <= 1;
 }
 
 // ============================================================================

@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import type { MessageRef, ToolEvent, ToolFinishEvent } from '../types.js';
+import { MessageNotEditableError } from './outbound-errors.js';
 import {
   ToolRenderer,
   formatDuration,
@@ -12,6 +13,7 @@ function makeSink(opts: { withEdit: boolean }) {
   const sends: string[] = [];
   const edits: Array<{ ref: MessageRef; text: string }> = [];
   let counter = 0;
+  let refuseAfter = Infinity;
 
   const sink: BubbleSink = {
     async sendBubble(text: string): Promise<MessageRef> {
@@ -22,10 +24,19 @@ function makeSink(opts: { withEdit: boolean }) {
   };
   if (opts.withEdit) {
     sink.editBubble = async (ref: MessageRef, text: string): Promise<void> => {
+      if (edits.length >= refuseAfter) throw new MessageNotEditableError('edit limit reached');
       edits.push({ ref, text });
     };
   }
-  return { sink, sends, edits };
+  return {
+    sink,
+    sends,
+    edits,
+    /** Make editBubble start refusing (as Lark does) once n edits have landed. */
+    refuseEditsAfter(n: number) {
+      refuseAfter = n;
+    },
+  };
 }
 
 function makeOpts(over: Partial<ToolRendererOptions> = {}): ToolRendererOptions {
@@ -174,6 +185,69 @@ describe('accumulate mode', () => {
     expect(sends).toHaveLength(2);
     // The second segment's bubble holds only the new line, not the prior segment.
     expect(sends[1]).toBe('✏️ Edit: "src/b.ts"');
+  });
+});
+
+describe('accumulate: sealing a bubble that can take no more edits', () => {
+  it('spending maxEdits opens a new bubble carrying only the unsettled lines', async () => {
+    const { sink, sends, edits } = makeSink({ withEdit: true });
+    // Budget of 1 edit per bubble: send, one edit, then the next update must open a new bubble.
+    const r = new ToolRenderer(makeOpts({ grouping: 'accumulate', maxEdits: 1 }), sink);
+
+    await r.onToolStart(start('Read', 'a.ts', 0)); // sends bubble 1
+    await r.onToolFinish(finish('Read', true, 500, 0)); // edit 1/1 → ✓ delivered
+    expect(sends).toHaveLength(1);
+    expect(edits).toHaveLength(1);
+
+    // Budget spent → seal. The finished Read line stays in bubble 1 and is not repeated.
+    expect(await r.onToolStart(start('Bash', 'ls', 1))).toBe(true);
+    expect(sends).toHaveLength(2);
+    expect(sends[1]).toBe('💻 Bash: "ls"');
+    expect(edits[0]!.text).toBe('📖 Read: "a.ts" ✓ 500ms');
+  });
+
+  it('a finish that arrives with no budget left is carried into the new bubble, not lost', async () => {
+    const { sink, sends } = makeSink({ withEdit: true });
+    const r = new ToolRenderer(makeOpts({ grouping: 'accumulate', maxEdits: 0 }), sink);
+
+    await r.onToolStart(start('Bash', 'sleep 1', 0)); // bubble 1, no edits allowed at all
+    await r.onToolFinish(finish('Bash', true, 1200, 0));
+
+    // The ✓ could not be edited into bubble 1, so the line moves to a bubble that can show it.
+    expect(sends).toHaveLength(2);
+    expect(sends[1]).toBe('💻 Bash: "sleep 1" ✓ 1.2s');
+  });
+
+  it('a platform refusing an edit seals the bubble and repaints into a new one', async () => {
+    const { sink, sends, edits, refuseEditsAfter } = makeSink({ withEdit: true });
+    const r = new ToolRenderer(makeOpts({ grouping: 'accumulate' }), sink);
+
+    await r.onToolStart(start('Read', 'a.ts', 0));
+    refuseEditsAfter(0); // every edit from here on is rejected permanently (Lark 230072)
+
+    expect(await r.onToolStart(start('Bash', 'ls', 1))).toBe(true);
+    expect(edits).toHaveLength(0);
+    expect(sends).toHaveLength(2);
+    // Still-running Read is unsettled, so it is carried over rather than stranded.
+    expect(sends[1]).toBe('📖 Read: "a.ts"\n💻 Bash: "ls"');
+  });
+
+  it('a transient edit error still propagates (the caller decides, no silent seal)', async () => {
+    const sends: string[] = [];
+    const sink: BubbleSink = {
+      async sendBubble(text: string): Promise<MessageRef> {
+        sends.push(text);
+        return { address: { channel: 'c' }, messageId: `m${sends.length}` };
+      },
+      editBubble: async (): Promise<void> => {
+        throw new Error('rate-limited');
+      },
+    };
+    const r = new ToolRenderer(makeOpts({ grouping: 'accumulate' }), sink);
+
+    await r.onToolStart(start('Read', 'a.ts', 0));
+    await expect(r.onToolStart(start('Bash', 'ls', 1))).rejects.toThrow('rate-limited');
+    expect(sends).toHaveLength(1); // no new bubble: a rate limit is not a seal
   });
 });
 

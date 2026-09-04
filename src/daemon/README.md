@@ -253,7 +253,7 @@ Turn outcomes:
 
 - **Normal**: final flush with the footer.
 - **Interrupted** (`signal.aborted`): finalize the partial reply cleanly — drop the
-  cursor, no footer, no ✅, skip the command fallback. The continuing batch produces its
+  no footer, no ✅, skip the command fallback. The continuing batch produces its
   own reply.
 - **Failed**: log the stack, send a capped (300 char) `❌ This turn failed: <reason>`
   in-channel, then rethrow for the merger to mark ❌. The reason is surfaced because the

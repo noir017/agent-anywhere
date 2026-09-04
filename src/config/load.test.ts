@@ -26,20 +26,25 @@ describe('config path resolution', () => {
     expect(configPath()).toBe(path.join(os.homedir(), '.config', 'agent-anywhere', 'config.yaml'));
   });
 
+  // The precedence rules are platform-independent, but the paths they produce are not: configPath
+  // joins/resolves with the host separator, and on Windows path.resolve('/etc/x') also gains the
+  // current drive letter. So the expectations are built with the same primitives the implementation
+  // uses — asserting literal POSIX strings only tested that the suite was running on POSIX.
   it('honors AGENT_ANYWHERE_CONFIG_DIR', () => {
     delete process.env.AGENT_ANYWHERE_CONFIG_FILE;
     process.env.AGENT_ANYWHERE_CONFIG_DIR = '/srv/am';
-    expect(configPath()).toBe('/srv/am/config.yaml');
-    expect(defaultSocketPath()).toBe('/srv/am/daemon.sock');
+    expect(configPath()).toBe(path.join('/srv/am', 'config.yaml'));
+    expect(defaultSocketPath()).toBe(path.join('/srv/am', 'daemon.sock'));
   });
 
   it('AGENT_ANYWHERE_CONFIG_FILE points configPath at the file and configDir at its parent', () => {
     process.env.AGENT_ANYWHERE_CONFIG_DIR = '/srv/am'; // must be ignored when FILE is set
     process.env.AGENT_ANYWHERE_CONFIG_FILE = '/etc/agent-anywhere/discord.yaml';
-    expect(configPath()).toBe('/etc/agent-anywhere/discord.yaml');
-    expect(configDir()).toBe('/etc/agent-anywhere');
+    const resolved = path.resolve('/etc/agent-anywhere/discord.yaml');
+    expect(configPath()).toBe(resolved);
+    expect(configDir()).toBe(path.dirname(resolved));
     // socket sits next to the chosen file (one daemon at a time, so no collision with other configs).
-    expect(defaultSocketPath()).toBe('/etc/agent-anywhere/daemon.sock');
+    expect(defaultSocketPath()).toBe(path.join(path.dirname(resolved), 'daemon.sock'));
   });
 
   it('expands a leading ~ in AGENT_ANYWHERE_CONFIG_FILE', () => {

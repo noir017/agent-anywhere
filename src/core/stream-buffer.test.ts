@@ -1,10 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import type { MessageRef } from '../types.js';
+import { MessageNotEditableError } from './outbound-errors.js';
 import {
   StreamBuffer,
   splitIntoChunks,
   splitByMeasure,
-  shouldSkipFlush,
   type StreamBufferOptions,
   type StreamSink,
 } from './stream-buffer.js';
@@ -149,111 +149,34 @@ describe('splitIntoChunks', () => {
   });
 });
 
-describe('shouldSkipFlush', () => {
-  it('unchanged + non-final → skip (avoid redundant edit)', () => {
-    expect(
-      shouldSkipFlush({
-        rendered: 'abc',
-        lastRenderedBody: 'abc',
-        final: false,
-        overflowSent: false,
-        chunkCount: 1,
-      })
-    ).toBe(true);
-  });
-
-  it('unchanged + final but overflow chunks pending (chunkCount>1 and not yet sent) → do not skip', () => {
-    expect(
-      shouldSkipFlush({
-        rendered: 'abc',
-        lastRenderedBody: 'abc',
-        final: true,
-        overflowSent: false,
-        chunkCount: 3,
-      })
-    ).toBe(false);
-  });
-
-  it('unchanged + final and overflow already sent → skip', () => {
-    expect(
-      shouldSkipFlush({
-        rendered: 'abc',
-        lastRenderedBody: 'abc',
-        final: true,
-        overflowSent: true,
-        chunkCount: 3,
-      })
-    ).toBe(true);
-  });
-
-  it('unchanged + final and only 1 chunk → skip (nothing to do)', () => {
-    expect(
-      shouldSkipFlush({
-        rendered: 'abc',
-        lastRenderedBody: 'abc',
-        final: true,
-        overflowSent: false,
-        chunkCount: 1,
-      })
-    ).toBe(true);
-  });
-
-  it('text changed → never skip (non-final)', () => {
-    expect(
-      shouldSkipFlush({
-        rendered: 'abcd',
-        lastRenderedBody: 'abc',
-        final: false,
-        overflowSent: false,
-        chunkCount: 1,
-      })
-    ).toBe(false);
-  });
-
-  it('text changed → never skip (final)', () => {
-    expect(
-      shouldSkipFlush({
-        rendered: 'abcd',
-        lastRenderedBody: 'abc',
-        final: true,
-        overflowSent: true,
-        chunkCount: 1,
-      })
-    ).toBe(false);
-  });
-});
-
 interface FakeSink extends StreamSink {
   sends: string[];
   edits: Array<{ ref: MessageRef; text: string }>;
-  deletes: MessageRef[];
   setNow(t: number): void;
   runTimers(): void;
+  /** Next n edits throw a transient error (rate limit). */
   failEdits(n: number): void;
+  /** Every edit from now on throws MessageNotEditableError — i.e. the platform sealed the message. */
+  refuseEditsForever(): void;
 }
 
-/**
- * Controllable sink: advance now manually, fire registered timers manually, set
- * a number of edit failures.
- *  - withDelete=false omits the delete method (platform not implementing/injecting it).
- *  - deleteThrows=true makes delete throw (delete-error fallback case).
- */
-function makeSink(opts: { withDelete?: boolean; deleteThrows?: boolean } = {}): FakeSink {
-  const { withDelete = true, deleteThrows = false } = opts;
+/** Controllable sink: advance now manually, fire registered timers manually, script edit failures. */
+function makeSink(): FakeSink {
   let nowVal = 0;
   let editFailRemaining = 0;
+  let refusing = false;
   const pending: Array<{ fn: () => void; at: number }> = [];
   let msgSeq = 0;
 
   const sink: FakeSink = {
     sends: [],
     edits: [],
-    deletes: [],
     async send(text: string): Promise<MessageRef> {
       sink.sends.push(text);
       return { address: { channel: 'c' }, messageId: `m${++msgSeq}` };
     },
     async edit(ref: MessageRef, text: string): Promise<void> {
+      if (refusing) throw new MessageNotEditableError('edit limit reached');
       if (editFailRemaining > 0) {
         editFailRemaining--;
         throw new Error('rate-limited');
@@ -280,46 +203,42 @@ function makeSink(opts: { withDelete?: boolean; deleteThrows?: boolean } = {}): 
     failEdits(n: number) {
       editFailRemaining = n;
     },
+    refuseEditsForever() {
+      refusing = true;
+    },
   };
-  if (withDelete) {
-    sink.delete = async (ref: MessageRef): Promise<void> => {
-      sink.deletes.push(ref);
-      if (deleteThrows) throw new Error('delete-failed');
-    };
-  }
   return sink;
 }
 
-/** Drive the buffer into degraded state: first send succeeds, then edits fail to the threshold. */
-async function driveIntoDegraded(buf: StreamBuffer, sink: FakeSink, failures: number): Promise<void> {
-  buf.push('ab'); // first send succeeds (send unaffected by failEdits) → gets primaryRef
-  await Promise.resolve();
-  await Promise.resolve();
-  sink.failEdits(99);
-  for (let k = 0; k < failures; k++) {
-    sink.setNow(sink.now() + 100000); // jump past backoff to guarantee a trigger
-    buf.push('cd'); // each addition changes rendered → triggers a (failing) edit
-    // Extra microtask rounds so this edit settles on the flushChain before the next.
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
-  }
+/** Push a delta and let the flush chain settle. */
+async function pushAndSettle(buf: StreamBuffer, sink: FakeSink, delta: string): Promise<void> {
+  sink.setNow(sink.now() + 100000); // jump past any backoff so the write is guaranteed to trigger
+  buf.push(delta);
+  // Several microtask rounds: each write settles on the flushChain before the next.
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+}
+
+/** Everything the sink actually delivered, in order: each send followed by its latest edit. */
+function visibleMessages(sink: FakeSink): string[] {
+  return sink.sends.map((text, i) => {
+    const ref = `m${i + 1}`;
+    const lastEdit = [...sink.edits].reverse().find((e) => e.ref.messageId === ref);
+    return lastEdit?.text ?? text;
+  });
 }
 
 function makeOpts(over: Partial<StreamBufferOptions> = {}): StreamBufferOptions {
   return {
     charThreshold: 10,
     flushIntervalMs: 800,
-    cursor: '▌',
     maxBackoffMs: 10000,
-    maxFailuresBeforeFallback: 3,
     silentToken: '[SILENT]',
     maxMessageLength: 2000,
     ...over,
   };
 }
 
-describe('StreamBuffer dual-trigger and degradation', () => {
+describe('StreamBuffer dual-trigger and delivery', () => {
   it('accumulating to charThreshold triggers one initial send', async () => {
     const sink = makeSink();
     const buf = new StreamBuffer(makeOpts({ charThreshold: 5 }), sink);
@@ -329,7 +248,7 @@ describe('StreamBuffer dual-trigger and degradation', () => {
     await Promise.resolve();
 
     expect(sink.sends.length).toBe(1);
-    expect(sink.sends[0]).toBe('hello world▌'); // first send carries the cursor
+    expect(sink.sends[0]).toBe('hello world');
   });
 
   it('below the threshold does not trigger immediately, flushes when the timer expires', async () => {
@@ -345,7 +264,7 @@ describe('StreamBuffer dual-trigger and degradation', () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(sink.sends.length).toBe(1);
-    expect(sink.sends[0]).toBe('hi▌');
+    expect(sink.sends[0]).toBe('hi');
   });
 
   it('skips the edit call when the text is unchanged', async () => {
@@ -369,153 +288,154 @@ describe('StreamBuffer dual-trigger and degradation', () => {
     const sink = makeSink();
     const buf = new StreamBuffer(makeOpts({ charThreshold: 3 }), sink);
 
-    buf.push('aaa');
-    await Promise.resolve();
-    await Promise.resolve();
+    await pushAndSettle(buf, sink, 'aaa');
     expect(sink.sends.length).toBe(1);
 
-    sink.setNow(5000);
-    buf.push('bbbb'); // adds 4 >= 3
-    await Promise.resolve();
-    await Promise.resolve();
+    await pushAndSettle(buf, sink, 'bbbb'); // adds 4 >= 3
     expect(sink.edits.length).toBe(1);
-    expect(sink.edits[0]!.text).toBe('aaabbbb▌');
+    expect(sink.edits[0]!.text).toBe('aaabbbb');
   });
 
-  it('after consecutive edit failures reach maxFailuresBeforeFallback it degrades, whole-sends on complete', async () => {
+  it('a transient edit failure keeps the message open: the next flush edits the same message', async () => {
     const sink = makeSink();
-    const opts = makeOpts({ charThreshold: 2, maxFailuresBeforeFallback: 3 });
-    const buf = new StreamBuffer(opts, sink);
+    const buf = new StreamBuffer(makeOpts({ charThreshold: 2 }), sink);
 
-    // First send succeeds (send unaffected by failEdits).
-    buf.push('ab');
-    await Promise.resolve();
-    await Promise.resolve();
+    await pushAndSettle(buf, sink, 'ab');
     expect(sink.sends.length).toBe(1);
 
-    // Next 3 edits all fail → triggers degradation.
-    sink.failEdits(99);
-    for (let k = 0; k < 3; k++) {
-      sink.setNow(sink.now() + 100000); // jump past backoff to guarantee a trigger
-      buf.push('cd');
-      await Promise.resolve();
-      await Promise.resolve();
-    }
-    expect(sink.edits.length).toBe(0); // degraded by now, no edit written
+    sink.failEdits(1);
+    await pushAndSettle(buf, sink, 'cd'); // this edit fails (rate limit)
+    expect(sink.edits.length).toBe(0);
 
-    const sendsBefore = sink.sends.length;
-    await buf.complete();
-    await Promise.resolve();
-    // Degraded path: whole-send on complete, with no cursor.
-    expect(sink.sends.length).toBeGreaterThan(sendsBefore);
-    expect(sink.sends[sink.sends.length - 1]).not.toContain(opts.cursor);
-  });
-
-  it('complete() after degradation: deletes the frozen preview and whole-sends the full text, no cursor remnant', async () => {
-    const sink = makeSink({ withDelete: true });
-    const opts = makeOpts({ charThreshold: 2, maxFailuresBeforeFallback: 3 });
-    const buf = new StreamBuffer(opts, sink);
-
-    await driveIntoDegraded(buf, sink, 3);
-    expect(sink.edits.length).toBe(0); // degraded: no edit ever written
-    // The frozen cursor preview (the first send) is still present.
+    await pushAndSettle(buf, sink, 'ef'); // retried on the SAME message, not a new one
     expect(sink.sends.length).toBe(1);
-    expect(sink.sends[0]).toContain(opts.cursor);
+    expect(sink.edits.at(-1)!.text).toBe('abcdef');
+  });
 
-    const sendsBefore = sink.sends.length;
+  it('spending the edit budget seals the message and streams on into a new one, losing nothing', async () => {
+    const sink = makeSink();
+    // Budget of 2 edits: send + 2 edits, then the 3rd update must open a new message.
+    const buf = new StreamBuffer(makeOpts({ charThreshold: 2, maxEditsPerMessage: 2 }), sink);
+
+    await pushAndSettle(buf, sink, 'aa'); // send #1
+    await pushAndSettle(buf, sink, 'bb'); // edit 1/2
+    await pushAndSettle(buf, sink, 'cc'); // edit 2/2 → budget spent
+    expect(sink.sends.length).toBe(1);
+    expect(sink.edits.length).toBe(2);
+
+    await pushAndSettle(buf, sink, 'dd'); // no budget left → seal, send #2 with just the new tail
+    expect(sink.sends.length).toBe(2);
+    expect(sink.sends[1]).toBe('dd');
+
+    await buf.complete({ footer: 'ftr' });
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+
+    // Concatenating what each message shows reproduces the whole reply exactly once.
+    expect(visibleMessages(sink).join('')).toBe('aabbccdd\n\nftr');
+  });
+
+  it('a platform that refuses further edits seals the message rather than losing the rest', async () => {
+    const sink = makeSink();
+    const buf = new StreamBuffer(makeOpts({ charThreshold: 2 }), sink);
+
+    await pushAndSettle(buf, sink, 'head');
+    expect(sink.sends.length).toBe(1);
+
+    // Lark 230072 equivalent: this message will never accept another edit.
+    sink.refuseEditsForever();
+    await pushAndSettle(buf, sink, '-tail');
+
+    expect(sink.sends.length).toBe(2);
+    expect(sink.sends[1]).toBe('-tail'); // continues in a new message, no duplicated head
+    expect(visibleMessages(sink).join('')).toBe('head-tail');
+  });
+
+  it("regression: the final flush delivers the conclusion even when the message can't be edited any more", async () => {
+    // The exact production failure: a long Lark reply exhausts the per-message edit quota, and the
+    // final flush — which carries the complete answer plus footer — used to re-edit that same dead
+    // message, swallow the rejection, and report the turn complete. The user saw a reply truncated
+    // mid-sentence with a ✅ on it.
+    const sink = makeSink();
+    const buf = new StreamBuffer(makeOpts({ charThreshold: 4 }), sink);
+
+    await pushAndSettle(buf, sink, 'part one. ');
+    expect(sink.sends.length).toBe(1);
+
+    sink.refuseEditsForever();
+    buf.push('and the whole conclusion nobody ever saw.');
+    await buf.complete({ footer: 'oc · 12k / 1M' });
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+
+    expect(visibleMessages(sink).join('')).toBe(
+      'part one. and the whole conclusion nobody ever saw.\n\noc · 12k / 1M'
+    );
+  });
+
+  it('the final flush routes around a transient failure too, rather than truncating the reply', async () => {
+    const sink = makeSink();
+    const buf = new StreamBuffer(makeOpts({ charThreshold: 4 }), sink);
+
+    await pushAndSettle(buf, sink, 'body ');
+    expect(sink.sends.length).toBe(1);
+
+    sink.failEdits(99); // every edit fails, including the final one
+    buf.push('ending');
     await buf.complete();
-    await Promise.resolve();
+    for (let i = 0; i < 6; i++) await Promise.resolve();
 
-    expect(sink.deletes.length).toBe(1); // frozen primaryRef deleted
-    // Full text emitted as a new message.
-    expect(sink.sends.length).toBeGreaterThan(sendsBefore);
-    const finalSend = sink.sends[sink.sends.length - 1];
-    expect(finalSend).toBe('abcdcdcd'); // ab + 3×cd, no cursor
-    expect(finalSend).not.toContain(opts.cursor);
-    expect(sink.edits.length).toBe(0); // strip fallback not used (delete + send path)
+    // Sealed and sent as a new message: the ending is on screen, not swallowed.
+    expect(sink.sends.length).toBe(2);
+    expect(sink.sends[1]).toBe('ending');
   });
 
-  it('complete() after degradation: with no sink.delete, falls back to stripping the cursor (edits primary to drop the cursor, no ▌ remnant)', async () => {
-    const sink = makeSink({ withDelete: false });
-    const opts = makeOpts({ charThreshold: 2, maxFailuresBeforeFallback: 3 });
-    const buf = new StreamBuffer(opts, sink);
+  it('overflow mid-stream seals the full message and keeps streaming into the next one', async () => {
+    const sink = makeSink();
+    const buf = new StreamBuffer(makeOpts({ charThreshold: 4, maxMessageLength: 10 }), sink);
 
-    await driveIntoDegraded(buf, sink, 3);
-    expect(sink.delete).toBeUndefined();
-    sink.failEdits(0); // stop failing so the strip-fallback edit can land
-    const sendsBefore = sink.sends.length;
+    await pushAndSettle(buf, sink, 'aaaaaaaaaa'); // exactly 10 → fills one message
+    await pushAndSettle(buf, sink, 'bbbb');       // overflow → second message, still open
+    await pushAndSettle(buf, sink, 'cc');         // edits the second message, not the sealed first
 
-    await buf.complete();
-    await Promise.resolve();
-
-    // No delete → no new whole-send (strip fallback makes the edited primary final).
-    expect(sink.sends.length).toBe(sendsBefore);
-    const lastEdit = sink.edits[sink.edits.length - 1]!;
-    expect(lastEdit).toBeDefined();
-    expect(lastEdit.text).toBe('abcdcdcd');
-    expect(lastEdit.text).not.toContain(opts.cursor);
-    // No frozen cursor left anywhere.
-    expect(sink.edits.every((e) => !e.text.includes(opts.cursor))).toBe(true);
+    expect(sink.sends.length).toBe(2);
+    expect(visibleMessages(sink).join('')).toBe('aaaaaaaaaabbbbcc');
+    // The sealed first message was never touched again.
+    expect(sink.edits.every((e) => e.ref.messageId !== 'm1')).toBe(true);
   });
 
-  it('complete() after degradation: when delete throws, falls back to strip, no dirty cursor remnant, no exception', async () => {
-    const sink = makeSink({ withDelete: true, deleteThrows: true });
-    const opts = makeOpts({ charThreshold: 2, maxFailuresBeforeFallback: 3 });
-    const buf = new StreamBuffer(opts, sink);
+  it('abort() then complete(): performs no further writes', async () => {
+    const sink = makeSink();
+    const buf = new StreamBuffer(makeOpts({ charThreshold: 2 }), sink);
 
-    await driveIntoDegraded(buf, sink, 3);
-    sink.failEdits(0); // stop failing so the post-delete strip-fallback edit can land
-    const sendsBefore = sink.sends.length;
-
-    // complete must not throw (best-effort).
-    await expect(buf.complete()).resolves.toBeUndefined();
-    await Promise.resolve();
-
-    expect(sink.deletes.length).toBe(1); // delete attempted (and threw)
-    // Falls back to strip: no new whole-send, edits primary to drop the cursor.
-    expect(sink.sends.length).toBe(sendsBefore);
-    const lastEdit = sink.edits[sink.edits.length - 1]!;
-    expect(lastEdit).toBeDefined();
-    expect(lastEdit.text).toBe('abcdcdcd');
-    expect(sink.edits.every((e) => !e.text.includes(opts.cursor))).toBe(true);
-  });
-
-  it('abort() then complete() after degradation: performs no further writes/deletes', async () => {
-    const sink = makeSink({ withDelete: true });
-    const opts = makeOpts({ charThreshold: 2, maxFailuresBeforeFallback: 3 });
-    const buf = new StreamBuffer(opts, sink);
-
-    await driveIntoDegraded(buf, sink, 3);
+    await pushAndSettle(buf, sink, 'ab');
     const sendsBefore = sink.sends.length;
     const editsBefore = sink.edits.length;
 
     buf.abort();
-    await buf.complete(); // after abort, complete returns early: no write/delete
+    await buf.complete(); // after abort, complete returns early: no write
     await Promise.resolve();
 
     expect(sink.sends.length).toBe(sendsBefore);
     expect(sink.edits.length).toBe(editsBefore);
-    expect(sink.deletes.length).toBe(0);
   });
 
-  it('complete() drops the streaming cursor', async () => {
+  it('complete() writes the final body', async () => {
     const sink = makeSink();
     const opts = makeOpts({ charThreshold: 2 });
     const buf = new StreamBuffer(opts, sink);
 
-    buf.push('hello'); // first send carries the cursor
+    buf.push('hello');
     await Promise.resolve();
     await Promise.resolve();
-    expect(sink.sends[0]).toContain(opts.cursor);
+    expect(sink.sends[0]).toBe('hello');
 
     sink.setNow(5000);
+    buf.push(' there');
     await buf.complete();
-    await Promise.resolve();
-    // The final write (edit) has no cursor.
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+
     const lastEdit = sink.edits[sink.edits.length - 1]!;
     expect(lastEdit).toBeDefined();
-    expect(lastEdit.text).toBe('hello');
-    expect(lastEdit.text).not.toContain(opts.cursor);
+    expect(lastEdit.text).toBe('hello there');
   });
 
   it('complete({ footer }): on normal completion the footer is appended to the end of the final message', async () => {
@@ -523,7 +443,7 @@ describe('StreamBuffer dual-trigger and degradation', () => {
     const opts = makeOpts({ charThreshold: 2 });
     const buf = new StreamBuffer(opts, sink);
 
-    buf.push('hello'); // first send carries the cursor
+    buf.push('hello');
     await Promise.resolve();
     await Promise.resolve();
 
@@ -534,24 +454,20 @@ describe('StreamBuffer dual-trigger and degradation', () => {
     const lastEdit = sink.edits[sink.edits.length - 1]!;
     expect(lastEdit).toBeDefined();
     expect(lastEdit.text).toBe('hello\n\nclaude-opus · ~/repo');
-    expect(lastEdit.text).not.toContain(opts.cursor);
   });
 
-  it('complete({ footer }): an empty footer is not appended', async () => {
+  it('complete({ footer }): an empty footer is not appended — and costs no edit', async () => {
     const sink = makeSink();
     const opts = makeOpts({ charThreshold: 2 });
     const buf = new StreamBuffer(opts, sink);
 
-    buf.push('hello');
-    await Promise.resolve();
-    await Promise.resolve();
-
-    sink.setNow(5000);
+    await pushAndSettle(buf, sink, 'hello');
     await buf.complete({ footer: '' });
-    await Promise.resolve();
+    for (let i = 0; i < 6; i++) await Promise.resolve();
 
-    const lastEdit = sink.edits[sink.edits.length - 1]!;
-    expect(lastEdit.text).toBe('hello');
+    // The final render equals what the message already shows, so there is nothing to write.
+    expect(visibleMessages(sink)).toEqual(['hello']);
+    expect(sink.edits.length).toBe(0);
   });
 
   it('complete({ footer }): [SILENT] body sends no message at all (footer also absent)', async () => {
@@ -565,28 +481,23 @@ describe('StreamBuffer dual-trigger and degradation', () => {
     expect(sink.edits.length).toBe(0);
   });
 
-  it('regression: empty cursor + overlong text, complete must send all overflow chunks (previously only 1/N)', async () => {
+  it('overlong text is delivered as several messages that reassemble into exactly the original', async () => {
     const sink = makeSink();
-    // Regression: with cursor='', streaming render (acc) equals final render
-    // (acc, no footer), so final was early-exited as "unchanged" and the overflow
-    // chunks were lost forever. This pins that down.
-    const buf = new StreamBuffer(
-      makeOpts({ cursor: '', maxMessageLength: 60, charThreshold: 5 }),
-      sink
-    );
+    // Chunks 2..N used to be emitted on the final flush only, and an "unchanged" early-exit could
+    // drop them entirely. Now each full message is sealed and the next one continues the stream.
+    const buf = new StreamBuffer(makeOpts({ maxMessageLength: 60, charThreshold: 5 }), sink);
     const body = 'x'.repeat(220); // far over 60 → certainly multiple chunks
     buf.push(body);
     await Promise.resolve();
     await Promise.resolve();
     await buf.complete();
-    await Promise.resolve();
+    for (let i = 0; i < 6; i++) await Promise.resolve();
 
-    // Multiple unlabeled sends, fully recoverable (chunks 2..N must not be lost).
+    // Multiple unlabeled messages, fully recoverable.
     expect(sink.sends.length).toBeGreaterThan(1);
     for (const s of sink.sends) expect(parseLabel(s)).toBeNull();
-    const lastEdit = sink.edits.at(-1)?.text;
-    const primaryFinal = lastEdit ?? sink.sends[0]; // primary may be finished by an edit
-    expect([primaryFinal, ...sink.sends.slice(1)].join('')).toBe(body);
+    for (const m of visibleMessages(sink)) expect(m.length).toBeLessThanOrEqual(60);
+    expect(visibleMessages(sink).join('')).toBe(body);
   });
 
   it('complete({ footer }): empty body (never pushed visible text) appends no footer and sends no message', async () => {
@@ -610,11 +521,11 @@ describe('StreamBuffer dual-trigger and degradation', () => {
     expect(sink.edits.length).toBe(0);
   });
 
-  it('complete()\'s final write is not swallowed while a streaming flush is in flight (cursor dropped)', async () => {
+  it("complete()'s final write is not swallowed while a streaming flush is in flight", async () => {
     // Race regression: the first send hangs (manually resolved) to simulate an
     // in-flight flush; complete() is called during its await, then the send is
-    // released. The final write must drop the trailing cursor (not be swallowed
-    // by a re-entrancy guard).
+    // released. The final write must still land (not be swallowed by a
+    // re-entrancy guard).
     let resolveFirstSend: ((ref: MessageRef) => void) | null = null;
     let sendCount = 0;
     let nowVal = 0;
@@ -649,22 +560,22 @@ describe('StreamBuffer dual-trigger and degradation', () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(sends.length).toBe(1);
-    expect(sends[0]).toBe('hello▌'); // streaming write carries the cursor
+    expect(sends[0]).toBe('hello');
 
     // End of turn: a re-entrancy-guarded impl would no-op and drop the final write.
     nowVal = 5000;
-    const done = buf.complete();
+    const done = buf.complete({ footer: 'ftr' });
     // Release the hung first send so the in-flight flush settles and the chain runs final.
     expect(resolveFirstSend).not.toBeNull();
     resolveFirstSend!({ address: { channel: 'c' }, messageId: 'm-first' });
     await done;
     await Promise.resolve();
 
-    // Final write (edit on primary) is the cursor-free body.
+    // Final write lands as an edit on the message the hung send returned.
     const lastEdit = edits[edits.length - 1]!;
     expect(lastEdit).toBeDefined();
-    expect(lastEdit.text).toBe('hello');
-    expect(lastEdit.text).not.toContain(opts.cursor);
+    expect(lastEdit.ref.messageId).toBe('m-first');
+    expect(lastEdit.text).toBe('hello\n\nftr');
   });
 
   it('push() after abort() produces no new send/edit', async () => {
@@ -698,7 +609,7 @@ describe('StreamBuffer dual-trigger and degradation', () => {
 // ============================================================================
 
 describe('StreamBuffer noEdit mode', () => {
-  it('sends nothing during push, complete() emits the accumulated text as a single new send, no cursor, no edit', async () => {
+  it('sends nothing during push, complete() emits the accumulated text as a single new send, no edit', async () => {
     const sink = makeSink();
     const opts = makeOpts({ charThreshold: 2, noEdit: true });
     const buf = new StreamBuffer(opts, sink);
@@ -721,21 +632,18 @@ describe('StreamBuffer noEdit mode', () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    // Finish: accumulated text emitted as a single new message, no edit, no cursor.
+    // Finish: accumulated text emitted as a single new message, no edit.
     expect(sink.sends.length).toBe(1);
     expect(sink.sends[0]).toBe('hello world');
     expect(sink.edits.length).toBe(0);
-    expect(sink.sends[0]).not.toContain(opts.cursor);
   });
 
-  it('with cursor:"" (production setting), complete() still sends — mid-stream no-op flushes must not mark the text as delivered', async () => {
-    // Regression: turn-runner passes cursor:'' — the streaming and final renders are then
-    // IDENTICAL. The degraded mid-stream branch used to advance lastRenderedBody without
-    // sending, so the final flush saw "unchanged" and skipped the whole-send: noEdit
-    // platforms (DingTalk/QQ/LINE/WeCom) never delivered any reply. (The '▌' cursor in the
-    // other tests masked this by making the renders differ.)
+  it('regression: mid-stream no-op flushes must not mark the text as delivered', async () => {
+    // The streaming and final renders are identical here (no footer). An older mid-stream branch
+    // recorded the accumulation as written without sending it, so the final flush saw "unchanged"
+    // and skipped: noEdit platforms (DingTalk/QQ/LINE/WeCom) never delivered any reply at all.
     const sink = makeSink();
-    const opts = makeOpts({ charThreshold: 2, cursor: '', noEdit: true });
+    const opts = makeOpts({ charThreshold: 2, noEdit: true });
     const buf = new StreamBuffer(opts, sink);
 
     buf.push('hello'); // crosses charThreshold → triggers a mid-stream (no-op) flush
@@ -770,11 +678,10 @@ describe('StreamBuffer noEdit mode', () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    // Overlong → multiple sends; each within budget, unlabeled, cursor-free, no edit.
+    // Overlong → multiple sends; each within budget, unlabeled, no edit.
     expect(sink.sends.length).toBeGreaterThan(1);
     for (const s of sink.sends) {
       expect(s.length).toBeLessThanOrEqual(opts.maxMessageLength);
-      expect(s).not.toContain(opts.cursor);
       expect(/^\(\d+\/\d+\) /.test(s)).toBe(false);
     }
     expect(sink.edits.length).toBe(0);
@@ -798,7 +705,7 @@ describe('StreamBuffer noEdit mode', () => {
     expect(sink.edits.length).toBe(0);
   });
 
-  it('noEdit final still appends the footer (at the end of the last message, no cursor, no edit)', async () => {
+  it('noEdit final still appends the footer (at the end of the last message, no edit)', async () => {
     const sink = makeSink();
     const opts = makeOpts({ charThreshold: 2, noEdit: true });
     const buf = new StreamBuffer(opts, sink);
@@ -814,7 +721,6 @@ describe('StreamBuffer noEdit mode', () => {
     expect(sink.sends.length).toBe(1);
     expect(sink.sends[0]).toBe('hello\n\nclaude-opus · ~/repo');
     expect(sink.edits.length).toBe(0);
-    expect(sink.sends[0]).not.toContain(opts.cursor);
   });
 
   it('under noEdit, a [SILENT] body sends no message at all', async () => {

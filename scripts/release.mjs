@@ -24,8 +24,17 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const run = (cmd, args, { inherit = false } = {}) =>
-  execFileSync(cmd, args, { cwd: root, encoding: 'utf8', stdio: inherit ? 'inherit' : 'pipe' });
+const run = (cmd, args, { inherit = false, shell = false } = {}) =>
+  execFileSync(cmd, args, { cwd: root, encoding: 'utf8', shell, stdio: inherit ? 'inherit' : 'pipe' });
+/**
+ * npm, spawned through a shell on Windows and only there.
+ *
+ * `npm` is npm.cmd on Windows, which execFileSync will not run: bare `npm` is ENOENT and `npm.cmd`
+ * is EINVAL (Node refuses to exec a .cmd without a shell — the CVE-2024-27980 hardening). A shell
+ * is the only way, but it is scoped to npm on purpose: git.exe spawns directly, and routing IT
+ * through a shell would re-quote its arguments and mangle the multi-line commit message below.
+ */
+const npm = (args, opts = {}) => run('npm', args, { ...opts, shell: process.platform === 'win32' });
 const die = (msg) => {
   console.error(`release: ${msg}`);
   process.exit(1);
@@ -65,9 +74,16 @@ if (run('git', ['status', '--porcelain']).trim()) die('working tree is dirty —
 if (run('git', ['tag', '--list', `v${version}`]).trim()) die(`tag v${version} already exists`);
 
 // The Unreleased section becomes this version's section, so it has to have something in it.
+//
+// Line endings are taken FROM THE FILE rather than assumed: with `core.autocrlf=true` (the default
+// on a Windows checkout) CHANGELOG.md is stored LF in git and lands CRLF on disk, so an LF-only
+// search for the header found nothing and the release aborted with "no [Unreleased] section" on a
+// file that plainly had one. Writing the new heading with the file's own EOL also keeps the commit
+// from being a whole-file line-ending rewrite.
 const clPath = path.join(root, 'CHANGELOG.md');
 const before = fs.readFileSync(clPath, 'utf8');
-const header = '## [Unreleased]\n\n';
+const eol = before.includes('\r\n') ? '\r\n' : '\n';
+const header = `## [Unreleased]${eol}${eol}`;
 const at = before.indexOf(header);
 if (at < 0) die('CHANGELOG.md has no "## [Unreleased]" section');
 const rest = before.slice(at + header.length);
@@ -81,7 +97,7 @@ if (verify) {
   for (const step of ['typecheck', 'lint', 'test', 'build']) {
     console.log(`release: npm run ${step}`);
     try {
-      run('npm', ['run', step], { inherit: true });
+      npm(['run', step], { inherit: true });
     } catch {
       die(`npm run ${step} failed — nothing was changed`);
     }
@@ -101,8 +117,8 @@ const files = ['CHANGELOG.md', 'package.json', 'package-lock.json'];
 try {
   // `## [Unreleased]` stays where it is, empty, and this version's header goes under it — the
   // shape every previous release commit produced.
-  fs.writeFileSync(clPath, before.slice(0, at + header.length) + `## [${version}] - ${date}\n\n` + rest);
-  run('npm', ['version', version, '--no-git-tag-version']); // package.json + package-lock.json
+  fs.writeFileSync(clPath, before.slice(0, at + header.length) + `## [${version}] - ${date}${eol}${eol}` + rest);
+  npm(['version', version, '--no-git-tag-version']); // package.json + package-lock.json
   run('git', ['commit', '-m', body ? `chore(release): ${version}\n\n${body}\n` : `chore(release): ${version}\n`, '--', ...files]);
   run('git', ['tag', '-a', `v${version}`, '-m', `v${version}`]);
 } catch (err) {

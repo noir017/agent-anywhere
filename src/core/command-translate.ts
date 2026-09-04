@@ -110,6 +110,13 @@ const GENERIC_COMMANDS: Record<string, GenericCommand> = {
     // Probed live against opencode 1.18.18: a turn emits `usage_update {used, size, cost}` exactly
     // as claude's adapter does, so the numbers the footer already shows can answer this with no
     // harness command involved.
+    //
+    // CONDITIONAL, and the condition is not the harness: opencode sends the notification only for a
+    // model whose context window it knows. Re-probed on 1.18.27 — `opencode/big-pickle` reports
+    // `{used, size: 200000}`, while a model from a custom `provider` block with no `limit.context`
+    // reports nothing at all (not a zero window — no notification), and adding `limit.context` to
+    // that model makes it report. The local answer is still right for the harness; the empty case is
+    // a model-config gap, which is why describeContext names the fix instead of saying "not yet".
     local: ['opencode'],
   },
   model: {

@@ -342,8 +342,9 @@ export const ConfigSchema = z
              * `cwd` = working dir.
              *
              * The context fields need the harness to report ACP `usage_update` (claude and
-             * opencode both do); one that doesn't renders no context segment rather than a
-             * guessed number.
+             * opencode both do — opencode only for a model whose context window it knows, so a
+             * custom-provider model needs a `limit.context` in opencode.json); one that doesn't
+             * renders no context segment rather than a guessed number.
              */
             fields: z
               .array(z.enum(['agent', 'model', 'context', 'contextPct', 'cwd']))

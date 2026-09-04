@@ -19,6 +19,25 @@ All notable changes to this project are documented here. The format is based on
   rather than opening the menu. agy exposes no model selector and no way to switch in-process — the
   model is fixed by `--model=` at spawn — so a menu there could only offer a switch it cannot make.
 
+### Fixed
+
+- **`/context` no longer promises numbers that are never coming.** A harness reports context only as
+  ACP `usage_update`, and opencode sends one only for a model whose context window it knows. A model
+  declared in a custom `provider` block with no `limit.context` therefore reports nothing at all —
+  not a zero window, no notification — so the footer's context segment stayed absent and `/context`
+  answered "No context numbers yet — they arrive with the first reply. Send a message, then
+  /context." forever, sending the user in a circle. That sentence is still right before the first
+  turn; after one has finished, `/context` now says the numbers were not reported and, on opencode,
+  names the fix (a `limit` block on that model in `opencode.json`). Verified on opencode 1.18.27 in
+  the same session: `opencode/big-pickle` reports `{used, size: 200000}`, a custom-provider model
+  reports nothing, and adding `limit.context` to it makes the numbers appear.
+
+- **`/new` and an agent rebind now clear the context snapshot they invalidate.** `/context` reads
+  the last `usage_update` and labels it with the currently bound agent, but the snapshot outlived
+  both resets — so after `/new` it reported the size of the context that reset had just destroyed,
+  and after `/oc` it showed claude's numbers under opencode's name. Both now forget it, which puts
+  the pair back in the honest empty state until the new context reports its own.
+
 ## [0.8.0] - 2026-09-04
 
 ### Added

@@ -14,6 +14,9 @@ import type { InboundMessage } from '../types.js';
  * supported". Probed live against opencode 1.18.18, both are there — a `usage_update {used, size}`
  * on every turn, and a `model` select with its full model list — so the gateway answers them.
  *
+ * "Every turn" holds only for a model whose window opencode knows; a custom-provider model with no
+ * `limit.context` reports none, ever. That empty case has its own answer, and its own test below.
+ *
  * The negatives matter as much as the answers: neither may reach the agent as a prompt.
  */
 
@@ -128,6 +131,39 @@ describe('/context answered by the gateway', () => {
 
   it('says the numbers have not arrived yet rather than inventing a window', async () => {
     const { send, replies } = rig(); // agent never reports usage
+    await send('/context');
+    expect(replies().at(-1)).toContain('No context numbers yet');
+  });
+
+  // The same empty state, one turn later, means the opposite thing. opencode emits usage_update only
+  // for a model whose window it knows, so on a custom-provider model with no `limit.context` the
+  // numbers never arrive — and "send a message, then /context" sent the user in a circle.
+  it('stops promising numbers once a turn has finished without reporting any', async () => {
+    const { send, replies } = rig(); // agent never reports usage
+    await send('hello');
+    await send('/context');
+    const answer = replies().at(-1)!;
+    expect(answer).toContain('not reported');
+    expect(answer).not.toContain('No context numbers yet');
+    expect(answer).toContain('opencode.json'); // the default agent here is opencode: name the fix
+  });
+
+  it('forgets the snapshot on /new, which is what just invalidated it', async () => {
+    const { send, replies } = rig({ usage: { used: 13942, size: 200_000 } });
+    await send('hello');
+    await send('/context');
+    expect(replies().at(-1)).toContain('14k / 200k (7%)');
+
+    await send('/new');
+    await send('/context');
+    // Not the pre-reset number, and not "not reported" either: nothing has run since the reset.
+    expect(replies().at(-1)).toContain('No context numbers yet');
+  });
+
+  it('forgets the snapshot on a rebind, so one agent never wears another\'s numbers', async () => {
+    const { send, replies } = rig({ usage: { used: 13942, size: 200_000 } });
+    await send('/cc hello'); // claude answers and reports usage
+    await send('/oc'); // bare agent command: rebinds to opencode without running a turn
     await send('/context');
     expect(replies().at(-1)).toContain('No context numbers yet');
   });

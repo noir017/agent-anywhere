@@ -128,6 +128,15 @@ interface ConversationState {
    * this the answer would have to guess a window size — the one thing the footer refuses to do.
    */
   lastUsage?: AgentUsage;
+  /**
+   * Whether a turn has ended normally under the CURRENT binding since the last reset.
+   *
+   * Only `/context` reads it, and only to choose between two different empty answers: before the
+   * first turn the numbers are merely late, while after one they are not coming at all (the harness
+   * reports usage only for a model whose context window it knows). Cleared wherever `lastUsage` is,
+   * so the pair always describes the same agent and the same context.
+   */
+  turnCompleted?: boolean;
 }
 
 /**
@@ -227,6 +236,10 @@ export class ConversationRegistry {
         recordUsage: (id, usage) => {
           const state = this.conversations.get(id);
           if (state) state.lastUsage = usage;
+        },
+        recordTurnComplete: (id) => {
+          const state = this.conversations.get(id);
+          if (state) state.turnCompleted = true;
         },
         // During an active turn the state must exist, but handle absence robustly anyway.
         setActiveAddress: (id, address, platformId) => {
@@ -589,6 +602,10 @@ export class ConversationRegistry {
     // The model override belonged to the previous agent's model list; carrying it over would hand
     // the new harness a name it may not know.
     state.modelOverride = undefined;
+    // Same reasoning for the context snapshot, and it matters more: `/context` labels the numbers
+    // with the bound agent's name, so keeping the outgoing agent's usage would attribute one
+    // harness's context to another. The incoming agent reports its own on its next turn.
+    this.forgetUsage(state);
     this.store?.bind(key, agentId);
     const name = agentDisplayName(findAgent(this.config, agentId), agentId);
     const resuming = this.store?.agentSession(key, agentId) != null;
@@ -797,12 +814,43 @@ export class ConversationRegistry {
     }
   }
 
-  /** `/context`: the last usage snapshot, rendered exactly as the footer renders it. */
+  /** Drop this conversation's context snapshot; the pair moves together or the answer lies. */
+  private forgetUsage(state: ConversationState): void {
+    state.lastUsage = undefined;
+    state.turnCompleted = false;
+  }
+
+  /**
+   * `/context`: the last usage snapshot, rendered exactly as the footer renders it.
+   *
+   * The two EMPTY answers are deliberately different sentences, and that is most of what this
+   * function is for. Context reaches the gateway only as ACP `usage_update`, and a harness sends one
+   * only for a model whose window it knows — so silence before the first turn means the numbers are
+   * late, while silence after one means they are not coming.
+   *
+   * Probed on opencode 1.18.27, same container and same session: `opencode/big-pickle` reports
+   * `{used, size: 200000}`, a model from a custom provider reports NOTHING (not a zero window — no
+   * notification at all), and giving that model a `limit.context` in opencode.json makes the numbers
+   * appear. So the second answer names the fix instead of repeating "send a message, then /context",
+   * which was the one thing that could never help.
+   */
   private describeContext(state: ConversationState): string {
     const def = findAgent(this.config, state.agentId);
+    const name = agentDisplayName(def, state.agentId);
     const usage = state.lastUsage;
     if (!usage) {
-      return 'No context numbers yet — they arrive with the first reply. Send a message, then /context.';
+      if (!state.turnCompleted) {
+        return 'No context numbers yet — they arrive with the first reply. Send a message, then /context.';
+      }
+      const fix =
+        def?.harness === 'opencode'
+          ? ' On opencode that means a model from a custom provider: give it a `limit` block in opencode.json (e.g. `"limit": { "context": 128000 }`) and the numbers appear.'
+          : '';
+      return (
+        `Context: not reported. ${name} finished a turn without sending any usage numbers, and ` +
+        `another message will not change that — a harness reports context only for a model whose ` +
+        `window it knows.${fix}`
+      );
     }
     const line = formatRuntimeFooter(
       { contextTokens: usage.used, contextLength: usage.size },
@@ -810,7 +858,7 @@ export class ConversationRegistry {
     );
     const left = Math.max(0, usage.size - usage.used);
     return `Context: ${line}
-${formatTokens(left)} left before compaction — ${agentDisplayName(def, state.agentId)}`;
+${formatTokens(left)} left before compaction — ${name}`;
   }
 
   /**
@@ -1043,6 +1091,9 @@ ${formatTokens(left)} left before compaction — ${agentDisplayName(def, state.a
     const state = this.conversations.get(id);
     if (state) {
       state.headerSent = false;
+      // The context this snapshot measured is exactly what was just destroyed; reporting it back
+      // would make /context contradict the reset the user just asked for.
+      this.forgetUsage(state);
       // Re-record the binding: clear() dropped the whole entry, but the conversation is still
       // answered by this agent — only its history is gone.
       this.store?.bind(id, state.agentId);

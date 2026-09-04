@@ -47,6 +47,18 @@ export interface TurnRunnerDeps {
    * writer: the harness's own `usage_update`, never a guess.
    */
   recordUsage?(id: ConversationId, usage: AgentUsage): void;
+  /**
+   * Record that a turn ran to completion here.
+   *
+   * `/context` has to tell two empty states apart, because they call for opposite advice: nothing has
+   * run yet (send a message and ask again), versus the harness ran and reported no `usage_update` at
+   * all — which for a given harness+model is permanent, so asking again is the one thing that cannot
+   * help. Without this flag both read as "no numbers yet".
+   *
+   * Only a turn that ENDED NORMALLY counts: an interrupted turn may simply not have reached its
+   * usage snapshot, and a failed one never got near it.
+   */
+  recordTurnComplete?(id: ConversationId): void;
 }
 
 /**
@@ -207,6 +219,10 @@ export class TurnRunner {
         if (isCommandTurn && !ref.producedOutput) {
           await this.sendCommandFallback(platform, address, lastContent);
         }
+        // Normal end: whatever usage this harness was going to report, it has reported. Recorded
+        // only here (not in `finally`) so an interrupted or failed turn doesn't claim the harness
+        // stayed silent — see recordTurnComplete.
+        this.deps.recordTurnComplete?.(conversationId);
         console.log(`[turn] ${conversationId} turn complete`);
       }
     } catch (err) {

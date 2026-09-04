@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-04
+
 ### Changed
 
 - **A channel entry now covers that channel's topics** — in `chat.channels`,

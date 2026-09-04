@@ -5,6 +5,16 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **`agent-anywhere --version` reports the version that is actually installed.** It was a string
+  literal and had been wrong for four minor releases — a 0.11.0 install answered `0.2.0`. That is
+  worse than having no flag, because it is the first thing you check when a deployment misbehaves:
+  it sent an investigation of a live daemon looking for a stale install that did not exist. The
+  uniagent image had already worked around it by asserting on the installed `package.json` instead,
+  with a comment noting that `--version` "will always pass". Now read at runtime, correct both as
+  `dist/cli.js` and under `tsx src/cli.ts`.
+
 ## [1.0.0] - 2026-09-05
 
 ### Fixed

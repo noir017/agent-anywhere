@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-09-05
+
 ### Changed
 
 - **Replies are no longer streamed by default.** A reply now arrives as a whole message once each

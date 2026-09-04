@@ -7,7 +7,7 @@
  */
 
 import type { InboundMessage } from '../types.js';
-import { addressOf, formatAddress } from './conversation.js';
+import { addressListed, addressOf } from './conversation.js';
 
 /** Gating config (mirrors config.inbound.gating). */
 export interface GateConfig {
@@ -18,8 +18,9 @@ export interface GateConfig {
   /** Responding to other bots: none / mentions (only when @-ed) / all. */
   allowBots: 'none' | 'mentions' | 'all';
   /**
-   * Allowlist: these channels trigger without a mention. Matched against the textual address, so
-   * an operator may name a whole chat (`123`) or one topic in it (`123/7353`).
+   * Allowlist: these channels trigger without a mention. Matched with `addressSelects`, so an
+   * operator may name a whole chat (`123`, which covers its topics too) or one topic in it
+   * (`123/7353`).
    */
   freeResponseChannels: string[];
   /** Blocklist: these channels are fully ignored. Same address matching as freeResponseChannels. */
@@ -71,10 +72,13 @@ export function shouldRespond(
     return { respond: false, reason: 'empty' };
   }
 
-  const where = formatAddress(addressOf(msg.conversation));
+  const address = addressOf(msg.conversation);
 
   // 1) Blocklisted channel: highest priority among the real gates, ignore outright.
-  if (cfg.ignoredChannels.includes(where)) {
+  // Matched with addressListed, not `includes`: a bare chat entry has to cover the chat's
+  // topics, or a Feishu topic-mode group (a new topic id per root message) could not be
+  // blocked at all — see addressSelects.
+  if (addressListed(cfg.ignoredChannels, address)) {
     return { respond: false, reason: 'ignored-channel' };
   }
 
@@ -97,8 +101,10 @@ export function shouldRespond(
       : { respond: false, reason: 'dm-disabled' };
   }
 
-  // 4) Free-response channel: allowlisted, respond without a mention.
-  if (cfg.freeResponseChannels.includes(where)) {
+  // 4) Free-response channel: allowlisted, respond without a mention. Same chat-covers-its-
+  // topics matching as the blocklist above — in a topic-mode group EVERY message carries a
+  // lane, so an exact-match list could never exempt one.
+  if (addressListed(cfg.freeResponseChannels, address)) {
     return { respond: true, reason: 'free-response' };
   }
 

@@ -20,7 +20,7 @@ import type {
   SlashCommandSpec,
 } from '../types.js';
 import type { ConversationAddress, ConversationRef } from '../core/conversation.js';
-import { addressOf, describeConversation, formatAddress } from '../core/conversation.js';
+import { addressListed, addressOf, describeConversation, formatAddress } from '../core/conversation.js';
 import type { PlatformAdapter } from './adapter.js';
 import type { PlatformProfile } from './profile.js';
 import { installProxy } from '../core/proxy.js';
@@ -43,13 +43,18 @@ export async function createSatoriAdapter(
   profile: PlatformProfile,
   instance: PlatformInstance
 ): Promise<PlatformAdapter> {
-  // Channel allowlist (empty = allow all). Matched against the textual address form, so an
-  // operator can allowlist either a whole chat (`5865716608`) or one topic in it
-  // (`5865716608/7353`) — a whole-chat entry deliberately does NOT admit its topics, since
-  // each topic is its own conversation.
-  const allow = new Set(instance.chat.channels);
+  // Channel allowlist (empty = allow all). Matched with addressSelects, so an operator can
+  // allowlist a whole chat (`5865716608`, its topics included) or one topic in it
+  // (`5865716608/7353`).
+  //
+  // ⚠️ A whole-chat entry USED to exclude the chat's topics, deliberately, on the grounds that
+  // each topic is its own conversation. In a Feishu topic-mode group that made the entry match
+  // nothing at all — every message there carries a fresh topic lane — so the bot went silent in
+  // the very chat the operator had just allowlisted, with only the (debug-level) drop to show
+  // for it. See addressSelects in core/conversation.ts.
+  const allow = instance.chat.channels;
   const channelAllowed = (ref: ConversationRef): boolean =>
-    allow.size === 0 || allow.has(formatAddress(addressOf(ref)));
+    allow.length === 0 || addressListed(allow, addressOf(ref));
 
   /**
    * Guard for the Satori-GENERIC outbound paths: they hand the channel straight to `bot.*`,

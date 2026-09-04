@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { createSatoriAdapter } from './satori-core.js';
 import type { PlatformProfile } from './profile.js';
 import type { PlatformInstance } from './config-schemas.js';
+import { h } from '@satorijs/core';
 import type { Bot, Context, Session } from '@satorijs/core';
 
 /**
@@ -33,11 +34,16 @@ interface Seen {
  * Build an adapter over a stub profile. `lane` decides whether resolveConversation reports a
  * sub-lane, so one harness covers both a topic-carrying platform and a plain one.
  */
-async function build(opts: { lane?: string; profileSendFile?: boolean } = {}): Promise<{
+async function build(
+  opts: { lane?: string; profileSendFile?: boolean; channels?: string[] } = {}
+): Promise<{
   adapter: Awaited<ReturnType<typeof createSatoriAdapter>>;
   seen: Seen;
+  /** The adapter's own Context, captured in install(), so a test can emit an inbound session. */
+  ctx: Context;
 }> {
   const seen: Seen = { deleted: [], history: [], sent: [], profileFile: [] };
+  let captured: Context | undefined;
 
   const bot = {
     platform: 'stub',
@@ -71,6 +77,7 @@ async function build(opts: { lane?: string; profileSendFile?: boolean } = {}): P
     // Push our fake bot so getBot() resolves without a real connection.
     install(ctx: Context) {
       ctx.bots.push(bot as never);
+      captured = ctx;
     },
     detectMention: () => false,
     resolveConversation: (session: Session) => ({
@@ -92,10 +99,18 @@ async function build(opts: { lane?: string; profileSendFile?: boolean } = {}): P
   const instance = {
     id: 'stub1',
     type: 'stub',
-    chat: { channels: [], requireMention: true, freeResponseChannels: [], ignoredChannels: [], allowBots: 'none' },
+    chat: {
+      channels: opts.channels ?? [],
+      requireMention: true,
+      freeResponseChannels: [],
+      ignoredChannels: [],
+      allowBots: 'none',
+    },
   } as unknown as PlatformInstance;
 
-  return { adapter: await createSatoriAdapter(profile, instance), seen };
+  const adapter = await createSatoriAdapter(profile, instance);
+  // install() has run by now, so the context is captured.
+  return { adapter, seen, ctx: captured! };
 }
 
 describe('generic outbound paths address the channel', () => {
@@ -163,5 +178,54 @@ describe('a reported lane with no override fails loudly', () => {
     const { adapter, seen } = await build();
     await adapter.sendMessage({ channel: 'C123' }, 'hi');
     expect(seen.sent).toEqual([{ channelId: 'C123' }]);
+  });
+});
+
+/**
+ * The listen allowlist (`chat.channels`).
+ *
+ * A whole-chat entry has to admit the chat's topics. It did not, deliberately, until a Feishu
+ * topic-mode group showed what that costs: there EVERY message carries a freshly minted topic
+ * lane, so the chat id — the only thing an operator can write down — matched nothing, and the
+ * bot went silent in the chat it had just been allowlisted for.
+ */
+describe('chat.channels allowlist', () => {
+  /** Emit a minimal inbound session through the adapter's own context. */
+  async function inboundFrom(opts: { channels?: string[]; lane?: string }): Promise<number> {
+    const { adapter, ctx } = await build({ ...opts, profileSendFile: true });
+    let received = 0;
+    adapter.onMessage(() => {
+      received += 1;
+    });
+    const session = {
+      platform: 'stub',
+      selfId: 'self',
+      userId: 'u1',
+      channelId: 'oc_chat',
+      messageId: 'm1',
+      content: 'hi',
+      timestamp: 1,
+      elements: [h.text('hi')],
+    } as unknown as Session;
+    ctx.emit('message', session);
+    return received;
+  }
+
+  it('an entry naming the chat admits a message from one of its topics', async () => {
+    expect(await inboundFrom({ channels: ['oc_chat'], lane: 'omt_1' })).toBe(1);
+  });
+
+  it('an entry naming a different chat still drops it', async () => {
+    expect(await inboundFrom({ channels: ['oc_other'], lane: 'omt_1' })).toBe(0);
+  });
+
+  it('an empty list admits everything, lane or not', async () => {
+    expect(await inboundFrom({ lane: 'omt_1' })).toBe(1);
+    expect(await inboundFrom({})).toBe(1);
+  });
+
+  it('a topic-level entry admits that topic and not the chat root', async () => {
+    expect(await inboundFrom({ channels: ['oc_chat/omt_1'], lane: 'omt_1' })).toBe(1);
+    expect(await inboundFrom({ channels: ['oc_chat/omt_1'] })).toBe(0);
   });
 });

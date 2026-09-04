@@ -71,6 +71,13 @@ Gating config is **split in two on purpose**:
 `ConversationRegistry.gateFor(platformId)` assembles both into one `GateConfig`, per platform
 instance. An unknown instance id falls back to "mention required" — the safe default.
 
+Both channel lists are matched with `addressSelects` (`conversation.ts`), not string equality:
+an entry naming a chat covers the chat **and its topics**, while `<chat>/<thread>` names one
+lane. That is the same rule routing's `when.channelId` has always used, and it is not a
+convenience — in a Feishu topic-mode group every message carries a freshly minted topic lane, so
+under exact matching the chat id (the only thing an operator can write down) matched nothing:
+`channels` silenced the bot in the allowlisted chat, and neither list could reach it.
+
 `GateContext.hasActiveSession` is a proxy for "the bot is already participating in this
 thread". The caller must read it **before** creating a merger, or it is always true once
 a session exists and the thread-participation exemption is distorted. That ordering

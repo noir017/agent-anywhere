@@ -116,6 +116,35 @@ export function parseAddress(s: string): ConversationAddress {
 }
 
 /**
+ * Whether one config entry (a textual address an operator wrote) selects `a`.
+ *
+ * Two forms, and the second is the one that had to change: `<chat>/<thread>` names exactly
+ * one lane, and a bare `<chat>` names the chat AND every lane inside it.
+ *
+ * ⚠️ A bare chat entry used to match the chat ROOT ONLY, on the reasoning that each topic is
+ * its own conversation. That reasoning holds for identity and breaks for these lists. A
+ * Telegram forum has a handful of long-lived topic ids an operator can enumerate; a Feishu
+ * **topic-mode group** (话题模式群) mints a fresh `omt_…` for every root message, so no entry
+ * an operator can write would ever match — `channels: [oc_xxx]` silenced the bot in the whole
+ * group, `freeResponseChannels` could not exempt it, and `ignoredChannels` could not block it,
+ * all three without a word in the log. It also disagreed with routing, whose `when.channelId`
+ * has always covered a channel's topics (see routing.ts).
+ *
+ * The trade, stated plainly: "the chat root but not its topics" is no longer expressible.
+ * Nothing asked for it, and the previous spelling of it was a trap.
+ */
+export function addressSelects(entry: string, a: ConversationAddress): boolean {
+  if (entry === formatAddress(a)) return true;
+  // A lane message additionally answers to its chat; a root message has already been compared.
+  return a.thread != null && a.thread !== '' && entry === a.channel;
+}
+
+/** Whether any entry of a config list selects `a`. Lists are a handful of entries, so linear is fine. */
+export function addressListed(list: readonly string[], a: ConversationAddress): boolean {
+  return list.some((entry) => addressSelects(entry, a));
+}
+
+/**
  * Field separator for conversation keys. `#` is not `/` (the address separator) on
  * purpose: a key is not an address and must never be parsed as one. Keys are opaque
  * map/JSON keys — nothing in the codebase parses them back.

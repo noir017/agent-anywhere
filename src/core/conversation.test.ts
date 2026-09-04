@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
+  addressListed,
   addressOf,
+  addressSelects,
   conversationKey,
   describeConversation,
   formatAddress,
@@ -132,5 +134,45 @@ describe('describeConversation', () => {
     expect(describeConversation(ref({ platform: 'telegram-bot', thread: '7353' }))).toBe(
       'telegram-bot #5865716608/7353'
     );
+  });
+});
+
+describe('addressSelects / addressListed', () => {
+  const root = { channel: 'oc_chat' };
+  const topic = { channel: 'oc_chat', thread: 'omt_1' };
+
+  it('an exact entry selects that address', () => {
+    expect(addressSelects('oc_chat', root)).toBe(true);
+    expect(addressSelects('oc_chat/omt_1', topic)).toBe(true);
+  });
+
+  it('a bare chat entry ALSO selects the chat\'s topics', () => {
+    // The regression this exists for: a Feishu topic-mode group mints a new topic id per root
+    // message, so an operator can only ever name the chat — an exact-match list matched nothing
+    // there and silenced the bot in the chat it had just been pointed at.
+    expect(addressSelects('oc_chat', topic)).toBe(true);
+  });
+
+  it('a topic entry does NOT select the chat root or a sibling topic', () => {
+    expect(addressSelects('oc_chat/omt_1', root)).toBe(false);
+    expect(addressSelects('oc_chat/omt_1', { channel: 'oc_chat', thread: 'omt_2' })).toBe(false);
+  });
+
+  it('another chat is never selected, lane or no lane', () => {
+    expect(addressSelects('oc_other', topic)).toBe(false);
+    expect(addressSelects('oc_other/omt_1', topic)).toBe(false);
+  });
+
+  it('a chat id that merely PREFIXES another is not a match (no prefix matching)', () => {
+    // Guard against implementing this with startsWith: Telegram ids in particular nest
+    // (-100123 vs -1001234), and Slack thread_ts look like decimals.
+    expect(addressSelects('oc_cha', topic)).toBe(false);
+    expect(addressSelects('-100123', { channel: '-1001234', thread: '7' })).toBe(false);
+  });
+
+  it('addressListed is the any-of over the list; empty list matches nothing', () => {
+    expect(addressListed([], topic)).toBe(false);
+    expect(addressListed(['x', 'oc_chat'], topic)).toBe(true);
+    expect(addressListed(['x', 'y'], topic)).toBe(false);
   });
 });

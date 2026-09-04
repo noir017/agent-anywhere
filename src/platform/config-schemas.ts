@@ -24,13 +24,21 @@ import { z } from 'zod';
  */
 export const ChatGateSchema = z
   .object({
-    /** Listen-channel allowlist; empty = all channels. */
+    /**
+     * Listen-channel allowlist; empty = all channels.
+     *
+     * All three channel lists here take the textual address form (`core/conversation.ts`):
+     * `<chat>` names a chat AND every topic/thread inside it, `<chat>/<thread>` names one lane.
+     * Matched by `addressSelects`, whose doc block records why a bare chat entry has to include
+     * its lanes — a Feishu topic-mode group mints a topic id per message, so exact matching made
+     * all three lists unusable there.
+     */
     channels: z.array(z.string()).default([]),
     /** Whether group/guild channels require an @mention to respond. */
     requireMention: z.boolean().default(true),
-    /** Channels that respond without a mention. */
+    /** Channels that respond without a mention (same address form as `channels`). */
     freeResponseChannels: z.array(z.string()).default([]),
-    /** Channels that are fully ignored. */
+    /** Channels that are fully ignored (same address form as `channels`). */
     ignoredChannels: z.array(z.string()).default([]),
     /** Responding to other bots: none / mentions (only when @-ed) / all. */
     allowBots: z.enum(['none', 'mentions', 'all']).default('none'),

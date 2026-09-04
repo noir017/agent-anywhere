@@ -5,6 +5,23 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **A channel entry now covers that channel's topics** — in `chat.channels`,
+  `freeResponseChannels` and `ignoredChannels` alike. All three matched the textual address
+  exactly, and a whole-chat entry deliberately excluded the chat's lanes on the grounds that each
+  topic is its own conversation. That reasoning is right about identity and wrong about these
+  lists, which a Feishu **topic-mode group** (话题模式群) makes unmissable: there a topic id is
+  minted per root message, so the chat id — the only thing an operator can write down — matched
+  nothing at all. `channels: [oc_xxx]` silenced the bot in the very chat it had just been pointed
+  at, `freeResponseChannels` could not exempt it from the @mention rule, and `ignoredChannels`
+  could not block it; all three failed by doing nothing, which is the hardest failure to read.
+  It also disagreed with routing, where `when.channelId` has always covered a channel's topics.
+
+  `<chat>/<thread>` still names exactly one lane, and nothing else changed. What is no longer
+  expressible is "the chat root but not its topics" — nobody asked for it, and the previous
+  spelling of it was a trap.
+
 ## [0.9.0] - 2026-09-04
 
 ### Added

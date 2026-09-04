@@ -254,3 +254,45 @@ describe('shouldRespond · empty message', () => {
     expect(shouldRespond(makeMsg({ isDirect: true }), makeCfg(), makeCtx()).respond).toBe(true);
   });
 });
+
+/**
+ * Topic-mode groups (Feishu 话题模式群): every message carries a lane, and the lane id is minted
+ * per root message — so the only entry an operator can write is the chat id. Both lists have to
+ * honour it, or the config silently does nothing at all.
+ */
+describe('shouldRespond · a chat-level entry covers the chat\'s topics', () => {
+  it('freeResponseChannels naming the chat exempts a message in one of its topics', () => {
+    const d = shouldRespond(
+      makeMsg({ channelId: 'oc_chat', thread: 'omt_1', isThread: true }),
+      makeCfg({ freeResponseChannels: ['oc_chat'] }),
+      makeCtx()
+    );
+    expect(d).toEqual({ respond: true, reason: 'free-response' });
+  });
+
+  it('ignoredChannels naming the chat blocks a message in one of its topics', () => {
+    const d = shouldRespond(
+      makeMsg({ channelId: 'oc_chat', thread: 'omt_1', isThread: true, mentionedSelf: true }),
+      makeCfg({ ignoredChannels: ['oc_chat'] }),
+      makeCtx()
+    );
+    expect(d).toEqual({ respond: false, reason: 'ignored-channel' });
+  });
+
+  it('a topic-level entry still targets only that topic', () => {
+    const cfg = makeCfg({ freeResponseChannels: ['oc_chat/omt_1'] });
+    const inTopic = shouldRespond(
+      makeMsg({ channelId: 'oc_chat', thread: 'omt_1', isThread: true }),
+      cfg,
+      makeCtx()
+    );
+    const inSibling = shouldRespond(
+      makeMsg({ channelId: 'oc_chat', thread: 'omt_2', isThread: true }),
+      cfg,
+      makeCtx()
+    );
+    expect(inTopic.reason).toBe('free-response');
+    // Not exempted: no mention, no active session in this topic.
+    expect(inSibling).toEqual({ respond: false, reason: 'no-mention' });
+  });
+});

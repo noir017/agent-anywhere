@@ -178,6 +178,30 @@ export interface PlatformProfile<P extends PlatformConfig = PlatformConfig> {
    * never overflows the platform after rendering. Absent ⇒ identity (text.length), correct for any
    * platform that sends the raw text unchanged. */
   measureRendered?(text: string): number;
+  /**
+   * Inbound attachment fetch override: for a platform whose media elements are NOT public URLs.
+   *
+   * The daemon's generic downloader speaks http(s) and nothing else (deliberately — every hop of
+   * an inbound, user-controlled URL is SSRF-checked there). adapter-lark hands out
+   * `internal:lark/<selfId>/im/v1/messages/<id>/resources/<key>` instead, an address only the bot
+   * itself can resolve, so a Feishu image or file reached the agent as
+   * "[Attachment … failed to download]" and nothing else. A profile implements this to fetch such
+   * a URL through its own authenticated client.
+   *
+   * Returns `undefined` when the URL is not one this profile owns, so the caller falls through to
+   * the generic HTTP path — a platform that mixes public CDN links with private ones needs no
+   * branch of its own.
+   *
+   * `name`/`mime` are returned because the platforms that need this hook are exactly the ones
+   * whose elements carry neither: Feishu images arrive with no filename at all, and the adapter's
+   * binary route drops the response headers. The ingest layer prefers what the element declared
+   * and falls back to these.
+   */
+  fetchAttachment?(
+    bot: Bot,
+    url: string
+  ): Promise<{ bytes: Uint8Array; mime?: string; name?: string } | undefined>;
+
   /** Reaction override: when the adapter doesn't wrap generic bot.createReaction, the profile
    *  implements it via internal. emoji is unicode (e.g. 👀/✅/❌); the profile maps it to the
    *  platform-accepted form and safely skips unsupported ones (may throw; upper safeReaction

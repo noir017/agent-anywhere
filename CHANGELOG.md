@@ -22,6 +22,50 @@ All notable changes to this project are documented here. The format is based on
   expressible is "the chat root but not its topics" — nobody asked for it, and the previous
   spelling of it was a trap.
 
+### Fixed
+
+- **A Feishu rich-text message is no longer ignored outright.** adapter-lark's decode handles
+  `text/image/audio/media/file` and lets everything else fall off the end of the switch, so a
+  `msg_type: 'post'` — what a Feishu client sends whenever the message mixes formatting or embeds
+  an image — reached the gateway with empty content and was dropped by the inbound gate as
+  `empty`. From the chat it looked like the bot ignoring a message that had just @-mentioned it,
+  and there was nothing in the log to contradict that reading.
+
+  The profile now rebuilds the content in the same `internal/session` hook that already learns
+  topic reply anchors, and two parts of that are load-bearing rather than tidy. A post's `at`
+  carries a placeholder (`@_user_1`) with the real `open_id` in the message's `mentions` array, so
+  passing it through verbatim would have left mention detection permanently blind in rich text —
+  the message would still be dropped in any group that requires a mention. And embedded images
+  are addressed exactly like a standalone image message, so they download through the same route
+  as everything else, names included. `sticker`, `share_chat` and `merge_forward` are still
+  empty, now on purpose and with the reason recorded: Feishu's resource API excludes 表情包, and a
+  forwarded bundle needs another API call to read.
+
+- **A Feishu image or file now reaches the agent instead of a "failed to download" line.**
+  adapter-lark decodes inbound media into `internal:lark/<selfId>/im/v1/messages/…/resources/…`,
+  satori's internal-URL form, which nothing but the bot can resolve — while the daemon's
+  downloader speaks http(s) only, deliberately, because it re-validates every hop of a
+  user-controlled URL against SSRF. So every attachment anyone sent the bot on Feishu was
+  swallowed by that guard and reported as a network flake. Lark is the only one of the eight
+  adapters that does this (the other seven emit public https links), and now the only one with a
+  `fetchAttachment` override: a profile gets first refusal on each URL and fetches its own
+  through the authenticated client, returning `undefined` for anything it does not own.
+
+  The SSRF model is unchanged — those requests go to the endpoint the operator configured, with
+  the bot's own token, and the only user-controlled part is a path segment, validated against
+  Feishu's id alphabet so a crafted event cannot address a different endpoint. The size cap still
+  applies, enforced after the fetch because that route reports no `content-length` to pre-check.
+
+  Two things had to be recovered along the way, because a Feishu attachment declares neither a
+  name nor a mime type anywhere the adapter surfaces. The filename comes from the raw event body
+  (a `file` message states it; the profile caches it by `file_key` in the same `internal/session`
+  hook that already learns topic reply anchors), and for an image — which has no name at all —
+  the extension and mime are sniffed from the leading bytes, since the adapter's binary route
+  discards the response headers. Without an extension the agent receives a blob it cannot open,
+  and guessing `.jpg` for a png is worse than looking. A text file sent on Feishu is now inlined
+  into the prompt like anywhere else, because the readable-text decision is re-taken once the
+  name is known.
+
 ## [0.9.0] - 2026-09-04
 
 ### Added

@@ -69,6 +69,13 @@ export interface PlatformAdapter {
     opts: { limit?: number; before?: string }
   ): Promise<InboundMessage[]>;
 
+  /**
+   * Fetch an inbound attachment the generic HTTP downloader cannot reach (Lark's
+   * `internal:` resource URLs). Absent on platforms whose media elements are public URLs;
+   * `undefined` from the call itself means "not my URL, use HTTP". See PlatformProfile.fetchAttachment.
+   */
+  fetchAttachment?(url: string): Promise<{ bytes: Uint8Array; mime?: string; name?: string } | undefined>;
+
   /** Register the inbound callback, attached when daemon starts. */
   onMessage(handler: (msg: InboundMessage) => void): void;
 

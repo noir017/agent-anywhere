@@ -7,6 +7,10 @@ import {
   larkReceiveIdType,
   rememberBounded,
   createLarkProfile,
+  parseLarkResourceUrl,
+  sniffLarkMedia,
+  extractResourceNames,
+  larkPostElements,
 } from './lark.js';
 
 // ── Fake bot for delivery-contract tests ──────────────────────────────────────
@@ -312,5 +316,216 @@ describe('lark editButtons (card patched in place)', () => {
     await profile.editButtons!(bot, { address: { channel: 'oc_1' }, messageId: 'om_42' }, 'done', []);
     const card = JSON.parse(calls.patch[0]!.content) as { body: { elements: unknown[] } };
     expect(card.body.elements).toHaveLength(1);
+  });
+});
+
+/**
+ * Inbound attachment plumbing.
+ *
+ * adapter-lark is the only adapter here that decodes media into an `internal:` URL — an address
+ * nothing but the bot can resolve — so before fetchAttachment every Feishu image and file reached
+ * the agent as "[Attachment … failed to download]". These pin the three pure pieces it rests on.
+ */
+describe('parseLarkResourceUrl', () => {
+  it('parses the two URL shapes the adapter mints', () => {
+    expect(parseLarkResourceUrl('internal:lark/cli_x/im/v1/messages/om_1/resources/img_v2_ab-cd?type=image')).toEqual({
+      messageId: 'om_1',
+      fileKey: 'img_v2_ab-cd',
+      type: 'image',
+    });
+    expect(parseLarkResourceUrl('internal:lark/cli_x/im/v1/messages/om_2/resources/file_v2_zz?type=file')).toEqual({
+      messageId: 'om_2',
+      fileKey: 'file_v2_zz',
+      type: 'file',
+    });
+  });
+
+  it('returns null for a URL this profile does not own (the HTTP path keeps it)', () => {
+    expect(parseLarkResourceUrl('https://cdn.example.com/a.png')).toBeNull();
+    expect(parseLarkResourceUrl('internal:telegram/bot/x')).toBeNull();
+  });
+
+  it('rejects a missing or unexpected type (Feishu requires image|file)', () => {
+    expect(parseLarkResourceUrl('internal:lark/cli_x/im/v1/messages/om_1/resources/k')).toBeNull();
+    expect(parseLarkResourceUrl('internal:lark/cli_x/im/v1/messages/om_1/resources/k?type=sticker')).toBeNull();
+  });
+
+  it('rejects ids outside Feishu\'s alphabet, so nothing can be spliced into the request path', () => {
+    // Both ids come off a user-sent event and end up in a request path; a dot, a slash or an
+    // escape would let a crafted event address a different Feishu endpoint.
+    const bad = [
+      'internal:lark/cli_x/im/v1/messages/..%2F..%2Fchats/resources/k?type=file',
+      'internal:lark/cli_x/im/v1/messages/om.1/resources/k?type=file',
+      'internal:lark/cli_x/im/v1/messages/om_1/resources/k%2E%2E?type=file',
+    ];
+    for (const url of bad) expect(parseLarkResourceUrl(url)).toBeNull();
+  });
+});
+
+describe('sniffLarkMedia', () => {
+  const bytes = (...b: number[]): Uint8Array => new Uint8Array([...b, ...Array(16).fill(0)]);
+  const withAscii = (offset: number, text: string): Uint8Array => {
+    const buf = new Uint8Array(32);
+    [...text].forEach((c, i) => (buf[offset + i] = c.charCodeAt(0)));
+    return buf;
+  };
+
+  it('recognizes the formats Feishu delivers as message resources', () => {
+    expect(sniffLarkMedia(bytes(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a))?.ext).toBe('.png');
+    expect(sniffLarkMedia(bytes(0xff, 0xd8, 0xff))?.mime).toBe('image/jpeg');
+    expect(sniffLarkMedia(withAscii(0, 'GIF89a'))?.ext).toBe('.gif');
+    expect(sniffLarkMedia(withAscii(8, 'WEBP'))?.ext).toBeUndefined(); // RIFF header missing
+    const webp = withAscii(0, 'RIFF');
+    [...'WEBP'].forEach((c, i) => (webp[8 + i] = c.charCodeAt(0)));
+    expect(sniffLarkMedia(webp)?.mime).toBe('image/webp');
+    expect(sniffLarkMedia(withAscii(0, '%PDF-1.7'))?.ext).toBe('.pdf');
+    expect(sniffLarkMedia(bytes(0x50, 0x4b, 0x03, 0x04))?.mime).toBe('application/zip');
+    expect(sniffLarkMedia(withAscii(4, 'ftyp'))?.ext).toBe('.mp4');
+    expect(sniffLarkMedia(withAscii(0, 'OggS'))?.mime).toBe('audio/ogg');
+  });
+
+  it('unknown bytes and a truncated buffer report nothing rather than guessing', () => {
+    // A wrong extension is worse than none: the agent picks its tool by it.
+    expect(sniffLarkMedia(new Uint8Array([1, 2, 3]))).toBeUndefined();
+    expect(sniffLarkMedia(new Uint8Array())).toBeUndefined();
+  });
+});
+
+describe('extractResourceNames', () => {
+  const body = (content: string): unknown => ({
+    type: 'im.message.receive_v1',
+    event: { message: { message_id: 'om_1', content } },
+  });
+
+  it('recovers the filename a file message declares (the adapter drops it)', () => {
+    expect(extractResourceNames(body('{"file_key":"file_v2_z","file_name":"季度报告.pdf"}'))).toEqual([
+      { key: 'file_v2_z', name: '季度报告.pdf' },
+    ]);
+  });
+
+  it('an image message declares no name, so there is nothing to learn', () => {
+    expect(extractResourceNames(body('{"image_key":"img_v2_a"}'))).toEqual([]);
+  });
+
+  it('a non-message event or malformed content yields nothing, never a throw', () => {
+    expect(extractResourceNames(body('not json'))).toEqual([]);
+    expect(extractResourceNames({ type: 'card.action.trigger' })).toEqual([]);
+    expect(extractResourceNames(undefined)).toEqual([]);
+  });
+});
+
+/**
+ * Rich text (富文本, msg_type: 'post').
+ *
+ * adapter-lark decodes nothing for this message type, so the whole message used to arrive empty
+ * and be dropped by the gate as `empty` — a message that had @-mentioned the bot, ignored with no
+ * log line. These pin the rebuild, and especially the mention: a post's `at` carries a
+ * placeholder, so passing it through would leave detectMention permanently blind in rich text.
+ */
+describe('larkPostElements', () => {
+  const url = (type: 'image' | 'file', messageId: string, key: string): string =>
+    `internal:lark/cli_x/im/v1/messages/${messageId}/resources/${key}?type=${type}`;
+
+  const postBody = (post: unknown, mentions?: unknown[]): unknown => ({
+    type: 'im.message.receive_v1',
+    event: {
+      message: {
+        message_id: 'om_1',
+        message_type: 'post',
+        content: JSON.stringify(post),
+        ...(mentions ? { mentions } : {}),
+      },
+    },
+  });
+
+  it('rebuilds title, text, links and images in order', () => {
+    const els = larkPostElements(
+      postBody({
+        title: '周报',
+        content: [
+          [
+            { tag: 'text', text: 'see ' },
+            { tag: 'a', href: 'https://x.dev', text: 'the docs' },
+          ],
+          [{ tag: 'img', image_key: 'img_v2_a' }],
+        ],
+      }),
+      url
+    );
+    expect(els?.map((e) => e.toString()).join('')).toBe(
+      '周报\nsee [the docs](https://x.dev)\n<img src="internal:lark/cli_x/im/v1/messages/om_1/resources/img_v2_a?type=image"/>'
+    );
+  });
+
+  it('resolves an @mention placeholder to the real open_id', () => {
+    // The load-bearing case: `user_id` in a post is '@_user_1', and the open_id lives in
+    // `mentions`. detectMention compares against the bot's open_id, so an unresolved placeholder
+    // means "not mentioned" forever.
+    const els = larkPostElements(
+      postBody({ content: [[{ tag: 'at', user_id: '@_user_1', user_name: 'bot' }]] }, [
+        { key: '@_user_1', id: { open_id: 'ou_bot' }, name: 'agent' },
+      ]),
+      url
+    );
+    expect(els).toEqual([{ type: 'at', attrs: { id: 'ou_bot', name: 'agent' }, children: [] }]);
+  });
+
+  it('degrades @_all and an unknown placeholder to text', () => {
+    const all = larkPostElements(postBody({ content: [[{ tag: 'at', user_id: '@_all' }]] }), url);
+    expect(all?.[0]?.attrs?.['content']).toBe('@all');
+    const unknown = larkPostElements(
+      postBody({ content: [[{ tag: 'at', user_id: '@_user_9', user_name: '张三' }]] }),
+      url
+    );
+    expect(unknown?.[0]?.attrs?.['content']).toBe('@张三');
+  });
+
+  it('maps media to a file element addressed like a standalone file message', () => {
+    const els = larkPostElements(
+      postBody({ content: [[{ tag: 'media', file_key: 'file_v2_z', file_name: 'demo.mp4' }]] }),
+      url
+    );
+    expect(els?.[0]?.attrs?.['src']).toBe(
+      'internal:lark/cli_x/im/v1/messages/om_1/resources/file_v2_z?type=file'
+    );
+    // …and that name is learned too, so the download does not fall back to the resource key.
+    expect(
+      extractResourceNames(
+        postBody({ content: [[{ tag: 'media', file_key: 'file_v2_z', file_name: 'demo.mp4' }]] })
+      )
+    ).toEqual([{ key: 'file_v2_z', name: 'demo.mp4' }]);
+  });
+
+  it('renders the decorative tags an agent can still read', () => {
+    const els = larkPostElements(
+      postBody({
+        content: [
+          [{ tag: 'code_block', language: 'ts', text: 'const a = 1' }],
+          [{ tag: 'hr' }, { tag: 'emotion', emoji_type: 'SMILE' }, { tag: 'br' }],
+        ],
+      }),
+      url
+    );
+    const text = els?.map((e) => e.attrs?.['content'] ?? '').join('');
+    expect(text).toContain('```ts\nconst a = 1\n```');
+    expect(text).toContain('---');
+    expect(text).toContain(':SMILE:');
+  });
+
+  it('leaves anything that is not a post alone', () => {
+    expect(larkPostElements({ type: 'im.message.receive_v1', event: { message: { message_type: 'text', message_id: 'om_1', content: '{"text":"hi"}' } } }, url)).toBeUndefined();
+    expect(larkPostElements({ type: 'card.action.trigger' }, url)).toBeUndefined();
+    expect(larkPostElements(undefined, url)).toBeUndefined();
+  });
+
+  it('malformed content, or content with nothing renderable, reports nothing', () => {
+    // The hook only assigns when this returns elements, so `undefined` means "leave the session
+    // exactly as the adapter left it" — never "replace it with an empty message".
+    const broken = {
+      type: 'im.message.receive_v1',
+      event: { message: { message_id: 'om_1', message_type: 'post', content: 'not json' } },
+    };
+    expect(larkPostElements(broken, url)).toBeUndefined();
+    expect(larkPostElements(postBody({ content: [[{ tag: 'sticker', key: 'x' }]] }), url)).toBeUndefined();
   });
 });

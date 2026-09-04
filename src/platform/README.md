@@ -149,6 +149,53 @@ inbound topic message and every send it makes, and falls back to the thread hist
 cold miss. A platform whose lane needs a *lookup* rather than a parameter should copy that
 shape rather than reach for an undocumented endpoint.
 
+## Inbound attachments: a URL is not always fetchable
+
+`attachmentMeta` normalizes what a media element *declares* (mime, size). What it cannot fix is
+an element whose URL nothing outside the bot can resolve: adapter-lark decodes an inbound image
+or file into `internal:lark/<selfId>/im/v1/messages/<id>/resources/<key>?type=…`, satori's
+internal-URL form. The daemon's downloader speaks http(s) only — deliberately, since it
+re-validates every hop of a user-controlled URL — so every Feishu image and file reached the
+agent as `[Attachment … failed to download]`.
+
+The optional `fetchAttachment(bot, url)` is the way out: the profile gets first refusal on each
+URL and returns `undefined` for anything it does not own, so a platform mixing public CDN links
+with private ones needs no branch of its own. Lark is the only one of the eight that needs it
+(the other seven emit public https links — verified by grepping their adapters for
+`getInternalUrl`).
+
+It also returns `name` and `mime`, because the platform that needs the hook is the platform
+whose elements carry neither: a Feishu **image** message has no filename anywhere, and the
+adapter's binary route drops the response headers, so both are recovered inside the profile —
+the filename from the raw event body (a `file` message states it, and the profile caches it by
+`file_key` in the same `internal/session` hook that learns topic anchors), the mime and
+extension by sniffing magic bytes. An extension-less blob is a file the agent cannot open, and
+guessing `.jpg` for a png is worse than looking.
+
+## Inbound content an adapter leaves empty
+
+An adapter that decodes only some of a platform's message types produces a session with **no
+content**, and an empty message is dropped by the inbound gate (`empty`) before anything else
+looks at it. That failure is invisible from the outside: the bot ignores a message that plainly
+@-mentioned it, and nothing is logged.
+
+adapter-lark decodes `text/image/audio/media/file` and nothing else, so Feishu **rich text**
+(`msg_type: 'post'` — sent whenever a message mixes formatting or embeds an image) arrived empty.
+The Lark profile rebuilds it in its `internal/session` hook (`larkPostElements`), which works
+because satori's `dispatch` emits that event *before* the typed `message` event, and `elements` is
+a Session accessor over the same storage core normalizes from. It is the one place a profile
+**writes** to a session; if you copy the pattern, keep the citation and the test, since an
+ordering change upstream would silently restore the bug.
+
+Two details are load-bearing rather than cosmetic. A post's `at` carries a placeholder
+(`@_user_1`), with the real `open_id` in the message's `mentions` array — unresolved, it can never
+equal the bot's selfId, so `detectMention` would be permanently blind in rich text. And a post's
+embedded images are addressed exactly like a standalone image message, so the attachment fetch
+above needs no special case for them.
+
+Still empty on purpose, with the reason written down at the call site: `sticker` (Feishu's
+resource API excludes 表情包), `share_chat`, `merge_forward`.
+
 ## Markdown: one converter per dialect
 
 Agents emit standard CommonMark. Almost no IM platform renders it. Each converter
@@ -230,7 +277,11 @@ only the events endpoint.
 5. If the platform's message limit counts something other than characters (UTF-8 bytes,
    post-render length), implement `measureRendered` — otherwise chunks overflow after
    rendering.
-6. For button events, follow the decision table in `profile.ts`'s `mountButtonEvents`
+6. If inbound media arrives as anything but a public http(s) URL, implement
+   `fetchAttachment` — see the section above. A URL the generic downloader cannot fetch
+   degrades to a "failed to download" line in the prompt, which reads like a network
+   flake rather than a missing adapter method.
+7. For button events, follow the decision table in `profile.ts`'s `mountButtonEvents`
    doc, top-down: use `mountSatoriButtonInteraction` if the adapter exposes the generic
    `interaction/button` event; only if it does not, hand-write a socket/internal hook —
    and document the internal behavior you depend on, as Slack does.

@@ -287,6 +287,13 @@ expire, so attachments are downloaded and cached. Readable text ≤ `maxInjectBy
 agent to `Read` itself. Above `maxDownloadBytes` (25 MB) nothing is fetched and only a
 metadata line is emitted.
 
+`download` may report a `name` and a `contentType` alongside the bytes, and both are
+**fallbacks** — what the message element declared wins. They exist because the platforms whose
+media needs a platform-specific fetch (Lark) are exactly the ones whose elements declare
+neither, so the fetch is the only place either can be learned: a Feishu image has no filename at
+all. Learning them late changes two decisions, which is why they are not merely logged — what
+the saved file is called, and whether this was readable text after all.
+
 ## `runtime-footer.ts`
 
 Renders the trailing tagline from `FooterField`s, joined by ` · `, empty when no field is

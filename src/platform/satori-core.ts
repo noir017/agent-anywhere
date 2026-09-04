@@ -455,6 +455,14 @@ export async function createSatoriAdapter(
       }
     },
 
+    // Only mounted when the profile implements it, so `adapter.fetchAttachment` being absent is
+    // the honest signal that this platform's attachments are plain URLs.
+    ...(profile.fetchAttachment
+      ? {
+          fetchAttachment: (url: string) => profile.fetchAttachment!(getBot(), url),
+        }
+      : {}),
+
     async startTyping(address) {
       // typing goes through profile (platform-specific); no-op if not implemented.
       if (profile.typing) await profile.typing(getBot(), address);

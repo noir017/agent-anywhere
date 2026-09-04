@@ -468,6 +468,15 @@ Downloads early-exit on a `content-length` over the cap. Saved filenames are san
 against traversal and prefixed with a short hash to avoid overwrite. Coverage thresholds
 are set on this file's pure guards specifically (`vitest.config.ts`).
 
+One URL class never reaches those guards: a platform that declares `fetchAttachment` gets first
+refusal on each URL, and Lark's `internal:lark/…` resource addresses are fetched through the
+bot's own authenticated client instead (nothing else *can* fetch them — the guard rejects the
+scheme, which is why a Feishu image used to arrive as "failed to download"). That is not a hole
+in the SSRF model: those requests go to the vendor endpoint the operator configured, with the
+bot's token, and the only user-controlled part is a path segment the profile validates against
+Feishu's id alphabet. The size cap still applies and is enforced after the fetch, since that
+route reports no `content-length` to pre-check.
+
 **`conversation-token-registry.ts`** compares tokens with `timingSafeEqual` against each
 registered token rather than a `Map.get`, so a timing side-channel cannot reveal how many
 leading characters of a guess are correct. Defense in depth — tokens are 122-bit UUIDs

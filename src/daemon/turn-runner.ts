@@ -367,24 +367,28 @@ export class TurnRunner {
   /**
    * StreamBuffer factory: sink bound to the given address; each call yields a fresh buffer for
    * per-segment rotation (trailing text below a tool bubble goes to a new message, not editing the prior).
-   * noEdit: on platforms without in-place edit (QQ/LINE/WeCom), take the "send-only, merge whole" path.
    */
   private makeStreamBuffer(platform: PlatformAdapter, address: ConversationAddress): StreamBuffer {
     return new StreamBuffer(
       {
+        // Streaming is opt-in AND capability-gated in one place: `stream.enabled` is what the
+        // operator asked for, editMessage is whether it is possible at all. A platform that cannot
+        // edit (QQ/LINE/WeCom/DingTalk) delivers whole segments no matter what the config says,
+        // which is also the shape their 1-2 message quota wants.
+        mode: this.config.stream.enabled && platform.capabilities.editMessage ? 'live' : 'once',
         charThreshold: this.config.stream.charThreshold,
         flushIntervalMs: this.config.stream.flushIntervalMs,
         maxBackoffMs: this.config.stream.maxBackoffMs,
         silentToken: this.config.stream.silentToken,
         maxMessageLength: platform.capabilities.maxMessageLength,
         // Per-message edit budget: config overrides the profile's declared value (see the schema).
-        // Once spent, the buffer seals that message and streams on into a new one.
+        // Once spent, the buffer seals that message and continues in a new one.
         maxEditsPerMessage: this.editBudget(platform),
         // Chunk by the platform's RENDERED length (markdown rendering can expand/re-unit it), so a
         // chunk never overflows the platform after the profile renders it.
         measureLength: (s) => platform.measureRendered(s),
-        noEdit: !platform.capabilities.editMessage,
       },
+
       {
         now: this.clock.now,
         schedule: this.clock.schedule,

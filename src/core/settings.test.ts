@@ -87,6 +87,7 @@ describe('the settings screen', () => {
       'model.own',
       'idle',
       'scope',
+      'stream',
     ]);
   });
 
@@ -100,6 +101,8 @@ describe('the settings screen', () => {
     expect(values.get('model.cc')).toBe('(harness default)');
     expect(values.get('idle')).toBe('1h');
     expect(values.get('scope')).toBe('per_thread');
+    // A boolean reads as the same word the parser takes back, so a value can be typed as shown.
+    expect(values.get('stream')).toBe('off');
   });
 
   it('names the key to type next to every row, and it resolves back', () => {
@@ -126,6 +129,9 @@ describe('resolving what the user typed', () => {
     expect(settingKeyOf(row('session.scope'))).toBe('scope');
     expect(settingKeyOf(row('idle'))).toBe('idle');
     expect(settingKeyOf(row('session.idleTimeoutMs'))).toBe('idle');
+    expect(settingKeyOf(row('stream'))).toBe('stream');
+    expect(settingKeyOf(row('streaming'))).toBe('stream');
+    expect(settingKeyOf(row('stream.enabled'))).toBe('stream');
   });
 
   it('points a bare per-agent key at the agent answering HERE', () => {
@@ -343,6 +349,38 @@ describe('the conversation scope', () => {
   });
 });
 
+describe('the live-streaming switch', () => {
+  it('offers exactly on and off, each labelled with what it does', () => {
+    const offered = settingOptions(row('stream'), cfg, ctx);
+    expect(offered.map((o) => o.raw)).toEqual(['off', 'on']);
+    // Off is listed first because it is the default; the labels say the consequence, not the word.
+    expect(offered[0]!.label).toContain('whole message');
+    expect(offered[1]!.label).toContain('editing one message');
+  });
+
+  it('takes the spellings a person actually types for a toggle', () => {
+    for (const yes of ['on', 'On', 'true', 'yes', 'y', '1', 'enable', 'enabled']) {
+      expect(parseSettingValue(row('stream'), yes, cfg, ctx)).toMatchObject({ value: true, display: 'on' });
+    }
+    for (const no of ['off', 'OFF', 'false', 'no', 'n', '0', 'disable', 'disabled']) {
+      expect(parseSettingValue(row('stream'), no, cfg, ctx)).toMatchObject({ value: false, display: 'off' });
+    }
+  });
+
+  it('refuses an unrecognized word instead of reading it as off', () => {
+    // Coercing would flip a switch the user believes they just turned on.
+    const parsed = parseSettingValue(row('stream'), 'sure', cfg, ctx);
+    expect(parsed.kind).toBe('invalid');
+    if (parsed.kind === 'invalid') expect(parsed.reason).toContain('on or off');
+  });
+
+  it('is no longer refused by name — it is a real config field now', () => {
+    expect(resolveSettingKey('stream.enabled', cfg, ctx).kind).toBe('row');
+    // The rest of that config section stays refused.
+    expect(resolveSettingKey('tools.mode', cfg, ctx).kind).toBe('refused');
+  });
+});
+
 describe('reading the stored value back', () => {
   it('returns the patch-shaped value, not the display string', () => {
     expect(readSettingValue(row('agent'), cfg)).toBe('cc'); // not `cc · claude`
@@ -350,6 +388,7 @@ describe('reading the stored value back', () => {
     expect(readSettingValue(row('model.cc'), cfg)).toBeUndefined(); // unset, not '(harness default)'
     expect(readSettingValue(row('idle'), cfg)).toBe(3_600_000); // not '1h'
     expect(readSettingValue(row('scope'), cfg)).toBe('per_thread');
+    expect(readSettingValue(row('stream'), cfg)).toBe(false); // the boolean, not 'off'
   });
 });
 

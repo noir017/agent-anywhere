@@ -17,11 +17,11 @@ nothing else from the project.
 ## The central design decision: a small user surface
 
 The config file has exactly five sections — `platforms`, `agents`, `routing`,
-`session`, `access` — plus an optional `display`. Everything else that *looks* like
-config (stream throttling, tool-bubble rendering, inbound merge windows, attachment
-limits, reaction emoji, the IPC socket) is **not** user-configurable. It lives in the
-frozen `EXPERIENCE` constant in `schema.ts` and is merged into every loaded `Config` at
-load time.
+`session`, `access` — plus an optional `display` and `stream`. Everything else that
+*looks* like config (stream throttling, tool-bubble rendering, inbound merge windows,
+attachment limits, reaction emoji, the IPC socket) is **not** user-configurable. It lives
+in the frozen `EXPERIENCE` constant in `schema.ts` and is merged into every loaded
+`Config` at load time.
 
 ```
 UserConfig  (what config.yaml can contain, validated by ConfigSchema)
@@ -41,6 +41,14 @@ Two fields were deliberately promoted from `EXPERIENCE` to the user surface when
 turned out to be per-deployment decisions after all: `freeResponseChannels` and
 `ignoredChannels` (now under `platforms.<id>.chat`) were dead config while frozen. The
 gating rules split accordingly — see [`core/inbound-gate.ts`](../core/README.md).
+
+`stream.enabled` was promoted for the same reason, and shows the shape that promotion
+takes: only the DECISION crosses the line, not the tuning around it. Whether a reply is
+typed out live or sent whole is a taste-and-platform judgement an operator makes once; the
+numbers that pace a stream (`charThreshold`, `flushIntervalMs`, the backoff cap) stay
+frozen next to it. `Config.stream` is therefore a deep merge of the two halves, exactly
+like `session` — a plain `...EXPERIENCE` spread would drop the operator's value and it
+would silently revert on the next restart (pinned by `display.test.ts`).
 
 `session.idleTimeoutMs` was born on the user side for the same reason. It bounds how long
 an idle conversation keeps its resident agent process, and the right answer is a property
@@ -105,8 +113,8 @@ Three writers, in increasing order of how much they claim:
 
 `/setting` is the one that changed the assumption that this file is only ever
 hand-edited: config.yaml is now written **while the daemon is running**, from a chat
-message. Four fields are reachable that way (`routing.default`, `agents[].model`,
-`session.idleTimeoutMs`, `session.scope`) and the rest are refused by name — see
+message. Five fields are reachable that way (`routing.default`, `agents[].model`,
+`session.idleTimeoutMs`, `session.scope`, `stream.enabled`) and the rest are refused by name — see
 [`core/settings.ts`](../core/README.md#settingsts) for the table and
 [`daemon/settings-store.ts`](../daemon/README.md#settings-storets) for the order the write
 happens in. Two constraints from that path land here:

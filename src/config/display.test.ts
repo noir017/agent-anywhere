@@ -107,6 +107,47 @@ describe('display config survives the experience merge', () => {
 });
 
 /**
+ * `stream.enabled` is the one field of the frozen `stream` block that IS user surface, so it needs
+ * the deep merge `session` already has. Everything above documents what happens without it: the
+ * `...EXPERIENCE` spread replaces the whole `stream` object, and an operator's value survives until
+ * the next restart and then silently reverts — with `/setting` making that far easier to hit,
+ * since the write succeeds and the ack says "in effect now".
+ */
+describe('stream.enabled survives the experience merge', () => {
+  const raw = (stream?: unknown): Record<string, unknown> => ({
+    platforms: { tg: { type: 'telegram', token: 't' } },
+    agents: [{ id: 'cc', harness: 'claude' }],
+    routing: { default: 'cc' },
+    ...(stream !== undefined ? { stream } : {}),
+  });
+
+  it('defaults to off — replies arrive as whole messages unless asked otherwise', () => {
+    expect(parseConfig(raw()).stream.enabled).toBe(false);
+  });
+
+  it('keeps enabled=true set by the operator', () => {
+    expect(parseConfig(raw({ enabled: true })).stream.enabled).toBe(true);
+  });
+
+  it('keeps the frozen tuning alongside the operator value, not instead of it', () => {
+    const cfg = parseConfig(raw({ enabled: true }));
+    expect(cfg.stream.enabled).toBe(true);
+    expect(cfg.stream.charThreshold).toBe(200);
+    expect(cfg.stream.flushIntervalMs).toBe(1200);
+    expect(cfg.stream.silentToken).toBe('[SILENT]');
+  });
+
+  it('rejects a non-boolean instead of silently coercing it', () => {
+    expect(() => parseConfig(raw({ enabled: 'yes' }))).toThrow();
+  });
+
+  it('ignores a throttling knob written into the file — those stay frozen', () => {
+    const cfg = parseConfig(raw({ enabled: true, charThreshold: 9999 }) as never);
+    expect(cfg.stream.charThreshold).toBe(200);
+  });
+});
+
+/**
  * Agent display name.
  *
  * The config id is operator shorthand — `oc`, `cc`, whatever is fast to type after a slash — and

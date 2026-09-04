@@ -2,47 +2,77 @@ import type { MessageRef } from '../types.js';
 import { MessageNotEditableError } from './outbound-errors.js';
 
 /**
- * Streaming buffer: turns a token stream into a live-edited chat message.
+ * Outbound buffer for one turn's reply text. Two delivery modes, chosen by `mode`.
  *
- * DELIVERY MODEL — one logical reply, delivered as an ordered run of real messages:
+ * ── `'once'` (the DEFAULT; `stream.enabled: false`) ──────────────────────────────────────────────
+ *
+ *     push … push … complete({footer}) ─▶ [ message ][ message ]…
+ *
+ * Nothing goes out until the buffer completes; then the accumulated text is split by
+ * `maxMessageLength` and sent, as one message or as several. No message is ever edited.
+ *
+ * This is the default because live editing costs more than it returns. Every flush spends an edit,
+ * platforms meter and cap them — Feishu allows 20 per message and then refuses that message
+ * forever — so the reply most likely to run out of edits mid-delivery is the long, considered one
+ * that matters most. Finished text sent once has no such ceiling: the only limit left is message
+ * length, which splits cleanly. The turn is not silent in the meantime either: a text segment is
+ * completed and sent at every tool boundary, so a turn that uses tools still reports as it goes.
+ *
+ * ── `'live'` (`stream.enabled: true`) ───────────────────────────────────────────────────────────
  *
  *     [ sealed ][ sealed ][ open ]
- *                            ↑ the only one still edited in place
- *
- * A message is SEALED — immutable, never touched again — for one of three reasons, and the buffer
- * treats all three identically:
- *
- *   - **full**: the text outgrew `maxMessageLength`, so the remainder continues in a new message.
- *   - **budget spent**: `maxEditsPerMessage` in-place edits have been used (Lark allows 20 per
- *     message, then refuses forever).
- *   - **not editable**: the platform said so mid-stream (`MessageNotEditableError`).
- *
- * Sealing is never a failure. The sealed text counts as delivered and streaming continues into a
- * fresh message, so `sealedText + open.text` is always EXACTLY what the user can see: nothing is
- * re-sent, nothing is lost. Folding the edit budget into the same concept as the length limit is
- * what makes that invariant hold — both are just "this message can take no more".
- *
- * This replaced a "back off, then degrade to whole-message send" path that could not express
- * "permanently un-editable": past Lark's edit cap the final flush re-edited the dead message,
- * swallowed the rejection, and reported the turn complete, losing every character after the cap.
+ *                            ↑ still edited in place as text arrives
  *
  * Dual-trigger throttle: flush when `charThreshold` chars accumulate OR `flushIntervalMs` elapses
- * since the last write. Transient failures (rate limit, network) back the interval off
- * exponentially and keep the open message. The final flush refuses to leave text undelivered behind
- * a failure it can route around — it seals and sends the remainder instead. Overflow is split
- * without breaking code fences. `[SILENT]` as the whole reply suppresses all output.
+ * since the last write. Requires a platform that can edit (`capabilities.editMessage`).
+ *
+ * ── Sealing (both modes) ────────────────────────────────────────────────────────────────────────
+ *
+ * A message is SEALED — immutable, never touched again — for one of three reasons, all handled
+ * identically:
+ *
+ *   - **full**: the text outgrew `maxMessageLength`, so the remainder continues in a new message.
+ *   - **budget spent**: `maxEditsPerMessage` in-place edits have been used up.
+ *   - **not editable**: the platform said so mid-stream (`MessageNotEditableError`).
+ *
+ * Sealing is never a failure. The sealed text counts as delivered and delivery continues into a
+ * fresh message, so `sealedText + open.text` is always EXACTLY what the user can see: nothing is
+ * re-sent, nothing is lost. In `'once'` mode only the first reason can occur, which is why that
+ * mode cannot lose the tail of a reply at all.
+ *
+ * Folding the edit budget into the same concept as the length limit is what makes that invariant
+ * hold — both are just "this message can take no more". The design this replaced had only "back
+ * off, then degrade to whole-message send", which could not express *permanently un-editable*: past
+ * Lark's cap the final flush re-edited the dead message, swallowed the rejection, and reported the
+ * turn complete, losing everything after the cap.
+ *
+ * Transient failures (rate limit, network) back the interval off exponentially and keep the open
+ * message. The final flush refuses to leave text undelivered behind a failure it can route around —
+ * it seals and sends the remainder instead. Overflow is split without breaking code fences.
+ * `[SILENT]` as the whole reply suppresses all output.
  */
 
 export interface StreamBufferOptions {
+  /**
+   * Delivery mode. `'once'`: accumulate and send on `complete()`. `'live'`: edit one message in
+   * place as text arrives. Resolved by the daemon from `stream.enabled` AND the platform's
+   * `editMessage` capability, so a platform that cannot edit (QQ/LINE/WeCom/DingTalk) always gets
+   * `'once'` no matter what the config asks for.
+   */
+  mode: 'once' | 'live';
+  /** `'live'` only: flush after this many new chars accumulate. */
   charThreshold: number;
+  /** `'live'` only: flush once this long has passed since the last write. */
   flushIntervalMs: number;
+  /** `'live'` only: cap for the exponential backoff after a transient failure. */
   maxBackoffMs: number;
   silentToken: string;
   maxMessageLength: number;
   /**
    * In-place edits one delivered message accepts before the buffer seals it and continues in a new
    * one. Undefined = unbounded (most platforms only rate-limit edits). Wired from
-   * `PlatformCapabilities.maxEditsPerMessage`; Lark declares 20.
+   * `PlatformCapabilities.maxEditsPerMessage`; Lark declares 20. Only reachable in `'live'` mode —
+   * `'once'` never edits.
    */
   maxEditsPerMessage?: number;
   /**
@@ -52,17 +82,12 @@ export interface StreamBufferOptions {
    * chunks fit post-render. Defaults to char length (identity) — correct for raw-passthrough.
    */
   measureLength?: (text: string) => number;
-  /**
-   * Set on platforms without in-place edit (editMessage=false, e.g. QQ/LINE/WeCom/DingTalk).
-   * Nothing is written mid-stream; the accumulated text is emitted as new message(s) on
-   * `complete()`, which fits those platforms' 1-2 message quota.
-   */
-  noEdit?: boolean;
 }
 
 /** Outbound sink wrapping platform send/edit; bound by the daemon to the current channel. */
 export interface StreamSink {
   send(text: string): Promise<MessageRef>;
+  /** Only called in `'live'` mode. */
   edit(ref: MessageRef, text: string): Promise<void>;
   /** Clock injected externally so the core never reads Date.now() (eases testing/resume). */
   now(): number;
@@ -142,9 +167,10 @@ export class StreamBuffer {
     return this.acc.trim() === this.opts.silentToken;
   }
 
-  /** Dual-trigger check: char threshold OR time interval. */
+  /** Dual-trigger check: char threshold OR time interval. `'once'` never flushes mid-turn. */
   private maybeFlush(): void {
     if (this.aborted) return;
+    if (this.opts.mode === 'once') return; // delivery happens in complete(), so don't even arm a timer
     if (this.isSilent()) return;
     const pendingChars = this.acc.length - this.deliveredLength();
     const elapsed = this.sink.now() - this.lastWriteAt;
@@ -190,8 +216,8 @@ export class StreamBuffer {
     if (this.aborted) return;
     this.cancelTimer?.();
     this.cancelTimer = null;
-    // noEdit platforms write nothing mid-stream (see StreamBufferOptions.noEdit).
-    if (this.opts.noEdit && !final) return;
+    // 'once': nothing is written until the buffer completes (see the header comment).
+    if (this.opts.mode === 'once' && !final) return;
 
     // The footer joins only the final render; mid-stream is the raw accumulation.
     const rendered = final && this.footer ? this.acc + '\n\n' + this.footer : this.acc;

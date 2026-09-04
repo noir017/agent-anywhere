@@ -229,6 +229,8 @@ function visibleMessages(sink: FakeSink): string[] {
 
 function makeOpts(over: Partial<StreamBufferOptions> = {}): StreamBufferOptions {
   return {
+    // The suites below drive the live path unless a test overrides it; 'once' has its own block.
+    mode: 'live',
     charThreshold: 10,
     flushIntervalMs: 800,
     maxBackoffMs: 10000,
@@ -605,16 +607,17 @@ describe('StreamBuffer dual-trigger and delivery', () => {
 });
 
 // ============================================================================
-// noEdit mode (editMessage=false constrained platforms: QQ/LINE/WeCom)
+// 'once' mode: the default (stream.enabled off), and the only mode available on
+// platforms that cannot edit messages (QQ/LINE/WeCom/DingTalk)
 // ============================================================================
 
-describe('StreamBuffer noEdit mode', () => {
+describe("StreamBuffer 'once' mode", () => {
   it('sends nothing during push, complete() emits the accumulated text as a single new send, no edit', async () => {
     const sink = makeSink();
-    const opts = makeOpts({ charThreshold: 2, noEdit: true });
+    const opts = makeOpts({ charThreshold: 2, mode: 'once' });
     const buf = new StreamBuffer(opts, sink);
 
-    // Multiple pushes crossing the char threshold and timer: noEdit never sends mid-stream.
+    // Multiple pushes crossing the char threshold and timer: 'once' never sends mid-turn.
     buf.push('hello');
     await Promise.resolve();
     await Promise.resolve();
@@ -639,11 +642,11 @@ describe('StreamBuffer noEdit mode', () => {
   });
 
   it('regression: mid-stream no-op flushes must not mark the text as delivered', async () => {
-    // The streaming and final renders are identical here (no footer). An older mid-stream branch
+    // The mid-turn and final renders are identical here (no footer). An older mid-stream branch
     // recorded the accumulation as written without sending it, so the final flush saw "unchanged"
-    // and skipped: noEdit platforms (DingTalk/QQ/LINE/WeCom) never delivered any reply at all.
+    // and skipped: platforms that cannot edit never delivered any reply at all.
     const sink = makeSink();
-    const opts = makeOpts({ charThreshold: 2, noEdit: true });
+    const opts = makeOpts({ charThreshold: 2, mode: 'once' });
     const buf = new StreamBuffer(opts, sink);
 
     buf.push('hello'); // crosses charThreshold → triggers a mid-stream (no-op) flush
@@ -652,7 +655,7 @@ describe('StreamBuffer noEdit mode', () => {
     buf.push(' world'); // and again
     await Promise.resolve();
     await Promise.resolve();
-    expect(sink.sends.length).toBe(0); // nothing mid-stream, per noEdit design
+    expect(sink.sends.length).toBe(0); // nothing mid-turn, by design
 
     await buf.complete(); // no footer: final render === mid-stream render
     await Promise.resolve();
@@ -663,9 +666,9 @@ describe('StreamBuffer noEdit mode', () => {
     expect(sink.edits.length).toBe(0);
   });
 
-  it('under noEdit, overlong text on complete() still splits via splitIntoChunks into multiple messages', async () => {
+  it('overlong text on complete() splits into multiple messages, none of them edited', async () => {
     const sink = makeSink();
-    const opts = makeOpts({ charThreshold: 2, noEdit: true, maxMessageLength: 20 });
+    const opts = makeOpts({ charThreshold: 2, mode: 'once', maxMessageLength: 20 });
     const buf = new StreamBuffer(opts, sink);
 
     const text = ['line-one', 'line-two', 'line-three', 'line-four'].join('\n');
@@ -687,9 +690,9 @@ describe('StreamBuffer noEdit mode', () => {
     expect(sink.edits.length).toBe(0);
   });
 
-  it('under noEdit, complete() after abort() sends no message', async () => {
+  it('complete() after abort() sends no message', async () => {
     const sink = makeSink();
-    const opts = makeOpts({ charThreshold: 2, noEdit: true });
+    const opts = makeOpts({ charThreshold: 2, mode: 'once' });
     const buf = new StreamBuffer(opts, sink);
 
     buf.push('hello world');
@@ -705,9 +708,9 @@ describe('StreamBuffer noEdit mode', () => {
     expect(sink.edits.length).toBe(0);
   });
 
-  it('noEdit final still appends the footer (at the end of the last message, no edit)', async () => {
+  it('the footer still lands at the end of the last message, with no edit', async () => {
     const sink = makeSink();
-    const opts = makeOpts({ charThreshold: 2, noEdit: true });
+    const opts = makeOpts({ charThreshold: 2, mode: 'once' });
     const buf = new StreamBuffer(opts, sink);
 
     buf.push('hello');
@@ -723,14 +726,72 @@ describe('StreamBuffer noEdit mode', () => {
     expect(sink.edits.length).toBe(0);
   });
 
-  it('under noEdit, a [SILENT] body sends no message at all', async () => {
+  it('a [SILENT] body sends no message at all', async () => {
     const sink = makeSink();
-    const buf = new StreamBuffer(makeOpts({ noEdit: true }), sink);
+    const buf = new StreamBuffer(makeOpts({ mode: 'once' }), sink);
     buf.push('[SILENT]');
     await Promise.resolve();
     await buf.complete({ footer: 'claude-opus · ~/repo' });
     await Promise.resolve();
     expect(sink.sends.length).toBe(0);
+    expect(sink.edits.length).toBe(0);
+  });
+
+  it('never edits, even with an edit budget available — so the edit cap cannot truncate a reply', async () => {
+    // The point of the default: a reply that would have blown Feishu's 20-edit budget while
+    // streaming is delivered as finished text, where the only limit left is message length.
+    const sink = makeSink();
+    const buf = new StreamBuffer(
+      makeOpts({ mode: 'once', charThreshold: 2, maxEditsPerMessage: 20, maxMessageLength: 10000 }),
+      sink
+    );
+
+    // 4.7k of text arriving in 200-char deltas: 24 flushes, i.e. past the budget, while streaming.
+    for (let i = 0; i < 24; i++) await pushAndSettle(buf, sink, 'x'.repeat(200));
+    expect(sink.sends.length).toBe(0);
+
+    await buf.complete({ footer: 'oc · 12k / 1M' });
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+
+    expect(sink.edits.length).toBe(0);
+    expect(sink.sends.length).toBe(1);
+    expect(sink.sends[0]).toBe('x'.repeat(4800) + '\n\noc · 12k / 1M');
+  });
+
+  it('a reply past the message limit arrives as several messages that reassemble exactly', async () => {
+    const sink = makeSink();
+    const buf = new StreamBuffer(makeOpts({ mode: 'once', maxMessageLength: 500 }), sink);
+
+    const body = Array.from({ length: 40 }, (_, i) => `第 ${i} 行内容，凑够长度好切成多条消息。`).join('\n');
+    buf.push(body);
+    await buf.complete();
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+
+    expect(sink.sends.length).toBeGreaterThan(1);
+    expect(sink.edits.length).toBe(0);
+    for (const s of sink.sends) expect(s.length).toBeLessThanOrEqual(500);
+    // Joined back with the separators the chunker consumed at cut points.
+    expect(sink.sends.join('\n').replace(/\n+/g, '\n')).toBe(body.replace(/\n+/g, '\n'));
+  });
+
+  it('each completed segment is its own message, so a turn using tools still reports as it goes', async () => {
+    // TurnRunner completes the body buffer at every tool boundary and rotates in a fresh one. That
+    // is what keeps 'once' from being silent for the whole turn.
+    const sink = makeSink();
+    const opts = makeOpts({ mode: 'once' });
+
+    const first = new StreamBuffer(opts, sink);
+    first.push('looking into it');
+    await first.complete(); // tool boundary
+    for (let i = 0; i < 4; i++) await Promise.resolve();
+    expect(sink.sends).toEqual(['looking into it']);
+
+    const second = new StreamBuffer(opts, sink);
+    second.push('here is the answer');
+    await second.complete({ footer: 'oc' });
+    for (let i = 0; i < 4; i++) await Promise.resolve();
+
+    expect(sink.sends).toEqual(['looking into it', 'here is the answer\n\noc']);
     expect(sink.edits.length).toBe(0);
   });
 });

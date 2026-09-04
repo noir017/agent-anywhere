@@ -154,7 +154,7 @@ export class SettingsStore {
  * the same function is used for the candidate and for the live object, without its live-apply
  * behavior being considered at the same time.
  */
-function applyToConfig(cfg: Config, row: SettingRow, value: string | number | undefined): void {
+function applyToConfig(cfg: Config, row: SettingRow, value: string | number | boolean | undefined): void {
   switch (row.id) {
     case 'agent':
       cfg.routing.default = String(value);
@@ -175,6 +175,11 @@ function applyToConfig(cfg: Config, row: SettingRow, value: string | number | un
       // Narrowed by parseSettingValue (only the four SessionScope literals reach here) and
       // re-checked by the ConfigSchema pass in apply() before anything is written.
       cfg.session.scope = value as SessionScope;
+      return;
+    case 'stream':
+      // Live: TurnRunner resolves the delivery mode per turn from this object, so the next reply
+      // uses the new setting — no restart, and a turn already in flight finishes as it started.
+      cfg.stream.enabled = Boolean(value);
       return;
     default: {
       const _exhaustive: never = row.id;

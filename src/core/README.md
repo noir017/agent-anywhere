@@ -111,16 +111,43 @@ idle ──ingest──► collecting ──window elapsed──► running ─�
 
 ## `stream-buffer.ts`
 
-The most subtle file in the module. It turns a token stream into a live-edited chat
-message — or, when one message isn't enough, into a run of them.
+The most subtle file in the module. It buffers one turn's reply text and delivers it,
+in one of two modes.
 
-**Delivery model.** One logical reply is delivered as an ordered run of real messages,
-of which only the last is still edited:
+### `'once'` — the default (`stream.enabled: false`)
+
+```
+push … push … complete({footer}) ─▶ [ message ][ message ]…
+```
+
+Nothing goes out until the buffer completes; then the accumulated text is split by
+`maxMessageLength` and sent as one message, or several. No message is ever edited.
+
+This is the default because live editing costs more than it returns. Every flush spends an
+edit and platforms cap them per message — Feishu allows 20 and then refuses *that message*
+forever — so the reply most likely to run out of edits mid-delivery is the long, considered
+one that matters most. Finished text sent once has no such ceiling: the only limit left is
+message length, which splits cleanly.
+
+The turn is not silent in the meantime. `TurnRunner` completes the body buffer at every
+tool boundary and rotates in a fresh one, so a turn that uses tools reports as it goes —
+each finished text segment arrives as its own message, alongside the session header bubble,
+the 👀 reaction, and the tool bubbles (which *do* refresh in place).
+
+### `'live'` (`stream.enabled: true`)
 
 ```
 [ sealed ][ sealed ][ open ]
-                       ↑ still edited in place
+                       ↑ still edited in place as text arrives
 ```
+
+Dual-trigger throttle: flush when `charThreshold` (200) chars accumulate **or**
+`flushIntervalMs` (1200 ms) elapses since the last write. 1200 ms tracks the ~1 edit/sec
+rate limit most IM platforms impose. Requires `capabilities.editMessage`, so the daemon
+resolves the mode from `stream.enabled` **and** the capability: a platform that cannot edit
+(QQ, LINE, WeCom, DingTalk) always gets `'once'`, which also fits its 1–2 message quota.
+
+### Sealing (both modes)
 
 A message is **sealed** — immutable, never touched again — for one of three reasons, all
 handled identically:
@@ -131,20 +158,18 @@ handled identically:
 | budget spent | `maxEditsPerMessage` in-place edits used up |
 | not editable | the platform rejected an edit with `MessageNotEditableError` |
 
-Sealing is never a failure: the sealed text counts as delivered and the stream continues
-into a fresh message, so `sealedText + open.text` is always exactly what the user can
-see. Nothing is re-sent, nothing is lost.
+Sealing is never a failure: the sealed text counts as delivered and delivery continues into
+a fresh message, so `sealedText + open.text` is always exactly what the user can see.
+Nothing is re-sent, nothing is lost. In `'once'` mode only the first reason can occur, which
+is why that mode cannot lose the tail of a reply at all.
 
 Folding the edit budget into the same concept as the length limit is what makes that
-invariant hold — both are just *"this message can take no more"*. The previous design
-had only "back off, then degrade to whole-message send", which could not express
-*permanently un-editable*: past Lark's 20-edit-per-message cap the final flush re-edited
-the dead message, swallowed the rejection, and reported the turn complete. Everything
-after the cap was lost, and the user saw a reply truncated mid-sentence with a ✅ on it.
+invariant hold — both are just *"this message can take no more"*. The previous design had
+only "back off, then degrade to whole-message send", which could not express *permanently
+un-editable*: past Lark's cap the final flush re-edited the dead message, swallowed the
+rejection, and reported the turn complete. Everything after the cap was lost, and the user
+saw a reply truncated mid-sentence with a ✅ on it.
 
-- **Dual-trigger throttle**: flush when `charThreshold` (200) chars accumulate **or**
-  `flushIntervalMs` (1200 ms) elapses since the last write. 1200 ms tracks the ~1 edit/sec
-  rate limit most IM platforms impose.
 - **First write sends** (to obtain a `MessageRef`); later writes **edit in place**. Text
   already on screen verbatim skips the API call — and, importantly, does not spend budget.
 - **Transient failures** (rate limit, network) back the interval off exponentially up to
@@ -153,9 +178,6 @@ after the cap was lost, and the user saw a reply truncated mid-sentence with a �
 - **The final flush never gives up**: with no later flush to recover, any failure it can
   route around is routed around — it seals the open message and sends the remainder rather
   than leaving the answer truncated.
-- **`noEdit`** platforms (`editMessage: false` — QQ, LINE, WeCom, DingTalk) write nothing
-  mid-stream and emit the accumulated text as new message(s) on `complete()`, which fits
-  those platforms' 1–2 message quota.
 - **Chunking** splits overflow without breaking code fences. Critically, it splits the
   **raw** text while the platform limit applies to the **rendered** output — so
   `measureLength` (wired to `PlatformAdapter.measureRendered`) reports the post-render
@@ -334,8 +356,7 @@ degradation this project avoids.
 validation, the config path that gets patched, and the ack sentence — so a settings screen
 cannot list a field it will not write, or write one it never listed.
 
-The editable set is deliberately four entries wide (`model` expands to one row per
-configured agent):
+The editable set is deliberately narrow (`model` expands to one row per configured agent):
 
 | key | config path | accepts | takes effect |
 |---|---|---|---|
@@ -343,6 +364,7 @@ configured agent):
 | `model` / `model.<agent>` | `agents[<id>].model` | the agent's reported list, any name, or `-` to clear | **next agent session** — the value is read at spawn |
 | `idle` | `session.idleTimeoutMs` | `off`, `<n>m`, `<n>h` | **now** — the sweeper is re-armed |
 | `scope` | `session.scope` | the four `SessionScope` values | **on restart** — file only |
+| `stream` | `stream.enabled` | `on` / `off` | **now** — `TurnRunner` resolves the delivery mode per turn |
 
 `scope` is the one that is written but not applied, and that is the interesting decision.
 The scope decides how `conversationKey` is computed, so changing it live would silently

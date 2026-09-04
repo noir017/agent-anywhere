@@ -5,6 +5,42 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **Replies are no longer streamed by default.** A reply now arrives as a whole message once each
+  part of it is finished, split across several messages when it exceeds the platform's per-message
+  limit. Live streaming is still available as `stream.enabled: true`.
+
+  Streaming was costing more than it returned. Every flush spends a message edit, platforms cap
+  those per message — Feishu allows 20, then refuses *that message* permanently — and so the reply
+  most likely to run out of edits partway through delivery was the long, considered one that
+  mattered most. 1.0.0 made that survivable by sealing the exhausted message and continuing in a new
+  one, but the honest fix is not to spend the edits at all: sent-once text has no such ceiling, and
+  the only limit left is message length, which splits cleanly.
+
+  The turn does not go quiet in exchange. `TurnRunner` already completes the body buffer at every
+  tool boundary, so each finished text segment is sent as it happens — a turn that uses tools still
+  reports as it goes, alongside the session header bubble, the 👀 reaction, and the tool bubbles,
+  which do still refresh in place.
+
+  The switch is `stream.enabled` (default `false`), also reachable as `/setting stream on|off` and
+  in effect on the next reply. It is ignored on platforms that cannot edit messages (QQ, LINE,
+  WeCom, DingTalk), which have always delivered whole segments. The knobs that *pace* a stream
+  (`charThreshold`, `flushIntervalMs`, the backoff cap) stay frozen in `EXPERIENCE` — only the
+  decision crossed onto the user surface, which is why `Config.stream` is now a deep merge of the
+  two halves the way `session` already was. A plain spread would have dropped the operator's value
+  and reverted it on the next restart; `display.test.ts` pins that, since it is the third feature
+  to walk into that trap.
+
+### Added
+
+- **`/setting stream on|off`.** `stream` used to be refused by name with a reason that was not even
+  true of it ("not in config.yaml at all — frozen in the code"), which was correct for the
+  throttling knobs and wrong for the one field an operator actually decides. It is a fifth editable
+  setting now, `live` like the default agent: `TurnRunner` resolves the delivery mode per turn, so
+  the next reply uses the new value with no restart and a turn already in flight finishes as it
+  started.
+
 ### Fixed
 
 - **`agent-anywhere --version` reports the version that is actually installed.** It was a string

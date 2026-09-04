@@ -226,6 +226,7 @@ Markdown 按平台分别渲染；缺失的能力平滑降级（不能编辑 → 
 | 某个智能体的默认模型 | `agents[].model` | 该智能体上报的模型、任意名字，或 `-` 清空 | 它的下一个会话（`/new` 可立刻开一个） |
 | 空闲回收窗口 | `session.idleTimeoutMs` | `off`、`15m`、`4h` …… | 立即 |
 | 会话粒度 | `session.scope` | `per_thread`、`per_channel`、`per_user`、`shared` | 重启后 |
+| 流式输出 | `stream.enabled` | `on`、`off`（默认 `off`） | 立即 —— 下一条回复生效 |
 
 ```
 /setting                       →  整个设置面板，能放按钮的平台就是按钮

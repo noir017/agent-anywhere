@@ -116,25 +116,28 @@ const ExperienceSchema = z.object({
     .default({}),
 
   /**
-   * Outbound streaming params.
+   * Outbound reply delivery — the TUNING half, frozen. Whether streaming happens at all is
+   * `stream.enabled` on the user schema below (the same split `session` uses: the decision is the
+   * operator's, the guardrails are not).
    *
-   * There is no "delivery mode" knob: how a reply is delivered follows from what the platform can
-   * do (capabilities.editMessage / maxMessageLength / maxEditsPerMessage), not from a preference.
-   * The `mode: auto|edit|chunk` field that used to sit here was read by nothing.
+   * There is no "delivery mode" enum: whether a reply streams follows from `enabled` AND what the
+   * platform can do, not from a preference three values wide. The `mode: auto|edit|chunk` field
+   * that used to sit here was read by nothing.
    */
   stream: z
     .object({
-      /** Char trigger threshold: edit immediately after this many new chars accumulate. */
+      /** Streaming only: flush after this many new chars accumulate. */
       charThreshold: z.number().int().positive().default(200),
-      /** Time trigger interval (ms): flush once this long has passed since the last edit (~1/sec IM limit → 1200ms). */
+      /** Streaming only: flush once this long has passed since the last write (~1/sec IM limit → 1200ms). */
       flushIntervalMs: z.number().int().positive().default(1200),
-      /** Rate-limit backoff cap for transient edit failures. */
+      /** Streaming only: cap for the exponential backoff after a transient edit failure. */
       maxBackoffMs: z.number().int().positive().default(10_000),
       /**
-       * Override the platform's per-message edit budget (PlatformCapabilities.maxEditsPerMessage).
-       * Set it only to work around a platform changing its cap on you: too high and the tail of
-       * every long reply is refused until the writer notices, too low and long replies fragment
-       * into more messages than necessary. Absent = trust the profile's declared value.
+       * Override the platform's per-message edit budget (`PlatformCapabilities.maxEditsPerMessage`),
+       * which bounds both streaming edits and tool-bubble refreshes. Set it only to work around a
+       * platform changing its cap on you: too high and the tail of a streamed reply is refused until
+       * the writer notices, too low and replies fragment into more messages than necessary.
+       * Absent = trust the profile's declared value.
        */
       maxEditsPerMessage: z.number().int().positive().optional(),
       /** If the model replies with only this token, send no message. */
@@ -316,6 +319,29 @@ export const ConfigSchema = z
       .default({}),
 
     /**
+     * Reply delivery. Alongside `display`, the part of outbound rendering an operator legitimately
+     * decides; the throttling and chunking guardrails stay in the frozen EXPERIENCE block.
+     */
+    stream: z
+      .object({
+        /**
+         * Stream the reply by editing one message in place as text arrives.
+         *
+         * OFF by default, which delivers each completed text segment as a whole message instead.
+         * The live effect reads better while it works, but every flush spends an edit and platforms
+         * cap them per message (Feishu: 20, after which that message is refused permanently) — so
+         * the long, considered reply is the one that runs out of edits mid-delivery. Sent-once text
+         * has no such ceiling; the only limit left is message length, which splits cleanly. A turn
+         * is not silent either way: a finished segment is sent at every tool boundary.
+         *
+         * Ignored on platforms that cannot edit messages (QQ/LINE/WeCom/DingTalk) — they deliver
+         * whole segments regardless.
+         */
+        enabled: z.boolean().default(false),
+      })
+      .default({}),
+
+    /**
      * Reply decoration. The one part of the streaming experience an operator legitimately
      * decides — everything else about outbound rendering (throttling, chunking, tool bubbles)
      * stays in the frozen EXPERIENCE block, but whether replies are annotated with which agent
@@ -434,9 +460,10 @@ export const ConfigSchema = z
 export type UserConfig = z.infer<typeof ConfigSchema>;
 
 /** Full runtime config: user fields + the frozen experience defaults. */
-export type Config = Omit<UserConfig, 'session'> &
-  Omit<Experience, 'session'> & {
+export type Config = Omit<UserConfig, 'session' | 'stream'> &
+  Omit<Experience, 'session' | 'stream'> & {
     session: Experience['session'] & UserConfig['session'];
+    stream: Experience['stream'] & UserConfig['stream'];
   };
 
 /** Merge the frozen experience defaults onto a parsed user config to get the runtime Config. */
@@ -446,6 +473,10 @@ export function withExperienceDefaults(u: UserConfig): Config {
     ...EXPERIENCE,
     // scope comes from the user; guardrails from experience.
     session: { ...EXPERIENCE.session, ...u.session },
+    // Same split for delivery: `enabled` is the operator's call, the throttling knobs are not.
+    // Without this the spread above would drop the user's value on the floor — a written
+    // stream.enabled would work until the next restart and then silently revert.
+    stream: { ...EXPERIENCE.stream, ...u.stream },
   };
 }
 

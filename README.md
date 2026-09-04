@@ -242,6 +242,7 @@ and restarting, which stops every resident agent.
 | an agent's default model | `agents[].model` | that agent's reported models, any name, or `-` to clear | its next agent session (`/new` starts one) |
 | idle reclaim window | `session.idleTimeoutMs` | `off`, `15m`, `4h`, … | immediately |
 | conversation scope | `session.scope` | `per_thread`, `per_channel`, `per_user`, `shared` | after a restart |
+| live streaming | `stream.enabled` | `on`, `off` (default `off`) | immediately — the next reply |
 
 ```
 /setting                       →  the whole screen, as buttons where they work
@@ -252,7 +253,7 @@ and restarting, which stops every resident agent.
 
 Where buttons can be posted *and* replaced (Discord, Telegram, Slack, Lark) the
 bare form opens a two-level menu — tap a setting, tap a value, and the screen
-returns to the list with the new value on it. Everywhere else the same four
+returns to the list with the new value on it. Everywhere else the same
 commands work as text. A long list of models is paged, and a name your harness
 accepts but never advertised (`opusplan`) is taken as typed.
 

@@ -228,6 +228,26 @@ State lives in `<configDir>/conversations.json`: per conversation, the bound age
 each agent's own session id. A pre-0.3 `sessions.json` is migrated automatically on
 first start, so in-flight work survives the upgrade.
 
+## `stream.enabled`
+
+```yaml
+stream:
+  enabled: false   # default
+```
+
+`false` (default): each finished part of a reply is sent as a whole message, split across
+several when it exceeds the platform's per-message limit. `true`: the reply is typed out by
+editing one message in place as text arrives.
+
+Off is the default because every streaming flush spends a message edit and platforms cap
+those per message — Feishu allows 20, then refuses that message permanently — so a long
+reply is the one that runs out of edits partway through delivery. Sent-once text has no such
+ceiling. Either way the turn is not silent: a finished text segment is sent at every tool
+boundary, and tool bubbles refresh in place regardless.
+
+Ignored on platforms that cannot edit messages (QQ, LINE, WeCom, DingTalk). Also settable
+from chat with `/setting stream on|off`, which takes effect on the next reply.
+
 ## `access.allowFrom`
 
 Identity format `"<platform-instance-id>:<userId>"`, e.g. `"discord-main:325041233"`.
@@ -237,7 +257,11 @@ can execute code on this machine — always fill it for shared deployments.
 
 ## Not configurable (don't add these)
 
-Streaming/edit throttling, tool-bubble rendering, inbound merge windows, attachment
-size limits, lifecycle reaction emojis, turn timeout, and the IPC socket path are
-frozen in code (`EXPERIENCE` in `src/config/schema.ts`), not config surface. If the
-user asks to tune them, explain it requires a code change, not a config edit.
+Streaming/edit *throttling* (`charThreshold`, `flushIntervalMs`, backoff), tool-bubble
+rendering, inbound merge windows, attachment size limits, lifecycle reaction emojis, turn
+timeout, and the IPC socket path are frozen in code (`EXPERIENCE` in `src/config/schema.ts`),
+not config surface. If the user asks to tune them, explain it requires a code change, not a
+config edit.
+
+Note the split: `stream.enabled` (above) IS config surface — whether to stream at all is the
+operator's decision — while the numbers that pace a stream are not.

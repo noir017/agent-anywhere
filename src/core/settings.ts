@@ -36,7 +36,7 @@ import { pageCount, pageOf, pageSlice, truncateLabel, wrapPage } from './paging.
  */
 
 /** The settings this gateway can write. Everything else is refused by name. */
-export type SettingId = 'agent' | 'model' | 'idle' | 'scope';
+export type SettingId = 'agent' | 'model' | 'idle' | 'scope' | 'stream';
 
 /**
  * When a change reaches the running daemon.
@@ -107,7 +107,7 @@ export type ParsedSettingValue =
   | {
       kind: 'value';
       /** The value to write. `undefined` means DELETE the key (fall back to the schema default). */
-      value: string | number | undefined;
+      value: string | number | boolean | undefined;
       /** How the ack spells it. */
       display: string;
       /** An extra sentence the ack should carry (e.g. a model name the agent never advertised). */
@@ -175,7 +175,6 @@ const NOT_EDITABLE: Record<string, string> = {
   allowbots: 'per-platform response gating',
   channels: 'per-platform response gating',
   autothread: 'per-platform response gating',
-  stream: 'the streaming experience',
   tools: 'the streaming experience',
   inbound: 'the streaming experience',
   attachments: 'the streaming experience',
@@ -211,6 +210,9 @@ const KEY_ALIASES: Record<string, SettingId> = {
   idle: 'idle',
   idletimeout: 'idle',
   'session.idletimeoutms': 'idle',
+  stream: 'stream',
+  streaming: 'stream',
+  'stream.enabled': 'stream',
 };
 
 // ─────────────────────────────── reading ───────────────────────────────
@@ -272,6 +274,12 @@ export function settingsRows(cfg: Config): SettingRow[] {
       label: 'Conversation scope',
       value: cfg.session.scope,
       effect: 'restart',
+    },
+    {
+      id: 'stream',
+      label: 'Live streaming',
+      value: cfg.stream.enabled ? 'on' : 'off',
+      effect: 'live',
     }
   );
   return rows;
@@ -288,6 +296,12 @@ export function settingDescription(row: SettingRow): string {
       return 'How long a conversation may sit quiet before its agent child is stopped. It resumes on the next message.';
     case 'scope':
       return 'What counts as one conversation — a thread, a channel, a person, or the whole deployment.';
+    case 'stream':
+      return (
+        'Whether a reply is typed out by editing one message as it arrives (`on`), or sent whole once ' +
+        'each part is finished (`off`, the default). Off costs no edits, so a long reply can never run ' +
+        'into a platform’s per-message edit cap; either way a segment is sent at every tool boundary.'
+      );
     default: {
       const _exhaustive: never = row.id;
       return String(_exhaustive);
@@ -403,6 +417,11 @@ export function settingOptions(row: SettingRow, cfg: Config, ctx: SettingsContex
       return IDLE_PRESETS.map((p) => ({ raw: p, label: p === 'off' ? 'off (never reclaim)' : p }));
     case 'scope':
       return SCOPE_OPTIONS.map(([value, gloss]) => ({ raw: value, label: `${value} — ${gloss}` }));
+    case 'stream':
+      return [
+        { raw: 'off', label: 'off — send each finished part as a whole message' },
+        { raw: 'on', label: 'on — type the reply out by editing one message' },
+      ];
     default: {
       const _exhaustive: never = row.id;
       return _exhaustive;
@@ -452,6 +471,8 @@ export function parseSettingValue(
       }
       return { kind: 'value', value: match[0], display: match[0] };
     }
+    case 'stream':
+      return parseBooleanValue(input);
     default: {
       const _exhaustive: never = row.id;
       return { kind: 'invalid', reason: String(_exhaustive) };
@@ -532,6 +553,8 @@ export function settingLocation(row: SettingRow): SettingLocation {
       return { kind: 'path', path: ['session', 'idleTimeoutMs'] };
     case 'scope':
       return { kind: 'path', path: ['session', 'scope'] };
+    case 'stream':
+      return { kind: 'path', path: ['stream', 'enabled'] };
     default: {
       const _exhaustive: never = row.id;
       return _exhaustive;
@@ -540,11 +563,28 @@ export function settingLocation(row: SettingRow): SettingLocation {
 }
 
 /**
+ * Read an on/off answer.
+ *
+ * Deliberately generous about spelling — a toggle typed from a phone arrives as whatever the person
+ * had in mind, and `true`/`enable`/`1` all plainly mean the same thing here. Anything else is
+ * refused rather than coerced: silently reading an unrecognized word as `off` would flip a setting
+ * the user believes they just turned on.
+ */
+function parseBooleanValue(input: string): ParsedSettingValue {
+  const on = new Set(['on', 'true', 'yes', 'y', '1', 'enable', 'enabled']);
+  const off = new Set(['off', 'false', 'no', 'n', '0', 'disable', 'disabled']);
+  const norm = input.toLowerCase();
+  if (on.has(norm)) return { kind: 'value', value: true, display: 'on' };
+  if (off.has(norm)) return { kind: 'value', value: false, display: 'off' };
+  return { kind: 'invalid', reason: `\`${input}\` is not on or off.` };
+}
+
+/**
  * The value currently stored for a row, in the form a patch would write — as opposed to
  * `SettingRow.value`, which is formatted for a human. The writer compares against this to answer
  * "already that" without touching the file.
  */
-export function readSettingValue(row: SettingRow, cfg: Config): string | number | undefined {
+export function readSettingValue(row: SettingRow, cfg: Config): string | number | boolean | undefined {
   switch (row.id) {
     case 'agent':
       return cfg.routing.default;
@@ -554,6 +594,8 @@ export function readSettingValue(row: SettingRow, cfg: Config): string | number 
       return cfg.session.idleTimeoutMs;
     case 'scope':
       return cfg.session.scope;
+    case 'stream':
+      return cfg.stream.enabled;
     default: {
       const _exhaustive: never = row.id;
       return _exhaustive;

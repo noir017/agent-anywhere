@@ -10,11 +10,13 @@ function recorder(): {
   commands: unknown[];
   usage: AgentUsage[];
   models: string[];
+  configOptions: Array<SessionConfigOption[] | null | undefined>;
 } {
   const events: string[] = [];
   const commands: unknown[] = [];
   const usage: AgentUsage[] = [];
   const models: string[] = [];
+  const configOptions: Array<SessionConfigOption[] | null | undefined> = [];
   const st: TurnState = {
     handlers: {
       onText: (d) => events.push(`text:${d}`),
@@ -28,8 +30,9 @@ function recorder(): {
     lastSegment: 'none',
     toolLedger: new Map(),
     toolIndexSeq: 0,
+    onConfigOptions: (o) => configOptions.push(o),
   };
-  return { st, events, commands, usage, models };
+  return { st, events, commands, usage, models, configOptions };
 }
 
 const feed = (st: TurnState, u: unknown) => translateUpdate(u as SessionUpdate, st);
@@ -263,6 +266,27 @@ describe('translateUpdate config_option_update (mid-session model switch)', () =
     });
     expect(models).toEqual(['Sonnet 4.5']);
     expect(events).toEqual([]);
+  });
+
+  it('hands the whole option list back to the session, not just the model name', () => {
+    // onModel alone kept the FOOTER current while modelSelector() went on reporting the value
+    // session/new had reported — so a /model menu opened after a mid-session switch marked the
+    // wrong model as current and opened on the wrong page.
+    const { st, configOptions } = recorder();
+    const options: SessionConfigOption[] = [
+      {
+        id: 'model',
+        type: 'select',
+        name: 'Model',
+        currentValue: 'newapi/GLM-5.2',
+        options: [
+          { value: 'newapi/GLM-5.2', name: 'GLM-5.2' },
+          { value: 'newapi/deepseek-v4-pro', name: 'DeepSeek-V4-Pro' },
+        ],
+      },
+    ];
+    feed(st, { sessionUpdate: 'config_option_update', configOptions: options });
+    expect(configOptions).toEqual([options]);
   });
 
   it('stays silent when the update carries no model selector', () => {

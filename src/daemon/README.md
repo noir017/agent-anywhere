@@ -12,7 +12,7 @@ session id, agy's conversation id). One conversation holds one session *per agen
 
 | File | Role |
 |---|---|
-| `daemon.ts` | Top-level wiring: platforms + conversation registry + IPC. Slash registration, `ask` buttons, harness pickers. |
+| `daemon.ts` | Top-level wiring: platforms + conversation registry + IPC. Slash registration, `ask` buttons, harness pickers, the `/model` menu. |
 | `routing.ts` | Pure: inbound → which agent (and whether the user *asked* for it) + which scope |
 | `conversation.ts` | `ConversationRegistry` — per-conversation state, agent binding, access + gating, command translation |
 | `turn-runner.ts` | One turn end to end: prompt, streaming, tools, footer, errors |
@@ -360,6 +360,30 @@ to be a silent `return` — indistinguishable, from the chat, from a dead button
 - **An expired menu says so.** `pendingPicks` is in-memory and one-shot, so a second click
   or a click after a daemon restart finds nothing — and used to answer nothing.
 
+**The model menu** — a bare `/model` where the platform can post buttons *and* replace them
+(`capabilities.editButtons`). The registry decides who the menu is for and hands over the
+live selector; `daemon.ts` posts it, pages it and acks it. Three things it does differently
+from the harness picker, each for a reason:
+
+- **It is not one-shot.** Paging is the point, so a page click leaves the entry in place;
+  only a successful pick (or a `gone`/`rebound`/`missing` outcome) retires it.
+- **At most one live menu per conversation.** Opening a new one retires the old *in place*,
+  saying so on the message rather than leaving live-looking buttons behind. That is what
+  bounds `pendingModelMenus` — by live conversations, which `access.allowFrom` already
+  bounds — with no TTL (which would expire a menu still on screen because a clock ran out)
+  and no LRU (which would let one user's traffic kill another's open menu).
+- **The option list is frozen at open, and the resolved VALUE is re-checked at click.** A
+  pick id carries an absolute index into that snapshot; the page a button targets lives in
+  its id too, so the daemon holds no page cursor that could disagree with the screen. The
+  harness can rebuild its list mid-session, and without the value re-check a stale index
+  would switch to a model the user never saw — the one path here that could be silently
+  wrong. `ConversationRegistry.applyModelChoice` does that check, along with "conversation
+  still exists", "same agent still bound", and "there is a live selector at all".
+
+The pure half — paging, labels, ids, matching, and every string either surface says — is
+[`core/model-menu.ts`](../core/README.md), so the menu and `/model <query>` cannot answer
+differently.
+
 **Inbound dedup.** On platforms where a slash *is* a normal message (Telegram), one
 `/cmd` fires both a message event and a command event with the same `messageId`; they are
 deduped by `platform:<address>:messageId` within 15 s. When `messageId` is empty (Slack
@@ -404,17 +428,21 @@ back to whatever PATH offers.
 
 ## Tests
 
-Twelve test files. `agent-acp.test.ts` and `agent-agy.test.ts` cover protocol
+Thirteen test files. `agent-acp.test.ts` and `agent-agy.test.ts` cover protocol
 translation; `routing.test.ts`, `command-routing.test.ts`, `session-control.test.ts`,
 `conversation-store.test.ts`, `conversation-token-registry.test.ts`,
 `multi-platform.test.ts`, `slash-register.test.ts`, `ask-button.test.ts`,
+`picker-click.test.ts`, `model-menu-click.test.ts`, `local-commands.test.ts`,
 `permission.test.ts`, and `attachment-io.test.ts` cover the rest.
 
 Two suites are load-bearing for the design rather than for a function:
 `command-routing.test.ts`'s *sticky agent binding* block reproduces the reported bug
 (`/oc hi` then a plain follow-up must stay with opencode, in one conversation), and
 `conversation-store.test.ts` pins the "agent owns its context" invariant — bind, switch
-away, switch back, and the first agent's own session id is still there.
+away, switch back, and the first agent's own session id is still there. A third,
+`model-menu-click.test.ts`, exists for the same reason `picker-click.test.ts` does: on a
+button, a silent `return` is indistinguishable from a dead button, so every way a click can
+fail has a test asserting it produces words.
 
 `daemon.ts` and `turn-runner.ts` have no direct test file — their pure helpers are
 exported and tested from the files above (`parseAskButtonId`, `parsePickButtonId`,

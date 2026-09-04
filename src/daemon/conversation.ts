@@ -24,7 +24,18 @@ import {
 } from '../core/conversation.js';
 import type { AgentCommand, ConversationId, InboundMessage } from '../types.js';
 import type { PlatformAdapter } from '../platform/adapter.js';
-import type { AgentFactory, AgentUsage } from './agent.js';
+import type { AgentFactory, AgentSession, AgentUsage } from './agent.js';
+import type { ModelSelector } from '../types.js';
+import {
+  matchModels,
+  modelAmbiguousText,
+  modelChoiceText,
+  modelMenuSurface,
+  modelNoMatchText,
+  modelNoSelectorText,
+  modelSummaryText,
+  type ModelChoiceResult,
+} from '../core/model-menu.js';
 import { formatRuntimeFooter, formatTokens } from '../core/runtime-footer.js';
 import { InboundMerger } from '../core/inbound-merger.js';
 import { shouldRespond, type GateConfig } from '../core/inbound-gate.js';
@@ -33,12 +44,6 @@ import type { ConversationStore } from './conversation-store.js';
 
 /** Daemon-level context-control commands (intercepted in route(), never forwarded to the agent). */
 const CONTEXT_CLEAR_RE = /^\/(new|clear)(@\S+)?$/;
-
-/**
- * Cap on how many models a `/model <query>` disambiguation lists. Past this the list stops being
- * scannable on a phone, and the answer is a narrower query rather than a longer message.
- */
-const MODEL_MATCH_MAX = 12;
 
 /** `/help` — answered by the gateway itself (see DAEMON_COMMANDS), never forwarded to the agent. */
 const HELP_RE = /^\/help(@\S+)?$/;
@@ -136,10 +141,19 @@ export class ConversationRegistry {
      * onPickerRequest: fired when a bare agent command (`/cc`, `/oc`) is invoked for a conversation
      * whose harness reports a command list; the daemon owns the button UI, the registry only
      * resolves who it is for.
+     * onModelMenuRequest: same division for a bare `/model` on a platform that can carry a menu —
+     * the registry hands over the live selector (it is the only side holding the AgentSession) and
+     * the daemon posts, pages and acks the buttons.
      */
     private readonly hooks?: {
       onAvailableCommands?(id: ConversationId, agentId: string, cmds: AgentCommand[]): void;
       onPickerRequest?(id: ConversationId, agentId: string, msg: InboundMessage): void;
+      onModelMenuRequest?(
+        id: ConversationId,
+        agentId: string,
+        msg: InboundMessage,
+        selector: ModelSelector
+      ): void;
     },
     /** Persistent conversation state (agent binding + each agent's own session id). */
     private readonly store?: ConversationStore
@@ -604,7 +618,13 @@ export class ConversationRegistry {
     console.log(`[command] /${name} answered locally for ${key} (${state.agentId})`);
     try {
       if (name === 'context') return reply(this.describeContext(state));
-      if (name === 'model') return reply(await this.applyModelCommand(state, key, rest));
+      if (name === 'model') {
+        // undefined means the answer went out on another surface — the daemon posted a button
+        // menu — so saying anything here would duplicate it.
+        const text = await this.applyModelCommand(state, key, rest, msg);
+        if (text !== undefined) reply(text);
+        return;
+      }
       reply(`/${name} has no local handler.`); // unreachable unless GENERIC_COMMANDS gains a `local` without one
     } catch (e) {
       reply(`Could not answer /${name}: ${e instanceof Error ? e.message : String(e)}`);
@@ -628,57 +648,109 @@ ${formatTokens(left)} left before compaction — ${agentDisplayName(def, state.a
   }
 
   /**
-   * `/model`: show the live selector, or switch to a model named by id or by any substring that
-   * picks exactly one.
+   * `/model`: open the menu, show the live selector, or switch to a model named by id or substring.
    *
-   * Substring matching is the phone affordance: opencode offers 93 models, far past what a button
-   * menu can hold and past what is readable as a list, but `/model sonnet-5` is one thumb-typed
-   * token. Ambiguity lists the candidates instead of guessing — picking one for the user would
-   * silently change which model answers.
+   * Returns the text to send, or undefined when the answer went out another way (a button menu the
+   * daemon posted) — the same "already answered, say nothing" idiom applyCommandTranslation uses.
+   *
+   * The three outcomes are deliberately ordered by how much the user already knows. A bare `/model`
+   * on a platform that can carry one gets the menu, because "what are my options" is the question
+   * a phone user actually has. A bare `/model` anywhere else gets the summary line it always got.
+   * And a query still resolves by substring without any menu at all: `/model glm` is one thumb-typed
+   * token, and it works identically on all eight platforms.
    */
   private async applyModelCommand(
     state: ConversationState,
     key: ConversationId,
-    rest: string | undefined
-  ): Promise<string> {
+    rest: string | undefined,
+    msg: InboundMessage
+  ): Promise<string | undefined> {
     const session = this.agents.getOrCreate(key, state.agentId);
     const selector = session.modelSelector?.();
-    if (!selector) {
-      return 'No model selector on this session yet — it arrives with the agent\'s first reply. Send a message, then /model.';
-    }
+    if (!selector) return modelNoSelectorText();
+
     const query = rest?.trim();
     if (!query) {
-      const current = selector.current ?? 'unknown';
-      return `Model: ${current}
-${selector.options.length} available — \`/model <part of a name>\` to switch (e.g. \`/model sonnet\`).`;
+      const caps = this.platforms.get(msg.conversation.platform)?.capabilities;
+      if (
+        caps &&
+        modelMenuSurface(caps, selector.options.length) === 'menu' &&
+        this.hooks?.onModelMenuRequest
+      ) {
+        this.hooks.onModelMenuRequest(key, state.agentId, msg, selector);
+        return undefined;
+      }
+      return modelSummaryText(selector);
     }
 
-    const exact = selector.options.find((o) => o.value === query);
-    const matches = exact
-      ? [exact]
-      : selector.options.filter(
-          (o) =>
-            o.value.toLowerCase().includes(query.toLowerCase()) ||
-            o.name.toLowerCase().includes(query.toLowerCase())
-        );
-    if (matches.length === 0) {
-      return `No model matches "${query}". \`/model\` alone shows the current one and how many are offered.`;
-    }
-    if (matches.length > 1) {
-      const shown = matches.slice(0, MODEL_MATCH_MAX);
-      const more = matches.length - shown.length;
-      const list = shown.map((o) => `\`/model ${o.value}\` — ${o.name}`).join('\n');
-      return `"${query}" matches ${matches.length} models:\n${list}${more > 0 ? `\n…and ${more} more` : ''}`;
-    }
+    const match = matchModels(selector.options, query);
+    if (match.kind === 'none') return modelNoMatchText(query);
+    if (match.kind === 'many') return modelAmbiguousText(query, match.matches);
+    return modelChoiceText(await this.setModelOn(session, state, match.option.value));
+  }
 
+  /**
+   * Switch a live session's model and mirror the result onto the conversation.
+   *
+   * Shared by the typed path and the clicked one so they cannot answer differently. The mirror is
+   * what lets the footer name the new model on the very next turn, before the harness's own
+   * `config_option_update` arrives.
+   *
+   * Failures become a value rather than an exception: the click path has no user to re-prompt, and
+   * a swallowed error on a button is indistinguishable from a dead button.
+   */
+  private async setModelOn(
+    session: AgentSession,
+    state: ConversationState,
+    value: string
+  ): Promise<ModelChoiceResult> {
     if (!session.setModel) {
-      return 'This agent cannot switch models at runtime.';
+      return { kind: 'failed', reason: 'this agent cannot switch models at runtime' };
     }
-    const applied = await session.setModel(matches[0]!.value);
-    // Mirror it onto the conversation so the footer names the new model even before the harness's
-    // own config_option_update lands.
-    state.modelOverride = applied;
-    return `Model set to \`${applied}\` for this conversation.`;
+    try {
+      const applied = await session.setModel(value);
+      state.modelOverride = applied;
+      return { kind: 'applied', model: applied };
+    } catch (e) {
+      return { kind: 'failed', reason: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
+  /**
+   * Apply a model chosen by clicking a menu the daemon posted.
+   *
+   * Lives here rather than in the daemon because the registry is the sole holder of the
+   * AgentFactory and of ConversationState — the daemon does not even retain the factory it was
+   * constructed with. The daemon owns the buttons; the registry owns the session.
+   *
+   * Everything a menu can outlive is re-checked, because a menu is a snapshot and a click is a
+   * later event:
+   *
+   * - the conversation may be gone (a restart, a release);
+   * - `expectAgentId` may no longer answer here (a `/cc` between opening and clicking), in which
+   *   case the menu belongs to a harness that has nothing to do with this conversation any more;
+   * - there may be no live selector (a `/new` disposed the child — modelSelector is deliberately
+   *   non-spawning, so the honest answer is "send a message first");
+   * - **the value may no longer be offered.** This is the load-bearing one: the harness can rebuild
+   *   its list mid-session, and a button whose index still resolves against a stale snapshot would
+   *   otherwise switch to a model the user never saw, silently.
+   */
+  async applyModelChoice(
+    id: ConversationId,
+    expectAgentId: string,
+    value: string
+  ): Promise<ModelChoiceResult> {
+    const state = this.conversations.get(id);
+    if (!state) return { kind: 'gone' };
+    if (state.agentId !== expectAgentId) {
+      const def = findAgent(this.config, state.agentId);
+      return { kind: 'rebound', agent: agentDisplayName(def, state.agentId) };
+    }
+    const session = this.agents.getOrCreate(id, state.agentId);
+    const selector = session.modelSelector?.();
+    if (!selector) return { kind: 'unavailable' };
+    if (!selector.options.some((o) => o.value === value)) return { kind: 'missing', value };
+    return this.setModelOn(session, state, value);
   }
 
   /**

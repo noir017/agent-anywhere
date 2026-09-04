@@ -1,4 +1,8 @@
-import type { AgentCommand, ToolEvent, ToolFinishEvent } from '../types.js';
+import type { AgentCommand, ModelSelector, ToolEvent, ToolFinishEvent } from '../types.js';
+
+// ModelSelector lives in types.ts rather than here: core/model-menu.ts renders it into a paginated
+// button menu, and core may not import daemon/. Re-exported so the runtimes keep one import site.
+export type { ModelSelector };
 
 /**
  * Thin wrapper over the agent runtime (ACP implementation in agent-acp.ts). One AgentSession per session
@@ -38,21 +42,6 @@ export interface AgentStreamHandlers {
    * Fired once after session startup and again on any `config_option_update`.
    */
   onModel?(model: string): void;
-}
-
-/**
- * The session's model selector, as the harness exposes it (ACP session config option `model`).
- *
- * Read off the live session rather than from config: `agents[].model` is an intent a harness may
- * ignore (opencode does — it reported its own default until the daemon set the option explicitly),
- * and a harness that pins its model elsewhere (claude, via ANTHROPIC_MODEL) offers no selector at
- * all, which is a different answer from "the list is empty".
- */
-export interface ModelSelector {
-  /** The model serving this session right now. */
-  current?: string;
-  /** Selectable ids with the display names the harness gave them. May be empty. */
-  options: Array<{ value: string; name: string }>;
 }
 
 /** Live context usage from the agent (ACP UsageUpdate: `used` / `size`). */

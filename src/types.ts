@@ -182,3 +182,18 @@ export interface ToolFinishEvent {
   /** Duration of this tool call (ms). */
   durationMs: number;
 }
+
+/**
+ * A session's model selector, as the harness exposes it (ACP session config option `model`).
+ *
+ * Read off the live session rather than from config: `agents[].model` is an intent a harness may
+ * ignore (opencode does — it reported its own default until the daemon set the option explicitly),
+ * and a harness that pins its model elsewhere (claude, via ANTHROPIC_MODEL) offers no selector at
+ * all, which is a different answer from "the list is empty".
+ */
+export interface ModelSelector {
+  /** The model serving this session right now. */
+  current?: string;
+  /** Selectable ids with the display names the harness gave them. May be empty. */
+  options: Array<{ value: string; name: string }>;
+}

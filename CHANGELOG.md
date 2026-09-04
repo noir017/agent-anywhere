@@ -5,6 +5,37 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **`/model` is now a menu you can page through.** It could already show the live model and
+  switch by substring, but not *list* — the list is what a phone user actually wants, and
+  93 models was past both the 25-button cap and what reads as a message. A bare `/model`
+  now posts the models the agent offers as buttons, opening on the page holding the current
+  one (naming what you are on is half the question), with ◀ ▶ turning the page on the same
+  message and a tap switching the model. `/model <part of a name>` is untouched and still
+  works everywhere, including the platforms that get no menu.
+
+  A menu is a snapshot and a click is a later event, so everything the menu assumed is
+  re-checked before anything switches: the conversation still exists, the same agent still
+  answers it, there is a live selector, and — the load-bearing one — the harness still
+  offers that model. The harness can rebuild its list mid-session, and a button index
+  resolved against a stale list would otherwise switch to a model nobody saw. Each of those
+  gets its own sentence on the menu itself; none of them is a silent no-op, because on a
+  button that is indistinguishable from a dead one.
+
+  Reaching Discord, Telegram, Slack and Lark, where a sent message's buttons can be
+  replaced. QQ and LINE have no message-edit endpoint at all, so a menu there could never
+  be paged *or* retired — its buttons would outlive their own ack — and they keep the text
+  answer, which was always the complete answer rather than a degraded one.
+
+### Fixed
+
+- **A mid-session model switch no longer leaves `/model` describing the old one.** The
+  harness reports `config_option_update` when its model changes, and the daemon forwarded
+  the new name to the footer but dropped the option list that came with it — so the
+  session's own selector kept reporting whatever `session/new` had said. The footer was
+  right and everything reading the selector was one switch behind.
+
 ## [0.5.1] - 2026-09-03
 
 ### Fixed

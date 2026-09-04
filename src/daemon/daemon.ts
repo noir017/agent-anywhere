@@ -9,6 +9,18 @@ import {
   genericNativeNames,
   harnessCommandName,
 } from '../core/command-translate.js';
+import { parseButtonId } from '../core/button-id.js';
+import {
+  buildModelMenu,
+  modelChoiceText,
+  modelIndexOf,
+  modelMenuExpiredText,
+  modelMenuSupersededText,
+  modelPageOf,
+  parseModelButtonId,
+  type ModelButtonClick,
+  type ModelOption,
+} from '../core/model-menu.js';
 import type { PlatformAdapter } from '../platform/adapter.js';
 import type {
   AgentCommand,
@@ -17,6 +29,7 @@ import type {
   ConversationId,
   InboundMessage,
   MessageRef,
+  ModelSelector,
   SlashCommandSpec,
 } from '../types.js';
 import {
@@ -70,21 +83,15 @@ const PICK_PREFIX = 'cmd:';
 /**
  * Parse a `<prefix><reqId>:<index>` button custom_id (pure, testable). Returns null when the
  * prefix does not match or the shape is invalid. Shared by the ask and picker buttons so both
- * accept exactly the same id grammar.
+ * accept exactly the same id grammar — which now lives in core/button-id.ts, because the model
+ * menu builds its ids there and this file only parses them.
  */
 function parsePrefixedButtonId(
   buttonId: string,
   prefix: string
 ): { reqId: string; index: number } | null {
-  if (!buttonId.startsWith(prefix)) return null;
-  const rest = buttonId.slice(prefix.length);
-  const sep = rest.lastIndexOf(':');
-  if (sep <= 0) return null;
-  const reqId = rest.slice(0, sep);
-  const indexStr = rest.slice(sep + 1);
-  // Accept only a non-negative integer string (reject empty/non-digit; Number('') would be 0).
-  if (!reqId || !/^\d+$/.test(indexStr)) return null;
-  return { reqId, index: Number(indexStr) };
+  const parsed = parseButtonId(buttonId, prefix);
+  return parsed && { reqId: parsed.reqId, index: parsed.n };
 }
 
 /**
@@ -189,6 +196,32 @@ interface PendingPick {
   ref?: MessageRef;
 }
 
+/**
+ * A posted model menu, awaiting clicks — plural, unlike every other menu here.
+ *
+ * `options` is a FROZEN snapshot taken when the menu was opened, and a pick id carries an index
+ * into it. Re-snapshotting on a page turn would let an index printed on an earlier page point at a
+ * different model in a rebuilt list, and re-validating the value could not catch it because the
+ * wrong value would still be a valid one. So: freeze here, and re-check the resolved VALUE against
+ * the live selector at click time (ConversationRegistry.applyModelChoice does).
+ *
+ * There is no page cursor. The page a button targets is absolute and lives in its id, so a failed
+ * edit cannot leave the daemon's idea of the current page disagreeing with what is on screen.
+ */
+interface PendingModelMenu {
+  conversationId: ConversationId;
+  /** The agent that offered this list; a rebind since then invalidates the menu. */
+  agentId: string;
+  /** Where the menu was posted (the ack and any error go back here). */
+  conversation: ConversationRef;
+  /** The option list as it stood when the menu opened. Indices in button ids point into THIS. */
+  options: ModelOption[];
+  /** The model marked ● when the menu was drawn. Display only; never used to decide a switch. */
+  current?: string;
+  /** The menu message itself, captured from the send — page turns and the ack both edit it. */
+  ref?: MessageRef;
+}
+
 /** Main daemon: wires platform, session registry, and IPC server together. `agent-anywhere start` constructs and run()s it. */
 export class Daemon {
   private registry: ConversationRegistry;
@@ -203,6 +236,20 @@ export class Daemon {
   private agentCommands = new Map<string, AgentCommand[]>();
   /** Pending harness-picker menus: reqId → the session and command names it was built for. */
   private pendingPicks = new Map<string, PendingPick>();
+  /**
+   * Live model menus: reqId → the conversation and option snapshot it was built for.
+   *
+   * Held to the invariant "at most one per conversation": opening a menu retires whichever one that
+   * conversation already had. That is what bounds this map — by live conversations, which
+   * access.allowFrom already bounds — with no TTL and no LRU. Both were considered and rejected:
+   * a TTL expires a menu that is still on screen because a clock ran out while the user read it,
+   * and an LRU lets one user's traffic kill another's open menu. Expiry should be caused by
+   * something the user did.
+   *
+   * Unlike pendingPicks these are NOT one-shot — paging is the point. A successful pick deletes the
+   * entry; a failed one keeps it, so a retry is one tap rather than retyping /model.
+   */
+  private pendingModelMenus = new Map<string, PendingModelMenu>();
   /** Instances whose "slash must be registered out-of-band" skip notice was printed (log once each). */
   private skipRuntimeRegisterLogged = new Set<string>();
   /** Inbound dedup: `platform:channelId:messageId` → timestamp (see DEDUP_TTL_MS). */
@@ -244,6 +291,9 @@ export class Daemon {
       onAvailableCommands: (_id, agentId, cmds) => this.onAgentCommands(agentId, cmds),
       // A harness picker (/claude, /opencode) was invoked in a conversation of that harness.
       onPickerRequest: (id, agentId, msg) => this.onPickerRequest(id, agentId, msg),
+      // A bare `/model` on a platform that can carry (and later edit) buttons.
+      onModelMenuRequest: (id, agentId, msg, selector) =>
+        this.onModelMenuRequest(id, agentId, msg, selector),
     }, store);
     this.ipc = new IpcServer(socketPath, {
       // resolveAddress is also the sole capture point for the conversation owning this reverse
@@ -310,6 +360,7 @@ export class Daemon {
       );
     }
     this.pendingPicks.clear();
+    this.pendingModelMenus.clear();
     // Clear pending asks after ipc/platform are down: no new clicks or asks can arrive now. Clear each
     // timer and resolve null ("no selection") so any caller still blocked on ask IPC gets a result
     // rather than hanging forever. Best-effort: never throw.
@@ -451,8 +502,15 @@ export class Daemon {
     });
   }
 
-  /** Button click: resolve the matching pending ask or picker; otherwise ignore. */
+  /** Button click: resolve the matching model menu, pending ask, or picker; otherwise ignore. */
   private onButton(ev: ButtonInteraction): void {
+    // Prefixes are pairwise non-prefixing (`mdl:`/`mpg:`/`cmd:`/`ask:`), so this order is for
+    // readability, not correctness.
+    const model = parseModelButtonId(ev.buttonId);
+    if (model) {
+      this.onModelClick(ev, model);
+      return;
+    }
     const pick = parsePickButtonId(ev.buttonId);
     if (pick) {
       this.onPickClick(ev, pick);
@@ -679,6 +737,182 @@ export class Daemon {
       .get(platformId)
       ?.editMessage(ackRef, `→ /${name}`)
       .catch((e) => console.warn('[picker] click ack edit failed:', e instanceof Error ? e.message : e));
+  }
+
+  /**
+   * A bare `/model` on a platform that can carry a menu: post the first page of the model list.
+   *
+   * Opened on the page holding the CURRENT model rather than always page one — the question behind
+   * `/model` is usually "what am I on, and what else is there", and answering the first half by
+   * making the user page to it is a poor trade for one line of arithmetic.
+   */
+  private onModelMenuRequest(
+    conversationId: ConversationId,
+    agentId: string,
+    msg: InboundMessage,
+    selector: ModelSelector
+  ): void {
+    const adapter = this.platforms.get(msg.conversation.platform);
+    if (!adapter) return;
+
+    // One live menu per conversation (see pendingModelMenus): retire the previous one before
+    // posting, so its buttons cannot keep answering for a list the user has moved on from.
+    this.retireModelMenusFor(conversationId);
+
+    const reqId = randomUUID().slice(0, 8);
+    // Copied, not referenced: the harness owns that array and may rebuild it mid-session.
+    const options = [...selector.options];
+    const pending: PendingModelMenu = {
+      conversationId,
+      agentId,
+      conversation: msg.conversation,
+      options,
+      current: selector.current,
+    };
+    this.pendingModelMenus.set(reqId, pending);
+
+    const index = modelIndexOf(options, selector.current);
+    const view = buildModelMenu({
+      reqId,
+      options,
+      current: selector.current,
+      page: index >= 0 ? modelPageOf(index) : 0,
+    });
+    void adapter
+      .sendButtons(addressOf(msg.conversation), view.text, view.buttons)
+      .then((ref) => {
+        // Keep the menu's own ref: page turns and the ack both edit THIS message, and the click
+        // event's messageId is not a reliable stand-in on every platform (Telegram reports the
+        // callback_query id there).
+        pending.ref = ref;
+      })
+      .catch((e) => {
+        this.pendingModelMenus.delete(reqId);
+        console.error('[model] failed to post the menu:', e instanceof Error ? e.message : e);
+      });
+  }
+
+  /** Retire every live menu of one conversation, saying so on the message rather than going quiet. */
+  private retireModelMenusFor(conversationId: ConversationId): void {
+    for (const [reqId, menu] of this.pendingModelMenus) {
+      if (menu.conversationId !== conversationId) continue;
+      this.pendingModelMenus.delete(reqId);
+      this.editModelMenu(menu, modelMenuSupersededText(menu.current), []);
+    }
+  }
+
+  /**
+   * Best-effort in-place edit of a menu message. Menu edits are `void`-and-`catch` like every other
+   * cosmetic side effect here — a failed edit must never take down the click that caused it.
+   *
+   * An EMPTY button array is how a menu is retired: `editMessage` would leave the buttons on Slack
+   * and Lark (only Discord and Telegram drop components on a text-only edit), which is the whole
+   * reason editButtons exists.
+   */
+  private editModelMenu(
+    menu: PendingModelMenu,
+    text: string,
+    buttons: Array<{ id: string; label: string }>
+  ): void {
+    const adapter = this.platforms.get(menu.conversation.platform);
+    if (!adapter) return;
+    if (!menu.ref) {
+      // The send has not resolved yet — a microsecond window, but editing ev.messageId instead
+      // would address the wrong thing on Telegram. Say nothing on the message, log the cause.
+      console.warn('[model] menu has no message ref yet; skipping the edit');
+      return;
+    }
+    void adapter
+      .editButtons(menu.ref, text, buttons)
+      .catch((e) => console.warn('[model] menu edit failed:', e instanceof Error ? e.message : e));
+  }
+
+  /**
+   * A model-menu button was clicked: turn the page, or switch the model.
+   *
+   * The clicker is re-checked against the allowlist first, because a menu in a shared channel can
+   * be pressed by someone other than the person who opened it — and unlike a picker click, this one
+   * changes which model answers for everyone in that conversation.
+   */
+  private onModelClick(ev: ButtonInteraction, click: ModelButtonClick): void {
+    const clicker = ev.conversation;
+    const allow = this.config.access.allowFrom;
+    if (allow.length > 0 && !allow.includes(`${clicker.platform}:${clicker.user}`)) {
+      console.log(`[access] denied model-menu click from ${clicker.platform}:${clicker.user}`);
+      return;
+    }
+
+    const menu = this.pendingModelMenus.get(click.reqId);
+    if (!menu) {
+      // Superseded, already used, or the daemon restarted (this map is in-memory). Answered where
+      // the click happened, since the recorded conversation may be gone too — a silent return is
+      // indistinguishable, from the chat, from a broken button.
+      console.log(`[model] click on an expired menu (${click.reqId})`);
+      this.replyToClick(ev, modelMenuExpiredText());
+      return;
+    }
+
+    if (click.kind === 'page') {
+      const view = buildModelMenu({
+        reqId: click.reqId,
+        options: menu.options,
+        current: menu.current,
+        page: click.page,
+      });
+      this.editModelMenu(menu, view.text, view.buttons);
+      return;
+    }
+    void this.onModelPickClick(ev, click.reqId, menu, click.index);
+  }
+
+  /** A model button was clicked: apply it, then say what happened on the menu itself. */
+  private async onModelPickClick(
+    ev: ButtonInteraction,
+    reqId: string,
+    menu: PendingModelMenu,
+    index: number
+  ): Promise<void> {
+    const option = menu.options[index];
+    if (!option) {
+      // Only reachable from a mangled id (Telegram hashes callback_data over 64 bytes). Our ids are
+      // ~16, so this is defence, not an expected path — and it still gets an answer.
+      console.warn(`[model] click index ${index} is outside the menu's ${menu.options.length} options`);
+      this.replyToClick(ev, modelMenuExpiredText());
+      return;
+    }
+
+    const result = await this.registry.applyModelChoice(menu.conversationId, menu.agentId, option.value);
+    const text = modelChoiceText(result);
+    console.log(`[model] ${menu.conversationId}: ${option.value} → ${result.kind}`);
+
+    // Retire the menu when it can no longer be trusted or is no longer wanted: a successful switch
+    // moves the ● marker, and gone/rebound/missing all mean the snapshot no longer describes
+    // anything real. A transient refusal keeps the menu, so retrying is one tap.
+    const retire =
+      result.kind === 'applied' ||
+      result.kind === 'gone' ||
+      result.kind === 'rebound' ||
+      result.kind === 'missing';
+    if (retire) {
+      this.pendingModelMenus.delete(reqId);
+      this.editModelMenu(menu, text, []);
+      return;
+    }
+    const view = buildModelMenu({
+      reqId,
+      options: menu.options,
+      current: menu.current,
+      page: modelPageOf(index),
+    });
+    this.editModelMenu(menu, `${view.text}\n\n${text}`, view.buttons);
+  }
+
+  /** Answer where a click happened (not where the menu lives) — used when the menu is gone. */
+  private replyToClick(ev: ButtonInteraction, text: string): void {
+    void this.platforms
+      .get(ev.conversation.platform)
+      ?.sendMessage(addressOf(ev.conversation), text)
+      .catch((e) => console.warn('[model] failed to answer a click:', e instanceof Error ? e.message : e));
   }
 
   /**

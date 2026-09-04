@@ -46,6 +46,8 @@ conversation, not part of its name — see [`daemon/README.md`](../daemon/README
 | `runtime-footer.ts` | The `cc · 18k / 1M (2%) · claude-opus-4-5` tagline |
 | `attachment-ingest.ts` | Inbound attachment orchestration (download/save injected) |
 | `command-translate.ts` | The generic slash vocabulary and its per-harness translation |
+| `model-menu.ts` | `/model` as data: paging, labels, button ids, matching, and every string it says |
+| `button-id.ts` | The `<prefix><reqId>:<n>` button id grammar every menu shares |
 | `proxy.ts` | The one impure file — see below |
 
 `proxy.ts` is the deliberate exception: it patches undici's global dispatcher and the
@@ -184,6 +186,17 @@ though the gateway could answer it outright. Two do:
 |---|---|---|
 | `/context` | opencode's `/compact`-family commands are TUI-only; ACP mode never sees them | the last `usage_update {used, size}` the agent sent, the same numbers the footer prints |
 | `/model` | ditto — but `session/new` reports a `model` select and `session/set_config_option` switches it | `ConversationRegistry.applyModelCommand` via `AgentSession.modelSelector()` / `setModel()` |
+
+`/model` has two surfaces, both built from `model-menu.ts` so they cannot disagree about
+what happened. On a platform that can post buttons **and** edit them afterwards, a bare
+`/model` opens a paginated menu — on the page holding the current model, since "what am I
+on" is half the question. Everywhere else it prints the summary line it always did.
+`/model <part of a name>` stays a pure text path on all eight platforms.
+
+`modelMenuSurface()` requires both capabilities, and the second is the interesting one: on
+a platform that cannot edit (LINE, QQ) a menu could never be paged and — worse — never
+retired, so after a pick its buttons would sit live above the ack answering "expired"
+forever. A text answer there is not a degraded menu; it is the whole answer.
 
 Two rules keep this honest:
 

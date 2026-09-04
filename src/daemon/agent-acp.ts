@@ -535,6 +535,13 @@ function createAcpSession(
         lastSegment: 'none',
         toolLedger: new Map(),
         toolIndexSeq: 0,
+        // Keep the session's own view of the selector current when the harness changes it, so a
+        // later /model reflects reality rather than what session/new happened to report.
+        onConfigOptions: (options) => {
+          if (!options) return;
+          liveConfigOptions = options;
+          liveModel = liveModelName(options) ?? liveModel;
+        },
       };
 
       // Report the live model up front, from the session/new response captured at startup. Doing it
@@ -704,6 +711,17 @@ export interface TurnState {
   /** toolCallId → evolving tool state (accumulated across tool_call ↔ tool_call_update). */
   toolLedger: Map<string, ToolRec>;
   toolIndexSeq: number;
+  /**
+   * Hand a fresh `configOptions` list back to the session that owns it (`config_option_update`).
+   *
+   * Exists because translateUpdate is a module-level function and the option list lives in the
+   * session closure: without this the footer learned about a mid-session model switch (onModel
+   * fires) while `modelSelector()` kept reporting the old `currentValue` — so a `/model` menu
+   * opened afterwards marked the wrong model as current and opened on the wrong page.
+   *
+   * Optional so the pure translation tests can omit it.
+   */
+  onConfigOptions?(options: SessionConfigOption[] | null | undefined): void;
 }
 
 /**
@@ -770,6 +788,8 @@ export function translateUpdate(u: SessionUpdate, st: TurnState): void {
     // The agent's session config changed (model / mode / effort picker). Only the model interests
     // us: re-read it so a mid-session model switch is reflected in the footer.
     case 'config_option_update': {
+      // Write the whole list back first: `/model` needs the choices, not just the current name.
+      st.onConfigOptions?.(u.configOptions);
       const model = liveModelName(u.configOptions);
       if (model) st.handlers.onModel?.(model);
       break;

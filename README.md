@@ -214,9 +214,16 @@ instead of spending a turn on a prompt it will misread.
 
 Two of them the gateway answers itself where the harness has no command for it,
 because the capability is there over the protocol rather than as a slash:
-`/context` prints the last usage the agent reported, and `/model` shows the live
-model — `/model <part of a name>` switches it for that conversation, listing the
-candidates when the query is ambiguous rather than guessing.
+`/context` prints the last usage the agent reported, and `/model` shows and
+switches the model.
+
+`/model` alone opens a **paginated button menu** of the models the agent offers,
+starting on the page holding the current one; ◀ ▶ turn the page on the same
+message, and tapping a model switches it for that conversation. On Discord,
+Telegram, Slack and Lark, which is where a message's buttons can be replaced —
+elsewhere it prints the same summary line as before. `/model <part of a name>`
+switches by substring on every platform, listing the candidates when the query is
+ambiguous rather than guessing.
 
 ## Acting in the chat
 

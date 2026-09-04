@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-09-05
+
 ### Fixed
 
 - **A long reply is no longer truncated where the platform stops accepting edits.** Feishu/Lark

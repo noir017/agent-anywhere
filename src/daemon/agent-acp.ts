@@ -34,7 +34,7 @@ import {
   buildReverseHint,
   isNonEmptyObject,
   killChildProcess,
-  resolveAgentCwd,
+  resolveConversationCwd,
   stripCode,
   truncateToolName,
 } from './agent-common.js';
@@ -333,7 +333,13 @@ function createAcpSession(
   store?: ConversationStore
 ): AgentSession {
   const decorate: PromptDecorator = defaultPromptDecorator;
-  const cwd = resolveAgentCwd(def);
+  /**
+   * The directory this session's child runs in. Resolved per SPAWN, not once per session, so a
+   * `/cd` that disposed the child takes effect on the next turn (see resolveConversationCwd).
+   * Held here because three call sites below — spawn, session/load and session/new — must all
+   * agree on one answer within a single startup.
+   */
+  let cwd = resolveConversationCwd(def, conversationId, store);
 
   /** Lazily-started connection handles; established on first turn, closed on dispose. */
   let proc: ChildProcessWithoutNullStreams | undefined;
@@ -421,6 +427,10 @@ function createAcpSession(
   /** Lazily start the ACP child and complete initialize + session/new. sessionToken is injected into its env here. */
   async function ensureStarted(sessionToken: string): Promise<void> {
     if (active) return;
+
+    // Re-read the conversation's directory: between the last child and this one the user may have
+    // moved the conversation with `/cd`, and this is the only point at which that can be honored.
+    cwd = resolveConversationCwd(def, conversationId, store);
 
     const { command, args } = resolveHarness(def);
 

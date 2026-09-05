@@ -48,6 +48,7 @@ conversation, not part of its name — see [`daemon/README.md`](../daemon/README
 | `command-translate.ts` | The generic slash vocabulary and its per-harness translation |
 | `settings.ts` | `/setting` as data: which config.yaml fields are editable, what they accept, when a change lands |
 | `model-menu.ts` | `/model` as data: paging, labels, button ids, matching, and every string it says |
+| `workdir-menu.ts` | `/cd` as data: the same shape, for the directory a conversation works in |
 | `paging.ts` | The platform-imposed shape of a button menu: page size, page arithmetic, label budget |
 | `button-id.ts` | The `<prefix><reqId>:<n>` button id grammar every menu shares |
 | `proxy.ts` | The one impure file — see below |

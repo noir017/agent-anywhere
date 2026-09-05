@@ -123,6 +123,9 @@ function rig(cfg: Config = baseConfig, persistedAgent?: string) {
       agentSession: () => undefined,
       setAgentSession: () => {},
       clear: () => {},
+      conversationCwd: () => undefined,
+      setConversationCwd: () => {},
+      clearAgentSessions: () => {},
     } as never
   );
 

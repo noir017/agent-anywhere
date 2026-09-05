@@ -122,8 +122,62 @@ describe('ConversationStore: clear (/new)', () => {
   });
 });
 
-describe('ConversationStore: durability', () => {
-  it('a missing file starts empty rather than throwing', () => {
+describe('ConversationStore: working directory (/cd)', () => {
+  it('records the directory and survives a reload', () => {
+    const s = new ConversationStore(file);
+    expect(s.conversationCwd('tg#c1#')).toBeUndefined();
+    s.setConversationCwd('tg#c1#', 'cc', '/home/u/workspace/quantlab');
+    expect(new ConversationStore(file).conversationCwd('tg#c1#')).toBe('/home/u/workspace/quantlab');
+  });
+
+  it('clears the field when the choice goes back to the agent default', () => {
+    const s = new ConversationStore(file);
+    s.setConversationCwd('tg#c1#', 'cc', '/home/u/workspace/quantlab');
+    s.setConversationCwd('tg#c1#', 'cc', undefined);
+    expect(s.conversationCwd('tg#c1#')).toBeUndefined();
+    // Pinned as absent, not as a literal — a later edit to agents[].cwd must still move it.
+    expect(JSON.parse(fs.readFileSync(file, 'utf8'))['tg#c1#'].cwd).toBeUndefined();
+  });
+
+  it('outlives the binding it was recorded alongside: a rebind keeps the directory', () => {
+    const s = new ConversationStore(file);
+    s.bind('tg#c1#', 'cc');
+    s.setConversationCwd('tg#c1#', 'cc', '/home/u/workspace/quantlab');
+    s.bind('tg#c1#', 'oc');
+    // Asking a different agent about the same project is the point of asking it.
+    expect(s.conversationCwd('tg#c1#')).toBe('/home/u/workspace/quantlab');
+  });
+
+  it('clearAgentSessions drops every session id while keeping the binding and the directory', () => {
+    const s = new ConversationStore(file);
+    s.bind('tg#c1#', 'cc');
+    s.setAgentSession('tg#c1#', 'cc', 'cc-1');
+    s.setAgentSession('tg#c1#', 'oc', 'oc-1');
+    s.setConversationCwd('tg#c1#', 'cc', '/home/u/workspace/quantlab');
+
+    s.clearAgentSessions('tg#c1#');
+
+    // Every agent's, not just the bound one's: a session is pinned to the directory it started in,
+    // so a later /oc must not resume opencode's thread from the old project.
+    expect(s.agentSession('tg#c1#', 'cc')).toBeUndefined();
+    expect(s.agentSession('tg#c1#', 'oc')).toBeUndefined();
+    expect(s.boundAgent('tg#c1#')).toBe('cc');
+    expect(s.conversationCwd('tg#c1#')).toBe('/home/u/workspace/quantlab');
+  });
+
+  it('drops a malformed cwd rather than the whole record', () => {
+    fs.writeFileSync(
+      file,
+      JSON.stringify({ 'tg#c1#': { agent: 'cc', agentSessions: { cc: 'cc-1' }, cwd: 42 } })
+    );
+    const s = new ConversationStore(file);
+    // Losing the session id over a bad field would restart the user's task.
+    expect(s.agentSession('tg#c1#', 'cc')).toBe('cc-1');
+    expect(s.conversationCwd('tg#c1#')).toBeUndefined();
+  });
+});
+
+describe('ConversationStore: durability', () => {  it('a missing file starts empty rather than throwing', () => {
     expect(() => new ConversationStore(path.join(dir, 'nope', 'x.json'))).not.toThrow();
   });
 

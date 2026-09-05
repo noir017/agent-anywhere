@@ -27,6 +27,14 @@ export interface TurnRunnerDeps {
   agentIdOf(id: ConversationId): string;
   /** Read this conversation's model override (/model); undefined means use agent.model. */
   getModelOverride(id: ConversationId): string | undefined;
+  /**
+   * The directory this conversation's turn actually runs in (`/cd`, else `agents[].cwd`).
+   *
+   * Read per turn rather than taken from config, because after a `/cd` the two disagree and the
+   * footer's job is to name what is serving THIS turn. Undefined only when no agent def can be
+   * resolved, in which case the footer falls back to the configured value it always used.
+   */
+  getWorkdir?(id: ConversationId): string | undefined;
   /** Mark the current turn's target address + platform instance; reverse commands locate by them. */
   setActiveAddress(id: ConversationId, address: ConversationAddress, platformId: string): void;
   /** Clear the current turn's address (at turn end). */
@@ -496,7 +504,9 @@ export class TurnRunner {
         model: ref.model ?? this.deps.getModelOverride(conversationId) ?? def?.model,
         contextTokens: ref.usage?.used,
         contextLength: ref.usage?.size,
-        cwd: def?.cwd,
+        // The conversation's own directory, not `agents[].cwd`: after a `/cd` the two differ, and
+        // the footer reports what is actually serving this turn.
+        cwd: this.deps.getWorkdir?.(conversationId) ?? def?.cwd,
         homeDir: process.env.HOME,
       },
       this.config.display.footer.fields

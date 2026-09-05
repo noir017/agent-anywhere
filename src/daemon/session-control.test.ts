@@ -59,6 +59,11 @@ function makeStore(cleared: string[] = []) {
     agentSession: () => undefined,
     setAgentSession: () => {},
     clear: (k: string) => cleared.push(k),
+    // The `/cd` half: a reset reads the working directory back out (it survives /new) and a
+    // directory change drops every agent's session id.
+    conversationCwd: () => undefined,
+    setConversationCwd: () => {},
+    clearAgentSessions: () => {},
   };
 }
 

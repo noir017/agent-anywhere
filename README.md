@@ -181,6 +181,7 @@ Discord, Slack), and equally usable as plain text everywhere else.
 | `/help` | everything below, for the agent currently answering |
 | `/new`, `/clear` | start a fresh conversation (clears context) |
 | `/stop` | stop the current turn, keeping the conversation |
+| `/cd` | choose the directory this conversation works in — see below |
 | `/setting` | change a saved setting in config.yaml — see below |
 | `/cc`, `/oc`, `/cx`, `/gm`, `/agy` | one per configured harness — see below |
 | `/compact`, `/context`, `/model`, `/usage`, `/doctor`, `/mcp`, `/init`, `/review` | a generic vocabulary, translated to each harness's own spelling |
@@ -191,7 +192,8 @@ are registered. It does two things:
 
 ```
 /oc fix the failing test    →  switch this conversation to opencode, and ask it
-/oc                         →  switch, then list opencode's own commands as buttons
+/oc                         →  switch, then ask WHERE (a new conversation),
+                               or list opencode's own commands (an ongoing one)
 ```
 
 The binding is **sticky**: everything after `/oc` keeps going to opencode until
@@ -205,11 +207,12 @@ whichever agent is bound still spelled `/agy …`, which reads it as one of its 
 slash commands, finds nothing, and replies that a command ran and produced no
 output.
 
-The bare form is the only way to reach a harness's *own* commands
-(`/customize-opencode`, and friends). They are deliberately not registered
-globally: native slash is per-bot while agents are per-conversation, so a merged
-menu could neither say who owned an entry nor route it to them. A harness that
-reports no command list (`agy`) simply confirms the switch.
+The bare form is also how you reach a harness's *own* commands
+(`/customize-opencode`, and friends) — once the conversation is under way. They
+are deliberately not registered globally: native slash is per-bot while agents
+are per-conversation, so a merged menu could neither say who owned an entry nor
+route it to them. A harness that reports no command list (`agy`) simply confirms
+the switch.
 
 Generic commands are rewritten to the target harness's native spelling
 (`/compact` → gemini's `/compress`), and a harness with no equivalent says so
@@ -228,6 +231,33 @@ elsewhere it prints the same summary line as before. `/model <part of a name>`
 switches by substring on every platform, listing the candidates when the query is
 ambiguous rather than guessing. Both work on `opencode` and `claude`; neither
 advertises a `/model` command, and both expose the selector over ACP.
+
+## Choosing where the agent works
+
+`agents[].cwd` says which directory an agent starts in. `/cd` says which
+directory *this conversation* works in, so one topic can be about one project and
+the next about another without touching config.yaml.
+
+The list is the agent's own `cwd` plus the directories one level inside it — no
+second place to declare projects, and a new one appears in the menu by existing
+on disk. The root is always offered, so a conversation can get back out.
+
+```
+/cd                →  a paginated button menu of the projects under the root
+/cd quantlab       →  move there by substring, on every platform
+```
+
+You are asked the question at the two moments it is free: a bare agent command
+(`/cc`, `/oc`, `/agy`) in a conversation that has never run, and right after
+`/new`. An **ongoing** conversation is never interrupted with it — including one
+whose agent process was reclaimed while idle, which resumes where it left off.
+
+Moving **starts a fresh session** in the new directory, and the menu says so
+before you tap. That is not a policy choice: a session is pinned to the directory
+it was created in (ACP takes `cwd` at `session/new`, agy at spawn), so the move
+cannot reach a process that is already running. Tapping the directory you are
+already in (marked ●) costs nothing. The choice is recorded per conversation, so
+it survives a restart and a `/new`, and applies to every agent that answers there.
 
 ## Changing settings from chat
 

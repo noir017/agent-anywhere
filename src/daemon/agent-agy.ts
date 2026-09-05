@@ -8,7 +8,7 @@ import {
   buildInputPreview,
   buildReverseHint,
   killChildProcess,
-  resolveAgentCwd,
+  resolveConversationCwd,
   truncateToolName,
 } from './agent-common.js';
 
@@ -135,7 +135,13 @@ function createAgySession(
   conversationId: string,
   store?: ConversationStore
 ): AgentSession {
-  const cwd = resolveAgentCwd(def);
+  /**
+   * The directory this session's child runs in — and, through `--add-dir`, the one it is allowed to
+   * write to. Resolved per SPAWN rather than once per session so a `/cd` that disposed the child
+   * takes effect on the next turn (see resolveConversationCwd); `let`, and reassigned in
+   * ensureStarted, for exactly that reason.
+   */
+  let cwd = resolveConversationCwd(def, conversationId, store);
 
   /** Lazily-started child; established on the first turn, killed on dispose. */
   let proc: ChildProcessWithoutNullStreams | undefined;
@@ -197,6 +203,10 @@ function createAgySession(
   /** Spawn the child and wait for its `init` event (which agy emits before reading any stdin). */
   async function ensureStarted(sessionToken: string): Promise<void> {
     if (ready) return;
+
+    // Re-read the conversation's directory: a `/cd` since the last child disposed it, and this is
+    // the only point at which the new one can be honored (agy takes its cwd at spawn).
+    cwd = resolveConversationCwd(def, conversationId, store);
 
     // Replay this session's prior conversation so a daemon restart keeps the context (the ACP
     // runtime's session/load equivalent). agy owns the history on its own disk; we only remember which.

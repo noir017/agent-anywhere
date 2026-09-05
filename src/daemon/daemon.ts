@@ -22,6 +22,17 @@ import {
   type ModelOption,
 } from '../core/model-menu.js';
 import {
+  buildWorkdirMenu,
+  parseWorkdirButtonId,
+  workdirChoiceText,
+  workdirIndexOf,
+  workdirMenuExpiredText,
+  workdirMenuSupersededText,
+  workdirPageOf,
+  type WorkdirButtonClick,
+  type WorkdirOption,
+} from '../core/workdir-menu.js';
+import {
   buildSettingValueMenu,
   buildSettingsMenu,
   parseSettingButtonId,
@@ -260,7 +271,34 @@ interface PendingSettingsMenu {
   ref?: MessageRef;
 }
 
-/** Main daemon: wires platform, session registry, and IPC server together. `agent-anywhere start` constructs and run()s it. */export class Daemon {
+/**
+ * A posted directory menu, awaiting clicks.
+ *
+ * Shaped like PendingModelMenu and for the same reasons — a frozen option snapshot that pick
+ * indices point into, no page cursor (the target page lives in the button id), and the resolved
+ * value re-checked at click time rather than the index trusted.
+ *
+ * It differs in what a click COSTS, which is why the two are not one type: applying a model is a
+ * live call on the running session, while applying a directory ends that session. So this menu is
+ * retired on any successful pick — including `unchanged`, where nothing happened and the menu has
+ * simply been answered — rather than left up for a second choice.
+ */
+interface PendingWorkdirMenu {
+  conversationId: ConversationId;
+  /** The agent whose root was scanned; a rebind since then invalidates the list (see applyWorkdirChoice). */
+  agentId: string;
+  /** Where the menu was posted (the ack and any error go back here). */
+  conversation: ConversationRef;
+  /** The directory list as it stood when the menu opened. Indices in button ids point into THIS. */
+  options: WorkdirOption[];
+  /** The directory marked ● when the menu was drawn. Display only. */
+  current: string;
+  /** The menu message itself, captured from the send — page turns and the ack both edit it. */
+  ref?: MessageRef;
+}
+
+/** Main daemon: wires platform, session registry, and IPC server together. `agent-anywhere start` constructs and run()s it. */
+export class Daemon {
   private registry: ConversationRegistry;
   private ipc: IpcServer;
   /** Pending ask requests: reqId → wait handle. Resolved and deleted on click or timeout. */
@@ -289,6 +327,13 @@ interface PendingSettingsMenu {
   private pendingModelMenus = new Map<string, PendingModelMenu>();
   /** Live settings menus: reqId → the conversation, row snapshot and open level it was built for. */
   private pendingSettingsMenus = new Map<string, PendingSettingsMenu>();
+  /**
+   * Live directory menus: reqId → the conversation and directory snapshot it was built for.
+   *
+   * Same "at most one per conversation" bound as the model menus, and the same reasoning about why
+   * that is the right bound rather than a TTL or an LRU (see pendingModelMenus).
+   */
+  private pendingWorkdirMenus = new Map<string, PendingWorkdirMenu>();
   /** Instances whose "slash must be registered out-of-band" skip notice was printed (log once each). */
   private skipRuntimeRegisterLogged = new Set<string>();
   /** Inbound dedup: `platform:channelId:messageId` → timestamp (see DEDUP_TTL_MS). */
@@ -345,6 +390,10 @@ interface PendingSettingsMenu {
         this.onModelMenuRequest(id, agentId, msg, selector),
       // A `/setting` on a platform that can carry (and later edit) buttons.
       onSettingMenuRequest: (id, msg, menu) => this.onSettingMenuRequest(id, msg, menu),
+      // A directory menu is wanted: `/cd`, a bare agent command in a conversation with no history,
+      // or a `/new` that just cleared one.
+      onWorkdirMenuRequest: (id, agentId, msg, menu) =>
+        this.onWorkdirMenuRequest(id, agentId, msg, menu),
     }, store);
     this.ipc = new IpcServer(socketPath, {
       // resolveAddress is also the sole capture point for the conversation owning this reverse
@@ -559,13 +608,18 @@ interface PendingSettingsMenu {
     });
   }
 
-  /** Button click: resolve the matching model menu, settings menu, pending ask, or picker; otherwise ignore. */
+  /** Button click: resolve the matching model menu, directory menu, settings menu, pending ask, or picker; otherwise ignore. */
   private onButton(ev: ButtonInteraction): void {
-    // Prefixes are pairwise non-prefixing (`mdl:`/`mpg:`/`stg:`/`stv:`/`stp:`/`stb:`/`cmd:`/`ask:`),
-    // so this order is for readability, not correctness.
+    // Prefixes are pairwise non-prefixing (`mdl:`/`mpg:`/`wdr:`/`wdp:`/`stg:`/`stv:`/`stp:`/`stb:`/
+    // `cmd:`/`ask:`), so this order is for readability, not correctness.
     const model = parseModelButtonId(ev.buttonId);
     if (model) {
       this.onModelClick(ev, model);
+      return;
+    }
+    const workdir = parseWorkdirButtonId(ev.buttonId);
+    if (workdir) {
+      this.onWorkdirClick(ev, workdir);
       return;
     }
     const setting = parseSettingButtonId(ev.buttonId);
@@ -975,6 +1029,157 @@ interface PendingSettingsMenu {
       .get(ev.conversation.platform)
       ?.sendMessage(addressOf(ev.conversation), text)
       .catch((e) => console.warn('[menu] failed to answer a click:', e instanceof Error ? e.message : e));
+  }
+
+  /**
+   * A directory menu is wanted here: post the page holding the CURRENT directory.
+   *
+   * Opened on that page rather than page one for the reason onModelMenuRequest is: half the question
+   * is "where am I", and answering it by making the user page to the ● marker is a poor trade for
+   * one line of arithmetic.
+   *
+   * The truncation notice is appended rather than folded into the menu text, because a scan that hit
+   * the cap is an unusual state and the sentence describing it should not be paid for on every
+   * normal menu (core/workdir-menu.ts owns the normal one).
+   */
+  private onWorkdirMenuRequest(
+    conversationId: ConversationId,
+    agentId: string,
+    msg: InboundMessage,
+    menu: { options: WorkdirOption[]; current: string; truncated: number }
+  ): void {
+    const adapter = this.platforms.get(msg.conversation.platform);
+    if (!adapter) return;
+
+    // One live menu per conversation: retire the previous one before posting, so its buttons cannot
+    // keep answering for a list the user has moved on from.
+    this.retireWorkdirMenusFor(conversationId);
+
+    const reqId = randomUUID().slice(0, 8);
+    // Copied, not referenced: the scan's array must not be shared with a later scan's.
+    const options = [...menu.options];
+    const pending: PendingWorkdirMenu = {
+      conversationId,
+      agentId,
+      conversation: msg.conversation,
+      options,
+      current: menu.current,
+    };
+    this.pendingWorkdirMenus.set(reqId, pending);
+
+    const index = workdirIndexOf(options, menu.current);
+    const view = buildWorkdirMenu({
+      reqId,
+      options,
+      current: menu.current,
+      page: index >= 0 ? workdirPageOf(index) : 0,
+    });
+    const text =
+      menu.truncated > 0
+        ? `${view.text}\n(+${menu.truncated} more not shown — type part of a name instead.)`
+        : view.text;
+    void adapter
+      .sendButtons(addressOf(msg.conversation), text, view.buttons)
+      .then((ref) => {
+        // Keep the menu's own ref: page turns and the ack both edit THIS message, and the click
+        // event's messageId is not a reliable stand-in on every platform.
+        pending.ref = ref;
+      })
+      .catch((e) => {
+        this.pendingWorkdirMenus.delete(reqId);
+        console.error('[workdir] failed to post the menu:', e instanceof Error ? e.message : e);
+      });
+  }
+
+  /** Retire every live directory menu of one conversation, saying so rather than going quiet. */
+  private retireWorkdirMenusFor(conversationId: ConversationId): void {
+    for (const [reqId, menu] of this.pendingWorkdirMenus) {
+      if (menu.conversationId !== conversationId) continue;
+      this.pendingWorkdirMenus.delete(reqId);
+      this.editWorkdirMenu(menu, workdirMenuSupersededText(menu.current), []);
+    }
+  }
+
+  /** Best-effort in-place edit of a directory menu; an empty button array retires it (see editModelMenu). */
+  private editWorkdirMenu(
+    menu: PendingWorkdirMenu,
+    text: string,
+    buttons: Array<{ id: string; label: string }>
+  ): void {
+    const adapter = this.platforms.get(menu.conversation.platform);
+    if (!adapter) return;
+    if (!menu.ref) {
+      console.warn('[workdir] menu has no message ref yet; skipping the edit');
+      return;
+    }
+    void adapter
+      .editButtons(menu.ref, text, buttons)
+      .catch((e) => console.warn('[workdir] menu edit failed:', e instanceof Error ? e.message : e));
+  }
+
+  /**
+   * A directory-menu button was clicked: turn the page, or move the conversation.
+   *
+   * The clicker is re-checked against the allowlist first, for the reason onModelClick is — a menu
+   * in a shared channel can be pressed by someone other than whoever opened it, and this one does
+   * more than change an answer: it ends the session everyone in that conversation was using.
+   */
+  private onWorkdirClick(ev: ButtonInteraction, click: WorkdirButtonClick): void {
+    const clicker = ev.conversation;
+    const allow = this.config.access.allowFrom;
+    if (allow.length > 0 && !allow.includes(`${clicker.platform}:${clicker.user}`)) {
+      console.log(`[access] denied workdir-menu click from ${clicker.platform}:${clicker.user}`);
+      return;
+    }
+
+    const menu = this.pendingWorkdirMenus.get(click.reqId);
+    if (!menu) {
+      // Superseded, already used, or the daemon restarted (this map is in-memory). Answered where
+      // the click happened: a silent return is indistinguishable, from the chat, from a dead button.
+      console.log(`[workdir] click on an expired menu (${click.reqId})`);
+      this.replyToClick(ev, workdirMenuExpiredText());
+      return;
+    }
+
+    if (click.kind === 'page') {
+      const view = buildWorkdirMenu({
+        reqId: click.reqId,
+        options: menu.options,
+        current: menu.current,
+        page: click.page,
+      });
+      this.editWorkdirMenu(menu, view.text, view.buttons);
+      return;
+    }
+
+    const option = menu.options[click.index];
+    if (!option) {
+      // Only reachable from a mangled id (Telegram hashes callback_data over 64 bytes); ours are
+      // ~16, so this is defence rather than an expected path — and it still gets an answer.
+      console.warn(`[workdir] click index ${click.index} is outside the menu's ${menu.options.length} options`);
+      this.replyToClick(ev, workdirMenuExpiredText());
+      return;
+    }
+
+    const result = this.registry.applyWorkdirChoice(menu.conversationId, menu.agentId, option.path);
+    const text = workdirChoiceText(result);
+    console.log(`[workdir] ${menu.conversationId}: ${option.path} → ${result.kind}`);
+
+    // Every outcome except a failed write retires the menu. `applied` ended the session the menu
+    // described; `unchanged` answered it; `rebound` and `missing` mean the snapshot no longer
+    // describes anything real. Only a `failed` write is worth a second tap.
+    if (result.kind === 'failed') {
+      const view = buildWorkdirMenu({
+        reqId: click.reqId,
+        options: menu.options,
+        current: menu.current,
+        page: workdirPageOf(click.index),
+      });
+      this.editWorkdirMenu(menu, `${view.text}\n\n${text}`, view.buttons);
+      return;
+    }
+    this.pendingWorkdirMenus.delete(click.reqId);
+    this.editWorkdirMenu(menu, text, []);
   }
 
   /**

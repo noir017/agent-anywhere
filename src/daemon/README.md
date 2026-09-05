@@ -12,7 +12,7 @@ session id, agy's conversation id). One conversation holds one session *per agen
 
 | File | Role |
 |---|---|
-| `daemon.ts` | Top-level wiring: platforms + conversation registry + IPC. Slash registration, `ask` buttons, harness pickers, the `/model` and `/setting` menus. |
+| `daemon.ts` | Top-level wiring: platforms + conversation registry + IPC. Slash registration, `ask` buttons, harness pickers, the `/model`, `/cd` and `/setting` menus. |
 | `routing.ts` | Pure: inbound → which agent (and whether the user *asked* for it) + which scope |
 | `conversation.ts` | `ConversationRegistry` — per-conversation state, agent binding, access + gating, command translation |
 | `settings-store.ts` | The write half of `/setting`: validate, patch config.yaml, apply to the live `Config` |
@@ -22,7 +22,8 @@ session id, agy's conversation id). One conversation holds one session *per agen
 | `agent-acp.ts` | ACP runtime (claude, codex, opencode, gemini, custom) |
 | `agent-agy.ts` | Antigravity CLI runtime — its own stream-json protocol |
 | `agent-common.ts` | Protocol-agnostic helpers shared by both runtimes |
-| `conversation-store.ts` | Persisted per conversation: the bound agent + each agent's own session id |
+| `conversation-store.ts` | Persisted per conversation: the bound agent, each agent's own session id, and the directory it works in |
+| `workdir-scan.ts` | The `/cd` option list: an agent's configured root plus the projects one level inside it |
 | `conversation-token-registry.ts` | Per-conversation reverse-command token ↔ conversation id |
 | `attachment-io.ts` | Real attachment IO + the SSRF guards |
 | `reverse-cli-shim.ts` | Guarantees `agent-anywhere` is on the agent's PATH |

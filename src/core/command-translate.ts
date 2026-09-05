@@ -52,11 +52,18 @@ export type Harness = AgentDef['harness'];
  * will and will not touch). Registered alongside the rest because the alternative — reaching the
  * machine to edit YAML and restarting, which stops every resident agent — is the cost this gateway
  * exists to remove.
+ *
+ * `/cd` is the one that costs the most when used, and it is here rather than in the generic
+ * vocabulary because it is not a question for the harness at all: the directory is recorded against
+ * the CONVERSATION and read at spawn, so every harness gets it, including the ones (agy) that
+ * expose no commands of their own. Its effect on the agent is the same as `/new` — a session is
+ * pinned to the directory it started in — which is why the menu it opens says so before the tap.
  */
 export const DAEMON_COMMANDS: SlashCommandSpec[] = [
   { name: 'new', description: 'Start a fresh conversation (clears context)' },
   { name: 'clear', description: 'Alias of /new: start a fresh conversation' },
   { name: 'stop', description: 'Stop the current turn (keeps the conversation)' },
+  { name: 'cd', description: 'Choose the working directory (starts a fresh session there)' },
   { name: 'setting', description: 'Change a saved setting (default agent, model, session)' },
   { name: 'help', description: 'List the commands this gateway understands' },
 ];

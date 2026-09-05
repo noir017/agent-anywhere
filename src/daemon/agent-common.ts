@@ -1,6 +1,6 @@
 import { homedir } from 'node:os';
 import { join, resolve, delimiter } from 'node:path';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, statSync } from 'node:fs';
 import type { ChildProcess } from 'node:child_process';
 import type { AgentDef } from '../config/schema.js';
 import { REVERSE_COMMANDS } from '../ipc/commands.js';
@@ -63,6 +63,37 @@ export function resolveAgentCwd(def: AgentDef): string {
   const dir = join(homedir(), '.agent-anywhere', 'agents', def.id);
   mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+/**
+ * The directory THIS conversation's next session starts in: its `/cd` choice, or the agent's
+ * configured cwd when it has made none.
+ *
+ * Called at spawn time by both runtimes rather than once per session object, because that is the
+ * only moment the answer can still change anything — ACP fixes the directory at `session/new` and
+ * agy at process spawn, so a session already running is standing where it is until it is replaced.
+ * Reading it late is what lets `/cd` take effect by disposing the child instead of by mutating a
+ * closure nobody re-reads.
+ *
+ * A recorded directory that has since disappeared falls back to the root rather than failing the
+ * turn: the conversation is still answerable from the agent's own workspace, and a spawn that dies
+ * on a missing cwd would strand it with an error the user cannot act on from a phone.
+ */
+export function resolveConversationCwd(
+  def: AgentDef,
+  conversationId: string,
+  store?: { conversationCwd(key: string): string | undefined }
+): string {
+  const root = resolveAgentCwd(def);
+  const chosen = store?.conversationCwd(conversationId);
+  if (!chosen || chosen === root) return root;
+  try {
+    if (statSync(chosen).isDirectory()) return chosen;
+    console.warn(`[agent] recorded working dir "${chosen}" is not a directory; using ${root}`);
+  } catch {
+    console.warn(`[agent] recorded working dir "${chosen}" is gone; using ${root}`);
+  }
+  return root;
 }
 
 /**

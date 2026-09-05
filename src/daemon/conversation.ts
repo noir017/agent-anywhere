@@ -52,6 +52,19 @@ import {
   type SettingsContext,
 } from '../core/settings.js';
 import { SettingsStore } from './settings-store.js';
+import {
+  matchWorkdirs,
+  workdirAmbiguousText,
+  workdirChoiceText,
+  workdirMenuSurface,
+  workdirNoMatchText,
+  workdirSummaryText,
+  workdirUnreadableText,
+  type WorkdirChoiceResult,
+  type WorkdirOption,
+} from '../core/workdir-menu.js';
+import { scanWorkdirs, isDirectory } from './workdir-scan.js';
+import { resolveAgentCwd, resolveConversationCwd } from './agent-common.js';
 import { formatRuntimeFooter, formatTokens } from '../core/runtime-footer.js';
 import { InboundMerger } from '../core/inbound-merger.js';
 import { shouldRespond, type GateConfig } from '../core/inbound-gate.js';
@@ -76,6 +89,15 @@ const STOP_RE = /^\/stop(@\S+)?$/;
  * actually called on disk.
  */
 const SETTING_NAMES = new Set(['setting', 'settings', 'config']);
+
+/**
+ * `/cd` — choose the directory this conversation works in. Answered by the gateway, never
+ * forwarded: no harness has a slash command that could move the session it is running in.
+ *
+ * `cd` and `dir` both accepted, only `cd` registered (the HARNESS_COMMANDS.aliases trade): `cd` is
+ * what anyone who has used a shell types, `dir` is what it is called on the button that offers it.
+ */
+const WORKDIR_NAMES = new Set(['cd', 'dir', 'workdir']);
 
 /** What the merger was doing when `/stop` arrived. */
 type StopOutcome = 'running' | 'collecting' | 'idle';
@@ -258,6 +280,21 @@ export class ConversationRegistry {
         }
       ): void;
       /**
+       * A directory menu is wanted here (`/cd`, a bare agent command in a conversation with no
+       * history yet, or a `/new` that just cleared one). Same division of labour as the model menu:
+       * the registry decides WHAT is on offer — it holds the config, the store and the filesystem
+       * root — and the daemon posts, pages and acks the buttons.
+       *
+       * `truncated` is how many directories did not fit the scan cap; the daemon says so on the
+       * menu rather than showing a list that looks complete.
+       */
+      onWorkdirMenuRequest?(
+        id: ConversationId,
+        agentId: string,
+        msg: InboundMessage,
+        menu: { options: WorkdirOption[]; current: string; truncated: number }
+      ): void;
+      /**
        * Whether the daemon is holding work for this conversation that lives OUTSIDE a turn — today,
        * a pending `ask` whose IPC caller is blocked on a button click. The idle sweeper asks before
        * reclaiming, because such a conversation looks idle from here (no turn, no messages) while
@@ -282,6 +319,7 @@ export class ConversationRegistry {
         tokenFor: (id) => this.tokens.tokenFor(id),
         agentIdOf: (id) => this.agentIdOf(id),
         getModelOverride: (id) => this.conversations.get(id)?.modelOverride,
+        getWorkdir: (id) => this.workdirOf(id),
         recordUsage: (id, usage) => {
           const state = this.conversations.get(id);
           if (state) state.lastUsage = usage;
@@ -721,9 +759,15 @@ export class ConversationRegistry {
     // Deliberately not forwarded: this is the one place the gateway is allowed to reset an agent,
     // and only because the user asked in so many words.
     if (CONTEXT_CLEAR_RE.test(text)) {
+      const agentId = this.boundAgentFor(key, fallbackAgent);
       this.resetConversation(key);
       console.log(`[conversation] ${key} context cleared by ${conv.platform}:${conv.user}`);
       ack('context clear', 'Context cleared — the next message starts a fresh conversation.');
+      // Then ask where that fresh conversation should happen. A reset is the one moment the
+      // question costs nothing: there is no context to strand, and the previous topic's directory
+      // is the least likely answer to still be right. Declined silently when there is nothing to
+      // choose between (see offerWorkdirMenu) — a menu of one is not a question.
+      this.offerWorkdirMenu(key, agentId, msg);
       return true;
     }
 
@@ -750,6 +794,19 @@ export class ConversationRegistry {
     const setting = parseTextCommand(text);
     if (setting && SETTING_NAMES.has(setting.name.toLowerCase())) {
       this.handleSetting(key, setting.rest, fallbackAgent, address, msg);
+      return true;
+    }
+
+    // `/cd` — where the agent works, as opposed to `/setting`, which is how it is configured.
+    // Answered here for the same reason `/new` is: it is the gateway's own decision (the directory
+    // is recorded per conversation, not per agent) and it resets the agent rather than asking it
+    // anything.
+    if (setting && WORKDIR_NAMES.has(setting.name.toLowerCase())) {
+      const agentId = this.boundAgentFor(key, fallbackAgent);
+      const answer = this.applyWorkdirCommand(key, agentId, setting.rest, msg);
+      // undefined = answered on another surface (the daemon posted a menu), the same
+      // "already answered, say nothing" idiom applyCommandTranslation uses.
+      if (answer !== undefined) ack('/cd', answer);
       return true;
     }
     return false;
@@ -908,10 +965,20 @@ export class ConversationRegistry {
   /**
    * Answer a bare agent command (`/oc` with no prompt), whose binding route() has already applied.
    *
-   * What it answers WITH depends on the harness:
-   *  - one that reports a command list gets its own menu, which is the ONLY way those commands are
-   *    reachable — they are deliberately not registered globally (core/command-translate.ts);
-   *  - one that reports none (agy) gets the binding ack, because an empty menu answers nothing.
+   * What it answers WITH depends on how far along the conversation is, and that ordering is the
+   * point:
+   *  - a conversation this agent has never run in gets the DIRECTORY menu, because "which project"
+   *    is the question that has to be answered before any other one matters — and it is the only
+   *    moment the answer is free, since there is no context yet to throw away;
+   *  - one already under way gets the harness's own command list, which is the ONLY way those
+   *    commands are reachable (core/command-translate.ts), or the binding ack for a harness that
+   *    reports none (agy).
+   *
+   * "Already under way" is read off the STORE, not off anything in memory, and that is deliberate:
+   * an idle-reclaimed conversation has no child and no live session, yet its agent's session id is
+   * still recorded and its next turn resumes it (see reclaimIdleSessions). Asking a returning user
+   * to re-pick a directory would be both wrong and destructive — the reclaim is invisible to them,
+   * and the answer would reset the very context that was just carefully preserved.
    *
    * A rebind, when there was one, already announced itself in rebind(); this adds what was asked
    * for rather than repeating who is answering.
@@ -923,6 +990,11 @@ export class ConversationRegistry {
     address: ConversationAddress,
     msg: InboundMessage
   ): void {
+    // No store means no place to record a directory, so `/cd` cannot work at all here — fall
+    // straight through to the behaviour this command has always had.
+    const started = this.store?.agentSession(key, state.agentId) !== undefined;
+    if (!started && this.offerWorkdirMenu(key, state.agentId, msg)) return;
+
     const def = findAgent(this.config, state.agentId);
     if (harnessHasPicker(def?.harness) && this.hooks?.onPickerRequest) {
       this.hooks.onPickerRequest(key, state.agentId, msg);
@@ -1188,6 +1260,164 @@ ${formatTokens(left)} left before compaction — ${name}`;
     return this.setModelOn(session, state, value);
   }
 
+  // ───────────────────────────── working directory (`/cd`) ─────────────────────────────
+
+  /**
+   * The directory this conversation's next turn will run in.
+   *
+   * The same call the runtimes make at spawn (resolveConversationCwd), so the footer, the menu's
+   * ● marker and the process actually launched can never disagree — including about a recorded
+   * directory that has since been deleted, which resolves back to the agent's root in one place
+   * rather than three.
+   */
+  workdirOf(id: ConversationId, agentId?: string): string | undefined {
+    const def = findAgent(this.config, agentId ?? this.agentIdOf(id));
+    return def ? resolveConversationCwd(def, id, this.store) : undefined;
+  }
+
+  /**
+   * Post a directory menu for this conversation, and say whether one went out.
+   *
+   * Returns false — silently — whenever there is nothing to ask: no platform buttons, no
+   * conversation store to record an answer in, an unreadable root, or a root with no
+   * sub-directories. Callers use that to fall through to whatever they would otherwise have said
+   * (the harness command list, or nothing at all), because a menu offering one directory is not a
+   * question, and an error about `agents[].cwd` is not an answer to `/cc`.
+   */
+  private offerWorkdirMenu(id: ConversationId, agentId: string, msg: InboundMessage): boolean {
+    const caps = this.platforms.get(msg.conversation.platform)?.capabilities;
+    const def = findAgent(this.config, agentId);
+    if (!this.store || !this.hooks?.onWorkdirMenuRequest || !caps || !def) return false;
+
+    const scan = scanWorkdirs(resolveAgentCwd(def));
+    if (!scan.ok || workdirMenuSurface(caps, scan.options.length) !== 'menu') return false;
+
+    this.hooks.onWorkdirMenuRequest(id, agentId, msg, {
+      options: scan.options,
+      current: this.workdirOf(id, agentId) ?? scan.options[0]!.path,
+      truncated: scan.truncated,
+    });
+    return true;
+  }
+
+  /**
+   * `/cd`: open the menu, list what is on offer, or move to a directory named by path or substring.
+   *
+   * Returns the text to send, or undefined when the answer went out another way (a button menu the
+   * daemon posted) — the same idiom applyModelCommand uses.
+   *
+   * The three shapes mirror `/model` deliberately: a bare `/cd` on a platform that can carry a menu
+   * gets one, because "where can I work" is a question a phone user cannot answer by typing; a bare
+   * `/cd` anywhere else gets the same list as text; and `/cd quantlab` resolves by substring on
+   * every platform, buttons or not.
+   */
+  private applyWorkdirCommand(
+    id: ConversationId,
+    agentId: string,
+    rest: string | undefined,
+    msg: InboundMessage
+  ): string | undefined {
+    const def = findAgent(this.config, agentId);
+    if (!def) return `No agent "${agentId}" is configured, so there is no directory to change.`;
+    const root = resolveAgentCwd(def);
+    const scan = scanWorkdirs(root);
+    // Reported rather than swallowed: an unreadable root means `agents[].cwd` names something that
+    // is not there, and that is a config bug the operator can only fix if they hear about it.
+    if (!scan.ok) return workdirUnreadableText(root, scan.reason);
+
+    const current = this.workdirOf(id, agentId) ?? root;
+    const query = rest?.trim();
+    if (!query) {
+      if (this.offerWorkdirMenu(id, agentId, msg)) return undefined;
+      const text = workdirSummaryText(current, scan.options);
+      return scan.truncated > 0
+        ? `${text}\n(+${scan.truncated} more not shown — type part of a name to reach one.)`
+        : text;
+    }
+
+    const match = matchWorkdirs(scan.options, query);
+    if (match.kind === 'none') return workdirNoMatchText(query);
+    if (match.kind === 'many') return workdirAmbiguousText(query, match.matches);
+    return workdirChoiceText(this.setWorkdir(id, agentId, match.option.path));
+  }
+
+  /**
+   * Move a conversation to a directory: record it, drop what cannot follow it, stop the child.
+   *
+   * Shared by the typed path and the clicked one so they cannot answer differently — the same
+   * reason setModelOn is shared, and with the same consequence: failures are VALUES here, because
+   * the click path has no user to re-prompt and a swallowed error on a button is indistinguishable
+   * from a dead one.
+   *
+   * What gets destroyed, and why each piece has to:
+   *  - every agent's persisted session id, because a session is pinned to the directory it was
+   *    created in (see ConversationStore.clearAgentSessions);
+   *  - the resident child, because it is *standing* in the old directory — both runtimes take their
+   *    cwd at spawn, so the move cannot reach a process that is already running;
+   *  - the context snapshot and the header flag, because both describe the conversation that just
+   *    ended, and `/context` reporting the old numbers would contradict the reset.
+   *
+   * Picking the directory already in use is answered as `unchanged` and destroys NOTHING. Not a
+   * micro-optimisation: the menu marks the current directory with ●, so tapping it is the obvious
+   * way to dismiss a menu, and wiping a conversation for that would be indefensible.
+   */
+  private setWorkdir(id: ConversationId, agentId: string, path: string): WorkdirChoiceResult {
+    const store = this.store;
+    if (!store) {
+      return {
+        kind: 'failed',
+        reason: 'this deployment keeps no conversation store, so a directory cannot be remembered',
+      };
+    }
+    const def = findAgent(this.config, agentId);
+    const root = def ? resolveAgentCwd(def) : undefined;
+    if ((this.workdirOf(id, agentId) ?? root) === path) return { kind: 'unchanged', path };
+    // Re-checked against the filesystem rather than trusted from the menu that offered it: a menu
+    // is a snapshot, and a directory can be renamed between opening one and tapping it.
+    if (!isDirectory(path)) return { kind: 'missing', path };
+
+    // Recorded as an override only while it differs from the agent's own root: going back to the
+    // root clears the field instead of pinning it, so a later edit to `agents[].cwd` still moves
+    // the conversations that never chose anything else.
+    store.setConversationCwd(id, agentId, path === root ? undefined : path);
+    store.clearAgentSessions(id);
+    this.agents.dispose(id);
+
+    const state = this.conversations.get(id);
+    if (state) {
+      state.headerSent = false;
+      this.forgetUsage(state);
+    }
+    console.log(`[workdir] ${id} → ${path} (agent ${agentId}; every session id dropped)`);
+    return { kind: 'applied', path };
+  }
+
+  /**
+   * Apply a directory chosen by clicking a menu the daemon posted.
+   *
+   * Lives here rather than in the daemon for the reason applyModelChoice does: the registry holds
+   * the store, the config and the AgentFactory, and the daemon holds only the buttons.
+   *
+   * The rebind check is the one thing a `/cd` menu can outlive that matters. The option list was
+   * scanned from ONE agent's root, so after a `/cc` → `/oc` in between, a click would apply a path
+   * the new agent may have no relationship to; answering `rebound` and asking for a fresh menu is
+   * the only honest outcome. A conversation with no in-memory state, by contrast, is NOT an error:
+   * the directory lives in the store, so recording one for a conversation whose state has not been
+   * built yet (a `/cd` as the opening message) works exactly as intended.
+   */
+  applyWorkdirChoice(
+    id: ConversationId,
+    expectAgentId: string,
+    path: string
+  ): WorkdirChoiceResult {
+    const state = this.conversations.get(id);
+    if (state && state.agentId !== expectAgentId) {
+      const def = findAgent(this.config, state.agentId);
+      return { kind: 'rebound', agent: agentDisplayName(def, state.agentId) };
+    }
+    return this.setWorkdir(id, expectAgentId, path);
+  }
+
   /**
    * Send the once-per-conversation header bubble (`🤖 opencode`) and mark it announced.
    *
@@ -1281,6 +1511,18 @@ ${formatTokens(left)} left before compaction — ${name}`;
     return this.conversations.get(id)?.agentId ?? this.config.routing.default;
   }
 
+  /**
+   * The agent answering this conversation, for a command that may arrive BEFORE it has any state.
+   *
+   * agentIdOf falls straight through to routing.default, which is wrong for the first message after
+   * a restart: the binding a previous run persisted is the honest answer, and `/cd` or `/new` typed
+   * as the opening message would otherwise scan (and reset) whichever agent config happens to lead
+   * the pipeline. Same precedence sendHelp uses.
+   */
+  private boundAgentFor(id: ConversationId, fallback: string): string {
+    return this.conversations.get(id)?.agentId ?? this.store?.boundAgent(id) ?? fallback;
+  }
+
   /** Set this conversation's model override (effective next turn). */
   setModelOverride(id: ConversationId, model: string): void {
     // Ignore if no state (not yet created / already reclaimed): the override rides on state.
@@ -1307,6 +1549,15 @@ ${formatTokens(left)} left before compaction — ${name}`;
    * conversation announces itself again.
    */
   resetConversation(id: ConversationId): void {
+    // Both read BEFORE clear(), which drops the whole record. The working directory is a property
+    // of the PLACE this conversation happens, not of the context it just threw away, so `/new`
+    // keeps it: a reset that also moved the topic back to the agent's root would silently undo a
+    // `/cd` nobody asked to undo — and the menu `/new` offers next is how you change it on purpose.
+    const cwd = this.store?.conversationCwd(id);
+    // Not read off in-memory state alone: `/cd` and `/new` are both answered before a conversation
+    // has any (route intercepts daemon commands first), so a topic driven entirely by commands
+    // would otherwise lose its binding and its directory here.
+    const agentId = this.conversations.get(id)?.agentId ?? this.store?.boundAgent(id);
     this.agents.dispose(id);
     this.store?.clear(id);
     const state = this.conversations.get(id);
@@ -1315,9 +1566,10 @@ ${formatTokens(left)} left before compaction — ${name}`;
       // The context this snapshot measured is exactly what was just destroyed; reporting it back
       // would make /context contradict the reset the user just asked for.
       this.forgetUsage(state);
-      // Re-record the binding: clear() dropped the whole entry, but the conversation is still
-      // answered by this agent — only its history is gone.
-      this.store?.bind(id, state.agentId);
+    }
+    if (agentId) {
+      this.store?.bind(id, agentId);
+      if (cwd) this.store?.setConversationCwd(id, agentId, cwd);
     }
   }
 

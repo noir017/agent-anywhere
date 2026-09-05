@@ -4,10 +4,18 @@ import path from 'node:path';
 /**
  * Persistent conversation state (`<configDir>/conversations.json`).
  *
- * Two things are remembered per conversation:
+ * Three things are remembered per conversation:
  *  - `agent`: which agent is currently answering it (the sticky binding).
  *  - `agentSessions`: for EACH agent that has ever answered it, that agent's OWN session id
  *    (an ACP sessionId, or agy's conversation id).
+ *  - `cwd`: the directory this conversation works in (`/cd`), overriding `agents[].cwd`.
+ *
+ * ── Why the cwd is persisted here ─────────────────────────────────────────────
+ * It is a property of the CONVERSATION, like the binding — "this topic is about quantlab" outlives
+ * any one process, and the alternative (in-memory only) would silently move a topic back to the
+ * agent's default root on the next daemon restart, which is the class of surprise this file exists
+ * to prevent. It rides on the record rather than in a table of its own because it is read on the
+ * same lookup as the binding, at spawn time.
  *
  * ── Why agentSessions is keyed by agent ───────────────────────────────────────
  * The agent owns its context; this gateway is just a chat client in front of it. So switching
@@ -31,6 +39,8 @@ export interface ConversationRecord {
   agent: string;
   /** agentId → that agent's own session/conversation id. Never pruned except by /new. */
   agentSessions: Record<string, string>;
+  /** Working directory chosen for this conversation (`/cd`); absent = the agent's configured cwd. */
+  cwd?: string;
 }
 
 export class ConversationStore {
@@ -85,6 +95,47 @@ export class ConversationStore {
   }
 
   /**
+   * Forget EVERY agent's session id in this conversation, keeping the binding and the cwd.
+   *
+   * The mechanism behind `/cd`, and the narrow counterpart of clear(): a session is pinned to the
+   * directory it was created in (ACP takes `cwd` at `session/new`, agy at spawn), so resuming one
+   * from a different directory would either fail to load or — worse — succeed and leave the agent
+   * reasoning about a project it is no longer standing in. Dropping the ids is what makes the next
+   * turn start a genuinely new session in the new place.
+   *
+   * Every agent's, not just the bound one's, because the directory belongs to the CONVERSATION:
+   * a `/cd` followed later by `/oc` must not resume opencode's thread from the old project just
+   * because opencode was not the agent that happened to be answering when the move was made.
+   */
+  clearAgentSessions(key: string): void {
+    const rec = this.map.get(key);
+    if (!rec || Object.keys(rec.agentSessions).length === 0) return;
+    rec.agentSessions = {};
+    this.flush();
+  }
+
+  /** The directory this conversation works in, if one was chosen (`/cd`). */
+  conversationCwd(key: string): string | undefined {
+    return this.map.get(key)?.cwd;
+  }
+
+  /**
+   * Record this conversation's working directory. Pass undefined to fall back to `agents[].cwd`.
+   *
+   * Takes an agentId only to seed a record for a conversation the store has never seen — the cwd
+   * belongs to the conversation, not to the agent, and survives a rebind: switching `/cc` → `/oc`
+   * asks a different agent about the same project, which is the whole point of asking.
+   */
+  setConversationCwd(key: string, agentId: string, cwd: string | undefined): void {
+    const rec = this.map.get(key) ?? { agent: agentId, agentSessions: {} };
+    if (rec.cwd === cwd) return;
+    if (cwd === undefined) delete rec.cwd;
+    else rec.cwd = cwd;
+    this.map.set(key, rec);
+    this.flush();
+  }
+
+  /**
    * Forget a conversation entirely — every agent's session id AND the binding.
    *
    * The only context-destroying path in the system, reached solely from an explicit `/new`.
@@ -109,7 +160,7 @@ export class ConversationStore {
 /** Validate one on-disk entry; anything malformed is dropped rather than trusted. */
 function toRecord(v: unknown): ConversationRecord | null {
   if (!v || typeof v !== 'object') return null;
-  const o = v as { agent?: unknown; agentSessions?: unknown };
+  const o = v as { agent?: unknown; agentSessions?: unknown; cwd?: unknown };
   if (typeof o.agent !== 'string' || !o.agent) return null;
   const sessions: Record<string, string> = {};
   if (o.agentSessions && typeof o.agentSessions === 'object') {
@@ -117,7 +168,13 @@ function toRecord(v: unknown): ConversationRecord | null {
       if (typeof val === 'string') sessions[k] = val;
     }
   }
-  return { agent: o.agent, agentSessions: sessions };
+  return {
+    agent: o.agent,
+    agentSessions: sessions,
+    // A malformed cwd is dropped rather than rejecting the whole record: the binding and the
+    // session ids are still good, and losing them would restart the user's task over a bad field.
+    ...(typeof o.cwd === 'string' && o.cwd ? { cwd: o.cwd } : {}),
+  };
 }
 
 /**

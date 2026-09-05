@@ -5,6 +5,43 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **`/cd`: choose the directory a conversation works in.** `agents[].cwd` was the only answer to
+  "where does this agent work", so a machine with a dozen projects on it was reachable one project
+  at a time, by editing config.yaml and restarting every resident agent. The directory is now a
+  property of the CONVERSATION, recorded in `conversations.json` next to the binding and read by
+  both runtimes at spawn — so one topic can be about one project and the next about another.
+
+  The candidate list is derived, not declared: the agent's own `cwd` plus the directories one level
+  inside it (`daemon/workdir-scan.ts`), so a new project appears in the menu by existing on disk and
+  nothing in config can drift out of date with what is there. `/cd` alone opens a paginated button
+  menu on the page holding the current directory; `/cd <part of a name>` switches by substring on
+  every platform. Both surfaces are built from `core/workdir-menu.ts`, the same split `/model`
+  already used.
+
+  The question is asked at the two moments it costs nothing: a bare agent command (`/cc`, `/oc`,
+  `/agy`) in a conversation that has never run, and right after `/new`. A conversation already under
+  way still gets the harness command list it always got — and "already under way" is read from the
+  stored session id rather than from a live child, so an idle-reclaimed conversation resumes where it
+  left off instead of being asked to re-pick.
+
+  Moving starts a fresh session in the new directory, which the menu says before the tap: a session
+  is pinned to the directory it was created in (ACP takes `cwd` at `session/new`, agy at spawn), so
+  the move cannot reach a running process. Every agent's session id is dropped, not just the bound
+  one's — the directory belongs to the conversation, so a later `/oc` must not resume opencode's
+  thread from the old project. Re-picking the directory already in use (marked ●) costs nothing.
+
+### Changed
+
+- **`/new` keeps the conversation's binding and its working directory.** It always meant "clear the
+  context", but for a conversation driven entirely by commands — one whose in-memory state had not
+  been built yet — it also dropped the persisted binding. Both are re-recorded now; only the history
+  is gone.
+
+- **The footer's `cwd` field reports the directory actually serving the turn**, rather than
+  `agents[].cwd`, which after a `/cd` is no longer the same thing.
+
 ## [1.1.2] - 2026-09-05
 
 ### Added

@@ -5,6 +5,31 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Tool bubbles no longer vanish on a long turn.** A bubble that accumulated past the platform's
+  per-message limit is now sealed and continued in a new one, the same way the message body already
+  was.
+
+  `core/README.md` has always documented three reasons a message is sealed — budget spent, full,
+  not editable — and said the tool bubble follows the same rule. It followed two of them. There was
+  no length limit in `ToolRendererOptions` at all, so under `accumulate` grouping the bubble simply
+  grew: every tool start and finish repainted it, and a turn with enough tools eventually wrote past
+  what one message can hold. Telegram answers `MESSAGE_TOO_LONG` to the edit and `text is too long`
+  to the send. Neither is a `MessageNotEditableError`, so `paint()`'s recovery did not catch them and
+  rethrew instead — the render side-effect chain swallowed the rejection, and the whole block of tool
+  progress disappeared, leaving one `[turn] render side effect failed:` line in the log. One
+  operator's daemon log had accumulated 2083 of them.
+
+  `maxMessageLength` and `measureLength` are now wired into the renderer alongside `maxEdits`, from
+  the same platform capabilities the body stream already uses — so the length is measured on the
+  RENDERED text, which matters wherever markdown rendering expands it (Telegram turns tables into
+  bullets, roughly 1.4x). Two cases a seal alone cannot fix are handled explicitly: when the lines
+  carried over still overflow, the oldest go first, because those are the ones already readable in
+  the sealed bubble above; and a single line longer than the entire limit — a `verbose`-mode JSON
+  dump — is clamped, on the grounds that delivering part of it beats having the platform reject all
+  of it.
+
 ## [1.1.0] - 2026-09-05
 
 ### Changed

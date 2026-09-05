@@ -211,10 +211,21 @@ Four modes: `off`, `all`, `new` (dedupe consecutive same-name calls), `verbose`
   event's `index`. Requires `editBubble`; degrades to `separate` when absent.
 
 `accumulate` spends one edit per update, so a ten-tool turn is 20 edits — exactly Lark's
-cap. The bubble is therefore **sealed** on the same rule as a message in `StreamBuffer`:
-stop editing it, carry the lines whose state it does not already show (still running, or
-finished since the last write) into a fresh bubble, and keep going. Lines already fully
-rendered are dropped rather than repeated, so bubbles don't grow by the whole history.
+cap. The bubble is therefore **sealed** on the same three rules as a message in
+`StreamBuffer` — budget spent, full, not editable: stop editing it, carry the lines whose
+state it does not already show (still running, or finished since the last write) into a
+fresh bubble, and keep going. Lines already fully rendered are dropped rather than
+repeated, so bubbles don't grow by the whole history.
+
+The "full" rule is why `maxMessageLength` and `measureLength` are wired in alongside
+`maxEdits`. Without them a busy turn grew one bubble until the platform refused the write
+outright — Telegram answers `MESSAGE_TOO_LONG` to the edit and `text is too long` to the
+send — and because neither is a `MessageNotEditableError`, `paint()` rethrew and the whole
+block of progress was dropped with only a `[turn] render side effect failed:` line to show
+for it. When the surviving lines *alone* still overflow (a burst of parallel tools, none
+finished), the oldest go first: they are the ones already readable in the sealed bubble
+above. A single line over the limit — a verbose-mode JSON dump — is clamped, because
+delivering part of it beats having the platform reject all of it.
 
 The renderer owns **only** the bubbles. The message body belongs to `StreamBuffer`.
 `TurnRunner` coordinates the handoff: complete the current body buffer, emit the bubble,

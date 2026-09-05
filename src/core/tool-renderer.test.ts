@@ -251,6 +251,89 @@ describe('accumulate: sealing a bubble that can take no more edits', () => {
   });
 });
 
+describe('accumulate: sealing a bubble that is full', () => {
+  it('outgrowing maxMessageLength seals the bubble and continues in a new one', async () => {
+    const { sink, sends, edits } = makeSink({ withEdit: true });
+    // '📖 Read: "a.ts"' is 15 chars; two lines plus the newline is 31. A 40-char ceiling
+    // therefore holds two lines but not three.
+    const r = new ToolRenderer(
+      makeOpts({ grouping: 'accumulate', maxMessageLength: 40 }),
+      sink
+    );
+
+    await r.onToolStart(start('Read', 'a.ts', 0));
+    await r.onToolStart(start('Read', 'b.ts', 1));
+    expect(sends).toHaveLength(1);
+    expect(edits).toHaveLength(1);
+
+    // The third line would overflow, so the bubble is sealed rather than rejected on the wire.
+    expect(await r.onToolStart(start('Read', 'c.ts', 2))).toBe(true);
+    expect(sends).toHaveLength(2);
+    // All three are still running, so all three are unsettled and carry over — then the oldest
+    // are dropped to fit, leaving the newest progress, which is what the user is waiting on.
+    expect(sends[1]).toBe('📖 Read: "b.ts"\n📖 Read: "c.ts"');
+  });
+
+  it('a delivered line is dropped on the length seal, so the new bubble stays small', async () => {
+    const { sink, sends } = makeSink({ withEdit: true });
+    const r = new ToolRenderer(
+      makeOpts({ grouping: 'accumulate', maxMessageLength: 40 }),
+      sink
+    );
+
+    await r.onToolStart(start('Read', 'a.ts', 0));
+    await r.onToolFinish(finish('Read', true, 500, 0)); // ✓ delivered into bubble 1
+    await r.onToolStart(start('Bash', 'ls', 1));
+
+    // Bubble 1 already shows the finished Read, so the seal carries only the running Bash.
+    expect(await r.onToolStart(start('Edit', 'src/x.ts', 2))).toBe(true);
+    expect(sends[sends.length - 1]).not.toContain('Read');
+  });
+
+  it('measures the RENDERED length, not the raw one', async () => {
+    const { sink, sends } = makeSink({ withEdit: true });
+    // A profile whose rendering doubles the visible length: 15 raw chars measure as 30, so a
+    // single line already fills a 40-char message and the second one must open a new bubble.
+    const r = new ToolRenderer(
+      makeOpts({
+        grouping: 'accumulate',
+        maxMessageLength: 40,
+        measureLength: (s) => s.length * 2,
+      }),
+      sink
+    );
+
+    await r.onToolStart(start('Read', 'a.ts', 0));
+    expect(await r.onToolStart(start('Read', 'b.ts', 1))).toBe(true);
+    expect(sends).toHaveLength(2);
+  });
+
+  it('separate mode clamps a bubble no seal can shrink', async () => {
+    const { sink, sends } = makeSink({ withEdit: false });
+    const r = new ToolRenderer(
+      makeOpts({ mode: 'verbose', grouping: 'separate', maxMessageLength: 30 }),
+      sink
+    );
+
+    // verbose appends the args JSON, which alone blows past the limit; there is no line set to
+    // seal in separate mode, so the only honest option is to clamp and still deliver something.
+    await r.onToolStart({ name: 'Read', inputPreview: 'a.ts', index: 0, input: { path: 'x'.repeat(200) } });
+    expect(sends).toHaveLength(1);
+    expect(sends[0]!.length).toBeLessThanOrEqual(30);
+    expect(sends[0]!.endsWith('…')).toBe(true);
+  });
+
+  it('is unbounded when no limit is configured', async () => {
+    const { sink, sends, edits } = makeSink({ withEdit: true });
+    const r = new ToolRenderer(makeOpts({ grouping: 'accumulate' }), sink);
+
+    for (let i = 0; i < 20; i++) await r.onToolStart(start('Read', `f${i}.ts`, i));
+    expect(sends).toHaveLength(1); // one bubble, edited throughout
+    expect(edits.length).toBe(19);
+  });
+});
+
+
 describe('new dedupe', () => {
   it('separate: consecutive same name sends only one', async () => {
     const { sink, sends } = makeSink({ withEdit: true });

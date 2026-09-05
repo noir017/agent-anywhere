@@ -16,8 +16,9 @@ import { MessageNotEditableError } from './outbound-errors.js';
  * cap edits per message (Lark: 20, then 230072 forever — a ten-tool turn is start+finish = 20).
  * Past the cap the bubble would freeze mid-run with no further progress and no error in channel.
  * So the bubble is SEALED the same way StreamBuffer seals a message: stop editing it, carry the
- * lines whose state hasn't been delivered yet into a fresh bubble, and keep going. `maxEdits`
- * drives that proactively; a platform's own refusal (MessageNotEditableError) triggers it too.
+ * lines whose state hasn't been delivered yet into a fresh bubble, and keep going. All three of
+ * StreamBuffer's sealing rules apply: `maxEdits` (budget spent), `maxMessageLength` (full), and
+ * the platform's own refusal (MessageNotEditableError).
  *
  * Note: the body is owned by StreamBuffer; this renderer only handles tool bubbles
  * and signals segment breaks. The daemon coordinates: it completes the current body
@@ -41,6 +42,24 @@ export interface ToolRendererOptions {
    * Undefined = unbounded. Wired from PlatformCapabilities.maxEditsPerMessage.
    */
   maxEdits?: number;
+  /**
+   * Rendered length one bubble can carry before it is sealed. Undefined = unbounded.
+   * Wired from PlatformCapabilities.maxMessageLength.
+   *
+   * This is the third of the three sealing rules in core/README.md ("full"). Without it an
+   * accumulating bubble grows until the platform rejects the write outright — on Telegram
+   * MESSAGE_TOO_LONG on the edit, "text is too long" on the send — and since neither is a
+   * MessageNotEditableError, paint() rethrew and the whole block of progress was dropped.
+   */
+  maxMessageLength?: number;
+  /**
+   * Measures `text` in the units maxMessageLength counts. Defaults to raw character count.
+   *
+   * Same seam as StreamBuffer's: a profile whose markdown rendering expands the visible text
+   * (Telegram renders tables to bullets, ~1.4x) must measure the RENDERED length, or a block
+   * that looks like it fits still overflows on arrival.
+   */
+  measureLength?: (text: string) => number;
 }
 
 
@@ -120,6 +139,8 @@ export class ToolRenderer {
       // separate (incl. degraded accumulate): one new bubble per tool, no line set.
       let text = body;
       if (json) text += '\n' + json;
+      // No line set to seal here, so an oversized bubble (verbose JSON) can only be clamped.
+      if (this.overflows(text)) text = this.clamp(text, this.opts.maxMessageLength!);
       await this.sink.sendBubble(text);
       return true;
     }
@@ -161,16 +182,21 @@ export class ToolRenderer {
   private async paint(): Promise<boolean> {
     // Budget spent: stop editing this bubble before the platform starts refusing.
     if (this.bubbleRef !== null && this.budgetSpent()) this.seal();
+    // Full: the block outgrew what one message can carry. Seal on the same rule StreamBuffer
+    // uses, so the overflow continues in a fresh bubble instead of being rejected on the wire.
+    if (this.bubbleRef !== null && this.overflows(this.renderBlock())) this.seal();
+
+    const text = this.fitBlock();
 
     if (this.bubbleRef === null) {
-      this.bubbleRef = await this.sink.sendBubble(this.renderBlock());
+      this.bubbleRef = await this.sink.sendBubble(text);
       this.bubbleEdits = 0;
       this.markDelivered();
       return true;
     }
 
     try {
-      await this.sink.editBubble!(this.bubbleRef, this.renderBlock());
+      await this.sink.editBubble!(this.bubbleRef, text);
       this.bubbleEdits++;
       this.markDelivered();
       return false;
@@ -179,11 +205,57 @@ export class ToolRenderer {
       // The platform refuses further edits to this bubble: seal it and repaint into a new one, so
       // the progress this call carried still reaches the channel.
       this.seal();
-      this.bubbleRef = await this.sink.sendBubble(this.renderBlock());
+      this.bubbleRef = await this.sink.sendBubble(this.fitBlock());
       this.bubbleEdits = 0;
       this.markDelivered();
       return true;
     }
+  }
+
+  /** Measure in the units maxMessageLength counts; raw characters unless a profile says otherwise. */
+  private measure(text: string): number {
+    return this.opts.measureLength ? this.opts.measureLength(text) : text.length;
+  }
+
+  private overflows(text: string): boolean {
+    const max = this.opts.maxMessageLength;
+    return max !== undefined && this.measure(text) > max;
+  }
+
+  /**
+   * The line set rendered down to something one message can actually carry.
+   *
+   * Usually a no-op: paint() has already sealed an overflowing bubble, and the lines carried
+   * over are far shorter. It bites only when the survivors alone still overflow — a burst of
+   * tools running in parallel, none of them finished. Then the OLDEST lines go first: those
+   * are the ones already readable in the sealed bubble above, while the newest progress is
+   * what the user is actually waiting on.
+   */
+  private fitBlock(): string {
+    if (this.opts.maxMessageLength === undefined) return this.renderBlock();
+
+    while (this.lines.length > 1 && this.overflows(this.renderBlock())) this.lines.shift();
+
+    const block = this.renderBlock();
+    if (!this.overflows(block)) return block;
+    // One line alone over the limit (a verbose-mode JSON dump). Truncating loses part of that
+    // line; not truncating loses the entire block to a platform rejection.
+    return this.clamp(block, this.opts.maxMessageLength);
+  }
+
+  /** Longest prefix of `text` that still measures within `max`, marked with an ellipsis. */
+  private clamp(text: string, max: number): string {
+    const ellipsis = '…';
+    // Binary search on the raw string: measure() may be non-linear (rendering expands), so the
+    // cut point cannot be computed directly from a character count.
+    let lo = 0;
+    let hi = text.length;
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2);
+      if (this.measure(text.slice(0, mid) + ellipsis) <= max) lo = mid;
+      else hi = mid - 1;
+    }
+    return text.slice(0, lo) + ellipsis;
   }
 
   private budgetSpent(): boolean {

@@ -170,6 +170,12 @@ export class TurnRunner {
         // Same edit budget the body stream respects: a long tool run seals its bubble and opens a
         // new one rather than freezing once the platform stops accepting edits.
         maxEdits: this.editBudget(platform),
+        // ...and the same length limit, measured the same way. A bubble that accumulates past what
+        // one message can carry is sealed and continued, instead of being rejected on the wire
+        // (Telegram answered MESSAGE_TOO_LONG on the edit and "text is too long" on the send, and
+        // neither is a MessageNotEditableError, so the whole block of progress was dropped).
+        maxMessageLength: platform.capabilities.maxMessageLength,
+        measureLength: (s) => platform.measureRendered(s),
       },
 
       {

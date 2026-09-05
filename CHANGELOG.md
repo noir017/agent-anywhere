@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-09-05
+
 ### Fixed
 
 - **Tool bubbles no longer vanish on a long turn.** A bubble that accumulated past the platform's

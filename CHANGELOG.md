@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-09-05
+
 ### Added
 
 - **`contextWindow` per-agent override for the footer's context size.** claude-agent-acp carries a

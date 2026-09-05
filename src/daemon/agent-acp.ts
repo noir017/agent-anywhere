@@ -371,8 +371,8 @@ function createAcpSession(
    * Model chosen at runtime for THIS conversation (`/model`), outranking `agents[].model`.
    *
    * Held here rather than in config so it survives what it must and no more: a child that crashes
-   * or is evicted rebuilds with the user's choice re-applied, while a new conversation starts from
-   * the configured default. Cleared on dispose along with the rest of the session.
+   * or is evicted rebuilds with the user's choice re-applied (resetHandles deliberately leaves this
+   * untouched), while a new conversation starts its own closure from the configured default.
    */
   let modelPreference: string | undefined;
 
@@ -389,7 +389,11 @@ function createAcpSession(
     // The next child re-reports its own model; keeping a stale name would misattribute the footer
     // if the rebuilt session resolves a different one.
     liveModel = undefined;
-    liveConfigOptions = undefined;
+    // liveConfigOptions is deliberately KEPT: after an idle reclaim the child is gone but the
+    // conversation lives on, and `/model` reads its choice list from here — clearing it would make
+    // a reclaimed conversation look like a harness with no model selector until the next turn (the
+    // "No model selector on this session yet" false negative). The next spawn refreshes it via
+    // session/new; a choice made while the child is down defers through modelPreference.
   }
 
   /** Max wait for initialize + session/new after spawn; on timeout, treat spawn as failed (ENOENT etc.) instead of hanging. */
@@ -673,10 +677,16 @@ function createAcpSession(
     },
 
     async setModel(value: string): Promise<string> {
-      // No live session = no selector to set: the option list arrives with session/new, and the
-      // caller can say "send a message first" far more usefully than a spawn here could.
+      // No live session = no selector to set right now: the option list arrives with session/new.
+      // Rather than fail, record the choice as this conversation's preference. modelPreference
+      // outlives dispose (resetHandles does not clear it), so applyModelPreference re-applies it when
+      // the next turn spawns a child — the same self-healing path a crashed child takes. Returning
+      // the requested value lets the footer name it immediately; if the harness resolves it to a
+      // concrete id, the next config_option_update corrects the display.
       if (!conn || !active) {
-        throw new Error('no live session yet');
+        modelPreference = value;
+        console.log(`[acp] agent "${def.id}": model "${value}" deferred — no live child, applies on next turn`);
+        return value;
       }
       const res = await conn.agent.request('session/set_config_option', {
         sessionId: active.sessionId,

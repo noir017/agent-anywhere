@@ -5,6 +5,18 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **`/model` no longer reports "No model selector" after an idle reclaim.** The choice list is read
+  from the session's last-reported config options, but idle reclaim cleared them along with the child
+  it stopped — so a conversation that had been talking for an hour, then went quiet past
+  `session.idleTimeoutMs`, answered `/model` as if it had never started. `resetHandles` now keeps
+  `liveConfigOptions` across a reclaim (only the live model name, which each new child re-reports, is
+  cleared), and `setModel` on a stopped child records the choice as the conversation's preference
+  instead of throwing `no live session yet` — the same `modelPreference` that already survives a
+  crash and is re-applied when the next turn spawns a child. The next spawn refreshes the list either
+  way.
+
 ## [1.1.1] - 2026-09-05
 
 ### Fixed

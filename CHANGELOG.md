@@ -5,6 +5,17 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **`contextWindow` per-agent override for the footer's context size.** claude-agent-acp carries a
+  hardcoded model table and falls back to a 200k window for any id missing from it — so with
+  `ANTHROPIC_MODEL=claude-opus-5` (absent from the table) the footer read `/ 200k`, while a session
+  that happened to be on `claude-opus-4-8` (present) read `/ 1M`. The same agent showed two different
+  windows depending only on which model the session landed on, even though the gateway serves 1M for
+  both. The real limit is a local fact, so it is now stated in local config rather than probed: set
+  `contextWindow: 1000000` on the agent and `usage_update`'s `size` is overridden before it reaches
+  the footer. Unset = trust the harness's number (unchanged behavior).
+
 ### Fixed
 
 - **`/model` no longer reports "No model selector" after an idle reclaim.** The choice list is read

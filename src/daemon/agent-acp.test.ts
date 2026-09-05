@@ -161,6 +161,27 @@ describe('translateUpdate usage_update (live context numbers)', () => {
     feed(st, { sessionUpdate: 'usage_update', used: 0, size: 200_000 });
     expect(usage).toEqual([{ used: 0, size: 200_000 }]);
   });
+
+  it('contextWindow override replaces the harness window (200k fallback → configured 1M)', () => {
+    const { st, usage } = recorder();
+    st.contextWindow = 1_000_000;
+    feed(st, { sessionUpdate: 'usage_update', used: 201_000, size: 200_000 });
+    // Same 201k tokens, but reported against the local 1M window rather than the harness's 200k.
+    expect(usage).toEqual([{ used: 201_000, size: 1_000_000 }]);
+  });
+
+  it('contextWindow override supplies a window even when the harness reports none', () => {
+    const { st, usage } = recorder();
+    st.contextWindow = 1_000_000;
+    feed(st, { sessionUpdate: 'usage_update', used: 50_000 });
+    expect(usage).toEqual([{ used: 50_000, size: 1_000_000 }]);
+  });
+
+  it('without an override, a windowless snapshot is still dropped (unchanged behavior)', () => {
+    const { st, usage } = recorder();
+    feed(st, { sessionUpdate: 'usage_update', used: 50_000 });
+    expect(usage).toEqual([]);
+  });
 });
 
 /**

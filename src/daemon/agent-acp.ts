@@ -592,6 +592,8 @@ function createAcpSession(
           liveConfigOptions = options;
           liveModel = liveModelName(options) ?? liveModel;
         },
+        // Local override for a harness that under-reports the window (e.g. claude-opus-5 → 200k fallback).
+        contextWindow: def.contextWindow,
       };
 
       // Report the live model up front, from the session/new response captured at startup. Doing it
@@ -790,6 +792,12 @@ export interface TurnState {
    * Optional so the pure translation tests can omit it.
    */
   onConfigOptions?(options: SessionConfigOption[] | null | undefined): void;
+  /**
+   * Override for the context-window size (tokens) reported over `usage_update`. When set, ingestUsage
+   * replaces the harness's `size` with this before forwarding — the local-config fix for a harness that
+   * under-reports the window (see AgentDef.contextWindow). Absent = trust the harness's number.
+   */
+  contextWindow?: number;
 }
 
 /**
@@ -876,8 +884,13 @@ export function translateUpdate(u: SessionUpdate, st: TurnState): void {
  * complexity within the lint budget.
  */
 function ingestUsage(st: TurnState, used: unknown, size: unknown): void {
-  if (typeof used !== 'number' || typeof size !== 'number' || size <= 0) return;
-  st.handlers.onUsage?.({ used, size });
+  if (typeof used !== 'number') return;
+  // A local override wins over the harness's window (see AgentDef.contextWindow): the harness
+  // under-reports for models missing from its hardcoded table, so a configured window is the more
+  // accurate number. Fall back to the reported size when no override is set.
+  const window = st.contextWindow ?? size;
+  if (typeof window !== 'number' || window <= 0) return;
+  st.handlers.onUsage?.({ used, size: window });
 }
 
 /** Merge a tool's latest fields, then trigger start / finish per readiness. */

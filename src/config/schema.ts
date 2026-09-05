@@ -53,6 +53,16 @@ export const AgentDefSchema = z
     /** Model (best-effort via newSession; whether it takes effect depends on the harness). */
     model: z.string().optional(),
     /**
+     * Override the context-window size the footer reports (tokens), replacing whatever the harness
+     * sends over ACP `usage_update`. Set this when the harness UNDER-reports the window: claude-agent-acp
+     * carries a hardcoded model table, and a model absent from it (e.g. `claude-opus-5`) falls back to a
+     * 200k default even though the gateway serves 1M — so the same agent shows 200k or 1M depending only
+     * on which model the session landed on. A local fact (the gateway's real limit), so it lives in local
+     * config rather than being probed: set `contextWindow: 1000000` and the footer reads `/ 1M` regardless.
+     * Unset = trust the harness's number.
+     */
+    contextWindow: z.number().int().positive().optional(),
+    /**
      * NOTE: there is no per-call permission policy here. As the ACP client, the daemon
      * auto-approves every tool request (session/request_permission) — agents run with full
      * tool access. Tightening tool permissions, if wanted, is delegated to the harness itself

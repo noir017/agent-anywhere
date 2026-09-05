@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-09-05
+
 ### Added
 
 - **`/cd`: choose the directory a conversation works in.** `agents[].cwd` was the only answer to

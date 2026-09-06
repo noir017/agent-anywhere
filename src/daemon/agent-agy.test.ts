@@ -2,13 +2,15 @@ import { describe, expect, it } from 'vitest';
 import {
   buildAgyArgs,
   consumeNdJsonLines,
+  createAgyAgentFactory,
+  parseAgyModelsOutput,
   toolLabel,
   translateAgyEvent,
   type AgyEvent,
   type AgyTurnState,
 } from './agent-agy.js';
 import { buildInputPreview } from './agent-common.js';
-import { AgentDefSchema } from '../config/schema.js';
+import { AgentDefSchema, type Config } from '../config/schema.js';
 
 /**
  * Every event fixture here is a verbatim shape captured from a real `agy 1.1.22` run
@@ -267,6 +269,15 @@ describe('buildAgyArgs', () => {
     expect(buildAgyArgs(def(), '/w').some((a) => a.startsWith('--model='))).toBe(false);
   });
 
+  it('prefers modelOverride over def.model when provided', () => {
+    expect(buildAgyArgs(def({ model: 'claude-sonnet-4-6' }), '/w', undefined, 'gemini-3.8-flash-high')).toContain(
+      '--model=gemini-3.8-flash-high'
+    );
+    expect(buildAgyArgs(def(), '/w', undefined, 'gemini-3.8-flash-high')).toContain(
+      '--model=gemini-3.8-flash-high'
+    );
+  });
+
   it('resumes a prior conversation only when one was persisted', () => {
     expect(buildAgyArgs(def(), '/w', 'abc-123')).toContain('--conversation=abc-123');
     expect(buildAgyArgs(def(), '/w').some((a) => a.startsWith('--conversation='))).toBe(false);
@@ -292,5 +303,122 @@ describe('consumeNdJsonLines', () => {
     const seen: string[] = [];
     consumeNdJsonLines('\n\n{"a":1}\n\n', (l) => seen.push(l));
     expect(seen).toEqual(['{"a":1}']);
+  });
+});
+
+describe('parseAgyModelsOutput', () => {
+  it('parses tab-separated model ID and display name', () => {
+    const raw = [
+      'gemini-3.8-flash-high\tGemini 3.8 Flash (High)',
+      'claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)',
+      'gpt-oss-120b-medium\tGPT-OSS 120B (Medium)',
+    ].join('\n');
+    expect(parseAgyModelsOutput(raw)).toEqual([
+      { value: 'gemini-3.8-flash-high', name: 'Gemini 3.8 Flash (High)' },
+      { value: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6 (Thinking)' },
+      { value: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' },
+    ]);
+  });
+
+  it('parses verbatim stdout captured from a real `agy models` run', () => {
+    // Captured 2026-09 from the logged-in CLI (same shape as the AgyEvent fixtures above).
+    // The "Fetching available models..." spinner goes to stderr, so stdout is pure TSV.
+    const raw = [
+      'gemini-3.8-flash-high\tGemini 3.8 Flash (High)',
+      'gemini-3.8-flash-medium\tGemini 3.8 Flash (Medium)',
+      'gemini-3.8-flash-low\tGemini 3.8 Flash (Low)',
+      'gemini-3.7-flash-high\tGemini 3.7 Flash (High)',
+      'gemini-3.7-flash-medium\tGemini 3.7 Flash (Medium)',
+      'gemini-3.7-flash-low\tGemini 3.7 Flash (Low)',
+      'gemini-3.6-flash-high\tGemini 3.6 Flash (High)',
+      'gemini-3.6-flash-medium\tGemini 3.6 Flash (Medium)',
+      'gemini-3.6-flash-low\tGemini 3.6 Flash (Low)',
+      'gemini-3.1-pro-high\tGemini 3.1 Pro (High)',
+      'gemini-3.1-pro-low\tGemini 3.1 Pro (Low)',
+      'claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)',
+      'claude-opus-4-6-thinking\tClaude Opus 4.6 (Thinking)',
+      'gpt-oss-120b-medium\tGPT-OSS 120B (Medium)',
+    ].join('\n');
+    const models = parseAgyModelsOutput(raw);
+    expect(models).toHaveLength(14);
+    expect(models[0]).toEqual({ value: 'gemini-3.8-flash-high', name: 'Gemini 3.8 Flash (High)' });
+    expect(models[13]).toEqual({ value: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' });
+  });
+
+  it('falls back to value when line contains no tab or has empty display name', () => {
+    const raw = 'model-one\nmodel-two\t\nmodel-three\tModel Three';
+    expect(parseAgyModelsOutput(raw)).toEqual([
+      { value: 'model-one', name: 'model-one' },
+      { value: 'model-two', name: 'model-two' },
+      { value: 'model-three', name: 'Model Three' },
+    ]);
+  });
+
+  it('handles empty or whitespace-only output', () => {
+    expect(parseAgyModelsOutput('')).toEqual([]);
+    expect(parseAgyModelsOutput('  \n\n  \t  \n  ')).toEqual([]);
+  });
+});
+
+describe('createAgyAgentFactory — model selector and switching', () => {
+  const SAMPLE_MODELS = [
+    { value: 'gemini-3.8-flash-high', name: 'Gemini 3.8 Flash (High)' },
+    { value: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6 (Thinking)' },
+  ];
+
+  const cfg = {
+    agents: [
+      def({ id: 'agy-main', harness: 'agy', model: 'gemini-3.8-flash-high' }),
+    ],
+  } as unknown as Config;
+
+  it('returns modelSelector with options from fetcher and initial current from def.model', async () => {
+    const fetcher = async () => SAMPLE_MODELS;
+    const factory = createAgyAgentFactory(cfg, '/tmp/test.sock', undefined, fetcher);
+    // Allow eager fetch to resolve
+    await Promise.resolve();
+
+    const session = factory.getOrCreate('conv-1', 'agy-main');
+    const selector = session.modelSelector?.();
+    expect(selector).toBeDefined();
+    expect(selector?.options).toEqual(SAMPLE_MODELS);
+    expect(selector?.current).toBe('gemini-3.8-flash-high');
+  });
+
+  it('setModel records preference and updates modelSelector current', async () => {
+    const fetcher = async () => SAMPLE_MODELS;
+    const factory = createAgyAgentFactory(cfg, '/tmp/test.sock', undefined, fetcher);
+    await Promise.resolve();
+
+    const session = factory.getOrCreate('conv-1', 'agy-main');
+    expect(session.setModel).toBeDefined();
+    const res = await session.setModel!('claude-sonnet-4-6');
+    expect(res).toBe('claude-sonnet-4-6');
+
+    // modelSelector now reports the chosen model as current
+    const selector = session.modelSelector?.();
+    expect(selector?.current).toBe('claude-sonnet-4-6');
+  });
+
+  it('modelSelector returns undefined if model fetcher returns empty or fails', async () => {
+    const failingFetcher = async () => {
+      throw new Error('command not found: agy');
+    };
+    const factory = createAgyAgentFactory(cfg, '/tmp/test.sock', undefined, failingFetcher);
+    await Promise.resolve();
+
+    const session = factory.getOrCreate('conv-1', 'agy-main');
+    expect(session.modelSelector?.()).toBeUndefined();
+  });
+
+  it('peek and dispose manage factory sessions', async () => {
+    const factory = createAgyAgentFactory(cfg, '/tmp/test.sock', undefined, async () => []);
+    expect(factory.peek('conv-1')).toBeUndefined();
+
+    const s = factory.getOrCreate('conv-1', 'agy-main');
+    expect(factory.peek('conv-1')).toBe(s);
+
+    factory.dispose('conv-1');
+    expect(factory.peek('conv-1')).toBeUndefined();
   });
 });

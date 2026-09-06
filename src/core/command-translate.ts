@@ -142,7 +142,10 @@ const GENERIC_COMMANDS: Record<string, GenericCommand> = {
     // session/set_config_option switches it (the daemon already uses that path to enforce
     // `agents[].model`). So the gateway can both show and change it without a slash command —
     // and, where the platform allows, offer the list as a menu instead of a name to type.
-    local: ['opencode', 'claude'],
+    //
+    // agy: stream-json has no in-process switch, but `agy models` provides the selector list, and
+    // setModel uses kill-and-respawn with --model and --conversation (resuming history).
+    local: ['opencode', 'claude', 'agy'],
   },
   usage: {
     description: 'Show token usage and limits',

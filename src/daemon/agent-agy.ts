@@ -1,7 +1,8 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { promisify } from 'node:util';
+import { execFile as execFileCb, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import type { AgentDef, Config } from '../config/schema.js';
 import { findAgent } from '../config/schema.js';
-import type { AgentFactory, AgentSession, AgentStreamHandlers, ReclaimState, RunTurnInput } from './agent.js';
+import type { AgentFactory, AgentSession, AgentStreamHandlers, ModelSelector, ReclaimState, RunTurnInput } from './agent.js';
 import type { ConversationStore } from './conversation-store.js';
 import {
   buildAgentEnv,
@@ -11,6 +12,8 @@ import {
   resolveConversationCwd,
   truncateToolName,
 } from './agent-common.js';
+
+const execFile = promisify(execFileCb);
 
 /**
  * AgentFactory implementation for `agy` — the Google Antigravity CLI (which replaced Gemini CLI).
@@ -40,11 +43,12 @@ import {
  * agy reports no command list (and slash expansion is deliberately disabled below), so
  * onAvailableCommands is never called and no native slash commands are registered for this harness.
  *
- * Models are half-supported, and the halves are worth naming. agy has no model SELECTOR and no
- * in-process switch — the model is fixed by `--model=` at spawn — so `modelSelector`/`setModel` stay
- * unimplemented and `/model` is answered "not supported" for this harness (GENERIC_COMMANDS in
- * core/command-translate.ts). But it does name the model it is serving, once, in `init`, which is
- * all the footer needs, so that one value is forwarded as onModel.
+ * Models: agy has no in-process switch — the model is fixed by `--model=` at spawn. However,
+ * available models can be queried via `agy models`, and switching models is performed via a
+ * kill-and-respawn strategy: setModel() sets the per-session preference and triggers teardown(),
+ * and the next turn respawns with the new `--model=` while resuming conversation history via
+ * `--conversation=<id>`. `modelSelector()` returns the available models list, and `setModel()`
+ * returns the newly applied model name.
  */
 
 // ───────────────────────── launch command ─────────────────────────
@@ -77,7 +81,13 @@ import {
  * last-wins (verified), e.g. `args: ["--disable-slash-commands=false"]` restores native slash commands.
  * `-p=` stays last so it can't consume a user argument.
  */
-export function buildAgyArgs(def: AgentDef, cwd: string, conversationId?: string): string[] {
+export function buildAgyArgs(
+  def: AgentDef,
+  cwd: string,
+  conversationId?: string,
+  modelOverride?: string
+): string[] {
+  const model = modelOverride ?? def.model;
   return [
     '--input-format=stream-json',
     '--output-format=stream-json',
@@ -85,7 +95,7 @@ export function buildAgyArgs(def: AgentDef, cwd: string, conversationId?: string
     '--disable-slash-commands',
     '--dangerously-skip-permissions',
     `--add-dir=${cwd}`,
-    ...(def.model ? [`--model=${def.model}`] : []),
+    ...(model ? [`--model=${model}`] : []),
     // Resume the conversation this session owned before the daemon restarted. A stale/unknown id is
     // non-fatal (agy warns on stderr and starts a fresh conversation), so no existence check is needed.
     ...(conversationId ? [`--conversation=${conversationId}`] : []),
@@ -97,10 +107,70 @@ export function buildAgyArgs(def: AgentDef, cwd: string, conversationId?: string
 /** The executable name; `agy install` puts it on PATH. Exported so doctor reports the same thing. */
 export const AGY_COMMAND = 'agy';
 
+/**
+ * Parse `agy models` TSV output into ModelSelector options (`{ value, name }`).
+ * Lines are formatted as `<modelId>\t<displayName>` (e.g. `gemini-3.8-flash-high\tGemini 3.8 Flash (High)`).
+ * Lines without tabs fall back to using the model ID as the display name.
+ */
+export function parseAgyModelsOutput(stdout: string): Array<{ value: string; name: string }> {
+  return stdout
+    .trim()
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const tabIdx = line.indexOf('\t');
+      if (tabIdx >= 0) {
+        const value = line.slice(0, tabIdx).trim();
+        const name = line.slice(tabIdx + 1).trim();
+        return { value, name: name || value };
+      }
+      return { value: line, name: line };
+    })
+    .filter((o) => o.value.length > 0);
+}
+
+export type AgyModelFetcher = () => Promise<Array<{ value: string; name: string }>>;
+
+export async function defaultFetchAgyModels(): Promise<Array<{ value: string; name: string }>> {
+  try {
+    const { stdout } = await execFile(AGY_COMMAND, ['models']);
+    return parseAgyModelsOutput(stdout);
+  } catch (e) {
+    console.debug('[agy] fetch models failed:', e instanceof Error ? e.message : e);
+    return [];
+  }
+}
+
 // ───────────────────────────────── factory / session ─────────────────────────────────
 
-export function createAgyAgentFactory(cfg: Config, socketPath: string, store?: ConversationStore): AgentFactory {
+export function createAgyAgentFactory(
+  cfg: Config,
+  socketPath: string,
+  store?: ConversationStore,
+  modelFetcher: AgyModelFetcher = defaultFetchAgyModels
+): AgentFactory {
   const sessions = new Map<string, AgentSession>();
+  let cachedModels: Array<{ value: string; name: string }> | undefined;
+  let fetchPromise: Promise<Array<{ value: string; name: string }>> | undefined;
+
+  function ensureModels(): void {
+    if (cachedModels !== undefined || fetchPromise !== undefined) return;
+    fetchPromise = modelFetcher()
+      .then((models) => {
+        cachedModels = models;
+        fetchPromise = undefined;
+        return models;
+      })
+      .catch((e) => {
+        console.debug('[agy] failed to fetch models:', e instanceof Error ? e.message : e);
+        fetchPromise = undefined;
+        return [];
+      });
+  }
+
+  // Eager pre-fetch so the model list is ready when /model is invoked.
+  ensureModels();
 
   return {
     getOrCreate(sessionId: string, agentId: string): AgentSession {
@@ -108,7 +178,10 @@ export function createAgyAgentFactory(cfg: Config, socketPath: string, store?: C
       if (!s) {
         const def = findAgent(cfg, agentId);
         if (!def) throw new Error(`unknown agent id: ${agentId} (check the routing and agents config)`);
-        s = createAgySession(def, socketPath, sessionId, store);
+        s = createAgySession(def, socketPath, sessionId, store, () => {
+          ensureModels();
+          return cachedModels;
+        });
         sessions.set(sessionId, s);
       }
       return s;
@@ -133,7 +206,8 @@ function createAgySession(
   socketPath: string,
   /** The conversation this agent instance serves (store key half; the other half is def.id). */
   conversationId: string,
-  store?: ConversationStore
+  store?: ConversationStore,
+  getModels?: () => Array<{ value: string; name: string }> | undefined
 ): AgentSession {
   /**
    * The directory this session's child runs in — and, through `--add-dir`, the one it is allowed to
@@ -162,6 +236,11 @@ function createAgySession(
    * the first turn's footer and on no other. Stored here, replayed at the top of every turn.
    */
   let lastSeenModel: string | undefined;
+  /**
+   * Per-conversation model preference set via setModel() (/model command or menu).
+   * Kept in the session closure across child respawns (same pattern as ACP runtime's modelPreference).
+   */
+  let modelPreference: string | undefined;
   /** Whether the reverse-command hint was injected (once per child, like the ACP runtime). */
   let hintInjected = false;
   /** Intentional-abort flag: set by abort()/dispose() so a killed turn resolves silently. */
@@ -176,6 +255,7 @@ function createAgySession(
   function resetHandles(): void {
     proc = undefined;
     ready = false;
+    lastSeenModel = undefined;
   }
 
   /**
@@ -212,10 +292,14 @@ function createAgySession(
     // runtime's session/load equivalent). agy owns the history on its own disk; we only remember which.
     // Keyed by (conversation, agent) so agy resumes ITS conversation here, not one belonging to
     // another agent that also answered in this topic.
-    const child = spawn(AGY_COMMAND, buildAgyArgs(def, cwd, store?.agentSession(conversationId, def.id)), {
-      cwd,
-      env: buildAgentEnv(def, sessionToken, socketPath),
-    });
+    const child = spawn(
+      AGY_COMMAND,
+      buildAgyArgs(def, cwd, store?.agentSession(conversationId, def.id), modelPreference),
+      {
+        cwd,
+        env: buildAgentEnv(def, sessionToken, socketPath),
+      }
+    );
     // Record immediately so the 'exit' callback and start-failure rollback can match by reference.
     proc = child;
     // agy sends diagnostics (auth notices, permission notes, conversation warnings) to stderr.
@@ -321,6 +405,10 @@ function createAgySession(
 
     async runTurn(input: RunTurnInput, handlers: AgentStreamHandlers): Promise<void> {
       aborting = false;
+      if (input.model && input.model !== (modelPreference ?? def.model)) {
+        modelPreference = input.model;
+        if (proc) teardown('model changed');
+      }
       await ensureStarted(input.sessionToken);
       // Nothing renders from this; it only records which model to name in this turn's footer.
       if (lastSeenModel) handlers.onModel?.(lastSeenModel);
@@ -370,6 +458,23 @@ function createAgySession(
       // the run). The next turn respawns and resumes the same conversation via --conversation, so
       // context survives an interrupt.
       teardown('turn aborted');
+    },
+
+    modelSelector(): ModelSelector | undefined {
+      const options = getModels?.();
+      if (!options || options.length === 0) return undefined;
+      return {
+        current: lastSeenModel ?? modelPreference ?? def.model,
+        options,
+      };
+    },
+
+    async setModel(value: string): Promise<string> {
+      modelPreference = value;
+      // Kill the current child. The next runTurn -> ensureStarted spawns a new one with
+      // --model=<value> --conversation=<id>. Context survives via --conversation.
+      teardown('model switch');
+      return value;
     },
 
     reclaimState(): ReclaimState {

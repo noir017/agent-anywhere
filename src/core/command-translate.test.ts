@@ -55,9 +55,9 @@ describe('translateCommand', () => {
     // A native spelling still wins where the harness really does own the answer.
     expect(translateCommand('context', 'claude')).toEqual({ kind: 'translated', native: 'context' });
     expect(translateCommand('context', 'gemini')).toEqual({ kind: 'translated', native: 'stats' });
-    // agy speaks no ACP: it reports neither usage nor config options, so a local answer there
-    // would be a promise that never arrives.
-    expect(translateCommand('model', 'agy')).toEqual({ kind: 'unsupported' });
+    // agy speaks no ACP, but model is answered locally via kill-and-respawn while /context stays
+    // unsupported because agy does not report usage telemetry.
+    expect(translateCommand('model', 'agy')).toEqual({ kind: 'local' });
     expect(translateCommand('context', 'agy')).toEqual({ kind: 'unsupported' });
   });
 
@@ -163,11 +163,13 @@ describe('agentCommandSpecs', () => {
 });
 
 describe('translateCommand — agy', () => {
-  it('reports generic commands as unsupported rather than forwarding them', () => {
-    // agy answers /model itself and doing so aborts its stream-json session, so the daemon
+  it('reports unsupported generic commands as unsupported rather than forwarding them', () => {
+    // agy answers /compact itself and doing so aborts its stream-json session, so the daemon
     // must reject the generic name instead of passing it through to the agent.
-    expect(translateCommand('model', 'agy')).toEqual({ kind: 'unsupported' });
     expect(translateCommand('compact', 'agy')).toEqual({ kind: 'unsupported' });
+    expect(translateCommand('context', 'agy')).toEqual({ kind: 'unsupported' });
+    // /model is handled locally via kill-and-respawn with --model and --conversation
+    expect(translateCommand('model', 'agy')).toEqual({ kind: 'local' });
   });
 
   it('still passes through a non-generic name (a skill or plugin command)', () => {
@@ -263,10 +265,20 @@ describe('buildHelpText', () => {
     expect(text).not.toContain('/usage');
   });
 
-  it('drops the whole generic section for a harness that supports none of it', () => {
+  it('lists only supported generic commands for agy (/model via local handler)', () => {
     const text = buildHelpText(cfg, { agent: 'g', harness: 'agy' });
-    expect(text).not.toContain('Works on the current agent');
+    expect(text).toContain('Works on the current agent');
+    expect(text).toContain('/model');
+    expect(text).not.toContain('/compact');
+    expect(text).not.toContain('/context');
     // The agent commands still list, because switching away is what a stuck user needs.
+    expect(text).toContain('/cc');
+  });
+
+  it('drops the whole generic section for a harness that supports none of it', () => {
+    const cfgCodex = { agents: [agent('cx', 'codex'), agent('cc', 'claude')] };
+    const text = buildHelpText(cfgCodex, { agent: 'cx', harness: 'codex' });
+    expect(text).not.toContain('Works on the current agent');
     expect(text).toContain('/cc');
   });
 

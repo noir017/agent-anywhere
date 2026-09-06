@@ -278,7 +278,7 @@ though the gateway could answer it outright. Two do:
 | command | why there is no native name to translate to | what answers it |
 |---|---|---|
 | `/context` (opencode) | opencode's `/compact`-family commands are TUI-only; ACP mode never sees them | the last `usage_update {used, size}` the agent sent, the same numbers the footer prints |
-| `/model` (opencode, claude) | neither advertises the command — opencode has none, and claude's adapter leaves `model` out of the list it reports — while both expose the selector as a `session/new` config option that `session/set_config_option` switches | `ConversationRegistry.applyModelCommand` via `AgentSession.modelSelector()` / `setModel()` |
+| `/model` (opencode, claude, agy) | opencode and claude expose the selector as a config option; agy reads it from `agy models` and switches via kill-and-respawn with `--model` and `--conversation` | `ConversationRegistry.applyModelCommand` via `AgentSession.modelSelector()` / `setModel()` |
 
 `/model` has two surfaces, both built from `model-menu.ts` so they cannot disagree about
 what happened. On a platform that can post buttons **and** edit them afterwards, a bare
@@ -304,8 +304,8 @@ Two rules keep this honest:
   more aliases (`opusplan`, `best`, a full model id), which stay reachable through
   `agents[].env.ANTHROPIC_MODEL`.
 - **`local` is a harness LIST, not a flag**, populated only from what was probed live.
-  `agy` speaks no ACP — it reports neither usage nor config options — so claiming a local
-  answer there would hand the user "no numbers yet, send a message first" forever. An
+  `agy` speaks no ACP — it reports no usage numbers — so claiming a local
+  answer for `/context` there would hand the user "no numbers yet, send a message first" forever. An
   honest "not supported" beats an answer that never arrives.
 
 `/model` matches on any substring that picks exactly one model, because opencode offers

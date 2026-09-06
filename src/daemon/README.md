@@ -356,11 +356,12 @@ are overridable through `args`, since agy's flag parsing is last-wins. Consequen
 reports no command list, so `/agy` switches the conversation but its bare form acks the
 binding rather than posting an empty menu.
 
-Models: agy names the one it is serving in `init` and nowhere else, so the footer can print
-it (`onModel` is replayed each turn, because the footer reads a per-turn record). There is
-no selector and no in-process switch — the model is fixed by `--model=` at spawn — so
-`modelSelector`/`setModel` stay unimplemented and `/model` is answered "not supported"
-rather than with a menu that could never apply.
+Models: agy names the one it is serving in `init` (`onModel` is replayed each turn, because the
+footer reads a per-turn record). While `agy` has no in-process protocol switch, `agy models` lists
+available choices, and `setModel` switches via a kill-and-respawn strategy: `teardown()` stops the
+child, and the next turn respawns with `--model=<value>` while `--conversation=<id>` restores
+conversation context intact from local disk. `modelSelector()` reports the parsed model list,
+bringing the `/model` menu and command to the agy harness.
 
 ### `agent-common.ts`
 

@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-09-06
+
 ### Added
 
 - **`dsh` (DeepSeek Harness) harness preset.** The gateway can now drive DeepSeek Harness over ACP

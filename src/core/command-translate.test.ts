@@ -289,3 +289,21 @@ describe('buildHelpText', () => {
   });
 });
 
+
+describe('dsh harness commands', () => {
+  it('registers /dsh as the agent command', () => {
+    expect(harnessCommandName('dsh')).toBe('dsh');
+    expect(harnessForCommand('dsh')).toBe('dsh');
+    expect(harnessHasPicker('dsh')).toBe(true);
+  });
+
+  it('dsh answers /model and /context locally (ACP select + usage_update path)', () => {
+    expect(translateCommand('model', 'dsh')).toEqual({ kind: 'local' });
+    expect(translateCommand('context', 'dsh')).toEqual({ kind: 'local' });
+  });
+
+  it('dsh has no native spelling for /compact or /usage', () => {
+    expect(translateCommand('compact', 'dsh')).toEqual({ kind: 'unsupported' });
+    expect(translateCommand('usage', 'dsh')).toEqual({ kind: 'unsupported' });
+  });
+});

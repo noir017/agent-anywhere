@@ -131,7 +131,7 @@ const GENERIC_COMMANDS: Record<string, GenericCommand> = {
     // reports nothing at all (not a zero window — no notification), and adding `limit.context` to
     // that model makes it report. The local answer is still right for the harness; the empty case is
     // a model-config gap, which is why describeContext names the fix instead of saying "not yet".
-    local: ['opencode'],
+    local: ['opencode', 'dsh'],
   },
   model: {
     description: 'Show or change the model',
@@ -145,7 +145,7 @@ const GENERIC_COMMANDS: Record<string, GenericCommand> = {
     //
     // agy: stream-json has no in-process switch, but `agy models` provides the selector list, and
     // setModel uses kill-and-respawn with --model and --conversation (resuming history).
-    local: ['opencode', 'claude', 'agy'],
+    local: ['opencode', 'claude', 'agy', 'dsh'],
   },
   usage: {
     description: 'Show token usage and limits',
@@ -206,6 +206,7 @@ const HARNESS_COMMANDS: Partial<Record<Harness, HarnessCommand>> = {
   codex: { name: 'cx', aliases: ['codex'], picker: true },
   gemini: { name: 'gm', aliases: ['gemini'], picker: true },
   agy: { name: 'agy', aliases: [], picker: false },
+  dsh: { name: 'dsh', aliases: ['deepseek'], picker: true },
 };
 
 /** Reverse index (every accepted spelling → harness), built once. Names are already lowercase. */

@@ -5,6 +5,27 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **`dsh` (DeepSeek Harness) harness preset.** The gateway can now drive DeepSeek Harness over ACP
+  (`harness: dsh`), the same way it drives opencode — `dsh --profile acp` is the dsh equivalent of
+  `opencode acp`. dsh's ACP bridge encodes its model selector as a JSON string (`["provider","model"]`)
+  rather than the "provider/model" spelling agent-anywhere uses everywhere else, so the daemon
+  translates between the two at every model boundary: a configured `agents[].model` is JSON-encoded
+  before `set_config_option` (a bare string is rejected as "unknown model option"), and the `/model`
+  menu decodes dsh's values back to "provider/model" for display and for typing a switch. Note dsh
+  ignores the ACP `_meta.model` hint entirely, so the model is enforced through the protocol's own
+  setter, exactly as for opencode.
+
+- **`/model` support for the `agy` (Google Antigravity CLI) harness.** The AGY harness previously
+  answered `/model` with "not supported" because its stream-json protocol has no in-process model
+  switch. It now supports runtime model inspection and switching using a kill-and-respawn strategy:
+  the available model choices are discovered via `agy models` and cached at factory startup, and
+  `/model` (both the paginated button menu and `/model <name>` substring matching) switches the model
+  by terminating the resident child and respawning on the next turn with `--model=<new>` and
+  `--conversation=<id>`. Conversation context is retained across the switch through agy's native
+  conversation recovery.
+
 ## [1.2.0] - 2026-09-05
 
 ### Added

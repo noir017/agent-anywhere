@@ -30,7 +30,7 @@ export const SessionScope = z.enum(['per_thread', 'per_channel', 'per_user', 'sh
 export type SessionScope = z.infer<typeof SessionScope>;
 
 /**
- * A single agent definition. harness is a preset (claude/gemini/codex/opencode/agy); with custom,
+ * A single agent definition. harness is a preset (claude/gemini/codex/opencode/dsh/agy); with custom,
  * command points at any ACP-speaking executable. harness-specific switches (e.g.
  * claude's --setting-sources) go through args, not the generic schema.
  *
@@ -43,7 +43,7 @@ export const AgentDefSchema = z
     /** Unique id referenced by routing. */
     id: z.string().min(1),
     /** Preset; command is required when custom. */
-    harness: z.enum(['claude', 'gemini', 'codex', 'opencode', 'agy', 'custom']),
+    harness: z.enum(['claude', 'gemini', 'codex', 'opencode', 'dsh', 'agy', 'custom']),
     /** Executable to launch the ACP agent when harness=custom; empty for presets (resolveHarness provides a default). */
     command: z.string().optional(),
     /** Extra args appended to the harness command (harness-specific switches go here). */

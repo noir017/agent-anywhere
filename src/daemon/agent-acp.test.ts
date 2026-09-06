@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import type { SessionConfigOption, SessionUpdate } from '@agentclientprotocol/sdk';
-import { liveModelName, translateUpdate, type TurnState } from './agent-acp.js';
+import {
+  dshModelDisplayValue,
+  dshModelSelectorValue,
+  liveModelName,
+  resolveHarness,
+  translateUpdate,
+  type TurnState,
+} from './agent-acp.js';
+import type { AgentDef } from '../config/schema.js';
 import type { AgentUsage } from './agent.js';
 
 /** Recording TurnState: capture handler calls as an event string for order assertions. */
@@ -438,5 +446,45 @@ describe('liveModelName label choice (real claude-agent-acp option list)', () =>
     // "Opus 5" says which model, not which context window — it must not satisfy [1m].
     const opts = [{ id: 'model', type: 'select', name: 'Model', currentValue: 'opus[1m]', options: [{ value: 'opus[1m]', name: 'Opus 5' }] }] as SessionConfigOption[];
     expect(liveModelName(opts)).toBe('opus[1m]');
+  });
+});
+
+/**
+ * The dsh (DeepSeek Harness) preset and its model-value encoding.
+ *
+ * DSH's ACP bridge encodes a model selection as JSON.stringify([provider, model]) — see modelValue
+ * in @deepseek-ai/dsh-acp lib/types/model-control.js — so agent-anywhere's "provider/model" spelling
+ * must be JSON-encoded to cross the wire (a bare "provider/model" is "unknown model option") and
+ * decoded again to present a readable /model menu.
+ */
+describe('dsh harness preset', () => {
+  const def = (o: Record<string, unknown>): AgentDef => o as AgentDef;
+
+  it('resolveHarness launches dsh through its ACP profile', () => {
+    expect(resolveHarness(def({ id: 'ds', harness: 'dsh', args: [] }))).toEqual({ command: 'dsh', args: ['--profile', 'acp'] });
+  });
+
+  it('resolveHarness appends def.args after the profile switch', () => {
+    expect(resolveHarness(def({ id: 'ds', harness: 'dsh', args: ['--verbose'] }))).toEqual({
+      command: 'dsh',
+      args: ['--profile', 'acp', '--verbose'],
+    });
+  });
+
+  it('dshModelSelectorValue: "provider/model" → the JSON string dsh set_config_option accepts', () => {
+    expect(dshModelSelectorValue('newapi/deepseek-v4-flash-0731')).toBe('["newapi","deepseek-v4-flash-0731"]');
+  });
+
+  it('dshModelSelectorValue: a provider-less model encodes with an empty provider (rejected by the offer check, not by dsh)', () => {
+    expect(dshModelSelectorValue('deepseek-v4-flash-0731')).toBe('["","deepseek-v4-flash-0731"]');
+  });
+
+  it('dshModelDisplayValue round-trips the wire value back to "provider/model"', () => {
+    expect(dshModelDisplayValue('["newapi","deepseek-v4-flash-0731"]')).toBe('newapi/deepseek-v4-flash-0731');
+  });
+
+  it('dshModelDisplayValue passes non-array / non-JSON values through unchanged (non-dsh harnesses)', () => {
+    expect(dshModelDisplayValue('claude-opus-4-5')).toBe('claude-opus-4-5');
+    expect(dshModelDisplayValue('[1,2]')).toBe('[1,2]');
   });
 });

@@ -45,6 +45,8 @@ function harnessCommand(def: import('../config/schema.js').AgentDef): string {
       return 'codex-acp';
     case 'opencode':
       return 'opencode';
+    case 'dsh':
+      return 'dsh';
     case 'agy':
       return AGY_COMMAND;
     case 'custom':

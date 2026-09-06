@@ -115,8 +115,8 @@ export function resolveCodexAdapterEntry(): string {
   );
 }
 
-/** Resolve an agent def into the actual spawn command + args (presets default; custom self-configures; then append def.args). */
-function resolveHarness(def: AgentDef): { command: string; args: string[] } {
+/** Resolve an agent def into the actual spawn command + args (presets default; custom self-configures; then append def.args). Exported for the doctor check and the harness unit tests. */
+export function resolveHarness(def: AgentDef): { command: string; args: string[] } {
   switch (def.harness) {
     case 'claude':
       // Claude via the official claude-agent-acp adapter (replacing Zed's claude-code-acp): its
@@ -135,6 +135,11 @@ function resolveHarness(def: AgentDef): { command: string; args: string[] } {
     case 'opencode':
       // OpenCode native ACP mode (per the ACP registry's official launch spec: `opencode acp`).
       return { command: 'opencode', args: ['acp', ...def.args] };
+    case 'dsh':
+      // DeepSeek Harness ACP profile (per the ACP registry's official launch spec: `dsh --profile acp`,
+      // the dsh equivalent of opencode's `opencode acp`). Config (provider/model, credentials) comes
+      // from dsh's own profile, not from args.
+      return { command: 'dsh', args: ['--profile', 'acp', ...def.args] };
     case 'custom':
       // refine already guarantees command exists.
       return { command: def.command!, args: [...def.args] };
@@ -263,6 +268,46 @@ function nameKeepsQualifiers(name: string, id: string): boolean {
 const MODEL_CONFIG_ID = 'model';
 
 /**
+ * DSH's model selector value: JSON.stringify([provider, model]) — see `modelValue` in
+ * @deepseek-ai/dsh-acp (lib/types/model-control.js), where the option's `currentValue` and every
+ * choice value carry that exact string and `set` looks the incoming value up in a map keyed by it.
+ * agent-anywhere spells models "provider/model" (the opencode convention), so the pair must be
+ * JSON-encoded to cross the wire — a bare "provider/model" is rejected as "unknown model option" —
+ * and decoded again to present a readable /model menu (see dshModelDisplayValue).
+ */
+export function dshModelSelectorValue(model: string): string {
+  // No provider half (a bare model id): encode with an empty provider. That cannot match DSH's list,
+  // so applyModelPreference's offer check rejects it explicitly with the real choices — a clearer
+  // failure than DSH's opaque "unknown model option".
+  const slash = model.indexOf('/');
+  const provider = slash === -1 ? '' : model.slice(0, slash);
+  const name = slash === -1 ? model : model.slice(slash + 1);
+  return JSON.stringify([provider, name]);
+}
+
+/**
+ * Inverse of dshModelSelectorValue: decode DSH's JSON-array selector value back to the
+ * "provider/model" spelling config and /model queries use. Anything that isn't a 2-element string
+ * array (a non-dsh harness's plain model id) passes through unchanged.
+ */
+export function dshModelDisplayValue(value: string): string {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (
+      Array.isArray(parsed) &&
+      parsed.length === 2 &&
+      typeof parsed[0] === 'string' &&
+      typeof parsed[1] === 'string'
+    ) {
+      return `${parsed[0]}/${parsed[1]}`;
+    }
+  } catch {
+    // Not JSON (a bare model id from a non-dsh harness) — pass through.
+  }
+  return value;
+}
+
+/**
  * Enforce `agents[].model` on a freshly created session, returning the resulting live model name
  * (undefined when nothing was applied, so the caller keeps what session/new reported).
  *
@@ -286,6 +331,11 @@ async function applyModelPreference(
 ): Promise<string | undefined> {
   const want = override ?? def.model;
   if (!want) return undefined;
+  // DSH's selector values are JSON.stringify([provider, model]) (see dshModelSelectorValue), so
+  // translate the "provider/model" config spelling before comparing against currentValue, checking
+  // the offered list, and setting. Logging keeps the readable spelling throughout.
+  const wireWant = def.harness === 'dsh' ? dshModelSelectorValue(want) : want;
+  const display = (v: string): string => (def.harness === 'dsh' ? dshModelDisplayValue(v) : v);
 
   const opt = (session.newSessionResponse?.configOptions ?? []).find((o) => o.id === MODEL_CONFIG_ID);
   // No model selector at all (the claude harness pins its model via ANTHROPIC_MODEL instead):
@@ -294,14 +344,14 @@ async function applyModelPreference(
     console.debug(`[acp] agent "${def.id}" exposes no model selector; leaving model.${want ? ` (configured "${want}" applies only if the harness reads it elsewhere)` : ''}`);
     return undefined;
   }
-  if (opt.currentValue === want) return undefined; // already correct — don't spend a round trip
+  if (opt.currentValue === wireWant) return undefined; // already correct — don't spend a round trip
 
   // Only offer ids the agent actually lists; a typo would otherwise surface as an opaque rejection.
   const offered = opt.options.flatMap((entry) => ('group' in entry ? entry.options : [entry]));
-  if (offered.length > 0 && !offered.some((o) => o.value === want)) {
+  if (offered.length > 0 && !offered.some((o) => o.value === wireWant)) {
     console.warn(
       `[acp] agent "${def.id}": configured model "${want}" is not among the models it offers; ` +
-        `continuing with "${opt.currentValue}". Available: ${offered.map((o) => o.value).join(', ')}`
+        `continuing with "${display(opt.currentValue)}". Available: ${offered.map((o) => display(o.value)).join(', ')}`
     );
     return undefined;
   }
@@ -310,7 +360,7 @@ async function applyModelPreference(
     const res = await ctx.request('session/set_config_option', {
       sessionId: session.sessionId,
       configId: MODEL_CONFIG_ID,
-      value: want,
+      value: wireWant,
     });
     const applied = liveModelName(res?.configOptions);
     console.log(`[acp] agent "${def.id}": model set to "${want}"`);
@@ -524,8 +574,19 @@ function createAcpSession(
           .buildSession({
             cwd,
             mcpServers: acpMcpServers(def, socketPath), // seam ②: empty for plan A
-            // model passed best-effort via _meta; whether it takes effect depends on the harness (claude/gemini differ).
-            ...(def.model ? { _meta: { model: def.model } } : {}),
+            // model passed best-effort via _meta; whether it takes effect depends on the harness
+            // (claude/gemini differ). dsh's bridge ignores _meta entirely — it reads provider/model
+            // only from its own profile config (verified in @deepseek-ai/dsh-acp newSession, which
+            // uses initialSelection(config)) — so the hint is kept well-formed (JSON-encoded like
+            // set_config_option expects) in case a future version reads it; the real enforcement is
+            // applyModelPreference below.
+            ...(def.model
+              ? {
+                  _meta: {
+                    model: def.harness === 'dsh' ? dshModelSelectorValue(def.model) : def.model,
+                  },
+                }
+              : {}),
           })
           .start();
         active = session; // active set = "ready": assigned last so a half-ready session isn't reused
@@ -678,17 +739,24 @@ function createAcpSession(
     modelSelector(): ModelSelector | undefined {
       const opt = liveConfigOptions?.find((o) => o.id === MODEL_CONFIG_ID);
       if (!opt || opt.type !== 'select') return undefined;
+      // dsh encodes every value as JSON.stringify([provider, model]); /model matches user-typed text
+      // against these values and feeds them back to setModel, so decode them to the same
+      // "provider/model" spelling config and queries use.
+      const display = (v: string): string => (def.harness === 'dsh' ? dshModelDisplayValue(v) : v);
       // Options come flat or grouped by provider; flatten so the caller sees one list.
       const options = opt.options
         .flatMap((entry) => ('group' in entry ? entry.options : [entry]))
-        .map((o) => ({ value: o.value, name: o.name || o.value }));
+        .map((o) => ({ value: display(o.value), name: o.name || display(o.value) }));
       return {
-        current: typeof opt.currentValue === 'string' ? opt.currentValue : undefined,
+        current: typeof opt.currentValue === 'string' ? display(opt.currentValue) : undefined,
         options,
       };
     },
 
     async setModel(value: string): Promise<string> {
+      // dsh's selector values are JSON.stringify([provider, model]) (see dshModelSelectorValue); the
+      // /model menu hands us decoded "provider/model" values, so re-encode before the wire.
+      const wire = def.harness === 'dsh' ? dshModelSelectorValue(value) : value;
       // No live session = no selector to set right now: the option list arrives with session/new.
       // Rather than fail, record the choice as this conversation's preference. modelPreference
       // outlives dispose (resetHandles does not clear it), so applyModelPreference re-applies it when
@@ -703,7 +771,7 @@ function createAcpSession(
       const res = await conn.agent.request('session/set_config_option', {
         sessionId: active.sessionId,
         configId: MODEL_CONFIG_ID,
-        value,
+        value: wire,
       });
       // Remember BEFORE trusting the echo: the choice must outlive this child either way.
       modelPreference = value;

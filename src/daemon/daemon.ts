@@ -66,6 +66,7 @@ import { ConversationRegistry } from './conversation.js';
 import type { ConversationStore } from './conversation-store.js';
 import { IpcServer } from '../ipc/server.js';
 import type { IpcAction } from '../ipc/protocol.js';
+import { DEFAULT_ASK_TIMEOUT_MS as PROTOCOL_DEFAULT_ASK_TIMEOUT_MS } from '../ipc/protocol.js';
 
 /** Valid slash name: lowercase/digit/_/-, 1-32 chars (Discord constraint). Non-matching names are skipped on registration. */
 const SLASH_NAME_RE = /^[a-z0-9_-]{1,32}$/;
@@ -87,8 +88,22 @@ const SLASH_DESC_MAX = 100;
  */
 const DEDUP_TTL_MS = 15_000;
 
-/** Default timeout for an unclicked ask/clarify button (fallback when action.timeoutMs is absent). */
-const DEFAULT_ASK_TIMEOUT_MS = 120_000;
+/**
+ * Default timeout for an unclicked ask/clarify button (fallback when action.timeoutMs is absent).
+ *
+ * Ten minutes, not the two it used to be, because the person being asked is on a phone rather than
+ * at the terminal the agent is running in. Two minutes is well inside the time it takes to read a
+ * notification, switch apps and think — and the failure was silent (`ask` prints an empty line on
+ * timeout, exactly as it does when nothing was chosen), so a question the user answered three
+ * minutes later looked to the agent like a broken command. Observed doing precisely that.
+ *
+ * The ceiling still exists because an unanswered question must not pin an agent turn forever; an
+ * agent that knows its question is urgent can shorten it with `--timeout`.
+ *
+ * The value itself lives in ipc/protocol.ts: the CLI sizes its socket deadline from the same number
+ * and the two must not drift apart.
+ */
+const DEFAULT_ASK_TIMEOUT_MS = PROTOCOL_DEFAULT_ASK_TIMEOUT_MS;
 
 /**
  * Max buttons in a harness-command menu. Discord allows 25 components per message (5 rows × 5);

@@ -5,6 +5,7 @@ import { loadConfig, resolveSocketPath } from '../config/load.js';
 import { callDaemon } from '../ipc/client.js';
 import { DEFAULT_FETCH_FIELDS } from '../ipc/commands.js';
 import type { IpcAction } from '../ipc/protocol.js';
+import { ASK_CLIENT_TIMEOUT_MARGIN_MS, DEFAULT_ASK_TIMEOUT_MS } from '../ipc/protocol.js';
 import type { InboundMessage } from '../types.js';
 
 /**
@@ -59,10 +60,12 @@ export async function runReverse(rawAction: IpcAction): Promise<void> {
   const action = normalizeActionPaths(rawAction);
 
   // Blocking ask hangs on the daemon side until the user selects/times out, so the
-  // client's default 10s isn't enough; use action.timeoutMs (default 120s) plus a 10s
-  // margin so the client doesn't give up before the daemon.
+  // client's default 10s isn't enough; use action.timeoutMs (default from the protocol,
+  // shared with the daemon) plus a margin so the client doesn't give up before the daemon.
   const clientTimeout =
-    action.kind === 'ask' ? (action.timeoutMs ?? 120_000) + 10_000 : undefined;
+    action.kind === 'ask'
+      ? (action.timeoutMs ?? DEFAULT_ASK_TIMEOUT_MS) + ASK_CLIENT_TIMEOUT_MARGIN_MS
+      : undefined;
 
   const resp = await callDaemon(socket, action, undefined, clientTimeout);
   if (!resp.ok) {
@@ -85,6 +88,17 @@ function printResult(action: IpcAction, data: unknown): void {
     case 'ask': {
       const chosen = (data as { chosen?: string | null } | undefined)?.chosen ?? null;
       console.log(chosen ?? '');
+      // An empty stdout line is a legitimate answer shape, which makes it a poor way to learn that
+      // nobody answered at all — the agent sees the same blank either way and reasonably concludes
+      // the command is broken. Say so on stderr, where it cannot corrupt the label on stdout.
+      if (chosen === null) {
+        const waited = Math.round((action.timeoutMs ?? DEFAULT_ASK_TIMEOUT_MS) / 1000);
+        console.error(
+          `ask: no option was chosen within ${waited}s (the buttons have been withdrawn). ` +
+            `The question was delivered — nobody clicked. Ask again in plain text, or retry with ` +
+            `--timeout <ms> for longer.`
+        );
+      }
       return;
     }
     case 'fetch-messages':

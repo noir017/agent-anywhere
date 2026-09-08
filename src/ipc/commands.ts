@@ -218,6 +218,14 @@ export const REVERSE_COMMANDS: ReverseCommandSpec[] = [
       timeoutMs: typeof opts.timeout === 'number' ? opts.timeout : undefined,
       channelId: str(opts.channel),
     }),
-    hint: 'Ask a clarifying question (blocks until the user chooses): agent-anywhere ask "question" -o optionA -o optionB (writes the chosen label to stdout; empty on timeout)',
+    // The hint is what reaches an agent's prompt, so it has to carry the two things that were
+    // learned the hard way: `--timeout` exists, and a blank answer is "nobody clicked", not
+    // "this command does not work". An agent that reads the blank as a malfunction stops using
+    // ask entirely — which is worse than the unanswered question it started with.
+    hint:
+      'Ask a clarifying question (blocks until the user chooses): agent-anywhere ask "question" ' +
+      '-o optionA -o optionB [--timeout <ms>, default 10min] (writes the chosen label to stdout; ' +
+      'empty stdout plus a stderr note means nobody clicked in time — the question WAS delivered, ' +
+      'so follow up in plain text instead of assuming the command is broken)',
   },
 ];

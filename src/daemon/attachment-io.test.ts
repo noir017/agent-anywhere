@@ -162,6 +162,10 @@ describe('createAttachmentIngestDeps · platform fetch first', () => {
       name: 'img_v2_a.png',
     });
     expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+
+    // Also covers the branches where mime and name are absent
+    const depsNoMeta = createAttachmentIngestDeps(config, async () => ({ bytes }));
+    await expect(depsNoMeta.download(LARK_URL)).resolves.toEqual({ bytes });
   });
 
   it('falls through to HTTP when the platform declines the URL', async () => {

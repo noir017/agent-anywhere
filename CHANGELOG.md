@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-09-08
+
 ### Fixed
 
 - **Topic names now start with the agent, and no longer leak the speaker's name.** Two problems

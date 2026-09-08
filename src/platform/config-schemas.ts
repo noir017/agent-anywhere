@@ -63,6 +63,20 @@ const common = {
   threadAutoArchiveMinutes: z
     .union([z.literal(60), z.literal(1440), z.literal(4320), z.literal(10080)])
     .default(1440),
+  /**
+   * Rename a conversation's thread to the title the agent generates for it.
+   *
+   * On by default, because a topic named after what is being discussed is the point of having
+   * topics, and the alternative — every lane keeping the placeholder it was created with — is what
+   * this setting exists to end. Gated at runtime by `capabilities.renameThread`, so it is inert on
+   * platforms that cannot do it.
+   *
+   * Turn it off when the lane names are yours to curate: with it on, a new title from the harness
+   * WILL overwrite a name you set by hand (the Bot API cannot report a topic's current name, so
+   * "was this renamed by a human" is not a question that can be answered — only "is it what we
+   * last set"). That is the deliberate trade for keeping the name current.
+   */
+  autoRenameThread: z.boolean().default(true),
 };
 
 export const DiscordConfigSchema = z.object({

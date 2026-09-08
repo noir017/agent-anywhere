@@ -6,6 +6,7 @@ import {
   telegramConversation,
   rawTopicFields,
   rawCallbackMessageId,
+  truncateForTopicName,
 } from './telegram.js';
 
 // ── Fake bot for delivery-contract tests ──────────────────────────────────────
@@ -557,6 +558,91 @@ describe('createThread', () => {
     );
     expect(created[0]).toEqual({ chat_id: '-1001234567890', name: 'debug' });
     expect(out).toEqual({ address: { channel: '-1001234567890', thread: '5' } });
+  });
+});
+
+/**
+ * Renaming an existing topic — the operation that lets a lane's name follow what is actually
+ * being discussed in it, rather than freezing whatever it was called at creation.
+ *
+ * The cases worth pinning are the refusals, because each one is a wrong call the Bot API would
+ * happily accept: renaming with no lane would target the chat, and an empty name is read by
+ * Telegram as "keep the current one" — reporting success while changing nothing.
+ */
+describe('renameThread', () => {
+  const profile = createTelegramProfile();
+  const fakeBot = (calls: Array<Record<string, unknown>>) =>
+    ({
+      internal: {
+        editForumTopic: (p: Record<string, unknown>) => {
+          calls.push(p);
+          return Promise.resolve(true);
+        },
+      },
+    }) as unknown as Parameters<NonNullable<typeof profile.renameThread>>[0];
+
+  it('renames the topic on the chat that owns it', async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    await profile.renameThread!(fakeBot(calls), { channel: '-1001234567890', thread: '99' }, 'ask 超时');
+    expect(calls[0]).toEqual({
+      chat_id: '-1001234567890',
+      message_thread_id: 99, // an integer, as the Bot API requires — not the '99' string
+      name: 'ask 超时',
+    });
+  });
+
+  it('refuses an address with no lane rather than renaming the whole chat', async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    await expect(
+      profile.renameThread!(fakeBot(calls), { channel: '-1001234567890' }, 'nope')
+    ).rejects.toThrow(/needs a forum topic/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('refuses the General lane, which is the chat wearing a topic id', async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    await expect(
+      profile.renameThread!(fakeBot(calls), { channel: '-1001234567890', thread: '1' }, 'nope')
+    ).rejects.toThrow(/needs a forum topic/);
+    expect(calls).toHaveLength(0);
+  });
+
+  // An empty `name` is not an error to Telegram: it means "leave the name as it is". So sending
+  // one would report a successful rename that did nothing, and the caller would record it as done.
+  it('refuses a blank name instead of sending a silent no-op', async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    await expect(
+      profile.renameThread!(fakeBot(calls), { channel: '-100', thread: '9' }, '   \n  ')
+    ).rejects.toThrow(/blank name/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('flattens a multi-line title into the single line a topic name is', async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    await profile.renameThread!(fakeBot(calls), { channel: '-100', thread: '9' }, 'fix\n\nthe   bug');
+    expect(calls[0]!.name).toBe('fix the bug');
+  });
+});
+
+describe('truncateForTopicName', () => {
+  it('leaves a short title alone', () => {
+    expect(truncateForTopicName('  fix the ask timeout  ')).toBe('fix the ask timeout');
+  });
+
+  it('fits an over-long title inside the 128-unit cap, marker included', () => {
+    const out = truncateForTopicName('x'.repeat(400));
+    expect(out.length).toBeLessThanOrEqual(128);
+    expect(out.endsWith('…')).toBe(true);
+  });
+
+  // The failure this guards against is invisible to `.length`: slicing a string of astral
+  // characters at a code-unit boundary can cut a surrogate pair in half, and Telegram answers a
+  // lone surrogate with a 400 on a name that measured as legal.
+  it('never splits a surrogate pair when truncating emoji', () => {
+    const out = truncateForTopicName('🎉'.repeat(200));
+    expect(out.length).toBeLessThanOrEqual(128);
+    expect(out).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/); // no high surrogate left dangling
+    expect(out).not.toMatch(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/); // …and no orphaned low one
   });
 });
 

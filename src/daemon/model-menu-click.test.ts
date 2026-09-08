@@ -195,11 +195,11 @@ describe('opening the menu', () => {
     expect(r.menu().buttons.some((b) => b.label.startsWith('●'))).toBe(true);
   });
 
-  it('still answers as text when there is no live selector yet', async () => {
+  it('still answers as text when the harness offers no selector', async () => {
     const r = rig({ noSelector: true });
     await r.send('/model');
     expect(r.buttonSends).toHaveLength(0);
-    expect(r.replies().at(-1)).toContain('No model selector on this session yet');
+    expect(r.replies().at(-1)).toContain('offers no model selector');
   });
 
   it('answers as text on a platform with no buttons', async () => {

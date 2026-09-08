@@ -33,6 +33,7 @@ function stubAdapter(id: string): PlatformAdapter & { sent: string[]; reacted: s
     async removeReaction() {},
     async replyMessage(ref, text) { sent.push(text); return ref; },
     async createThread() { return { address: { channel: 't' } }; },
+    async renameThread() {},
     async sendButtons(address) { return { address, messageId: 'b' }; },
     async editButtons() {},
     async registerCommands() {},

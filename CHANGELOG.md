@@ -5,6 +5,77 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **A conversation's topic takes the name the agent gave it.** A Telegram forum topic keeps whatever
+  name it was created with for as long as it exists, so a topic-per-task workflow ends up as a
+  column of names typed before any of the work happened. Meanwhile the harness has been generating
+  an accurate title the whole time and reporting it over ACP as `session_info_update` — which the
+  gateway dropped on the floor (`translateUpdate`'s `default: break`). The title now renames the
+  topic, through a new `renameThread` capability on the platform layer implemented for Telegram via
+  `editForumTopic`. Off with `platforms.<id>.autoRenameThread: false`.
+
+  Two things were needed to make the signal arrive at all. First, claude-agent-acp sends the
+  notification from its turn-end idle handler, which runs *after* the code that settles the prompt —
+  so it lands in the SDK's update queue behind the `stop` that ended the read loop, and the next
+  turn's `drainResidualUpdates` discarded it unread. The daemon log showed exactly this as
+  "dropped 1 residual update(s)" after every single turn; the drain now salvages a title out of the
+  residue before clearing it. Second, the title is generated in a background task, so it describes
+  the turn *before* the one that reports it — one turn late by construction.
+
+  Only the ACP harnesses report a title (`claude` observed; `opencode`'s schema carries the variant;
+  `dsh` does not, and the agy protocol has no notion of one), so a conversation with no title is the
+  normal case rather than a failure.
+
+- **`/title`** — name the current topic by hand, `/title auto` to hand naming back to the agent, or
+  bare to see what it was last called. A name set this way is *pinned*: the automatic rename stops
+  following the harness for that conversation, because an explicit command that the next turn
+  silently reverts is indistinguishable from a broken one. Note what cannot be guarded: Telegram
+  offers no way to read a topic's current name back, so a rename done in the Telegram UI is
+  invisible to the gateway and will be overwritten by the next new title.
+
+### Fixed
+
+- **`dsh` was registered as a harness but not reachable as a command.** `/dsh` was missing from the
+  agent-command table, and `/model` / `/context` reported "not supported" for it despite its ACP
+  bridge exposing both. (Committed before this release was cut; recorded here so the release notes
+  are complete.)
+
+- **`/model` works before a conversation's first turn.** Under ACP the model list arrives in the
+  `session/new` response, so `modelSelector()` had nothing to report until a turn had run — and
+  `/model` answered "No model selector on this session yet — send a message, then /model". That was
+  wrong in the flow it broke most: the directory menu invites picking a project and then a model, and
+  `/cd` makes it worse than a fresh conversation by disposing the session, so even an established
+  conversation lost its list. `AgentSession` gained `ensureSession()`, and the gateway now starts the
+  session to answer the question — the same child the next message would have started anyway, with no
+  prompt sent and no context spent. Fixed in the shared layer, so it covers `cc`, `oc` and `dsh`
+  alike (`agy` was unaffected: it reads its list from `agy models`, though a `/model` in the first
+  moments after a daemon start could previously race the prefetch, which is fixed too).
+
+  A failure to start now reports its real reason ("must be logged in…") instead of sending the user
+  to do the one thing guaranteed to fail the same way.
+
+  `/setting`'s model row is deliberately NOT warmed: doing it there would spawn a child to answer
+  `/setting banana`, and warming at the click instead would mean making the daemon's synchronous
+  menu path async.
+
+- **A second child could be spawned for one ACP session.** `ensureStarted` assigns `active` only at
+  the *end* of startup, so with two callers — a turn beginning and a `/model` warm-up — the second
+  would see no session, spawn its own child and overwrite `proc`, leaving the first as an orphan that
+  no `dispose` could reach while still holding the harness's session. Concurrent callers now share
+  one in-flight startup.
+
+- **`ask` no longer looks broken when someone takes more than two minutes to answer.** The default
+  timeout was 120s, which is well inside the time it takes to read a notification, switch apps and
+  think — and the failure was silent, since `ask` prints an empty line on timeout exactly as it does
+  when nothing was chosen. An agent could not tell "nobody clicked" from "this command does not
+  work", and would stop using `ask` at all. The default is now 10 minutes, a timeout writes an
+  explicit note to stderr, and the hint injected into agent prompts documents both `--timeout` and
+  what a blank answer means. The timeout constant also moved to `ipc/protocol.ts`: the daemon and the
+  CLI each held their own copy of `120_000` (the CLI sizes its socket deadline from it), and tuning
+  one without the other makes the CLI abandon a question the daemon is still waiting on.
+
+
 ## [1.2.1] - 2026-09-06
 
 ### Added

@@ -25,6 +25,15 @@ const CONVERSATION = { platform: 'tg', channel: 'c1', kind: 'direct' as const, u
 const CALLBACK_QUERY_ID = '4242424242424242';
 const MENU_MSG = 'menu-msg-id';
 
+/** What the fake session reports once it has been started — see the factory in rig(). */
+const MODELS = {
+  current: 'opencode/big-pickle',
+  options: [
+    { value: 'opencode/big-pickle', name: 'Big Pickle' },
+    { value: 'opencode/glm-5', name: 'GLM-5' },
+  ],
+};
+
 const root = mkdtempSync(join(tmpdir(), 'workdir-click-'));
 // Enough projects to force a second page (PAGE_SIZE is 6, and the root takes a slot).
 const PROJECTS = ['alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta', 'eta'];
@@ -57,17 +66,29 @@ function rig(opts: { access?: string[]; caps?: { buttons?: boolean; editButtons?
   const buttonSends: Array<{ text: string; buttons: Array<{ id: string; label: string }> }> = [];
   const buttonEdits: Array<{ messageId: string; text: string; buttons: Array<{ id: string; label: string }> }> = [];
   const disposed: string[] = [];
+  const starts: string[] = [];
   const sessions = new Map<string, AgentSession>();
 
   const agents: AgentFactory = {
     getOrCreate(conversationId) {
       let s = sessions.get(conversationId);
       if (!s) {
+        // Modelled on the ACP runtime: the model list does not exist until the session has been
+        // started, which is what made `/model` unanswerable before a conversation's first turn.
+        let started = false;
         s = {
           conversationId,
-          runTurn: async () => {},
+          runTurn: async () => {
+            started = true;
+          },
           abort: () => {},
           dispose: () => {},
+          ensureSession: async (token: string) => {
+            starts.push(token);
+            started = true;
+          },
+          modelSelector: () => (started ? MODELS : undefined),
+          setModel: async (v: string) => v,
         } as AgentSession;
         sessions.set(conversationId, s);
       }
@@ -148,9 +169,13 @@ function rig(opts: { access?: string[]; caps?: { buttons?: boolean; editButtons?
   const menu = () => buttonSends.at(-1)!;
   const pickIds = () => menu().buttons.filter((b) => b.id.startsWith('wdr:')).map((b) => b.id);
   const navIds = () => menu().buttons.filter((b) => b.id.startsWith('wdp:')).map((b) => b.id);
+  const modelIds = () => menu().buttons.filter((b) => b.id.startsWith('mdl:')).map((b) => b.id);
   const key = 'tg#c1#';
 
-  return { send, click, replies, menu, pickIds, navIds, buttonSends, buttonEdits, disposed, store, key };
+  return {
+    send, click, replies, menu, pickIds, navIds, modelIds,
+    buttonSends, buttonEdits, disposed, starts, store, key,
+  };
 }
 
 describe('opening the menu', () => {
@@ -255,5 +280,46 @@ describe('clicking a directory', () => {
     await r.click(target, 'intruder');
     expect(r.buttonEdits).toHaveLength(editsBefore);
     expect(r.store.conversationCwd(r.key)).toBeUndefined();
+  });
+});
+
+/**
+ * The reported bug, end to end: a fresh topic where the user sends `/oc`, picks a directory from
+ * the buttons, and then wants a model — the sequence the directory menu itself invites.
+ *
+ * It used to answer "No model selector on this session yet — send a message, then /model", which
+ * was both wrong and unactionable: under ACP the model list arrives with `session/new`, so nothing
+ * short of a turn would produce one, and picking a directory had just disposed the session anyway.
+ */
+describe('choosing a model straight after choosing a directory', () => {
+  it('offers the models once a directory has been picked, without a turn in between', async () => {
+    const r = rig();
+    await r.send('/oc');
+    await r.click(r.pickIds()[1]!); // pick a project
+    expect(r.store.conversationCwd(r.key)).toBe(join(root, PROJECTS[0]!));
+
+    await r.send('/model');
+    expect(r.starts).toHaveLength(1); // the session was started for the menu, deliberately
+    expect(r.modelIds()).toHaveLength(2); // …and the models are on offer as buttons
+  });
+
+  it('offers the models on a bare /oc that was never followed by anything', async () => {
+    const r = rig();
+    await r.send('/oc'); // directory menu posted, nothing picked, no turn run
+    await r.send('/model');
+    expect(r.modelIds()).toHaveLength(2);
+  });
+
+  // `/cd` in an ESTABLISHED conversation is the second, independent repro: setWorkdir disposes the
+  // session to move it, which drops the closure holding the model list. Warming on demand covers
+  // this case for free, and it is worth pinning because the dispose is the whole point of `/cd`.
+  it('offers the models again after /cd has moved an established conversation', async () => {
+    const r = rig();
+    await r.send('/oc do some work'); // a real turn: the conversation is now established
+    await r.send('/cd beta');
+    expect(r.disposed).toContain(r.key);
+
+    await r.send('/model');
+    expect(r.modelIds()).toHaveLength(2);
   });
 });

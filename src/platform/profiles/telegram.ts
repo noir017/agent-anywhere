@@ -123,6 +123,16 @@ interface TelegramInternal {
     chat_id: string | number;
     name: string;
   }): Promise<{ message_thread_id: number; name: string }>;
+  /**
+   * Rename an existing forum topic. `name` is optional in the Bot API (omitting it keeps the
+   * current name); we always send it, since renaming is the only reason to call this. Returns
+   * `true` on success — the adapter unwraps the envelope, so a failure is a throw, not a `false`.
+   */
+  editForumTopic(payload: {
+    chat_id: string | number;
+    message_thread_id: number;
+    name: string;
+  }): Promise<boolean>;
   sendMessage(payload: {
     chat_id: string | number;
     message_thread_id?: number;
@@ -164,6 +174,36 @@ function topicIdOf(address: ConversationAddress): number {
     );
   }
   return n;
+}
+
+/** Bot API cap on a forum topic's `name` (documented as "0-128 characters"). */
+const TOPIC_NAME_MAX = 128;
+
+/**
+ * Collapse whitespace and fit a title into a forum topic's name.
+ *
+ * Exported for the tests, because both halves have a way of being wrong that no reviewer sees:
+ *
+ * - Titles come from a harness and can carry newlines; a topic name is one line, and Telegram
+ *   silently mangles rather than rejects multi-line input.
+ * - The cap is measured in UTF-16 code units, so `slice` on a string of astral characters (emoji,
+ *   many CJK extension characters) can cut a surrogate pair in half and produce a lone surrogate.
+ *   Telegram answers that with a 400 on a string whose `.length` looked legal. `Array.from` walks
+ *   code points, so budgeting per code point cannot split one.
+ */
+export function truncateForTopicName(raw: string): string {
+  const flat = raw.replace(/\s+/g, ' ').trim();
+  if (flat.length <= TOPIC_NAME_MAX) return flat;
+  let used = 0;
+  let out = '';
+  // Leave room for the ellipsis, so the result is always within budget INCLUDING the marker.
+  const budget = TOPIC_NAME_MAX - 1;
+  for (const ch of flat) {
+    if (used + ch.length > budget) break;
+    out += ch;
+    used += ch.length;
+  }
+  return `${out.trimEnd()}…`;
 }
 
 /**
@@ -379,6 +419,11 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
     maxMessageLength: 4096,
     reply: true,
     thread: true,
+    // editForumTopic is in the adapter's Internal allow-list, and the bot is already a forum admin
+    // wherever it can create topics. Renaming still fails in a non-forum chat — renameThread
+    // refuses a thread-less address before the API call, and the caller treats any rejection as
+    // "leave the name alone" rather than an error worth surfacing.
+    renameThread: true,
     buttons: true,
     editButtons: true, // editMessageText carries reply_markup, so a menu can advance in place
     slashCommands: true,
@@ -467,6 +512,29 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
         throw new Error(`[telegram] createForumTopic did not return a message_thread_id (chat=${ref.address.channel})`);
       }
       return { address: { channel: ref.address.channel, thread: String(topicId) } };
+    },
+
+    async renameThread(bot, address, name) {
+      // Only a real topic lane has a name. The General/root lane is not a topic the Bot API will
+      // rename (and the resolver never reports it as one — see TELEGRAM_GENERAL_TOPIC_ID), and a
+      // thread-less address is the chat itself, whose title is emphatically not ours to change.
+      if (!address.thread || address.thread === TELEGRAM_GENERAL_TOPIC_ID) {
+        throw new Error(
+          `[telegram] renameThread needs a forum topic; got thread=${JSON.stringify(address.thread)} (channel=${address.channel})`
+        );
+      }
+      const trimmed = truncateForTopicName(name);
+      if (!trimmed) {
+        // The Bot API reads an empty `name` as "keep the current one", so sending it would report
+        // success while changing nothing — a silent no-op is worse than a refusal here.
+        throw new Error(`[telegram] renameThread was given a blank name (channel=${address.channel})`);
+      }
+      const internal = bot.internal as unknown as TelegramInternal;
+      await internal.editForumTopic({
+        chat_id: address.channel,
+        message_thread_id: topicIdOf(address),
+        name: trimmed,
+      });
     },
 
     async sendMessage(bot, address, text) {

@@ -286,6 +286,20 @@ what happened. On a platform that can post buttons **and** edit them afterwards,
 on" is half the question. Everywhere else it prints the summary line it always did.
 `/model <part of a name>` stays a pure text path on all eight platforms.
 
+Both surfaces go through `ConversationRegistry.warmModelSelector`, which **starts the session**
+when there is no list yet. Under ACP the list arrives in the `session/new` response, so a
+conversation that has not run a turn has none — and the old answer, "No model selector on this
+session yet, send a message then /model", was wrong in the flow it broke most: the `/cd` menu
+invites picking a project and then a model, and `/cd` disposes the session, so even an established
+conversation lost its list. Starting a child to answer the question brings forward the one the next
+message would have started anyway; nothing is prompted and no context is spent. A failure to start
+reports its real reason (`modelStartFailedText`), and `modelNoSelectorText` now means what it says:
+this harness offers no model choice at all.
+
+`/setting`'s model row deliberately does NOT warm — it reads through `peek`. Warming there would
+spawn a child to answer `/setting banana`, and warming at the button click instead would mean making
+the daemon's synchronous settings-menu path async.
+
 `modelMenuSurface()` requires both capabilities, and the second is the interesting one: on
 a platform that cannot edit (LINE, QQ) a menu could never be paged and — worse — never
 retired, so after a pick its buttons would sit live above the ack answering "expired"

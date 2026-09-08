@@ -359,6 +359,11 @@ export async function createSatoriAdapter(
       return profile.createThread(getBot(), ref, name, opts);
     },
 
+    async renameThread(address, name) {
+      if (!profile.renameThread) return unsupported('renameThread');
+      return profile.renameThread(getBot(), address, name);
+    },
+
     async sendButtons(address, text, buttons) {
       if (!profile.sendButtons) return unsupported('sendButtons');
       return profile.sendButtons(getBot(), address, text, buttons);

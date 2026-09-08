@@ -169,6 +169,19 @@ export function createAgyAgentFactory(
       });
   }
 
+  /**
+   * Start the prefetch if needed and wait for whichever attempt is in flight.
+   *
+   * Read `fetchPromise` AFTER ensureModels so a caller arriving before the first prefetch settles
+   * joins it rather than returning immediately on a still-empty cache. Never rejects — ensureModels
+   * already turns a failed `agy models` into an empty list, and a caller's job is then to report
+   * "no models offered", not to fail.
+   */
+  async function awaitModels(): Promise<void> {
+    ensureModels();
+    await fetchPromise;
+  }
+
   // Eager pre-fetch so the model list is ready when /model is invoked.
   ensureModels();
 
@@ -178,10 +191,17 @@ export function createAgyAgentFactory(
       if (!s) {
         const def = findAgent(cfg, agentId);
         if (!def) throw new Error(`unknown agent id: ${agentId} (check the routing and agents config)`);
-        s = createAgySession(def, socketPath, sessionId, store, () => {
-          ensureModels();
-          return cachedModels;
-        });
+        s = createAgySession(
+          def,
+          socketPath,
+          sessionId,
+          store,
+          () => {
+            ensureModels();
+            return cachedModels;
+          },
+          awaitModels
+        );
         sessions.set(sessionId, s);
       }
       return s;
@@ -207,7 +227,14 @@ function createAgySession(
   /** The conversation this agent instance serves (store key half; the other half is def.id). */
   conversationId: string,
   store?: ConversationStore,
-  getModels?: () => Array<{ value: string; name: string }> | undefined
+  getModels?: () => Array<{ value: string; name: string }> | undefined,
+  /**
+   * Await the factory's model prefetch. Distinct from getModels because `/model` needs a list
+   * BEFORE the prefetch settles, and the prefetch is fire-and-forget at factory construction —
+   * a `/model` in the first moments after a daemon start would otherwise read `undefined` and be
+   * told the harness has no model selector, which is simply untrue.
+   */
+  awaitModels?: () => Promise<void>
 ): AgentSession {
   /**
    * The directory this session's child runs in — and, through `--add-dir`, the one it is allowed to
@@ -458,6 +485,13 @@ function createAgySession(
       // the run). The next turn respawns and resumes the same conversation via --conversation, so
       // context survives an interrupt.
       teardown('turn aborted');
+    },
+
+    async ensureSession(): Promise<void> {
+      // No child needed: agy's model list comes from a separate `agy models` call, not from the
+      // session. So "make a selector available" means "wait for the prefetch", and deliberately
+      // NOT "spawn a child" — starting one here would cost a process and teach nothing.
+      await awaitModels?.();
     },
 
     modelSelector(): ModelSelector | undefined {

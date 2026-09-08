@@ -309,11 +309,45 @@ back into `AgentStreamHandlers`:
 | `available_commands_update` | `onAvailableCommands` |
 | `usage_update` | `onUsage` (feeds the footer's context segment) |
 | `config_option_update` | `onModel` |
+| `session_info_update` | `onTitle` (renames the chat lane — see below) |
 | `session/request_permission` | **auto-approved** — see below |
 
 `claude` and `codex` adapters are **bundled** as dependencies and resolved via
 `resolveClaudeAdapterEntry` / `resolveCodexAdapterEntry`, so neither needs a separate
 install. `opencode` and `custom` are located on PATH.
+
+#### The session title arrives behind `stop`
+
+`session_info_update` is the one notification that cannot be read where the others are.
+claude-agent-acp sends it from its turn-end idle handler, which runs **after** the code that
+settles the prompt — so it lands in the SDK's update queue behind the `stop` message that ended
+the read loop, and the loop has already returned. Nothing reads it, and the next turn's
+`drainResidualUpdates` clears the queue. The observable symptom was a log line reading
+`drain: dropped 1 residual update(s)` after every single turn.
+
+So `drainResidualUpdates` **salvages** a title out of the residue before clearing it, and reports
+it on the incoming turn's handlers. Two consequences fall out of that and are not bugs:
+
+- the title is one turn late, which it would be anyway — the harness generates it in a background
+  task, so it describes the turn before the one that reports it;
+- the first turn in a conversation usually produces no title at all.
+
+The drain reads the SDK's private `updates.values` array (see the function's own note on why
+`nextUpdate()` cannot be used to probe), so the walk is defensive: this runs on the way *into* a
+turn, and a shape change in the SDK must degrade to "no title", never throw.
+
+#### Starting a session without running a turn
+
+`AgentSession.ensureSession(token)` does everything the first turn does except send a prompt:
+spawn, `initialize`, `session/new` (or `session/load`). It exists because the model list arrives
+in the `session/new` response, so `modelSelector()` genuinely has nothing to report before a
+conversation's first turn — and `/model` used to answer "send a message, then /model", which is
+unactionable right after `/cd` invites you to pick a project and then a model.
+
+`ensureStarted` shares one in-flight startup between concurrent callers. That is load-bearing now
+that there are two of them: `active` is assigned only at the *end* of startup, so an unguarded
+second entrant would spawn its own child, overwrite `proc`, and leave the first as an orphan that
+no `dispose` can reach while it still holds the harness's session.
 
 > **The daemon auto-approves every tool permission request.** Agents run with full tool
 > access. There is no per-call policy in the config schema by design — tightening tool

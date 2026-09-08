@@ -33,6 +33,7 @@ import {
   modelMenuSurface,
   modelNoMatchText,
   modelNoSelectorText,
+  modelStartFailedText,
   modelSummaryText,
   type ModelChoiceResult,
 } from '../core/model-menu.js';
@@ -98,6 +99,16 @@ const SETTING_NAMES = new Set(['setting', 'settings', 'config']);
  * what anyone who has used a shell types, `dir` is what it is called on the button that offers it.
  */
 const WORKDIR_NAMES = new Set(['cd', 'dir', 'workdir']);
+
+/**
+ * `/title` — rename the chat lane this conversation lives in.
+ *
+ * The manual half of the automatic rename (applyConversationTitle): the automatic one follows the
+ * harness, and this one overrides it when the harness's guess is wrong or the user simply wants
+ * their own name on the topic. `rename` is accepted too, because that is what the action is called
+ * everywhere else in a chat client.
+ */
+const TITLE_NAMES = new Set(['title', 'rename', 'topic']);
 
 /** What the merger was doing when `/stop` arrived. */
 type StopOutcome = 'running' | 'collecting' | 'idle';
@@ -346,6 +357,7 @@ export class ConversationRegistry {
         // autoThread opened a thread mid-turn: alias its key to this conversation so the user's
         // reply inside it continues here instead of starting an empty one (see adoptThread).
         adoptThread: (id, address, platformId) => this.adoptThread(id, address, platformId),
+        recordTitle: (id, title) => this.applyConversationTitle(id, title),
       },
       this.hooks
     );
@@ -613,6 +625,135 @@ export class ConversationRegistry {
   }
 
   /**
+   * `/title` — show this conversation's name, set it, or hand naming back to the agent.
+   *
+   * Bare, it reports what the lane was last renamed to, which is the only thing knowable: Telegram
+   * offers no way to read a topic's current name back, so a name typed into the Telegram UI is
+   * invisible here. The wording says "last set by me" rather than "the title" for exactly that
+   * reason — claiming to know the topic's name would be a lie roughly half the time.
+   *
+   * A name PINS it: the automatic rename stops following the harness for this conversation, because
+   * a command whose effect the next turn reverts is indistinguishable from a broken command.
+   * `/title auto` releases the pin without changing the current name.
+   *
+   * Unlike the automatic path this is never silently skipped: an explicit command gets an explicit
+   * answer, including the reason it failed. The address is the incoming message's own, not
+   * `activeAddress` — `/title` is answered between turns, when there is no active one.
+   */
+  private async applyTitleCommand(
+    key: ConversationId,
+    fallbackAgent: string,
+    rest: string,
+    address: ConversationAddress,
+    msg: InboundMessage
+  ): Promise<string> {
+    const wanted = rest.trim();
+    const platformId = msg.conversation.platform;
+    const current = this.store?.conversationTitle(key);
+
+    if (wanted.toLowerCase() === 'auto') {
+      if (!this.store?.titlePinned(key)) {
+        return 'This topic already follows the agent\'s own title.';
+      }
+      this.store.unpinConversationTitle(key);
+      return `Handing naming back to the agent — it stays "${current ?? 'as it is'}" until the agent picks a new one.`;
+    }
+
+    if (!wanted) {
+      if (!current) {
+        return 'I have not named this topic. `/title <name>` to set it, or let the agent name it after its next reply.';
+      }
+      return this.store?.titlePinned(key)
+        ? `This topic is named "${current}", pinned — the agent will not rename it. \`/title auto\` to let it.`
+        : `This topic was last named "${current}" by me, following the agent. \`/title <name>\` to pin your own.`;
+    }
+
+    const agentId = this.boundAgentFor(key, fallbackAgent);
+    const failure = await this.retitleLane(key, agentId, address, platformId, wanted, true);
+    if (failure) return `Could not rename this topic: ${failure}`;
+    return `Renamed this topic to "${wanted}" and pinned it. \`/title auto\` to let the agent name it again.`;
+  }
+
+  // ───────────────────────── conversation title (thread/topic rename) ─────────────────────────
+
+  /**
+   * The harness named this conversation: rename the chat lane it lives in to match.
+   *
+   * Why this exists at all: a Telegram forum topic keeps whatever name it was created with for as
+   * long as it exists, so a topic-per-task workflow ends up as a column of names typed before the
+   * work started — while the harness has been generating an accurate title the whole time and
+   * sending it over ACP, where the gateway dropped it on the floor.
+   *
+   * Everything about this is best-effort, and every early return is a decision:
+   *
+   * - no `activeAddress` — the title arrived outside a turn, so there is nothing to point at. Only
+   *   reachable if a runtime reports a title without one, which none does today.
+   * - no `thread` — the address IS the chat. Renaming a whole Telegram group because an agent
+   *   summarised one conversation in it would be indefensible, so a lane is required.
+   * - unchanged — the harness re-reports the same title on many turns, and each rename costs an
+   *   API call plus a visible "topic renamed" service message in the chat.
+   * - `autoRenameThread: false` — the user curates lane names by hand (see the setting).
+   * - pinned — this conversation's name was set with `/title`. An explicit command that the next
+   *   turn silently reverts is a bug under any rename policy, so it wins until `/title auto`.
+   * - the API refused — a non-forum chat, a revoked admin right, a rate limit. A conversation whose
+   *   topic still has its old name is a cosmetic problem; a turn that fails because of one is not.
+   *
+   * NOT guarded on "did a human rename this in the Telegram UI": Telegram exposes no way to read a
+   * topic's current name, so that question is unanswerable and pretending otherwise would just
+   * move the failure somewhere less obvious. `/title` and the setting are the ways to opt out.
+   */
+  private async applyConversationTitle(id: ConversationId, title: string): Promise<void> {
+    const state = this.conversations.get(id);
+    if (!state?.activeAddress) return;
+    const platformId = state.activePlatform ?? state.platform;
+    if (this.config.platforms[platformId]?.autoRenameThread === false) return;
+    if (this.store?.titlePinned(id)) return;
+    await this.retitleLane(id, state.agentId, state.activeAddress, platformId, title);
+  }
+
+  /**
+   * Rename one conversation's lane and remember what it was renamed to.
+   *
+   * Shared by the automatic path and `/title`, so the two cannot disagree about what a successful
+   * rename means. Returns why it did not happen, or undefined on success — the automatic caller
+   * ignores that and `/title` reports it, which is the only difference between them.
+   */
+  private async retitleLane(
+    id: ConversationId,
+    agentId: string,
+    address: ConversationAddress,
+    platformId: string,
+    title: string,
+    /** A name the user typed: recorded as pinned, so the harness stops overriding it. */
+    pinned = false
+  ): Promise<string | undefined> {
+    const platform = this.platforms.get(platformId);
+    if (!platform?.capabilities.renameThread || !platform.renameThread) {
+      return 'this platform cannot rename a conversation lane';
+    }
+    if (!address.thread) {
+      return 'this conversation is not in a thread or topic, so there is no name to change';
+    }
+    const wanted = title.trim();
+    if (!wanted) return 'that is an empty title';
+    // Already what we set — but a manual `/title` still has to record the pin, so only the
+    // automatic path may return early here.
+    if (this.store?.conversationTitle(id) === wanted && !pinned) return undefined;
+    try {
+      await platform.renameThread(address, wanted);
+    } catch (e) {
+      const reason = e instanceof Error ? e.message : String(e);
+      console.warn(`[title] could not rename ${id} to "${wanted}": ${reason}`);
+      return reason;
+    }
+    // Recorded only AFTER the platform accepted it, so a failed rename is retried next time rather
+    // than remembered as done.
+    this.store?.setConversationTitle(id, agentId, wanted, pinned);
+    console.log(`[title] ${id} renamed to "${wanted}"${pinned ? ' (pinned)' : ''}`);
+    return undefined;
+  }
+
+  /**
    * Point an auto-created thread's key at the conversation that opened it.
    *
    * Called by TurnRunner right after autoThread creates a thread and moves the turn into it. The
@@ -809,6 +950,16 @@ export class ConversationRegistry {
       if (answer !== undefined) ack('/cd', answer);
       return true;
     }
+
+    // `/title` — the manual counterpart to the automatic rename. Answered here because the lane
+    // and the record of what it was last called both belong to the gateway; the harness has no
+    // idea it is being displayed inside a Telegram topic at all.
+    if (setting && TITLE_NAMES.has(setting.name.toLowerCase())) {
+      void this.applyTitleCommand(key, fallbackAgent, setting.rest, address, msg).then((answer) =>
+        ack('/title', answer)
+      );
+      return true;
+    }
     return false;
   }
 
@@ -867,6 +1018,12 @@ export class ConversationRegistry {
         ?.sendMessage(address, text)
         .catch((e) => console.warn('[setting] failed to answer:', e instanceof Error ? e.message : e));
     };
+    // NOT warmed, unlike `/model` (see warmModelSelector). A settings screen is mostly rows that
+    // have nothing to do with the agent, and it is reached by `/setting` with no argument and by
+    // clicking rows afterwards — so warming here would spawn a child to answer `/setting banana`,
+    // and warming at the click instead would mean making the daemon's whole sync menu path async.
+    // The model row keeps its own "no models offered" sentence until the session is up; `/model` is
+    // the surface that actually needed to work cold, and does.
     const ctx = this.settingsContext(key, fallbackAgent);
     const caps = this.platforms.get(platformId)?.capabilities;
     const canMenu =
@@ -915,7 +1072,8 @@ export class ConversationRegistry {
    *
    * The model list comes from `peek`, never `getOrCreate`: a settings screen must not spawn an
    * agent child just to fill a menu — the same trade onPickerRequest makes, and the reason an
-   * absent list has its own sentence instead of a blank menu.
+   * absent list has its own sentence instead of a blank menu. `/model` makes the opposite trade
+   * (warmModelSelector) because there the model list IS the answer being asked for.
    */
   private settingsContext(key: ConversationId, fallbackAgent: string): SettingsContext {
     const boundAgent =
@@ -1155,6 +1313,42 @@ ${formatTokens(left)} left before compaction — ${name}`;
   }
 
   /**
+   * The session's model selector, starting the session first if that is what it takes to have one.
+   *
+   * The single place that answers "what models can this conversation choose from", so `/model`, a
+   * clicked menu and the `/setting` model row cannot disagree about it — they used to, because each
+   * read `modelSelector()` directly and got undefined in exactly the situations a user hits first:
+   *
+   *  - a conversation that has never run a turn (under ACP the list arrives with `session/new`);
+   *  - a conversation that just answered `/cd`, since setWorkdir disposes the session to move it.
+   *
+   * Both produced "No model selector on this session yet — send a message, then /model", which is
+   * wrong twice over: it blames the user for the gateway's laziness, and it is unactionable right
+   * after picking a directory, when choosing a model is the obvious next step.
+   *
+   * Returns the selector, or an `error` string when the session could not be brought up at all.
+   * That distinction is the point: a missing harness or an un-logged-in agent has a real reason,
+   * and reporting it beats the old guess. `selector: undefined` with no error keeps its old
+   * meaning — the harness genuinely offers no model choice.
+   */
+  private async warmModelSelector(
+    key: ConversationId,
+    agentId: string
+  ): Promise<{ session: AgentSession; selector?: ModelSelector; error?: string }> {
+    const session = this.agents.getOrCreate(key, agentId);
+    const known = session.modelSelector?.();
+    if (known) return { session, selector: known };
+    // Nothing to warm up with (a runtime that does not implement it): keep the old answer.
+    if (!session.ensureSession) return { session };
+    try {
+      await session.ensureSession(this.tokens.tokenFor(key));
+    } catch (e) {
+      return { session, error: e instanceof Error ? e.message : String(e) };
+    }
+    return { session, selector: session.modelSelector?.() };
+  }
+
+  /**
    * `/model`: open the menu, show the live selector, or switch to a model named by id or substring.
    *
    * Returns the text to send, or undefined when the answer went out another way (a button menu the
@@ -1172,8 +1366,14 @@ ${formatTokens(left)} left before compaction — ${name}`;
     rest: string | undefined,
     msg: InboundMessage
   ): Promise<string | undefined> {
-    const session = this.agents.getOrCreate(key, state.agentId);
-    const selector = session.modelSelector?.();
+    // Bringing a session up takes a second or two of child spawn, and a silent gap is
+    // indistinguishable from a dropped command — so say something is happening, best-effort.
+    const typing = this.platforms.get(msg.conversation.platform);
+    void typing?.startTyping?.(addressOf(msg.conversation)).catch(() => undefined);
+    const warm = await this.warmModelSelector(key, state.agentId);
+    void typing?.stopTyping?.(addressOf(msg.conversation)).catch(() => undefined);
+    if (warm.error) return modelStartFailedText(warm.error);
+    const selector = warm.selector;
     if (!selector) return modelNoSelectorText();
 
     const query = rest?.trim();
@@ -1193,7 +1393,7 @@ ${formatTokens(left)} left before compaction — ${name}`;
     const match = matchModels(selector.options, query);
     if (match.kind === 'none') return modelNoMatchText(query);
     if (match.kind === 'many') return modelAmbiguousText(query, match.matches);
-    return modelChoiceText(await this.setModelOn(session, state, match.option.value));
+    return modelChoiceText(await this.setModelOn(warm.session, state, match.option.value));
   }
 
   /**
@@ -1236,8 +1436,8 @@ ${formatTokens(left)} left before compaction — ${name}`;
    * - the conversation may be gone (a restart, a release);
    * - `expectAgentId` may no longer answer here (a `/cc` between opening and clicking), in which
    *   case the menu belongs to a harness that has nothing to do with this conversation any more;
-   * - there may be no live selector (a `/new` disposed the child — modelSelector is deliberately
-   *   non-spawning, so the honest answer is "send a message first");
+   * - there may be no live selector, which now means the harness offers no model choice at all
+   *   rather than "nothing has started yet" — warmModelSelector brings the session up first;
    * - **the value may no longer be offered.** This is the load-bearing one: the harness can rebuild
    *   its list mid-session, and a button whose index still resolves against a stale snapshot would
    *   otherwise switch to a model the user never saw, silently.
@@ -1253,11 +1453,11 @@ ${formatTokens(left)} left before compaction — ${name}`;
       const def = findAgent(this.config, state.agentId);
       return { kind: 'rebound', agent: agentDisplayName(def, state.agentId) };
     }
-    const session = this.agents.getOrCreate(id, state.agentId);
-    const selector = session.modelSelector?.();
+    const warm = await this.warmModelSelector(id, state.agentId);
+    const selector = warm.selector;
     if (!selector) return { kind: 'unavailable' };
     if (!selector.options.some((o) => o.value === value)) return { kind: 'missing', value };
-    return this.setModelOn(session, state, value);
+    return this.setModelOn(warm.session, state, value);
   }
 
   // ───────────────────────────── working directory (`/cd`) ─────────────────────────────

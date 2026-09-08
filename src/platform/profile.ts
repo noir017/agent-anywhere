@@ -118,6 +118,12 @@ export interface PlatformProfile<P extends PlatformConfig = PlatformConfig> {
     name: string,
     opts?: { autoArchiveMinutes?: number }
   ): Promise<{ address: ConversationAddress }>;
+  /**
+   * Rename an existing lane (a Telegram forum topic's title). Absent on a platform whose lanes
+   * have no name, or whose API cannot change one after creation — the adapter then reports
+   * `renameThread: false` and callers skip it rather than fail.
+   */
+  renameThread?(bot: Bot, address: ConversationAddress, name: string): Promise<void>;
   /** Send a message with buttons. */
   sendButtons?(
     bot: Bot,

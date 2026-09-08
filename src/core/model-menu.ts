@@ -221,12 +221,29 @@ export function modelSummaryText(selector: ModelSelector): string {
   );
 }
 
-/** No live session yet — the selector arrives with the harness's first reply, not before. */
+/**
+ * The harness offers no model choice at all.
+ *
+ * No longer "not yet" — the gateway starts the session before asking (see warmModelSelector), so
+ * reaching this text means the agent genuinely exposes no model selector. The `claude` harness is
+ * the real example: it takes its model from ANTHROPIC_MODEL and never advertises a picker.
+ */
 export function modelNoSelectorText(): string {
   return (
-    "No model selector on this session yet — it arrives with the agent's first reply. " +
-    'Send a message, then /model.'
+    'This agent offers no model selector — it does not let the model be chosen at runtime. ' +
+    'Set `agents[].model` (or the harness\'s own env, e.g. ANTHROPIC_MODEL) and restart to change it.'
   );
+}
+
+/**
+ * The session could not be started, so there is nothing to choose from — and the reason why.
+ *
+ * Worth its own text because the old code answered "send a message, then /model" to a missing
+ * binary and an un-logged-in harness alike, which sent the user to do the one thing guaranteed to
+ * fail the same way.
+ */
+export function modelStartFailedText(reason: string): string {
+  return `Could not start this agent, so its model list is unavailable:\n${reason}`;
 }
 
 export function modelNoMatchText(query: string): string {

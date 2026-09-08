@@ -182,6 +182,7 @@ Discord, Slack), and equally usable as plain text everywhere else.
 | `/new`, `/clear` | start a fresh conversation (clears context) |
 | `/stop` | stop the current turn, keeping the conversation |
 | `/cd` | choose the directory this conversation works in — see below |
+| `/title` | name this topic; the agent names it automatically otherwise — see below |
 | `/setting` | change a saved setting in config.yaml — see below |
 | `/cc`, `/oc`, `/cx`, `/gm`, `/agy` | one per configured harness — see below |
 | `/compact`, `/context`, `/model`, `/usage`, `/doctor`, `/mcp`, `/init`, `/review` | a generic vocabulary, translated to each harness's own spelling |
@@ -258,6 +259,36 @@ it was created in (ACP takes `cwd` at `session/new`, agy at spawn), so the move
 cannot reach a process that is already running. Tapping the directory you are
 already in (marked ●) costs nothing. The choice is recorded per conversation, so
 it survives a restart and a `/new`, and applies to every agent that answers there.
+
+## What the topic is called
+
+A Telegram forum topic keeps whatever name it was created with for as long as it
+exists, so a topic-per-task workflow becomes a column of names typed *before* any
+of the work happened. But the harness has been writing an accurate title all
+along — Claude Code generates one in the background and reports it over ACP — so
+the gateway renames the topic to match.
+
+```
+/title                  →  what this topic was last named, and by whom
+/title ask 超时          →  name it yourself; the agent stops renaming it
+/title auto             →  hand naming back to the agent
+```
+
+A name you set is **pinned**: the automatic rename stops for that conversation,
+because a command the next turn silently reverts is indistinguishable from a
+broken one. `platforms.<id>.autoRenameThread: false` turns the automatic half off
+everywhere.
+
+Two limits worth knowing. The title is generated in a background task and read at
+the end of a turn, so it describes the turn *before* the one that applies it —
+the first exchange in a topic usually has none yet. And Telegram offers no way to
+read a topic's current name back, so a rename done in the Telegram UI is invisible
+here and will be overwritten by the next new title; `/title` or the setting are
+the ways to keep a name of your own.
+
+Only the ACP harnesses report a title at all (`claude` observed doing it,
+`opencode`'s protocol carries the field), so with `dsh` or `agy` the topic keeps
+its name unless you set one.
 
 ## Changing settings from chat
 

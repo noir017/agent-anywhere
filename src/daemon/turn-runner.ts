@@ -68,6 +68,13 @@ export interface TurnRunnerDeps {
    * usage snapshot, and a failed one never got near it.
    */
   recordTurnComplete?(id: ConversationId): void;
+  /**
+   * The harness named this conversation; do whatever the gateway does with that.
+   *
+   * A dep rather than a hook because the answer needs the conversation's address and the store,
+   * both of which live in the registry. Never awaited by the turn — see the onTitle callback.
+   */
+  recordTitle?(id: ConversationId, title: string): Promise<void>;
 }
 
 /**
@@ -322,6 +329,13 @@ export class TurnRunner {
       // Same for the live model name (see TurnRef.model for why it beats the configured value).
       onModel: (model) => {
         ref.model = model;
+      },
+      // The harness's name for this conversation. Renaming the chat lane is a side effect on the
+      // platform, not part of the reply, so it is deliberately NOT enqueued onto the render chain:
+      // a slow or failing editForumTopic must not delay a single character of the answer, and a
+      // chat whose topic keeps its old name is a far smaller problem than one that stops streaming.
+      onTitle: (title) => {
+        void this.deps.recordTitle?.(conversationId, title);
       },
     };
   }

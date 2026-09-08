@@ -41,6 +41,24 @@ export interface ConversationRecord {
   agentSessions: Record<string, string>;
   /** Working directory chosen for this conversation (`/cd`); absent = the agent's configured cwd. */
   cwd?: string;
+  /**
+   * The title this conversation's chat lane was last renamed TO by us.
+   *
+   * Not the current title of the lane — nothing can read that back (the Bot API offers no
+   * getForumTopic) — but a record of what we last set, which is the only thing needed to answer
+   * "has this changed since". Persisted so a daemon restart does not re-issue the same rename to
+   * every conversation it reattaches.
+   */
+  title?: string;
+  /**
+   * Whether the title was set by hand (`/title <name>`) and should stop following the harness.
+   *
+   * The one guard the automatic rename does have. Telegram cannot report a topic's current name,
+   * so "did a human rename this in the Telegram UI" is unanswerable — but "did a human rename it
+   * THROUGH ME" is, and an explicit command that gets silently reverted by the next turn is a bug
+   * whatever the rename policy is. Cleared by `/title auto`.
+   */
+  titlePinned?: boolean;
 }
 
 export class ConversationStore {
@@ -136,6 +154,42 @@ export class ConversationStore {
   }
 
   /**
+   * The title we last renamed this conversation's lane to, if we ever did.
+   *
+   * Compared against a freshly generated title to skip a rename that would change nothing —
+   * worth doing because the harness re-reports its title unchanged on many turns, and each
+   * rename is an API call plus a "topic renamed" service message in the chat.
+   */
+  conversationTitle(key: string): string | undefined {
+    return this.map.get(key)?.title;
+  }
+
+  /** Record the title this conversation's lane was renamed to. */
+  setConversationTitle(key: string, agentId: string, title: string, pinned?: boolean): void {
+    const rec = this.map.get(key) ?? { agent: agentId, agentSessions: {} };
+    const wantPinned = pinned === true;
+    if (rec.title === title && (rec.titlePinned ?? false) === wantPinned) return;
+    rec.title = title;
+    if (wantPinned) rec.titlePinned = true;
+    else delete rec.titlePinned;
+    this.map.set(key, rec);
+    this.flush();
+  }
+
+  /** Whether this conversation's title was set by hand and should stop following the harness. */
+  titlePinned(key: string): boolean {
+    return this.map.get(key)?.titlePinned === true;
+  }
+
+  /** Hand naming back to the harness (`/title auto`), keeping the current name until it says otherwise. */
+  unpinConversationTitle(key: string): void {
+    const rec = this.map.get(key);
+    if (!rec?.titlePinned) return;
+    delete rec.titlePinned;
+    this.flush();
+  }
+
+  /**
    * Forget a conversation entirely — every agent's session id AND the binding.
    *
    * The only context-destroying path in the system, reached solely from an explicit `/new`.
@@ -160,7 +214,13 @@ export class ConversationStore {
 /** Validate one on-disk entry; anything malformed is dropped rather than trusted. */
 function toRecord(v: unknown): ConversationRecord | null {
   if (!v || typeof v !== 'object') return null;
-  const o = v as { agent?: unknown; agentSessions?: unknown; cwd?: unknown };
+  const o = v as {
+    agent?: unknown;
+    agentSessions?: unknown;
+    cwd?: unknown;
+    title?: unknown;
+    titlePinned?: unknown;
+  };
   if (typeof o.agent !== 'string' || !o.agent) return null;
   const sessions: Record<string, string> = {};
   if (o.agentSessions && typeof o.agentSessions === 'object') {
@@ -174,6 +234,12 @@ function toRecord(v: unknown): ConversationRecord | null {
     // A malformed cwd is dropped rather than rejecting the whole record: the binding and the
     // session ids are still good, and losing them would restart the user's task over a bad field.
     ...(typeof o.cwd === 'string' && o.cwd ? { cwd: o.cwd } : {}),
+    // Same tolerance as cwd: a bad title is worth less than the session ids it sits next to. The
+    // cost of dropping it is one redundant rename.
+    ...(typeof o.title === 'string' && o.title ? { title: o.title } : {}),
+    // Only a pin recorded alongside a real title means anything; a pin on its own would freeze a
+    // conversation's naming at a name nobody set.
+    ...(o.titlePinned === true && typeof o.title === 'string' && o.title ? { titlePinned: true } : {}),
   };
 }
 

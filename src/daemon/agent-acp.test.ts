@@ -5,6 +5,7 @@ import {
   dshModelSelectorValue,
   liveModelName,
   resolveHarness,
+  drainResidualUpdates,
   translateUpdate,
   type TurnState,
 } from './agent-acp.js';
@@ -18,12 +19,14 @@ function recorder(): {
   commands: unknown[];
   usage: AgentUsage[];
   models: string[];
+  titles: string[];
   configOptions: Array<SessionConfigOption[] | null | undefined>;
 } {
   const events: string[] = [];
   const commands: unknown[] = [];
   const usage: AgentUsage[] = [];
   const models: string[] = [];
+  const titles: string[] = [];
   const configOptions: Array<SessionConfigOption[] | null | undefined> = [];
   const st: TurnState = {
     handlers: {
@@ -34,13 +37,14 @@ function recorder(): {
       onAvailableCommands: (c) => commands.push(c),
       onUsage: (u) => usage.push(u),
       onModel: (m) => models.push(m),
+      onTitle: (t) => titles.push(t),
     },
     lastSegment: 'none',
     toolLedger: new Map(),
     toolIndexSeq: 0,
     onConfigOptions: (o) => configOptions.push(o),
   };
-  return { st, events, commands, usage, models, configOptions };
+  return { st, events, commands, usage, models, titles, configOptions };
 }
 
 const feed = (st: TurnState, u: unknown) => translateUpdate(u as SessionUpdate, st);
@@ -486,5 +490,97 @@ describe('dsh harness preset', () => {
   it('dshModelDisplayValue passes non-array / non-JSON values through unchanged (non-dsh harnesses)', () => {
     expect(dshModelDisplayValue('claude-opus-4-5')).toBe('claude-opus-4-5');
     expect(dshModelDisplayValue('[1,2]')).toBe('[1,2]');
+  });
+});
+
+/**
+ * `session_info_update` — the harness's own name for the conversation.
+ *
+ * This notification used to land in translateUpdate's `default: break` and be dropped, which is
+ * why a Telegram topic kept whatever name it was created with forever while the harness had been
+ * generating an accurate title all along.
+ */
+describe('translateUpdate session_info_update (the harness names the conversation)', () => {
+  it('reports the title', () => {
+    const r = recorder();
+    feed(r.st, { sessionUpdate: 'session_info_update', title: 'Fix the ask timeout' });
+    expect(r.titles).toEqual(['Fix the ask timeout']);
+  });
+
+  it('trims a title the harness padded', () => {
+    const r = recorder();
+    feed(r.st, { sessionUpdate: 'session_info_update', title: '  spaced out \n' });
+    expect(r.titles).toEqual(['spaced out']);
+  });
+
+  // The field is `string | null` in the schema, and an update carrying only `updatedAt` is a
+  // legitimate partial. Neither is a title, and renaming a topic to "null" would be memorable.
+  it('ignores a cleared or absent title rather than renaming to nothing', () => {
+    const r = recorder();
+    feed(r.st, { sessionUpdate: 'session_info_update', title: null });
+    feed(r.st, { sessionUpdate: 'session_info_update', updatedAt: '2026-09-08T00:00:00Z' });
+    feed(r.st, { sessionUpdate: 'session_info_update', title: '   ' });
+    expect(r.titles).toEqual([]);
+  });
+
+  it('renders nothing into the reply — a title is metadata, not content', () => {
+    const r = recorder();
+    feed(r.st, { sessionUpdate: 'session_info_update', title: 'Fix the ask timeout' });
+    expect(r.events).toEqual([]);
+  });
+});
+
+/**
+ * The drain, and why it has to salvage rather than discard.
+ *
+ * claude-agent-acp sends `session_info_update` from its turn-end idle handler, which runs AFTER
+ * the code that settles the prompt. So the notification is queued behind the `stop` message that
+ * ended the read loop, and the loop has already returned — the next turn's drain is the only place
+ * it is ever seen. The daemon log showed exactly this as "dropped 1 residual update(s)" after
+ * every single turn.
+ */
+describe('drainResidualUpdates', () => {
+  /** The SDK's private queue shape, which is what the drain reads (see the note on the function). */
+  const sessionWith = (values: unknown[]) =>
+    ({ updates: { values } }) as unknown as Parameters<typeof drainResidualUpdates>[0];
+
+  it('salvages a title stranded behind the previous turn\'s stop', () => {
+    const values: unknown[] = [
+      { update: { sessionUpdate: 'session_info_update', title: 'Rename the topic' } },
+    ];
+    expect(drainResidualUpdates(sessionWith(values))).toBe('Rename the topic');
+    expect(values).toHaveLength(0); // …and still clears the residue, which is its first job
+  });
+
+  it('takes the last title when several are stranded', () => {
+    const values: unknown[] = [
+      { update: { sessionUpdate: 'session_info_update', title: 'first guess' } },
+      { update: { sessionUpdate: 'tool_call_update', toolCallId: 't1' } },
+      { update: { sessionUpdate: 'session_info_update', title: 'better guess' } },
+    ];
+    expect(drainResidualUpdates(sessionWith(values))).toBe('better guess');
+  });
+
+  it('reports no title when the residue holds none, and still drains', () => {
+    const values: unknown[] = [{ update: { sessionUpdate: 'tool_call_update', toolCallId: 't1' } }];
+    expect(drainResidualUpdates(sessionWith(values))).toBeUndefined();
+    expect(values).toHaveLength(0);
+  });
+
+  it('does nothing to an empty queue', () => {
+    expect(drainResidualUpdates(sessionWith([]))).toBeUndefined();
+  });
+
+  // The queue holds the SDK's own wrapper objects, whose shape is not public API. This runs on the
+  // way INTO a turn, so a shape change must degrade to "no title", never throw.
+  it('survives residue that does not look like an update at all', () => {
+    const values: unknown[] = [null, undefined, 42, 'nope', {}, { update: null }, { update: { title: 7 } }];
+    expect(() => drainResidualUpdates(sessionWith(values))).not.toThrow();
+    expect(values).toHaveLength(0);
+  });
+
+  it('skips the drain when the SDK has renamed its internal field', () => {
+    const renamed = { queue: { values: [1, 2] } } as unknown as Parameters<typeof drainResidualUpdates>[0];
+    expect(drainResidualUpdates(renamed)).toBeUndefined();
   });
 });

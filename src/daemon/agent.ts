@@ -42,6 +42,19 @@ export interface AgentStreamHandlers {
    * Fired once after session startup and again on any `config_option_update`.
    */
   onModel?(model: string): void;
+  /**
+   * The harness's own name for this conversation (ACP `session_info_update.title`).
+   *
+   * Where it comes from: claude-agent-acp generates a session title in a background task, persists
+   * it, and notifies when it changes. So it names the conversation's subject rather than any one
+   * turn, arrives at most once per turn, and is usually absent on the first one.
+   *
+   * Consumed to retitle the chat lane the conversation occupies — a Telegram forum topic, which
+   * otherwise keeps its creation-time name for as long as it exists. Optional because most
+   * harnesses report nothing of the kind (dsh does not, and the agy protocol has no notion of a
+   * title at all), so a conversation with no title is the normal case, not a failure.
+   */
+  onTitle?(title: string): void;
 }
 
 /** Live context usage from the agent (ACP UsageUpdate: `used` / `size`). */
@@ -75,13 +88,36 @@ export interface AgentSession {
   /** Interrupt the current turn (for fresh-window continuation, skipping the aborted tool call). */
   abort(): void;
   /**
-   * The live session's model selector, or undefined when there is no live session yet or the
-   * harness exposes none.
+   * The live session's model selector, or undefined when the harness exposes none.
    *
-   * Deliberately non-spawning: the selector arrives with session/new, and starting an agent child
-   * merely to populate a menu is a worse trade than telling the user to send a message first.
+   * Non-spawning: reports what is already known and never starts a child. A caller that wants an
+   * answer for a conversation which has not run yet must ask for one with `ensureSession` first —
+   * see the note there for why that used to be refused outright.
    */
   modelSelector?(): ModelSelector | undefined;
+  /**
+   * Bring the session up — spawn the child, `session/new` or `session/load` — without running a turn.
+   *
+   * Exists because a model list is not knowable without it. Under ACP the selector arrives as part
+   * of the `session/new` response, so before a conversation's first turn there is genuinely nothing
+   * to show; `modelSelector()` used to answer undefined and the gateway told the user to "send a
+   * message, then /model".
+   *
+   * That was the wrong trade, and the flow it broke is the common one: pick a directory with `/cd`,
+   * pick a model, then start work. `/cd` even makes it worse than a fresh conversation — it drops
+   * the session so the next `/model` has nothing to read either. The child being started here is
+   * the same child the next message would have started anyway, so the cost is bounded to bringing
+   * it forward; the reason to keep this separate from `runTurn` is that no prompt is sent and no
+   * context is consumed.
+   *
+   * Resolving means "a selector may now be available", not that one is — a harness with no model
+   * selector at all is a normal outcome, and callers must still handle `modelSelector()` returning
+   * undefined. Rejects when the session cannot be established (harness missing, auth required), and
+   * that rejection is worth surfacing: it is the real reason, where "no selector yet" was a guess.
+   *
+   * Optional so a runtime with nothing to warm up (or nothing to warm it with) simply omits it.
+   */
+  ensureSession?(sessionToken: string): Promise<void>;
   /**
    * Switch the live session's model, returning the name the harness reports afterwards.
    *

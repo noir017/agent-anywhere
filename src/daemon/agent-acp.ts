@@ -395,6 +395,11 @@ function createAcpSession(
   let proc: ChildProcessWithoutNullStreams | undefined;
   let conn: ClientConnection | undefined;
   let active: ActiveSession | undefined;
+  /**
+   * Startup currently in flight, shared by concurrent callers so only one child is ever spawned
+   * per session (see ensureStarted). Undefined whenever no startup is running.
+   */
+  let starting: Promise<void> | undefined;
   /** Whether the reverse-command hint was injected on the first turn (inject once, see seam ①). */
   let hintInjected = false;
   /** Intentional-abort flag: set by abort(); used to return silently when prompt ends as cancelled. */
@@ -450,6 +455,10 @@ function createAcpSession(
     // a reclaimed conversation look like a harness with no model selector until the next turn (the
     // "No model selector on this session yet" false negative). The next spawn refreshes it via
     // session/new; a choice made while the child is down defers through modelPreference.
+    // `starting` is deliberately NOT cleared here: the in-flight startup promise owns its own slot
+    // and clears it on settle. Clearing it from a reset that happens DURING startup (dispose's
+    // rollback, or a `/cd` landing mid-spawn) would let the next caller begin a second child while
+    // the first is still running — the exact race ensureStarted exists to prevent.
   }
 
   /** Max wait for initialize + session/new after spawn; on timeout, treat spawn as failed (ENOENT etc.) instead of hanging. */
@@ -474,8 +483,28 @@ function createAcpSession(
     hintInjected = false;
   }
 
-  /** Lazily start the ACP child and complete initialize + session/new. sessionToken is injected into its env here. */
+  /**
+   * Bring the session up, sharing one startup between concurrent callers.
+   *
+   * There are two of those now — a turn beginning, and a `/model` warm-up (ensureSession) — and
+   * `active` is assigned only at the END of startup, so a second entrant arriving mid-spawn would
+   * see `active === undefined`, spawn its own child, and overwrite `proc`. The first child is then
+   * an orphan that no dispose can reach while still holding the harness's session. Sharing the
+   * in-flight promise makes the second caller wait for the first result instead.
+   *
+   * The slot clears on settle either way, so a failed startup does not poison later attempts —
+   * the next caller retries for real, which is what the crash-self-healing path expects.
+   */
   async function ensureStarted(sessionToken: string): Promise<void> {
+    if (active) return;
+    starting ??= startSession(sessionToken).finally(() => {
+      starting = undefined;
+    });
+    await starting;
+  }
+
+  /** Lazily start the ACP child and complete initialize + session/new. sessionToken is injected into its env here. */
+  async function startSession(sessionToken: string): Promise<void> {
     if (active) return;
 
     // Re-read the conversation's directory: between the last child and this one the user may have
@@ -679,7 +708,12 @@ function createAcpSession(
       // bubble. So non-blocking drain once before prompt: discard only what's already in the queue now.
       // Must drain before prompt(): this turn's prompt isn't sent yet, so any value in the queue must be
       // residual from the previous turn — no risk of eating this turn's updates.
-      drainResidualUpdates(active!);
+      //
+      // The drain also SALVAGES a session title out of the residue, because the previous turn's
+      // `session_info_update` is queued behind its `stop` and has no other way out (see the note on
+      // drainResidualUpdates). Reported on this turn's handlers, since the previous turn's are gone.
+      const salvagedTitle = drainResidualUpdates(active!);
+      if (salvagedTitle) handlers.onTitle?.(salvagedTitle);
 
       // Per-iteration silence watchdog. turnTimeoutMs<=0 disables it (plain nextUpdate). Otherwise
       // race against a timer; the timer is created and cleared per call, so it measures the gap
@@ -734,6 +768,13 @@ function createAcpSession(
     abort(): void {
       aborting = true;
       if (conn && active) void conn.agent.notify('session/cancel', { sessionId: active.sessionId });
+    },
+
+    async ensureSession(sessionToken: string): Promise<void> {
+      // Exactly what the first turn does, minus the prompt: the child, initialize, and session/new
+      // (or session/load), which is where liveConfigOptions — and therefore the model list — comes
+      // from. Idempotent via `active`, so a second /model while one warm-up is in flight is free.
+      await ensureStarted(sessionToken);
     },
 
     modelSelector(): ModelSelector | undefined {
@@ -810,15 +851,39 @@ function createAcpSession(
  * the array in place is safe — no waiter side effect, no risk of eating updates.
  *
  * The internal field is a best-effort fallback: if absent (SDK rename), skip — correctness unaffected (at worst an occasional misplaced bubble).
+ *
+ * Returns the last session title found in the residue, if any. That is not a nicety: it is the ONLY
+ * way the title ever arrives. claude-agent-acp sends `session_info_update` from its turn-end idle
+ * handler, which runs after the code that settles the prompt — so the notification lands in this
+ * queue BEHIND the `stop` message that ended the read loop, and the loop has already returned. Left
+ * to itself the next turn would discard it here, unread, forever. The observed symptom was a log
+ * line reading "dropped 1 residual update(s)" after every single turn.
+ *
+ * One turn late by construction, and that is fine: the harness generates the title in a background
+ * task, so it describes the turn before this one either way.
  */
-function drainResidualUpdates(session: ActiveSession): void {
+export function drainResidualUpdates(session: ActiveSession): string | undefined {
   const q = (session as unknown as { updates?: { values?: unknown[] } }).updates;
   const values = q?.values;
-  if (Array.isArray(values) && values.length > 0) {
-    const n = values.length;
-    values.length = 0; // clear residue in place (values and residual errors dropped, consistent with prompt()'s clearErrors)
-    console.debug(`[acp] drain: dropped ${n} residual update(s) from the previous turn`);
+  if (!Array.isArray(values) || values.length === 0) return undefined;
+  const n = values.length;
+  let title: string | undefined;
+  for (const item of values) {
+    // The queue holds the SDK's own wrapper objects, whose shape is not part of the public API —
+    // hence the defensive walk rather than a cast. Anything that does not look like a title is
+    // simply not one; this must never throw on the way into a turn.
+    const update = (item as { update?: { sessionUpdate?: unknown; title?: unknown } } | undefined)?.update;
+    if (update?.sessionUpdate !== 'session_info_update') continue;
+    if (typeof update.title !== 'string') continue;
+    const trimmed = update.title.trim();
+    if (trimmed) title = trimmed; // last one wins: later notifications supersede earlier ones
   }
+  values.length = 0; // clear residue in place (values and residual errors dropped, consistent with prompt()'s clearErrors)
+  console.debug(
+    `[acp] drain: dropped ${n} residual update(s) from the previous turn` +
+      (title ? ` (salvaged session title "${title}")` : '')
+  );
+  return title;
 }
 
 /**
@@ -895,6 +960,30 @@ interface ToolRec {
   finished: boolean;
 }
 
+/**
+ * Report a `session_info_update`'s title, if it carries one.
+ *
+ * Its own function rather than inline in the switch because the guards are the interesting part:
+ * the schema types `title` as `string | null`, and an update carrying only `updatedAt` is a valid
+ * partial. Neither is a title, and a topic renamed to "null" would be memorable.
+ */
+function reportSessionTitle(u: Extract<SessionUpdate, { sessionUpdate: 'session_info_update' }>, st: TurnState): void {
+  const title = typeof u.title === 'string' ? u.title.trim() : '';
+  if (title) st.handlers.onTitle?.(title);
+}
+
+/**
+ * Hand a `config_option_update` back to the session and re-report the live model.
+ *
+ * The whole option list goes back, not just the model name: `/model` needs the choices to build a
+ * menu, and this notification is the only place a mid-session change to them shows up.
+ */
+function reportConfigOptions(u: Extract<SessionUpdate, { sessionUpdate: 'config_option_update' }>, st: TurnState): void {
+  st.onConfigOptions?.(u.configOptions);
+  const model = liveModelName(u.configOptions);
+  if (model) st.handlers.onModel?.(model);
+}
+
 export function translateUpdate(u: SessionUpdate, st: TurnState): void {
   switch (u.sessionUpdate) {
     case 'agent_message_chunk': {
@@ -941,13 +1030,19 @@ export function translateUpdate(u: SessionUpdate, st: TurnState): void {
 
     // The agent's session config changed (model / mode / effort picker). Only the model interests
     // us: re-read it so a mid-session model switch is reflected in the footer.
-    case 'config_option_update': {
-      // Write the whole list back first: `/model` needs the choices, not just the current name.
-      st.onConfigOptions?.(u.configOptions);
-      const model = liveModelName(u.configOptions);
-      if (model) st.handlers.onModel?.(model);
+    case 'config_option_update':
+      reportConfigOptions(u, st);
       break;
-    }
+
+    // The harness's own name for this conversation. claude-agent-acp polls the SDK's
+    // background-generated session title at each turn's end and notifies only when it changed, so
+    // this arrives at most once per turn and usually names the turn BEFORE it (the title is written
+    // asynchronously, so the first turn typically has none yet). Used to retitle the chat lane the
+    // conversation lives in — a Telegram forum topic — which otherwise keeps whatever name it was
+    // created with forever.
+    case 'session_info_update':
+      reportSessionTitle(u, st);
+      break;
 
     // agent_thought_chunk / plan* / *_update etc.: not rendered (consistent with existing behavior).
     default:

@@ -62,6 +62,7 @@ Three rules keep this from rotting:
 | `typing` | ✓ | ✓ | – | – | – | ✓ | – | – |
 | `reply` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | – | – |
 | `thread` | ✓ | ✓ | ✓ | ✓ | – | – | – | – |
+| `renameThread` | – | ✓ | – | – | – | – | – | – |
 | `buttons` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | – | – |
 | `editButtons` | ✓ | ✓ | ✓ | ✓ | – | – | – | – |
 | `slashCommands` | ✓ | ✓ | ✓ | – | – | – | – | – |
@@ -74,6 +75,15 @@ card — buttons live on a card and are replaced through `im.message.patch`. QQ 
 have buttons and no edit endpoint at all (LINE has no delete either, so not even
 delete-and-repost is available). A caller that needs to advance a posted menu — the
 paginated `/model` picker — checks this field and degrades to a text answer otherwise.
+
+**`renameThread` is not `thread` either**, for the same shape of reason. Four platforms
+report `thread: true` and give four different answers to "can this lane be renamed":
+Telegram forum topics can (`editForumTopic`), Slack `thread_ts` lanes have no name at all,
+and Discord threads would need a different endpoint. It also requires an `address.thread` —
+renaming "the whole channel" is a different and much more dangerous operation than renaming
+a lane, and no caller wants it, so the Telegram profile refuses a thread-less address before
+the API call. Used by the automatic topic rename and `/title`; see
+[daemon/README.md](../daemon/README.md) for where the name comes from.
 
 Three capability fields are easy to conflate:
 

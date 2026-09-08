@@ -95,6 +95,20 @@ export interface PlatformAdapter {
     opts?: { autoArchiveMinutes?: 60 | 1440 | 4320 | 10080 }
   ): Promise<{ address: ConversationAddress }>;
 
+  /**
+   * Rename the lane an address points at — a Telegram forum topic's title.
+   *
+   * Distinct from createThread's `name`, which only ever applies at creation: a conversation's
+   * subject is not knowable then (the agent has not read anything yet), so the useful name arrives
+   * later, from the harness. Without this the lane keeps whatever it was called when it was made,
+   * which for a hand-created topic is whatever the user typed before starting.
+   *
+   * Only call when capabilities.renameThread is true; the implementation throws otherwise. Requires
+   * `address.thread` — renaming "the whole channel" is a different and much more dangerous
+   * operation, and no caller wants it.
+   */
+  renameThread(address: ConversationAddress, name: string): Promise<void>;
+
   /** Send a message with buttons (used by clarify). */
   sendButtons(
     address: ConversationAddress,
@@ -152,6 +166,18 @@ export interface PlatformCapabilities {
   reply: boolean;
   /** Thread creation. */
   thread: boolean;
+  /**
+   * Whether an existing lane can be RENAMED (renameThread).
+   *
+   * Its own flag rather than something read off `thread`, for the reason editButtons is: `thread`
+   * is true on platforms where the operation does not exist. Slack threads have no name to change
+   * at all, and Telegram's `editForumTopic` works only in a topic-enabled supergroup — the same
+   * `thread: true` covers both a Telegram forum, a Telegram DM topic, a Discord thread and a Slack
+   * `thread_ts`, which are four different answers to "can this be renamed".
+   *
+   * Absent/undefined treated as false, so a profile that has not thought about it is never asked.
+   */
+  renameThread?: boolean;
   /** Interactive buttons (send + receive). */
   buttons: boolean;
   /**

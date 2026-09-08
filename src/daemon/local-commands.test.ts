@@ -57,16 +57,33 @@ const SELECTOR: ModelSelector = {
   ],
 };
 
-function rig(opts: { selector?: ModelSelector; usage?: AgentUsage } = {}) {
+/**
+ * @param opts.selector       models the session reports straight away
+ * @param opts.lazySelector   models that only exist once the session has been STARTED — the real
+ *                            ACP shape, where the list arrives in the session/new response. This is
+ *                            what `/model` before a conversation's first turn actually hits.
+ * @param opts.startError     make ensureSession reject, standing in for a missing binary or an
+ *                            un-logged-in harness
+ */
+function rig(
+  opts: {
+    selector?: ModelSelector;
+    usage?: AgentUsage;
+    lazySelector?: ModelSelector;
+    startError?: string;
+  } = {}
+) {
   const prompts: string[] = [];
   const sent: string[] = [];
   const setModelCalls: string[] = [];
+  const starts: string[] = [];
   const sessions = new Map<string, AgentSession>();
 
   const factory: AgentFactory = {
     getOrCreate(conversationId) {
       let s = sessions.get(conversationId);
       if (!s) {
+        let started = false;
         s = {
           conversationId,
           runTurn: async (input, handlers) => {
@@ -75,11 +92,20 @@ function rig(opts: { selector?: ModelSelector; usage?: AgentUsage } = {}) {
           },
           abort: () => {},
           dispose: () => {},
-          modelSelector: () => opts.selector,
+          modelSelector: () => (started ? (opts.lazySelector ?? opts.selector) : opts.selector),
           setModel: async (value: string) => {
             setModelCalls.push(value);
             return value;
           },
+          ...(opts.lazySelector || opts.startError
+            ? {
+                ensureSession: async (token: string) => {
+                  starts.push(token);
+                  if (opts.startError) throw new Error(opts.startError);
+                  started = true;
+                },
+              }
+            : {}),
         } as AgentSession;
         sessions.set(conversationId, s);
       }
@@ -115,7 +141,7 @@ function rig(opts: { selector?: ModelSelector; usage?: AgentUsage } = {}) {
   };
   /** Text the gateway sent that is not the header bubble. */
   const replies = (): string[] => sent.filter((t) => !t.startsWith('🤖'));
-  return { send, prompts, replies, setModelCalls };
+  return { send, prompts, replies, setModelCalls, starts };
 }
 
 describe('/context answered by the gateway', () => {
@@ -215,9 +241,52 @@ describe('/model answered by the gateway', () => {
     expect(replies().at(-1)).toContain('No model matches');
   });
 
-  it('explains that the selector arrives with the first reply when there is no session yet', async () => {
-    const { send, replies } = rig(); // no selector
+  it('says the agent has no model selector when it offers none and cannot be warmed', async () => {
+    const { send, replies } = rig(); // no selector, and the fake session has no ensureSession
     await send('/model');
-    expect(replies().at(-1)).toContain('No model selector on this session yet');
+    expect(replies().at(-1)).toContain('offers no model selector');
+    // The old answer told the user to send a message first, which is no longer true: the gateway
+    // starts the session itself now, so reaching this text means the harness really has no picker.
+    expect(replies().at(-1)).not.toContain('Send a message');
+  });
+
+  // The bug this fixes: under ACP the model list arrives in the session/new response, so a
+  // conversation that has not run a turn had nothing to show — and the natural order of operations
+  // is to pick a directory, pick a model, and only then say anything. `/cd` made it worse by
+  // disposing the session, so even an established conversation lost its list.
+  it('starts the session to answer /model before the conversation has run a turn', async () => {
+    const { send, prompts, replies, starts } = rig({ lazySelector: SELECTOR });
+    await send('/model');
+    expect(starts).toHaveLength(1); // the session was brought up on purpose
+    expect(prompts).toEqual([]); // …but no turn ran and no context was spent
+    expect(replies().at(-1)).toContain('4 available');
+    expect(replies().at(-1)).toContain('opencode/big-pickle');
+  });
+
+  it('switches by substring on a conversation that has not run a turn', async () => {
+    const { send, setModelCalls, prompts } = rig({ lazySelector: SELECTOR });
+    await send('/model glm');
+    expect(setModelCalls).toEqual(['opencode/glm-5']);
+    expect(prompts).toEqual([]);
+  });
+
+  it('reuses one warm session rather than starting it again per /model', async () => {
+    const { send, starts } = rig({ lazySelector: SELECTOR });
+    await send('/model');
+    await send('/model');
+    expect(starts).toHaveLength(1);
+  });
+
+  // The old code answered "send a message, then /model" to a missing binary too, which sent the
+  // user to do the one thing guaranteed to fail in exactly the same way.
+  it('reports why the agent could not start instead of blaming the user for not messaging', async () => {
+    const { send, replies } = rig({
+      lazySelector: SELECTOR,
+      startError: 'agent "oc" must be logged in before use',
+    });
+    await send('/model');
+    const answer = replies().at(-1)!;
+    expect(answer).toContain('must be logged in');
+    expect(answer).not.toContain('Send a message');
   });
 });

@@ -4,8 +4,8 @@ import {
   dshModelDisplayValue,
   dshModelSelectorValue,
   liveModelName,
+  isResultUsage,
   resolveHarness,
-  drainResidualUpdates,
   translateUpdate,
   type TurnState,
 } from './agent-acp.js';
@@ -531,56 +531,49 @@ describe('translateUpdate session_info_update (the harness names the conversatio
 });
 
 /**
- * The drain, and why it has to salvage rather than discard.
+ * `isResultUsage` is how a burst of out-of-turn output knows it is over.
  *
- * claude-agent-acp sends `session_info_update` from its turn-end idle handler, which runs AFTER
- * the code that settles the prompt. So the notification is queued behind the `stop` message that
- * ended the read loop, and the loop has already returned — the next turn's drain is the only place
- * it is ever seen. The daemon log showed exactly this as "dropped 1 residual update(s)" after
- * every single turn.
+ * claude-agent-acp settles the ACP prompt at a turn's terminal `result` so the client unlocks while
+ * background work continues, then keeps streaming that work's output with no prompt in flight. The
+ * gateway renders it as a follow-up message — and in the default `once` delivery mode nothing is
+ * sent until the buffer completes, so "the background work finished" has to be detectable. The
+ * result-tied `usage_update` carries `cost`; the mid-stream snapshots do not.
  */
-describe('drainResidualUpdates', () => {
-  /** The SDK's private queue shape, which is what the drain reads (see the note on the function). */
-  const sessionWith = (values: unknown[]) =>
-    ({ updates: { values } }) as unknown as Parameters<typeof drainResidualUpdates>[0];
-
-  it('salvages a title stranded behind the previous turn\'s stop', () => {
-    const values: unknown[] = [
-      { update: { sessionUpdate: 'session_info_update', title: 'Rename the topic' } },
-    ];
-    expect(drainResidualUpdates(sessionWith(values))).toBe('Rename the topic');
-    expect(values).toHaveLength(0); // …and still clears the residue, which is its first job
+describe('isResultUsage (end of a burst of background output)', () => {
+  it('recognises the usage_update the harness sends with a completed result', () => {
+    expect(
+      isResultUsage({
+        sessionUpdate: 'usage_update',
+        used: 1000,
+        size: 200_000,
+        cost: { amount: 0.12, currency: 'USD' },
+      } as SessionUpdate)
+    ).toBe(true);
   });
 
-  it('takes the last title when several are stranded', () => {
-    const values: unknown[] = [
-      { update: { sessionUpdate: 'session_info_update', title: 'first guess' } },
-      { update: { sessionUpdate: 'tool_call_update', toolCallId: 't1' } },
-      { update: { sessionUpdate: 'session_info_update', title: 'better guess' } },
-    ];
-    expect(drainResidualUpdates(sessionWith(values))).toBe('better guess');
+  it('does not mistake a mid-stream snapshot for one', () => {
+    expect(
+      isResultUsage({ sessionUpdate: 'usage_update', used: 1000, size: 200_000 } as SessionUpdate)
+    ).toBe(false);
   });
 
-  it('reports no title when the residue holds none, and still drains', () => {
-    const values: unknown[] = [{ update: { sessionUpdate: 'tool_call_update', toolCallId: 't1' } }];
-    expect(drainResidualUpdates(sessionWith(values))).toBeUndefined();
-    expect(values).toHaveLength(0);
+  // The schema types cost as `Cost | null`, and a harness sending an explicit null is saying
+  // "no cost known", not "this is a result".
+  it('treats an explicit null cost as not a result', () => {
+    expect(
+      isResultUsage({ sessionUpdate: 'usage_update', used: 1, size: 2, cost: null } as SessionUpdate)
+    ).toBe(false);
   });
 
-  it('does nothing to an empty queue', () => {
-    expect(drainResidualUpdates(sessionWith([]))).toBeUndefined();
-  });
-
-  // The queue holds the SDK's own wrapper objects, whose shape is not public API. This runs on the
-  // way INTO a turn, so a shape change must degrade to "no title", never throw.
-  it('survives residue that does not look like an update at all', () => {
-    const values: unknown[] = [null, undefined, 42, 'nope', {}, { update: null }, { update: { title: 7 } }];
-    expect(() => drainResidualUpdates(sessionWith(values))).not.toThrow();
-    expect(values).toHaveLength(0);
-  });
-
-  it('skips the drain when the SDK has renamed its internal field', () => {
-    const renamed = { queue: { values: [1, 2] } } as unknown as Parameters<typeof drainResidualUpdates>[0];
-    expect(drainResidualUpdates(renamed)).toBeUndefined();
+  it('ignores every other kind of update', () => {
+    expect(
+      isResultUsage({ sessionUpdate: 'session_info_update', title: 'anything' } as SessionUpdate)
+    ).toBe(false);
+    expect(
+      isResultUsage({
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'hi' },
+      } as SessionUpdate)
+    ).toBe(false);
   });
 });

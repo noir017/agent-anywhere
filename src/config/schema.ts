@@ -120,6 +120,11 @@ const ExperienceSchema = z.object({
        * Per-turn silence watchdog (ms): abort a turn if the agent emits no update for this long.
        * Bounds *silence*, not total turn length (timer resets on every agent update). On trip the
        * subprocess is force-disposed and the turn fails with ❌. Default 10 min; 0 disables.
+       *
+       * A turn with a tool call still open gets more than this — see TOOL_SILENCE_FACTOR in
+       * agent-acp.ts. It has to: a tool is silent for exactly as long as it runs, and Claude
+       * Code's Bash tool allows up to 600000ms, i.e. precisely this default, so a tool call at
+       * the harness's own limit was certain to trip a watchdog meant for hangs.
        */
       turnTimeoutMs: z.number().int().nonnegative().default(600_000),
     })
@@ -299,6 +304,15 @@ export const ConfigSchema = z
          * The clock counts SILENCE AFTER the last turn ended, not turn length — a task that runs for
          * hours (subagents included) is never a candidate, because its conversation is not idle
          * while it runs. Turn length is bounded separately by EXPERIENCE.session.turnTimeoutMs.
+         *
+         * One gap, and it is not closable from here: work Claude Code put in the BACKGROUND
+         * (`run_in_background`) outlives its turn, so its conversation genuinely does look idle
+         * while the script runs. The harness knows (the SDK sends `background_tasks_changed`), but
+         * claude-agent-acp does not forward that over ACP, so the gateway cannot see it. Output
+         * from such a job touches the conversation as it arrives (see TurnRunner.followUpSink),
+         * which keeps a chatty job warm; a job that stays silent longer than this deadline will
+         * have its child — and with it the job, a descendant process — stopped. Raise the deadline
+         * if that is the workload.
          *
          * Reclaim stops the process, not the conversation: the binding, the reverse-command token
          * and every agent's own session id in conversations.json are all kept, so the next message

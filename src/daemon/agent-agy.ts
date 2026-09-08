@@ -417,7 +417,15 @@ function createAgySession(
     // agy repeats conversation_id on later events; adopt it if `init` somehow lacked one.
     rememberConversation(msg.step_update?.conversation_id ?? msg.result?.conversation_id);
 
-    currentTurn?.feed(msg);
+    if (!currentTurn) {
+      // Never silently: the ACP runtime forwards out-of-turn output to the conversation as a
+      // follow-up message (see FollowUpSink), and agy has no such path yet because it has never
+      // been seen to emit anything after `result`. If this line ever shows up in the logs, that
+      // assumption is wrong and agy needs the same wiring.
+      console.debug(`[agy] dropping a "${msg.event}" event that arrived outside a turn`);
+      return;
+    }
+    currentTurn.feed(msg);
   }
 
   /** Persist the conversation id for post-restart `--conversation` resume (write-through on change). */

@@ -4,7 +4,7 @@ import { looksLikeCommand } from './routing.js';
 import { addressOf, sameAddress, type ConversationAddress } from '../core/conversation.js';
 import type { AgentCommand, ConversationId, InboundMessage } from '../types.js';
 import type { PlatformAdapter } from '../platform/adapter.js';
-import type { AgentFactory, AgentStreamHandlers, AgentUsage } from './agent.js';
+import type { AgentFactory, AgentStreamHandlers, AgentUsage, FollowUpSink } from './agent.js';
 import { StreamBuffer } from '../core/stream-buffer.js';
 import { ToolRenderer } from '../core/tool-renderer.js';
 import { describeOutboundError, MessageNotEditableError } from '../core/outbound-errors.js';
@@ -13,12 +13,23 @@ import { ingestAttachments, type AttachmentInput } from '../core/attachment-inge
 import { createAttachmentIngestDeps } from './attachment-io.js';
 
 /**
+ * Introduces a message that was NOT asked for in the moment — the agent reporting back on work
+ * that outlived its turn.
+ *
+ * Worth a bubble of its own because without it the message is unattributable: it arrives with no
+ * message of the user's above it, minutes or hours after the exchange it belongs to, and reads like
+ * the bot talking to itself. Deliberately not configurable — a gateway that could be set to deliver
+ * background output indistinguishably from a reply would just be recreating the confusion.
+ */
+const FOLLOW_UP_MARKER = '⏱ background update — picking up where the last reply left off';
+
+/**
  * Collaborator capabilities TurnRunner needs (DI interface).
  *
  * Deliberately exposes only what running one turn needs, not the whole ConversationRegistry — to
  * avoid bidirectional coupling. The registry remains the sole owner of state/lifecycle; this
  * borrows read-only views (agentIdOf / tokenFor / modelOverride) and a small write entry
- * (activeAddress set/delete).
+ * (setLane).
  */
 export interface TurnRunnerDeps {
   /** Get this conversation's stable token (reverse-command auth + locate). */
@@ -35,10 +46,14 @@ export interface TurnRunnerDeps {
    * resolved, in which case the footer falls back to the configured value it always used.
    */
   getWorkdir?(id: ConversationId): string | undefined;
-  /** Mark the current turn's target address + platform instance; reverse commands locate by them. */
-  setActiveAddress(id: ConversationId, address: ConversationAddress, platformId: string): void;
-  /** Clear the current turn's address (at turn end). */
-  deleteActiveAddress(id: ConversationId): void;
+  /**
+   * Record the lane this turn is running in; everything answered on this conversation's behalf
+   * locates it by this — reverse commands, a late harness title, background output.
+   *
+   * Not cleared at turn end, and that is the point: a conversation does not stop being in a place
+   * just because nothing is running there. See ConversationState.lane.
+   */
+  setLane(id: ConversationId, address: ConversationAddress, platformId: string): void;
   /**
    * Register an auto-created thread as belonging to an existing conversation.
    *
@@ -88,6 +103,38 @@ export interface TurnRunnerDeps {
    * a real harness title always wins and this never overwrites one.
    */
   suggestTitle?(id: ConversationId, seed: string): void;
+  /**
+   * Where to put output that arrives with no turn running (background work reporting in), or
+   * undefined when this conversation has never had a turn and so has no lane to write to.
+   *
+   * The whole point of a follow-up is that it happens after the turn, so this is the conversation's
+   * lane (see setLane) rather than anything scoped to a running turn.
+   */
+  followUpTarget?(id: ConversationId): { address: ConversationAddress; platformId: string } | undefined;
+  /**
+   * Mark this conversation as active, because something is happening in it outside a turn.
+   *
+   * Without it a conversation whose agent left a two-hour background job would look idle to the
+   * reclaim sweeper (no turn, no messages) and have its child stopped from under the job.
+   */
+  touch?(id: ConversationId): void;
+}
+
+/**
+ * One rendering context: the buffers and handlers that turn a stream of agent events into IM
+ * messages, plus the finalizer that seals the result.
+ *
+ * Extracted so a turn and a follow-up burst render through the same code — the serial effects
+ * chain, the segment rotation at tool boundaries and the footer are all properties of "agent output
+ * being written into a chat", not of a turn.
+ */
+interface Render {
+  ref: TurnRef;
+  handlers: AgentStreamHandlers;
+  /** Queue a side effect onto this render's serial chain (ordering with the stream is preserved). */
+  enqueue(fn: () => Promise<void> | void): void;
+  /** Drain the chain and seal the last message, appending `footer` when there is a body. */
+  finalize(footer: string): Promise<void>;
 }
 
 /**
@@ -164,71 +211,24 @@ export class TurnRunner {
 
     const sessionToken = this.deps.tokenFor(conversationId);
     const agentId = this.deps.agentIdOf(conversationId);
-    // Mark the current turn's address + platform: reverse commands locate via token→conversation→these.
-    this.deps.setActiveAddress(conversationId, address, platformId);
+    // Record the lane: everything answered for this conversation locates it via
+    // token→conversation→lane, during the turn and after it.
+    this.deps.setLane(conversationId, address, platformId);
 
     // Typing keep-alive: Discord's typing indicator self-expires ~10s, so re-fire every typingIntervalMs
     // (fire-and-forget, never gates the turn). Cancelled + stopTyping in finally.
     const stopTypingLoop = this.startTypingLoop(platform, address);
 
-    // StreamBuffer factory closure: sink bound to this turn's address, callable repeatedly to rotate a
-    // fresh buffer per segment — trailing text below a tool bubble goes to a new message, not editing the prior one.
-    const makeStream = (): StreamBuffer => this.makeStreamBuffer(platform, address);
-
-    // Turn-level mutable container: stream (active text buffer, rotated at segment boundaries),
-    // producedOutput (whether the turn emitted visible output) and usage (latest context snapshot
-    // the agent reported) are written by stream callbacks and read by the runTurn body. Wrapped in
-    // one object rather than separate `let`s because the callbacks are extracted to
-    // buildStreamHandlers — across that function boundary a bare local's mutable binding can't be
-    // shared. Sharing the ref makes assignment (ref.stream = makeStream()) and reads mutually
-    // visible (never cache a ref.stream instance early).
-    const ref: TurnRef = {
-      stream: makeStream(),
-      producedOutput: false,
-    };
-
-    const tools = new ToolRenderer(
-      {
-        mode: this.config.tools.mode,
-        // Tool-progress grouping (accumulate = edit one bubble in place; needs editBubble).
-        grouping: this.config.tools.grouping,
-        previewLimit: this.config.tools.previewLimit,
-        defaultEmoji: this.config.tools.defaultEmoji,
-        emojiMap: this.config.tools.emojiMap,
-        // Same edit budget the body stream respects: a long tool run seals its bubble and opens a
-        // new one rather than freezing once the platform stops accepting edits.
-        maxEdits: this.editBudget(platform),
-        // ...and the same length limit, measured the same way. A bubble that accumulates past what
-        // one message can carry is sealed and continued, instead of being rejected on the wire
-        // (Telegram answered MESSAGE_TOO_LONG on the edit and "text is too long" on the send, and
-        // neither is a MessageNotEditableError, so the whole block of progress was dropped).
-        maxMessageLength: platform.capabilities.maxMessageLength,
-        measureLength: (s) => platform.measureRendered(s),
-      },
-
-      {
-        sendBubble: (text) => platform.sendMessage(address, text),
-        // accumulate mode flushes whole tool progress/completion into one bubble (address closure).
-        // Capability-gated: on platforms with editMessage=false (QQ/LINE/WeCom) editMessage throws, so
-        // pass undefined to let ToolRenderer degrade to separate (one new bubble per tool) instead of
-        // throwing on every accumulate edit. Symmetric with StreamBuffer's noEdit inference.
-        editBubble: platform.capabilities.editMessage
-          ? (ref, text) => platform.editMessage(ref, text)
-          : undefined,
-      }
-    );
-
-    // Serialize all stream-event side effects into one promise chain: "text push → tool-boundary flush →
-    // tool bubble → trailing text" execute strictly in arrival order, no interleaving; any failure is
-    // swallowed into the chain (best-effort rendering) rather than bubbling as an unhandled rejection.
-    let effects: Promise<void> = Promise.resolve();
-    const enqueue = (fn: () => Promise<void> | void): void => {
-      effects = effects.then(fn).catch((e) =>
-        console.error('[turn] render side effect failed:', describeOutboundError(e))
-      );
-    };
+    // Everything that turns agent events into messages in this lane. Shared with the follow-up
+    // path (see followUpSink) so out-of-turn output renders exactly like in-turn output.
+    const render = this.beginRender(conversationId, platform, address);
+    const ref = render.ref;
 
     const agent = this.agents.getOrCreate(conversationId, agentId);
+    // Re-installed every turn rather than once per session: the session object outlives its child
+    // (crash, `/cd`, idle reclaim all rebuild one underneath it), and a sink installed on a dead
+    // child would leave background output with nowhere to go.
+    agent.setFollowUpSink?.(this.followUpSink(conversationId));
     const prompt = await this.buildPrompt(batch, platform);
     console.log(`[turn] ${conversationId} starting turn (${batch.length} message(s))`);
 
@@ -241,18 +241,17 @@ export class TurnRunner {
     try {
       await agent.runTurn(
         { prompt, sessionToken, model: this.deps.getModelOverride(conversationId) },
-        this.buildStreamHandlers(conversationId, ref, makeStream, tools, enqueue)
+        render.handlers
       );
-      await effects;                       // wait for all queued side effects to land
       if (signal?.aborted) {
         // Interrupted by a newer message: finalize the partial reply cleanly — drop the streaming
         // reply with no footer (it didn't finish), and skip the command fallback. The continuing
         // batch starts a fresh turn and produces its own reply + ✅.
-        await ref.stream.complete();
+        await render.finalize('');
         console.log(`[turn] ${conversationId} turn interrupted (continuing with newer input)`);
       } else {
         // Final flush: footer only on the last stream (intermediate segments carry none).
-        await ref.stream.complete({ footer: this.buildFooter(conversationId, ref) });
+        await render.finalize(this.buildFooter(conversationId, ref));
         // Command zero-output fallback: the agent ran a command but produced nothing displayable (often
         // harness-swallowed built-in stdout, or an unknown command); send a note instead of total silence. best-effort.
         if (isCommandTurn && !ref.producedOutput) {
@@ -286,7 +285,6 @@ export class TurnRunner {
     } finally {
       stopTypingLoop();
       await platform.stopTyping(address);
-      this.deps.deleteActiveAddress(conversationId);
     }
   }
 
@@ -354,6 +352,218 @@ export class TurnRunner {
       // a slow or failing editForumTopic must not delay a single character of the answer, and a
       // chat whose topic keeps its old name is a far smaller problem than one that stops streaming.
       onTitle: (title) => {
+        void this.deps.recordTitle?.(conversationId, title);
+      },
+    };
+  }
+
+  /**
+   * Build one rendering context for a lane: the text buffer, the tool renderer, the serial effects
+   * chain, the stream handlers, and the finalizer that seals it all.
+   *
+   * Lifted out of runTurn so a follow-up burst renders identically (see the Render interface). The
+   * only thing NOT in here is the footer text, which differs between a turn and a follow-up and is
+   * therefore passed to `finalize`.
+   */
+  private beginRender(
+    conversationId: ConversationId,
+    platform: PlatformAdapter,
+    address: ConversationAddress
+  ): Render {
+    // StreamBuffer factory closure: sink bound to this address, callable repeatedly to rotate a
+    // fresh buffer per segment — trailing text below a tool bubble goes to a new message, not editing the prior one.
+    const makeStream = (): StreamBuffer => this.makeStreamBuffer(platform, address);
+
+    // Render-level mutable container: stream (active text buffer, rotated at segment boundaries),
+    // producedOutput (whether it emitted visible output) and usage (latest context snapshot the
+    // agent reported) are written by stream callbacks and read by the caller. Wrapped in one object
+    // rather than separate `let`s because the callbacks are extracted to buildStreamHandlers —
+    // across that function boundary a bare local's mutable binding can't be shared. Sharing the ref
+    // makes assignment (ref.stream = makeStream()) and reads mutually visible (never cache a
+    // ref.stream instance early).
+    const ref: TurnRef = {
+      stream: makeStream(),
+      producedOutput: false,
+    };
+
+    const tools = new ToolRenderer(
+      {
+        mode: this.config.tools.mode,
+        // Tool-progress grouping (accumulate = edit one bubble in place; needs editBubble).
+        grouping: this.config.tools.grouping,
+        previewLimit: this.config.tools.previewLimit,
+        defaultEmoji: this.config.tools.defaultEmoji,
+        emojiMap: this.config.tools.emojiMap,
+        // Same edit budget the body stream respects: a long tool run seals its bubble and opens a
+        // new one rather than freezing once the platform stops accepting edits.
+        maxEdits: this.editBudget(platform),
+        // ...and the same length limit, measured the same way. A bubble that accumulates past what
+        // one message can carry is sealed and continued, instead of being rejected on the wire
+        // (Telegram answered MESSAGE_TOO_LONG on the edit and "text is too long" on the send, and
+        // neither is a MessageNotEditableError, so the whole block of progress was dropped).
+        maxMessageLength: platform.capabilities.maxMessageLength,
+        measureLength: (s) => platform.measureRendered(s),
+      },
+
+      {
+        sendBubble: (text) => platform.sendMessage(address, text),
+        // accumulate mode flushes whole tool progress/completion into one bubble (address closure).
+        // Capability-gated: on platforms with editMessage=false (QQ/LINE/WeCom) editMessage throws, so
+        // pass undefined to let ToolRenderer degrade to separate (one new bubble per tool) instead of
+        // throwing on every accumulate edit. Symmetric with StreamBuffer's noEdit inference.
+        editBubble: platform.capabilities.editMessage
+          ? (bubble, text) => platform.editMessage(bubble, text)
+          : undefined,
+      }
+    );
+
+    // Serialize all stream-event side effects into one promise chain: "text push → tool-boundary flush →
+    // tool bubble → trailing text" execute strictly in arrival order, no interleaving; any failure is
+    // swallowed into the chain (best-effort rendering) rather than bubbling as an unhandled rejection.
+    let effects: Promise<void> = Promise.resolve();
+    const enqueue = (fn: () => Promise<void> | void): void => {
+      effects = effects.then(fn).catch((e) =>
+        console.error('[turn] render side effect failed:', describeOutboundError(e))
+      );
+    };
+
+    return {
+      ref,
+      enqueue,
+      handlers: this.buildStreamHandlers(conversationId, ref, makeStream, tools, enqueue),
+      finalize: async (footer: string) => {
+        await effects; // wait for all queued side effects to land
+        await ref.stream.complete(footer ? { footer } : undefined);
+      },
+    };
+  }
+
+  /**
+   * A destination for output the harness produces once the turn that asked for it has ended — a
+   * background script finishing, and the agent reporting what it found.
+   *
+   * Rendered as a NEW message rather than an edit of the finished reply: that reply was already
+   * sealed and footered, and a chat that silently rewrites an old message is worse than one that
+   * posts a new one. The `⏱` marker bubble says which it is, because a paragraph arriving with no
+   * message of the user's before it is otherwise baffling.
+   *
+   * Lazy on purpose. `handlers()` always answers, because the metadata half (title / usage / model)
+   * must be recorded whether or not anything is displayed — but the message itself is opened only
+   * when text or a tool actually shows up. Without that, claude-agent-acp's post-turn
+   * `session_info_update` (which it sends after EVERY turn) would post an empty follow-up to every
+   * conversation, forever.
+   */
+  followUpSink(conversationId: ConversationId): FollowUpSink {
+    /** The follow-up message being rendered, once anything has been written to it. */
+    let render: Render | undefined;
+    /** Whether opening was already TRIED — a failed open must not be retried per chunk. */
+    let tried = false;
+
+    const open = (): Render | undefined => {
+      if (tried) return render;
+      tried = true;
+      const target = this.deps.followUpTarget?.(conversationId);
+      if (!target) {
+        console.warn(
+          `[follow-up] ${conversationId} produced output outside a turn, but no lane is known for it; dropping`
+        );
+        return undefined;
+      }
+      const platform = this.platforms.get(target.platformId);
+      if (!platform) {
+        console.warn(`[follow-up] ${conversationId}: no adapter for platform "${target.platformId}"; dropping`);
+        return undefined;
+      }
+      render = this.beginRender(conversationId, platform, target.address);
+      // Queued onto the render's own chain rather than sent directly, so the marker cannot land
+      // after the first chunk of the text it is introducing.
+      render.enqueue(() =>
+        platform
+          .sendMessage(target.address, FOLLOW_UP_MARKER)
+          .then(() => undefined)
+          .catch((e) => console.warn('[follow-up] failed to send the marker:', e instanceof Error ? e.message : e))
+      );
+      console.log(`[follow-up] ${conversationId}: rendering background output as a new message`);
+      return render;
+    };
+
+    return {
+      handlers: () => {
+        render = undefined;
+        tried = false;
+        return this.buildFollowUpHandlers(conversationId, open, () => render);
+      },
+      close: () => {
+        const done = render;
+        render = undefined;
+        tried = false;
+        if (!done) return;
+        // Returned rather than voided: the runtime awaits it before letting a new turn write into
+        // the same lane (see FollowUpSink.close). Failures are absorbed — a background report that
+        // could not be flushed must not fail the turn that happened to seal it.
+        return done
+          .finalize(this.buildFooter(conversationId, done.ref))
+          .catch((e) => console.error('[follow-up] failed to finalize:', describeOutboundError(e)));
+      },
+    };
+  }
+
+  /**
+   * Stream handlers for out-of-turn output: rendering events go through `open()` (which opens the
+   * follow-up message on first use), while everything that is merely REPORTED is forwarded to the
+   * conversation whether or not a message was ever opened.
+   *
+   * That split is the point. A title, a context snapshot and a model name are facts about the
+   * session which the gateway records and shows elsewhere (`/context`, the topic name, the footer);
+   * they are not output, and treating them as output is what would post empty bubbles.
+   *
+   * Each event also touches the conversation, so the reclaim sweeper can see that a conversation
+   * which looks idle from the outside (no turn, no messages) is in fact still working.
+   */
+  private buildFollowUpHandlers(
+    conversationId: ConversationId,
+    open: () => Render | undefined,
+    /** The open render, WITHOUT opening one — for events that must not cause a message. */
+    peek: () => Render | undefined
+  ): AgentStreamHandlers {
+    const touch = (): void => this.deps.touch?.(conversationId);
+    return {
+      onText: (delta) => {
+        touch();
+        open()?.handlers.onText(delta);
+      },
+      onToolStart: (evt) => {
+        touch();
+        open()?.handlers.onToolStart(evt);
+      },
+      onToolFinish: (evt) => {
+        touch();
+        open()?.handlers.onToolFinish(evt);
+      },
+      // Via peek, not open: a segment boundary before anything was rendered has no buffer to
+      // rotate, and opening a message for one would defeat the laziness.
+      onSegmentBreak: () => peek()?.handlers.onSegmentBreak(),
+      onAvailableCommands: (cmds) => {
+        try {
+          this.hooks?.onAvailableCommands?.(conversationId, this.deps.agentIdOf(conversationId), cmds);
+        } catch (e) {
+          console.error('[follow-up] onAvailableCommands hook failed:', e instanceof Error ? e.message : e);
+        }
+      },
+      onUsage: (usage) => {
+        touch();
+        this.deps.recordUsage?.(conversationId, usage);
+        // Also onto the open render's ref, so the follow-up's own footer reports the context as of
+        // the background work rather than as of the turn before it.
+        const live = peek();
+        if (live) live.ref.usage = usage;
+      },
+      onModel: (model) => {
+        const live = peek();
+        if (live) live.ref.model = model;
+      },
+      onTitle: (title) => {
+        touch();
         void this.deps.recordTitle?.(conversationId, title);
       },
     };

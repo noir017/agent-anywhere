@@ -57,6 +57,52 @@ export interface AgentStreamHandlers {
   onTitle?(title: string): void;
 }
 
+/**
+ * Where output that arrives OUTSIDE a turn goes.
+ *
+ * ── Why a harness produces output with no turn open ─────────────────────────────────────────────
+ * Because Claude Code's background work outlives the turn that started it, by design. A
+ * `run_in_background` Bash call, or a background Task, returns immediately; the agent ends its turn
+ * saying it will report back; and when the process exits the SDK re-invokes the model on its own
+ * with a task-notification. claude-agent-acp settles the ACP prompt at the turn's terminal `result`
+ * precisely so the client unlocks instead of waiting on that background work (its own comment cites
+ * issue #773), and then keeps emitting the followup's `session/update` notifications with no prompt
+ * in flight — stating outright that "the consumer keeps draining afterward (absorbing idle and
+ * forwarding any background output)".
+ *
+ * agent-anywhere used to break that contract: the read loop stopped at `stop`, so every character
+ * the agent produced after a long script finished landed in the SDK's queue unread and was cleared
+ * as residue at the start of the next turn. From the chat side the conversation simply went silent
+ * after "I've started it in the background, I'll let you know" — the exact bug this seam exists for.
+ *
+ * ── The lazy shape, and what it protects ────────────────────────────────────────────────────────
+ * `handlers()` is asked for once per burst and must always answer, because the metadata half
+ * (title / usage / model) has to be recorded whether or not anything is rendered. The RENDERING
+ * half opens a fresh message only when text or a tool actually arrives — otherwise a lone
+ * `session_info_update`, which claude-agent-acp sends after every single turn, would post an empty
+ * "background update" bubble to every conversation forever.
+ */
+export interface FollowUpSink {
+  /**
+   * Handlers for one burst of out-of-turn output. Called once when the burst starts; the same set
+   * is reused until `close()`.
+   */
+  handlers(): AgentStreamHandlers;
+  /**
+   * The burst is over — finalize whatever was opened (flush the tail, append the footer).
+   *
+   * Called when the harness reports a completed result, when a new turn takes over, or when the
+   * burst goes quiet. Idempotent, and a no-op when nothing was ever rendered.
+   *
+   * Returns a promise so a caller that is about to write into the SAME lane can order itself
+   * behind the flush. That is not a nicety: in the default `once` delivery mode the burst's entire
+   * body is sent by this call, so a new turn's reply streaming concurrently would leave the
+   * background report printed underneath an answer it has nothing to do with — with its own `⏱`
+   * marker orphaned above both.
+   */
+  close(): void | Promise<void>;
+}
+
 /** Live context usage from the agent (ACP UsageUpdate: `used` / `size`). */
 export interface AgentUsage {
   /** Tokens currently in context. */
@@ -87,6 +133,15 @@ export interface AgentSession {
   runTurn(input: RunTurnInput, handlers: AgentStreamHandlers): Promise<void>;
   /** Interrupt the current turn (for fresh-window continuation, skipping the aborted tool call). */
   abort(): void;
+  /**
+   * Install the destination for output this session produces outside any turn (see FollowUpSink).
+   *
+   * Optional so a runtime with no notion of out-of-turn output simply omits it, and idempotent —
+   * TurnRunner installs the same sink at the top of every turn rather than tracking whether this
+   * session has one yet, because a session can be rebuilt underneath it (crash, `/cd`, idle
+   * reclaim) and a sink installed once would then be attached to a dead child.
+   */
+  setFollowUpSink?(sink: FollowUpSink): void;
   /**
    * The live session's model selector, or undefined when the harness exposes none.
    *

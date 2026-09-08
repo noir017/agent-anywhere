@@ -203,10 +203,32 @@ interface ConversationState {
   modelOverride?: string;
   /** Platform instance of the most recently routed message (a shared-scope conversation may hop instances). */
   platform: string;
-  /** Active turn's address (set at turn start, cleared at end); reverse commands locate the target by it. */
-  activeAddress?: ConversationAddress;
-  /** Active turn's platform instance id (set/cleared with activeAddress). */
-  activePlatform?: string;
+  /**
+   * The lane this conversation is answered in: the address the last turn ran at, kept for the life
+   * of the conversation. Undefined until its first turn.
+   *
+   * This used to be an ACTIVE address, cleared the moment a turn ended, and three separate things
+   * were silently dropped as a result — all of them things that by nature happen after a turn:
+   *
+   *  - background output the harness produces once the turn has settled (TurnRunner.followUpSink);
+   *  - a harness title, which claude-agent-acp generates in a background task and reports from its
+   *    turn-end idle handler;
+   *  - a reverse command from a job the agent left running (`agent-anywhere send-message`), which
+   *    was refused outright with "this conversation has no active turn right now".
+   *
+   * So it is no longer cleared: a conversation does not stop being in a place just because nothing
+   * is running there. Nothing reads "is a turn running" off an address — the merger's phase is the
+   * authority on that (see InboundMerger.isIdle).
+   *
+   * KNOWN LIMITATION under `scope: shared` / `per_user`, where one conversation deliberately spans
+   * channels: between turns this names whichever lane ran last, so an out-of-turn answer can land
+   * in the previous lane rather than the one the user is now writing in. The default `per_thread`
+   * scope makes a conversation and a lane the same thing, and under the sharing scopes a
+   * single-lane answer was already ill-defined.
+   */
+  lane?: ConversationAddress;
+  /** Platform instance of `lane` (set with it, never cleared). */
+  lanePlatform?: string;
   /**
    * Whether this conversation already announced itself with the header bubble
    * (display.header.enabled). Once per conversation, so a long exchange isn't punctuated by a
@@ -374,20 +396,15 @@ export class ConversationRegistry {
           if (state) state.turnCompleted = true;
         },
         // During an active turn the state must exist, but handle absence robustly anyway.
-        setActiveAddress: (id, address, platformId) => {
+        setLane: (id, address, platformId) => {
           const state = this.conversations.get(id);
           if (state) {
-            state.activeAddress = address;
-            state.activePlatform = platformId;
+            state.lane = address;
+            state.lanePlatform = platformId;
           }
         },
-        deleteActiveAddress: (id) => {
-          const state = this.conversations.get(id);
-          if (state) {
-            state.activeAddress = undefined;
-            state.activePlatform = undefined;
-          }
-        },
+        followUpTarget: (id) => this.laneOf(id),
+        touch: (id) => this.touch(id),
         // autoThread opened a thread mid-turn: alias its key to this conversation so the user's
         // reply inside it continues here instead of starting an empty one (see adoptThread).
         adoptThread: (id, address, platformId) => this.adoptThread(id, address, platformId),
@@ -506,6 +523,24 @@ export class ConversationRegistry {
     if (state) state.lastActivityAt = this.clock.now();
   }
 
+  /**
+   * The lane this conversation writes to: the running turn's, else the last one a turn ran in.
+   *
+   * The single answer to "where does this conversation live", used by everything that happens
+   * BETWEEN turns — background output, a late harness title, a reverse command from a job the agent
+   * left behind. Each of those used to read `activeAddress` directly and get undefined, which is
+   * how a conversation that had merely finished replying became indistinguishable from one that had
+   * never existed. Undefined only before this conversation's first turn: until then there genuinely
+   * is no lane, only the address of whatever message is being handled right now.
+   */
+  private laneOf(
+    id: ConversationId
+  ): { address: ConversationAddress; platformId: string } | undefined {
+    const state = this.conversations.get(id);
+    if (!state?.lane) return undefined;
+    return { address: state.lane, platformId: state.lanePlatform ?? state.platform };
+  }
+
   /** Gating rules for one platform instance (built on first use; config is immutable at runtime). */
   private gateFor(platformId: string): GateConfig {
     let gate = this.gateConfigs.get(platformId);
@@ -526,18 +561,31 @@ export class ConversationRegistry {
   }
 
   /**
-   * Platform instance owning a conversation's outbound right now: the active turn's instance if a
-   * turn is running, else the last routed message's. Used by the daemon to pick the adapter for
-   * reverse commands (including --channel override sends on an idle conversation).
+   * Platform instance owning a conversation's OUTBOUND right now: the lane a turn is running (or
+   * last ran) in, else the last routed message's instance. Used by the daemon to pick the adapter
+   * for reverse commands, including `--channel` override sends on an idle conversation.
+   *
+   * Reads the lane rather than the last inbound instance because a reverse command is answered
+   * into the lane — `resolveAddress` returns that lane's address, and pairing it with a different
+   * instance's adapter would send one platform's channel id to another platform.
    */
   platformFor(id: ConversationId): string | undefined {
     const state = this.conversations.get(id);
-    return state?.activePlatform ?? state?.platform;
+    return state?.lanePlatform ?? state?.platform;
   }
 
-  /** Adapter for the conversation's current platform; clear error if unresolvable. */
+  /**
+   * Adapter for the instance a conversation's INBOUND messages are arriving on; clear error if
+   * unresolvable.
+   *
+   * Deliberately `state.platform` and not `platformFor`. Its only caller is the merger's
+   * lifecycle-reaction sink, which marks the user's own messages — under `scope: shared` (a
+   * platform-free conversation key) one conversation genuinely spans instances, and `route` keeps
+   * `state.platform` pointed at the message being handled precisely so a 👀 lands on the platform
+   * that sent it. Resolving that through the lane would address a Discord message id to Telegram.
+   */
   private adapterFor(id: ConversationId): PlatformAdapter {
-    const pid = this.platformFor(id);
+    const pid = this.conversations.get(id)?.platform;
     const adapter = pid ? this.platforms.get(pid) : undefined;
     if (!adapter) {
       throw new Error(`cannot resolve a platform adapter for conversation ${id} (platform=${pid ?? 'unknown'})`);
@@ -731,8 +779,7 @@ export class ConversationRegistry {
    *
    * Everything about this is best-effort, and every early return is a decision:
    *
-   * - no `activeAddress` — the title arrived outside a turn, so there is nothing to point at. Only
-   *   reachable if a runtime reports a title without one, which none does today.
+   * - no lane on record — the conversation has never run a turn, so there is nothing to point at.
    * - no `thread` — the address IS the chat. Renaming a whole Telegram group because an agent
    *   summarised one conversation in it would be indefensible, so a lane is required.
    * - unchanged — the harness re-reports the same title on many turns, and each rename costs an
@@ -743,21 +790,25 @@ export class ConversationRegistry {
    * - the API refused — a non-forum chat, a revoked admin right, a rate limit. A conversation whose
    *   topic still has its old name is a cosmetic problem; a turn that fails because of one is not.
    *
+   * Reads the lane rather than `activeAddress` because the title usually arrives AFTER the turn it
+   * describes: claude-agent-acp generates it in a background task and reports it from its turn-end
+   * idle handler, so by the time it lands the turn's address has already been cleared.
+   *
    * NOT guarded on "did a human rename this in the Telegram UI": Telegram exposes no way to read a
    * topic's current name, so that question is unanswerable and pretending otherwise would just
    * move the failure somewhere less obvious. `/title` and the setting are the ways to opt out.
    */
   private async applyConversationTitle(id: ConversationId, title: string): Promise<void> {
     const state = this.conversations.get(id);
-    if (!state?.activeAddress) return;
-    const platformId = state.activePlatform ?? state.platform;
-    if (this.config.platforms[platformId]?.autoRenameThread === false) return;
+    const lane = this.laneOf(id);
+    if (!state || !lane) return;
+    if (this.config.platforms[lane.platformId]?.autoRenameThread === false) return;
     if (this.store?.titlePinned(id)) return;
     await this.retitleLane(
       id,
       state.agentId,
-      state.activeAddress,
-      platformId,
+      lane.address,
+      lane.platformId,
       formatLaneTitle(state.agentId, title)
     );
   }
@@ -777,16 +828,16 @@ export class ConversationRegistry {
    */
   private seedConversationTitle(id: ConversationId, seed: string): void {
     const state = this.conversations.get(id);
-    if (!state?.activeAddress || !seed.trim()) return;
-    const platformId = state.activePlatform ?? state.platform;
-    if (this.config.platforms[platformId]?.autoRenameThread === false) return;
+    const lane = this.laneOf(id);
+    if (!state || !lane || !seed.trim()) return;
+    if (this.config.platforms[lane.platformId]?.autoRenameThread === false) return;
     // Anything already recorded — a harness title, or a pinned `/title` — outranks a guess.
     if (this.store?.conversationTitle(id) !== undefined) return;
     void this.retitleLane(
       id,
       state.agentId,
-      state.activeAddress,
-      platformId,
+      lane.address,
+      lane.platformId,
       formatLaneTitle(state.agentId, seed)
     );
   }
@@ -1731,9 +1782,25 @@ ${formatTokens(left)} left before compaction — ${name}`;
   }
 
   /**
-   * Reverse command: validate the token, return the current turn's target address.
-   * token→conversation is always valid; an address exists only while a turn is running
+   * Reverse command: validate the token, return the address this conversation writes to.
+   * token→conversation is always valid; an address exists once the conversation has run a turn
    * (override can push cross-channel).
+   *
+   * Resolved through the LANE (see laneOf), not the running turn's address, and that difference is
+   * load-bearing: an agent that finished its turn and left a background job reporting through
+   * `agent-anywhere send-message` is the normal case, not an error. It used to be refused with
+   * "this conversation has no active turn right now", which meant the job's whole report went
+   * nowhere — the same class of bug as background output being dropped by the update reader.
+   *
+   * ⚠️ That widened the token from a turn-scoped capability to a conversation-scoped one, and the
+   * cost is worth naming: the token has no expiry and is released only when the conversation is
+   * (daemon shutdown), so a process that escaped the agent's tree — `nohup ... &` — keeps every
+   * reverse command working indefinitely, `touch`ing the conversation as it goes and so holding
+   * off idle reclaim. Accepted deliberately, because refusing it is refusing the feature: "report
+   * back when the long job finishes" is precisely what a background job is for, and a gateway that
+   * answers `send-message` but not `ask` would be arbitrary. The mitigation is the same one the
+   * boundary below names — access.allowFrom — plus the fact that anything holding the token was
+   * started by an agent the operator already trusts with full tool access.
    *
    * ⚠️ Security boundary (deliberate capability + its cost): override (`--channel <any id>`) has no
    * channel-level authorization — a conversation holding a valid token can send/delete/fetch-history
@@ -1750,11 +1817,11 @@ ${formatTokens(left)} left before compaction — ${name}`;
     const id = this.tokens.conversationFor(token);
     if (!id) throw new Error('invalid session token');
     if (override) return override; // allow cross-channel proactive send; see security boundary above
-    const address = this.conversations.get(id)?.activeAddress;
-    if (!address) {
-      throw new Error('this conversation has no active turn right now; cannot locate a channel');
+    const lane = this.laneOf(id);
+    if (!lane) {
+      throw new Error('this conversation has not run a turn yet; cannot locate a channel');
     }
-    return address;
+    return lane.address;
   }
 
   /**

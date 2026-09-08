@@ -228,8 +228,8 @@ Verified resumable on the three harnesses in use: `claude` (claude-agent-acp adv
 One turn, end to end. It receives a narrow DI interface (`TurnRunnerDeps`) rather than
 the whole `ConversationRegistry`, to avoid bidirectional coupling: the registry stays the
 sole owner of state and lifecycle, and the runner borrows read-only views (`agentIdOf`,
-`tokenFor`, `getModelOverride`) plus two write entries (`setActiveAddress`,
-`adoptThread`).
+`tokenFor`, `getModelOverride`) plus a few write entries (`setLane`, `adoptThread`,
+`touch`).
 
 Per turn it: resolves the platform instance from the batch (a shared-scope conversation
 may hop instances between turns, so this is per-turn) → resolves the outbound address
@@ -316,25 +316,118 @@ back into `AgentStreamHandlers`:
 `resolveClaudeAdapterEntry` / `resolveCodexAdapterEntry`, so neither needs a separate
 install. `opencode` and `custom` are located on PATH.
 
-#### The session title arrives behind `stop`
+#### One reader for the whole session, not one per turn
 
-`session_info_update` is the one notification that cannot be read where the others are.
-claude-agent-acp sends it from its turn-end idle handler, which runs **after** the code that
-settles the prompt — so it lands in the SDK's update queue behind the `stop` message that ended
-the read loop, and the loop has already returned. Nothing reads it, and the next turn's
-`drainResidualUpdates` clears the queue. The observable symptom was a log line reading
-`drain: dropped 1 residual update(s)` after every single turn.
+The SDK's update queue has exactly **one** reader (`pumpUpdates`), started when the session comes
+up and running until its child goes away. A turn does not read the queue at all: it installs its
+translation state, sends the prompt, and waits for the pump to report the queue's `stop`.
 
-So `drainResidualUpdates` **salvages** a title out of the residue before clearing it, and reports
-it on the incoming turn's handlers. Two consequences fall out of that and are not bugs:
+Two constraints force that shape, and the second is the load-bearing one.
 
-- the title is one turn late, which it would be anyway — the harness generates it in a background
-  task, so it describes the turn before the one that reports it;
-- the first turn in a conversation usually produces no title at all.
+**A turn's answer is not the end of the harness's output.** Claude Code puts long work in the
+background — a `run_in_background` Bash call, a background Task — and ends its turn saying it will
+report back; when the work finishes the Agent SDK re-invokes the model on its own with a
+task-notification. claude-agent-acp settles the ACP prompt at the turn's terminal `result`
+precisely so the client unlocks instead of blocking on that work (its own comment cites issue
+\#773), and then keeps emitting `session/update` notifications with no prompt in flight, stating
+that "the consumer keeps draining afterward (absorbing idle and forwarding any background
+output)". A loop that returned at `stop` read none of it: every character the agent produced after
+a long script finished went into the queue unread and was cleared as residue on the next turn. The
+chat simply went silent at the moment the answer arrived.
 
-The drain reads the SDK's private `updates.values` array (see the function's own note on why
-`nextUpdate()` cannot be used to probe), so the walk is defensive: this runs on the way *into* a
-turn, and a shape change in the SDK must degrade to "no title", never throw.
+**The queue cannot be handed back and forth.** `AsyncQueue.next()` pushes a waiter when the queue
+is empty, and an abandoned waiter still consumes the next value that arrives — so "drain between
+turns, then let the turn read again" is unimplementable: whichever reader was waiting when the next
+turn began would swallow that turn's first update. A permanent reader whose *destination* switches
+has no handover to get wrong.
+
+What a permanent reader has to handle that a per-turn loop got for free:
+
+- **Ownership across the await.** `active !== session` is checked before *and* after every read.
+  `turnState` / `endTurnWait` are session-wide, so a value from a child replaced while the read was
+  parked would otherwise end — or be rendered into — the turn of a freshly spawned one. The old
+  waiter died with its turn and could not do this.
+- **Rejections mean two different things.** A failed prompt rejects the queue **once**; a closed
+  connection fails it **permanently**, so every later read rejects with the same error. A
+  consecutive-rejection counter with a small backoff tells them apart, and on standing down the
+  reader *tears the connection down* rather than returning — leaving `active` set with no reader
+  would present a session that looks ready but can never deliver a `stop`.
+- **The turn needs a failure path of its own.** It waits on `stop` for success (the harness's last
+  updates precede the prompt response, and the pump delivers them in order), but on **promptDone's
+  rejection** for failure — because a failed prompt produces no `stop`, and `AsyncQueue.reject` is
+  a no-op once the queue has terminally failed. Without that the turn waited out the whole silence
+  watchdog and blamed the agent for "sending no update", or hung forever with `turnTimeoutMs: 0`.
+- **One bad notification must not kill the reader.** `translateUpdate` is wrapped: an escaping
+  throw would leave the child permanently deaf, where the old per-turn loop merely failed that turn.
+- **Replayed history is not output.** `session/load` replays the stored conversation as ordinary
+  notifications (the resumed session is attached *before* the request precisely so they land in
+  this queue) and the deleted drain discarded them — "history must not re-render to the IM". A
+  `promptedYet` flag now does that job: until this child has been asked for something, renderable
+  updates are dropped and only reported facts are kept. Without it, every daemon restart would
+  re-narrate the previous conversation into the chat as a background update.
+- **A cancelled tool's tail is not output either.** See below.
+
+The silence watchdog (`session.turnTimeoutMs`) moved with the reader: one timer per turn, re-armed
+by the pump on every update it hands to that turn, so it still bounds silence rather than turn
+length. It also learned the difference between a hang and a long script — a tool call emits nothing
+for exactly as long as it runs, so from outside the two are identical, and the collision was
+guaranteed rather than unlucky: Claude Code's Bash tool allows up to 600000ms, which is *precisely*
+this watchdog's default. A turn quiet past its deadline with a tool call still open is therefore
+forgiven once, for `TOOL_SILENCE_FACTOR`× longer (30 minutes at the default), and only then failed
+— finite, so a genuinely wedged tool still cannot pin a conversation in `running` forever.
+
+The pre-prompt residue drain is gone with all of this. Nothing accumulates in the queue any more,
+and `session_info_update` — which claude-agent-acp sends from its turn-end idle handler, i.e.
+behind the `stop` — used to be salvageable only as next-turn residue (the log line
+`drain: dropped 1 residual update(s)` after every single turn). It now arrives when it is sent, so
+a lane is renamed a turn sooner.
+
+#### Out-of-turn output becomes a follow-up message
+
+Everything the pump reads with no turn running goes to the conversation's `FollowUpSink`
+(`TurnRunner.followUpSink`), which renders it as a **new** message in the conversation's lane,
+introduced by a `⏱ background update` bubble. New rather than an edit: the reply it follows was
+already sealed and footered, and a chat that silently rewrites an old message is worse than one
+that posts a new one.
+
+- **The message opens lazily, and so does the burst.** `handlers()` always answers, because the
+  metadata half (title, usage, model) must be recorded whether or not anything is displayed — but a
+  message is opened, and a burst announced, only when text or a tool actually arrives. Otherwise
+  the post-turn `session_info_update` that claude-agent-acp sends after *every* turn would post an
+  empty follow-up to every conversation, log a misleading "rendering a follow-up" line after every
+  exchange, and leave each idle conversation holding a three-minute timer.
+- **A burst is sealed a moment after the harness reports a result.** In the default `once` delivery
+  mode nothing is sent until the buffer completes, so "the work finished" has to be detectable: the
+  `usage_update` tied to a terminal `result` carries `cost`, the mid-stream ones do not (verified
+  against claude-agent-acp 0.58.1). That marker only *shortens* the timer rather than closing
+  outright, because the ACP schema documents `cost` as "Cumulative session cost (optional)" — a
+  harness reporting it on every snapshot would otherwise have one report cut into a message per
+  snapshot. A long quiet window backs the whole thing up.
+- **Closing is awaited where it matters.** `close()` returns a promise, and `runTurn` awaits it
+  before writing its own reply into the same lane. Fired and forgotten, a burst sealed by an
+  incoming turn would flush concurrently with that turn's answer and the background report would
+  land underneath something it has nothing to do with, its marker orphaned above both.
+- **A cancel's trailing writes are dropped.** A cancelled tool call still emits its
+  `tool_call_update`, after the prompt has settled. Two tests catch it: while `aborting` stands
+  (between the cancel and the next turn) anything tool-shaped is the cancelled turn's tail, and
+  once a new turn has cleared that flag, the tool ids the cancel snapshotted still identify it —
+  which matters because `interruptOnNewMessage` (the default) starts the next turn within
+  milliseconds, so the wreckage would otherwise be rendered into *its* reply. That is the case the
+  deleted drain described verbatim.
+
+Where the message goes comes from `ConversationState.lane`: the lane the last turn ran in, recorded
+by `setLane` and never cleared. It used to be an *active* address wiped at turn end, which is why
+three separate things were dropped after a turn — background output, a late harness title, and a
+reverse command from a job the agent left running (`resolveAddress` answered "this conversation has
+no active turn right now" and the job's whole report went nowhere). All three read the lane now.
+Nothing reads "is a turn running" off an address; the merger's phase is the authority on that.
+
+That last one widens the reverse-command token from turn-scoped to conversation-scoped; the cost is
+spelled out at `resolveAddress`.
+
+The agy runtime already had a persistent stdout reader but no such sink; it has never been observed
+to emit anything after `result`, so it **logs** an out-of-turn event instead of dropping it
+silently. If that log line ever appears, the assumption is wrong and agy needs the same wiring.
 
 #### Starting a session without running a turn
 

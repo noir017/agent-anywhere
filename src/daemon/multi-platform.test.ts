@@ -100,8 +100,7 @@ describe('multi-platform runtime', () => {
       tokenFor: () => 'tok',
       agentIdOf: () => 'a',
       getModelOverride: () => undefined,
-      setActiveAddress: (_id, _address, platformId) => { expect(platformId).toBe('open'); },
-      deleteActiveAddress: () => {},
+      setLane: (_id, _address, platformId) => { expect(platformId).toBe('open'); },
     });
     await runner.runTurn('open#c1', [msg('open')]);
     expect(open.sent).toContain('hello');
@@ -114,8 +113,7 @@ describe('multi-platform runtime', () => {
       tokenFor: () => 'tok',
       agentIdOf: () => 'a',
       getModelOverride: () => undefined,
-      setActiveAddress: () => {},
-      deleteActiveAddress: () => {},
+      setLane: () => {},
     });
     await expect(runner.runTurn('x', [msg('ghost')])).rejects.toThrowError(/no platform adapter for instance "ghost"/);
   });

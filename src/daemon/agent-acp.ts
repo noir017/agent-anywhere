@@ -22,6 +22,7 @@ import type {
   AgentFactory,
   AgentSession,
   AgentStreamHandlers,
+  FollowUpSink,
   ModelSelector,
   ReclaimState,
   RunTurnInput,
@@ -182,6 +183,71 @@ export function createAcpAgentFactory(cfg: Config, socketPath: string, store?: C
 
 /** Thrown by the per-turn silence watchdog so runTurn can reap the hung subprocess before rethrowing. */
 class TurnTimeoutError extends Error {}
+
+/**
+ * How long a burst of out-of-turn output may stay silent before it is sealed and decorated.
+ *
+ * A backstop, not the primary signal: a burst normally closes the moment the harness reports its
+ * terminal result (see isResultUsage), and this only covers a harness that stops carrying that
+ * marker. Generous on purpose — a background followup can sit inside one tool call for minutes, and
+ * cutting it early costs an extra message bubble, so the timer errs toward waiting.
+ */
+const FOLLOW_UP_QUIET_MS = 180_000;
+
+/**
+ * Consecutive queue rejections the reader tolerates before standing down, and how long it waits
+ * between them. See the comment in pumpUpdates: a failed prompt rejects once and pumping must go
+ * on, while a closed connection rejects forever — this bounds the spin to ~1s in the second case
+ * without giving up on a session that is merely reporting a per-turn error.
+ */
+const MAX_QUEUE_REJECTIONS = 20;
+const QUEUE_REJECT_BACKOFF_MS = 50;
+
+/**
+ * Extra silence a turn is allowed, as a multiple of `turnTimeoutMs`, while the harness has an
+ * unfinished tool call open.
+ *
+ * Not a fudge factor — it closes a guaranteed collision. The watchdog exists to catch an agent that
+ * is "alive but never sending `stop` nor any update", and a tool call is silent for exactly as long
+ * as it runs, so from outside the two are indistinguishable. Claude Code's own Bash tool allows up
+ * to 600000ms (its documented maximum), which is *precisely* the default `turnTimeoutMs` — so a
+ * tool call at the limit the harness itself permits was certain to trip a watchdog aimed at hangs,
+ * and the turn failed with "sent no update for 600000ms" while the script was still running fine.
+ * `turnTimeoutMs` is frozen in EXPERIENCE and not reachable from config.yaml, so an operator could
+ * not raise it out of the way either.
+ *
+ * Granted ONCE per stretch of silence, so the ceiling stays finite: 30 minutes at the default. Long
+ * enough for anything the harness will run in the foreground, short enough that a genuinely wedged
+ * tool still fails rather than pinning the conversation in `running` forever. Work that outlives
+ * even that belongs in the background, which is now forwarded properly (see FollowUpSink).
+ */
+export const TOOL_SILENCE_FACTOR = 2;
+
+/**
+ * Grace period after the harness reports a completed result before a burst of out-of-turn output
+ * is sealed and decorated.
+ *
+ * Not zero, because the "a result finished" marker is weaker than it looks — see the note at its
+ * use in pumpUpdates. Short enough that a background report is not visibly late (in the default
+ * `once` delivery mode nothing is sent until the buffer completes, so this IS the latency), long
+ * enough that a harness reporting cost on every snapshot does not fragment one report into many.
+ */
+const FOLLOW_UP_SEAL_GRACE_MS = 1_500;
+
+/**
+ * Whether a `usage_update` is the one the harness emits with a completed result, as opposed to a
+ * mid-stream snapshot — i.e. "a piece of work just finished here".
+ *
+ * Read off `cost`, which is part of the ACP UsageUpdate schema rather than a private extension.
+ * Verified against claude-agent-acp 0.58.1 (2026-09): the mid-stream send passes `{used, size}`
+ * only, while the send tied to the SDK's `result` message always adds
+ * `cost: {amount: total_cost_usd, currency: 'USD'}`. Hyrum's Law applies — a harness that started
+ * reporting cumulative cost mid-stream would end follow-up bursts early, which costs an extra
+ * message bubble and loses nothing (the quiet backstop and the next burst both still work).
+ */
+export function isResultUsage(update: SessionUpdate): boolean {
+  return update.sessionUpdate === 'usage_update' && update.cost != null;
+}
 
 /**
  * Pull the live model's display name out of an ACP `configOptions` list (as returned by session/new
@@ -396,6 +462,41 @@ function createAcpSession(
   let conn: ClientConnection | undefined;
   let active: ActiveSession | undefined;
   /**
+   * The single reader of `active`'s update queue, for as long as the child lives (see pumpUpdates).
+   * Held only so `resetHandles` can forget it; nothing ever awaits it.
+   */
+  let pump: Promise<void> | undefined;
+  /**
+   * The running turn's translation state, or undefined between turns. The pump routes each update
+   * here while a turn is in flight and to the follow-up sink otherwise — that switch IS the fix for
+   * dropped background output (see FollowUpSink).
+   */
+  let turnState: TurnState | undefined;
+  /**
+   * Called by the pump after every update it hands to the running turn, to re-arm the silence
+   * watchdog. Undefined between turns (nothing is being timed).
+   */
+  let onTurnUpdate: (() => void) | undefined;
+  /**
+   * Ends the running turn's wait, because the harness's prompt settled (queue `stop`) or the queue
+   * rejected. Undefined between turns.
+   */
+  let endTurnWait: (() => void) | undefined;
+  /** Where out-of-turn output goes; installed by TurnRunner at the top of every turn. */
+  let followUpSink: FollowUpSink | undefined;
+  /**
+   * The burst of out-of-turn output currently being rendered, together with the sink that opened
+   * it. Paired deliberately: TurnRunner installs a FRESH sink at the top of every turn, so closing
+   * through `followUpSink` could hand the close to a sink that knows nothing about this burst,
+   * leaving the previous one's text unflushed — which in the default `once` delivery mode means
+   * never sent at all.
+   */
+  let followUpState: { state: TurnState; sink: FollowUpSink } | undefined;
+  /** Cancels the follow-up quiet backstop (see FOLLOW_UP_QUIET_MS). */
+  let cancelFollowUpQuiet: (() => void) | undefined;
+  /** Whether the current burst has already said so in the log (see followUp). */
+  let burstAnnounced = false;
+  /**
    * Startup currently in flight, shared by concurrent callers so only one child is ever spawned
    * per session (see ensureStarted). Undefined whenever no startup is running.
    */
@@ -404,6 +505,36 @@ function createAcpSession(
   let hintInjected = false;
   /** Intentional-abort flag: set by abort(); used to return silently when prompt ends as cancelled. */
   let aborting = false;
+  /**
+   * Tool ids that were still open when the last cancel landed.
+   *
+   * A cancelled tool call still emits its `tool_call_update`, and it arrives AFTER the prompt has
+   * settled — so it would either open a "background update" bubble for the tool the user just
+   * stopped, or (on the `interruptOnNewMessage` path, where the continuing batch starts a turn
+   * within milliseconds) be rendered into the NEXT turn's reply. The deleted pre-prompt drain
+   * described exactly this and cleared the queue to prevent it.
+   *
+   * Answered by identity rather than by a time window, which is what makes it exact: no wreckage
+   * escapes by arriving late, and genuine background work reporting in seconds after a `/stop` is
+   * not collateral damage. Replaced (not accumulated) at each cancel, and deliberately NOT cleared
+   * when a turn starts — that is the moment the wreckage is most likely still in flight, and a tool
+   * id is never reused, so a stale entry can only ever match the update it was recorded for.
+   */
+  let cancelledTools = new Set<string>();
+  /**
+   * Whether this child has yet been asked to do anything.
+   *
+   * `session/load` replays the stored session's history as ordinary `session/update` notifications
+   * (the resumed session is attached BEFORE the request precisely so they land in this queue), and
+   * the pre-prompt drain used to discard them — "history must not re-render to the IM". With a
+   * permanent reader and a follow-up sink installed, that replay would instead be posted to the
+   * chat as a background update: every daemon restart would re-narrate the previous conversation.
+   *
+   * Nothing legitimate can render before the first prompt on a fresh or resumed child, so the flag
+   * is a sound gate: until one is sent, renderable updates are dropped and only reported facts
+   * (the command list, the model, the title) are kept.
+   */
+  let promptedYet = false;
   /**
    * Whether the harness said it can reload a stored session (initialize → `agentCapabilities.
    * loadSession`). Read once per child and NOT cleared by resetHandles: it describes the harness
@@ -447,6 +578,17 @@ function createAcpSession(
     proc = undefined;
     conn = undefined;
     active = undefined;
+    // The pump belongs to the queue of the session that just went away; the next spawn starts its
+    // own. Its loop notices `active` changed under it and returns.
+    pump = undefined;
+    // Whatever background output was mid-render died with the child, so finalize it rather than
+    // leaving a half-streamed message open forever. Not awaited here — resetHandles is called from
+    // synchronous teardown paths (the child's 'exit' callback), and the flush targets the chat
+    // platform, which does not care that the child is gone.
+    void closeFollowUp();
+    // A rebuilt child starts from nothing again: its `session/load` replay must not be rendered
+    // (see promptedYet).
+    promptedYet = false;
     // The next child re-reports its own model; keeping a stale name would misattribute the footer
     // if the rebuilt session resolves a different one.
     liveModel = undefined;
@@ -470,13 +612,32 @@ function createAcpSession(
    * process already exited, handles were reset by 'exit', and resetting again here is idempotent.
    */
   function dispose(): void {
+    // Only the EXPLICIT path claims the abort: it means "this teardown was asked for, so a turn
+    // ending because of it is not an error". teardown() deliberately does not, so a session
+    // dropped because its queue died still reports the real reason to the user.
     aborting = true;
+    teardown();
+  }
+
+  /**
+   * Drop the connection and the child, leaving the session rebuildable.
+   *
+   * Split out of `dispose` for the pump's stand-down: when the update queue has failed there is
+   * nothing left to read, and leaving `active` set would present a session that looks ready but
+   * can never deliver a `stop` — every later turn would wait out the full silence watchdog, or
+   * hang forever with `turnTimeoutMs: 0`. Dropping the handles instead sends the next turn down
+   * the crash-self-healing path, which is the honest outcome.
+   *
+   * A short delayed SIGKILL backs up SIGTERM (best-effort, non-blocking); if the process already
+   * exited, handles were reset by 'exit', and resetting again here is idempotent.
+   */
+  function teardown(): void {
     const child = proc; // capture the process to kill (the 'exit' callback compares by reference)
     try {
       active?.dispose();
       conn?.close();
     } catch (e) {
-      console.debug('[acp] dispose: ignoring error while closing connection:', e instanceof Error ? e.message : e);
+      console.debug('[acp] teardown: ignoring error while closing connection:', e instanceof Error ? e.message : e);
     }
     if (child) killChildProcess(child);
     resetHandles();
@@ -664,6 +825,272 @@ function createAcpSession(
     } finally {
       if (timer) clearTimeout(timer);
     }
+
+    // The session is up: start reading its updates NOW rather than when the first turn does, so
+    // nothing that arrives before or between turns is missed (see pumpUpdates).
+    beginPump();
+  }
+
+  /**
+   * Build the translation state one stream of updates renders through.
+   *
+   * Shared by the running turn and the follow-up burst so both get the same tool ledger, the same
+   * `configOptions` write-back and the same context-window override — an out-of-turn reply that
+   * rendered tools differently from an in-turn one would be a bug nobody would think to look for.
+   */
+  function newTranslationState(handlers: AgentStreamHandlers): TurnState {
+    return {
+      handlers,
+      lastSegment: 'none',
+      toolLedger: new Map(),
+      toolIndexSeq: 0,
+      // Keep the session's own view of the selector current when the harness changes it, so a
+      // later /model reflects reality rather than what session/new happened to report.
+      onConfigOptions: (options) => {
+        if (!options) return;
+        liveConfigOptions = options;
+        liveModel = liveModelName(options) ?? liveModel;
+      },
+      // Local override for a harness that under-reports the window (e.g. claude-opus-5 → 200k fallback).
+      contextWindow: def.contextWindow,
+    };
+  }
+
+  /**
+   * The translation state for out-of-turn output, opening a burst if one isn't already running.
+   *
+   * Returns undefined only when no sink is installed — a session driven by something other than
+   * TurnRunner (the doctor check, a test) has nowhere to put background output, and dropping it is
+   * then the honest outcome.
+   */
+  function followUp(renderable: boolean): TurnState | undefined {
+    if (!followUpSink) return undefined;
+    followUpState ??= { state: newTranslationState(followUpSink.handlers()), sink: followUpSink };
+    // Only OUTPUT starts a burst. Metadata gets the same translation state (it has to go
+    // somewhere) but neither announces itself nor arms a timer, because claude-agent-acp sends a
+    // `session_info_update` after every single turn: logging "rendering a follow-up" there would
+    // make the one line that tells an operator background work is happening indistinguishable
+    // from per-turn noise, and would leave every idle conversation holding a 3-minute timer.
+    if (!renderable) return followUpState.state;
+    if (!burstAnnounced) {
+      burstAnnounced = true;
+      console.log(`[acp] ${conversationId}: output arrived outside a turn; rendering it as a follow-up`);
+    }
+    // Re-armed on every update, so the backstop measures SILENCE rather than burst length: a
+    // background followup can spend minutes inside one tool call and must not be cut short for it.
+    armFollowUpQuiet(FOLLOW_UP_QUIET_MS);
+    return followUpState.state;
+  }
+
+  /**
+   * Whether an update can put something on screen, as opposed to reporting a fact the gateway
+   * records and displays elsewhere (the topic name, `/context`, the footer, the slash menu).
+   *
+   * The distinction carries three separate rules — the replay gate, the cancel-wreckage filter and
+   * whether a burst has begun — so it is named once rather than spelled out three times.
+   */
+  function isRenderableUpdate(update: SessionUpdate): boolean {
+    switch (update.sessionUpdate) {
+      case 'agent_message_chunk':
+      case 'tool_call':
+      case 'tool_call_update':
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  /** (Re)arm the timer that seals the current burst after `ms` of silence. */
+  function armFollowUpQuiet(ms: number): void {
+    cancelFollowUpQuiet?.();
+    const timer = setTimeout(() => {
+      console.log(`[acp] ${conversationId}: follow-up output went quiet; closing it`);
+      void closeFollowUp();
+    }, ms);
+    cancelFollowUpQuiet = () => clearTimeout(timer);
+  }
+
+  /**
+   * Whether a renderable update is a cancelled turn's trailing write rather than real output.
+   *
+   * A cancelled tool call still emits its `tool_call_update`, and it lands AFTER the prompt has
+   * settled — so it would either open a "background update" message containing a bubble for the
+   * very tool the user just stopped, or (on the `interruptOnNewMessage` path, where the continuing
+   * batch starts a turn within milliseconds) be rendered into the NEXT turn's reply. The deleted
+   * pre-prompt drain named exactly this case and cleared the queue to prevent it.
+   *
+   * Two tests, because the cancel and the next turn race:
+   *
+   * - while `aborting` still stands — i.e. between the cancel and the next turn — anything
+   *   tool-shaped is the cancelled turn's tail. The agent has been told to stop, so it is not
+   *   starting new tool calls; this is the old drain's rule, stated positively.
+   * - once a new turn has cleared `aborting`, the ids the cancel snapshotted still identify the
+   *   wreckage. Ids are never reused, so a stale entry can only match the update it was recorded
+   *   for — which is why the set is not cleared at turn start, the very moment the trailing write
+   *   is most likely still in flight.
+   */
+  function isWreckage(update: SessionUpdate): boolean {
+    if (update.sessionUpdate !== 'tool_call' && update.sessionUpdate !== 'tool_call_update') return false;
+    if (aborting) return true;
+    return typeof update.toolCallId === 'string' && cancelledTools.has(update.toolCallId);
+  }
+
+  /**
+   * Finish the current burst of out-of-turn output: close any tool bubbles it left open and let the
+   * sink flush and decorate the message. Idempotent — every path that could end a burst calls it.
+   */
+  async function closeFollowUp(): Promise<void> {
+    cancelFollowUpQuiet?.();
+    cancelFollowUpQuiet = undefined;
+    const burst = followUpState;
+    followUpState = undefined;
+    burstAnnounced = false;
+    if (!burst) return;
+    flushPendingTools(burst.state);
+    try {
+      // Awaited so a caller that is about to write to the same lane can order itself behind the
+      // flush; the pump's own closes have nothing to race and simply `void` it.
+      await burst.sink.close();
+    } catch (e) {
+      console.error('[acp] follow-up sink failed to close:', e instanceof Error ? e.message : e);
+    }
+  }
+
+  /**
+   * The one and only reader of a session's update queue, running from the moment the session is up
+   * until its child goes away.
+   *
+   * ── Why a pump rather than a read loop inside runTurn ──────────────────────────────────────────
+   * Two reasons, and the second is what forced it.
+   *
+   * 1. Updates that arrive with no prompt in flight have to be read, or they are lost.
+   *    claude-agent-acp settles the prompt at its terminal `result` and keeps emitting notifications
+   *    for background work afterwards (see FollowUpSink) — a loop that returns at `stop` reads none
+   *    of them, which is the reported bug: the chat went silent after "I've started it in the
+   *    background".
+   * 2. There can only be ONE reader, ever. The SDK's AsyncQueue.next() pushes a waiter when the
+   *    queue is empty (0.29.0 dist/acp.js AsyncQueue.next), and an abandoned waiter still consumes
+   *    the next value that arrives. So "drain between turns, then hand the queue back" cannot be
+   *    written safely: whichever reader was waiting when the next turn began would swallow that
+   *    turn's first update. Making the reader permanent and switching its DESTINATION instead
+   *    removes the handover entirely.
+   *
+   * This also retires the old pre-prompt residue drain: nothing accumulates in the queue any more,
+   * and a `session_info_update` that used to be salvaged a whole turn late (it lands behind the
+   * `stop` that ended the loop) now reaches the gateway when it arrives.
+   */
+  async function pumpUpdates(session: ActiveSession): Promise<void> {
+    // Consecutive rejections with no value in between. The queue rejects for two very different
+    // reasons and only this tells them apart: a prompt that failed rejects ONCE (the turn learns
+    // the reason from its own promptDone, and pumping must continue for the session to survive),
+    // while a closed connection FAILS the queue permanently, so every later read rejects with the
+    // same error and an unguarded loop would spin the event loop on it.
+    let rejections = 0;
+    for (;;) {
+      // Checked before AND after the await, because the await is unbounded: `resetHandles` can
+      // swap `active` while this read is parked, and `turnState` / `endTurnWait` are session-wide,
+      // so a value from a replaced child would otherwise end (or be rendered into) the turn of a
+      // freshly spawned one. The old per-turn waiter could not do this — it died with its turn.
+      if (active !== session) return;
+      let msg: Awaited<ReturnType<ActiveSession['nextUpdate']>>;
+      try {
+        msg = await session.nextUpdate();
+        rejections = 0;
+      } catch (e) {
+        if (active !== session) return;
+        // Wake the turn — it rethrows through promptDone, which carries the real reason.
+        endTurnWait?.();
+        if (++rejections > MAX_QUEUE_REJECTIONS) {
+          // Standing down would leave the session with no reader while still looking ready
+          // (`active` set, `pump` settled), so every later turn would wait on a `stop` that can
+          // never come. Drop the handles instead: the next turn rebuilds the child, which is the
+          // same self-healing path a crash takes.
+          console.warn(
+            `[acp] update queue for "${def.id}" keeps rejecting (${e instanceof Error ? e.message : e}); dropping the connection so the next turn rebuilds it`
+          );
+          teardown();
+          return;
+        }
+        await new Promise((r) => setTimeout(r, QUEUE_REJECT_BACKOFF_MS));
+        continue;
+      }
+      if (active !== session) return;
+
+      if (msg.kind === 'stop') {
+        endTurnWait?.();
+        continue;
+      }
+
+      const update = msg.update;
+      const renderable = isRenderableUpdate(update);
+
+      // A cancelled tool's trailing update is wreckage, not output. Checked whether or not a turn
+      // is running: on the `interruptOnNewMessage` path the next turn is already under way by the
+      // time it arrives (see isWreckage).
+      if (renderable && isWreckage(update)) {
+        console.debug(`[acp] ${conversationId}: dropping a trailing update for a tool the cancel killed`);
+        continue;
+      }
+
+      // `session/load`'s replayed history, or anything else a child emits before it is asked to do
+      // something. Reported facts still pass — only rendering is suppressed (see promptedYet).
+      if (renderable && !promptedYet) {
+        console.debug(`[acp] ${conversationId}: not rendering a ${update.sessionUpdate} from before the first prompt`);
+        continue;
+      }
+
+      const dest = turnState ?? followUp(renderable);
+      if (!dest) {
+        // Only reachable for a session nothing is driving: `ensureSession` (the `/model` warm-up)
+        // and the doctor check both start a child with no turn and no sink. Logged because a
+        // dropped update is exactly the class of thing that must never be silent.
+        console.debug(
+          `[acp] ${conversationId}: dropping a ${update.sessionUpdate} — no turn is running and no follow-up sink is installed`
+        );
+        continue;
+      }
+
+      try {
+        translateUpdate(update, dest);
+      } catch (err) {
+        // Never let one malformed notification kill the reader. This is the session's ONLY reader,
+        // so an escaping throw would leave the child permanently deaf: the in-flight turn would
+        // wait for a `stop` nobody will deliver, and every later update would go unread. Under the
+        // old per-turn loop the same throw merely failed that turn.
+        console.error(
+          `[acp] ${conversationId}: failed to render a ${update.sessionUpdate}:`,
+          err instanceof Error ? err.stack ?? err.message : err
+        );
+        continue;
+      }
+
+      if (turnState) {
+        onTurnUpdate?.(); // the turn is alive: re-arm its silence watchdog
+        continue;
+      }
+      // A result-tied `usage_update` says a piece of work finished, so it is the cue to seal the
+      // burst — which matters because in the default `once` delivery mode NOTHING is sent until
+      // the buffer completes, and the alternative cue is minutes of quiet.
+      //
+      // It SHORTENS the timer rather than closing outright, because the marker is weaker than it
+      // looks: the ACP schema documents `cost` as "Cumulative session cost (optional)", so a
+      // harness is entitled to report it on every snapshot, and closing synchronously would then
+      // cut one background report into a message per snapshot — each with its own marker bubble
+      // and footer. A grace window degrades to the right answer either way: more output re-arms
+      // the full quiet window, silence seals.
+      if (isResultUsage(update)) armFollowUpQuiet(FOLLOW_UP_SEAL_GRACE_MS);
+    }
+  }
+
+  /** Start the queue reader once the session is up. Idempotent (one pump per child). */
+  function beginPump(): void {
+    if (!active || pump) return;
+    const session = active;
+    pump = pumpUpdates(session).catch((e) => {
+      // pumpUpdates absorbs its own errors; this is the last resort, so a bug in it can never
+      // surface as an unhandled rejection that takes the daemon down.
+      console.error('[acp] update reader stopped unexpectedly:', e instanceof Error ? e.stack ?? e.message : e);
+    });
   }
 
   return {
@@ -680,21 +1107,14 @@ function createAcpSession(
       const hint = hintInjected || isCommand ? '' : buildReverseHint();
       if (!isCommand) hintInjected = true;
 
-      const state: TurnState = {
-        handlers,
-        lastSegment: 'none',
-        toolLedger: new Map(),
-        toolIndexSeq: 0,
-        // Keep the session's own view of the selector current when the harness changes it, so a
-        // later /model reflects reality rather than what session/new happened to report.
-        onConfigOptions: (options) => {
-          if (!options) return;
-          liveConfigOptions = options;
-          liveModel = liveModelName(options) ?? liveModel;
-        },
-        // Local override for a harness that under-reports the window (e.g. claude-opus-5 → 200k fallback).
-        contextWindow: def.contextWindow,
-      };
+      // Whatever background output was still rendering belongs to the previous exchange. AWAITED,
+      // not fired and forgotten: in the default `once` delivery mode the burst's whole body is
+      // sent by this call, and the new turn is about to start sending through a different buffer —
+      // unordered, they would interleave and the background report would appear underneath an
+      // answer it has nothing to do with.
+      await closeFollowUp();
+
+      const state = newTranslationState(handlers);
 
       // Report the live model up front, from the session/new response captured at startup. Doing it
       // here rather than inside ensureStarted keeps it per-turn: handlers belong to this turn, and a
@@ -702,71 +1122,112 @@ function createAcpSession(
       // config_option_update supersedes this if the model changes mid-session.
       if (liveModel) handlers.onModel?.(liveModel);
 
-      // The SDK updates queue is bound to the whole session, not cleared per turn (prompt() only
-      // clearErrors, keeping values). After last turn's cancel, the agent may still emit a late
-      // tool_call_update that lingers and bleeds into this turn's first nextUpdate → misplaced tool
-      // bubble. So non-blocking drain once before prompt: discard only what's already in the queue now.
-      // Must drain before prompt(): this turn's prompt isn't sent yet, so any value in the queue must be
-      // residual from the previous turn — no risk of eating this turn's updates.
-      //
-      // The drain also SALVAGES a session title out of the residue, because the previous turn's
-      // `session_info_update` is queued behind its `stop` and has no other way out (see the note on
-      // drainResidualUpdates). Reported on this turn's handlers, since the previous turn's are gone.
-      const salvagedTitle = drainResidualUpdates(active!);
-      if (salvagedTitle) handlers.onTitle?.(salvagedTitle);
-
-      // Per-iteration silence watchdog. turnTimeoutMs<=0 disables it (plain nextUpdate). Otherwise
-      // race against a timer; the timer is created and cleared per call, so it measures the gap
-      // since the last update, not cumulative turn time.
-      const nextUpdateWithTimeout = async (): ReturnType<NonNullable<typeof active>['nextUpdate']> => {
-        if (turnTimeoutMs <= 0) return active!.nextUpdate();
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        try {
-          return await Promise.race([
-            active!.nextUpdate(),
-            new Promise<never>((_, reject) => {
-              timer = setTimeout(
-                () =>
-                  reject(
-                    new TurnTimeoutError(
-                      `agent "${def.id}" sent no update for ${turnTimeoutMs}ms; treating it as hung and aborting this turn (raise session.turnTimeoutMs, or set 0 to disable)`
-                    )
-                  ),
-                turnTimeoutMs
-              );
-            }),
-          ]);
-        } finally {
-          if (timer) clearTimeout(timer);
+      // Silence watchdog: one timer, re-armed by the pump on every update it hands to this turn, so
+      // it bounds SILENCE rather than turn length. A hung agent — alive but never sending `stop` nor
+      // any update — would otherwise leave this turn waiting forever, pinning the conversation in
+      // `running` and unreclaimable.
+      let hung: ((err: Error) => void) | undefined;
+      let watchdog: ReturnType<typeof setTimeout> | undefined;
+      /** Whether this stretch of silence has already been forgiven for a running tool. */
+      let toolGraceUsed = false;
+      const arm = (ms: number): void => {
+        if (watchdog) clearTimeout(watchdog);
+        watchdog = setTimeout(() => onSilence(ms), ms);
+      };
+      const onSilence = (waited: number): void => {
+        // Silence with a tool call still open is not a hung agent, it is a script running — and
+        // the harness's own tool limit reaches exactly this deadline, so the collision was
+        // guaranteed rather than unlucky (see TOOL_SILENCE_FACTOR).
+        if (!toolGraceUsed && hasOpenToolCall(state)) {
+          toolGraceUsed = true;
+          const extra = turnTimeoutMs * TOOL_SILENCE_FACTOR;
+          console.log(
+            `[acp] ${conversationId}: quiet for ${waited}ms but a tool call is still open; allowing it ${extra}ms more`
+          );
+          arm(extra);
+          return;
         }
+        hung?.(
+          new TurnTimeoutError(
+            `agent "${def.id}" sent no update for ${waited}ms${
+              toolGraceUsed ? ' with a tool call still open' : ''
+            }; treating it as hung and aborting this turn`
+          )
+        );
+      };
+      const rearmWatchdog = (): void => {
+        if (turnTimeoutMs <= 0) return; // 0 disables the watchdog entirely
+        toolGraceUsed = false; // the agent spoke: this is a fresh stretch of silence
+        arm(turnTimeoutMs);
       };
 
-      // ActiveSession.prompt resolves at turn end and enqueues 'stop'; meanwhile iterate nextUpdate for streaming updates.
-      const promptDone = active!.prompt(decorate(input, hint));
+      // The pump routes updates here for as long as this is set, and calls the two callbacks to
+      // re-arm the watchdog and to end the wait below. All three are cleared in `finally`, so a late
+      // `stop` or a stray update can never bleed into the next turn.
+      turnState = state;
+      onTurnUpdate = rearmWatchdog;
+      const settled = new Promise<void>((resolve) => {
+        endTurnWait = resolve;
+      });
+      const timedOut = new Promise<never>((_, reject) => {
+        hung = reject;
+      });
+      rearmWatchdog();
+
       try {
-        for (;;) {
-          // Silence watchdog: race nextUpdate() against a per-iteration timer that resets every
-          // update (so it bounds silence, not turn length). A hung agent — alive but never sending
-          // `stop` nor any update — would otherwise leave this loop awaiting forever, pinning the
-          // session in `running` and unreclaimable. On timeout we throw TurnTimeoutError; the catch
-          // disposes the subprocess so the loser nextUpdate() waiter lands on a dead queue (safe).
-          const msg = await nextUpdateWithTimeout();
-          if (msg.kind === 'stop') break;
-          translateUpdate(msg.update, state);
-        }
+        // ActiveSession.prompt resolves at turn end and enqueues 'stop'; the pump reads the stream.
+        // Inside the try so a synchronous throw (a closed stream) still runs the cleanup below.
+        promptedYet = true; // from here on, renderable output is this session's own (see promptedYet)
+        const promptDone = active!.prompt(decorate(input, hint));
+        // Pre-attach a no-op rejection handler: when the watchdog wins the race we rethrow without
+        // awaiting the prompt, and a rejection nobody is listening for would surface as an
+        // unhandled rejection. `await promptDone` below still rethrows — a promise can have more
+        // than one handler.
+        void promptDone.catch(() => {});
+        // Success is waited on via the QUEUE's `stop`, not via promptDone: the harness emits its
+        // last updates (the final usage snapshot among them) before the prompt settles, and the
+        // pump delivers them in order, so `stop` is the only signal meaning "this turn's output
+        // has all been rendered". promptDone alone would finish the turn with renders still queued.
+        //
+        // FAILURE, though, has to be waited on directly, because a failed prompt produces no
+        // `stop` — and `AsyncQueue.reject` is a no-op once the queue has terminally failed, so on
+        // a dead connection nothing would ever wake this turn. It then hung out the full silence
+        // watchdog and blamed the agent for "sending no update", or with `turnTimeoutMs: 0` hung
+        // forever, pinning the conversation in `running`. So: a promise that rejects with the
+        // prompt's error and never resolves on success (that half is `settled`'s job).
+        const promptFailed = promptDone.then(() => new Promise<never>(() => {}));
+        await Promise.race([settled, timedOut, promptFailed]);
         await promptDone; // already resolved at stop; here only settles / rethrows an in-turn error
         flushPendingTools(state);
       } catch (err) {
         if (aborting) return; // intentional abort is not an error
         // A hung-agent timeout: reap the subprocess so the next turn rebuilds a fresh connection
-        // (otherwise the lingering nextUpdate waiter on the live queue would steal a future update).
+        // (and so the pump, which is waiting on this queue, lands on a dead one and stands down).
         if (err instanceof TurnTimeoutError) dispose();
         throw err;
+      } finally {
+        if (watchdog) clearTimeout(watchdog);
+        turnState = undefined;
+        onTurnUpdate = undefined;
+        endTurnWait = undefined;
       }
+    },
+
+    setFollowUpSink(sink: FollowUpSink): void {
+      // Deliberately does NOT close a burst still rendering through the outgoing sink. Two
+      // reasons: the close has to be AWAITED to stay ordered against the reply that is about to be
+      // written into the same lane (runTurn does that), and a burst carries the sink that opened
+      // it (see followUpState), so swapping cannot orphan one.
+      followUpSink = sink;
     },
 
     abort(): void {
       aborting = true;
+      // The tools this turn had open are the ones whose trailing updates are wreckage once a NEW
+      // turn has cleared `aborting` (see isWreckage). Read off the live turn's ledger, which is
+      // why that is a session-level variable. Empty when the cancel beats the harness's first
+      // tool_call — the `aborting` half of isWreckage covers that window.
+      cancelledTools = new Set(turnState?.toolLedger.keys() ?? []);
       if (conn && active) void conn.agent.notify('session/cancel', { sessionId: active.sessionId });
     },
 
@@ -838,52 +1299,6 @@ function createAcpSession(
       dispose();
     },
   };
-}
-
-/**
- * Non-blocking drain of last-turn residue from the SDK updates queue, before this turn's prompt.
- *
- * Can't probe with `nextUpdate()`: the SDK's AsyncQueue.next() pushes a waiter when the queue is empty
- * (0.29.0 dist/acp.js AsyncQueue.next); if Promise.race loses, that waiter lingers and steals this turn's
- * real first update — eating content. The SDK exposes no peek/poll either. So synchronously read the
- * queue's internal `values` array (ActiveSession's private `updates`): only items already in the queue
- * now are visible (pure sync, no await, can't see this turn's not-yet-sent prompt update), and clearing
- * the array in place is safe — no waiter side effect, no risk of eating updates.
- *
- * The internal field is a best-effort fallback: if absent (SDK rename), skip — correctness unaffected (at worst an occasional misplaced bubble).
- *
- * Returns the last session title found in the residue, if any. That is not a nicety: it is the ONLY
- * way the title ever arrives. claude-agent-acp sends `session_info_update` from its turn-end idle
- * handler, which runs after the code that settles the prompt — so the notification lands in this
- * queue BEHIND the `stop` message that ended the read loop, and the loop has already returned. Left
- * to itself the next turn would discard it here, unread, forever. The observed symptom was a log
- * line reading "dropped 1 residual update(s)" after every single turn.
- *
- * One turn late by construction, and that is fine: the harness generates the title in a background
- * task, so it describes the turn before this one either way.
- */
-export function drainResidualUpdates(session: ActiveSession): string | undefined {
-  const q = (session as unknown as { updates?: { values?: unknown[] } }).updates;
-  const values = q?.values;
-  if (!Array.isArray(values) || values.length === 0) return undefined;
-  const n = values.length;
-  let title: string | undefined;
-  for (const item of values) {
-    // The queue holds the SDK's own wrapper objects, whose shape is not part of the public API —
-    // hence the defensive walk rather than a cast. Anything that does not look like a title is
-    // simply not one; this must never throw on the way into a turn.
-    const update = (item as { update?: { sessionUpdate?: unknown; title?: unknown } } | undefined)?.update;
-    if (update?.sessionUpdate !== 'session_info_update') continue;
-    if (typeof update.title !== 'string') continue;
-    const trimmed = update.title.trim();
-    if (trimmed) title = trimmed; // last one wins: later notifications supersede earlier ones
-  }
-  values.length = 0; // clear residue in place (values and residual errors dropped, consistent with prompt()'s clearErrors)
-  console.debug(
-    `[acp] drain: dropped ${n} residual update(s) from the previous turn` +
-      (title ? ` (salvaged session title "${title}")` : '')
-  );
-  return title;
 }
 
 /**
@@ -1117,6 +1532,20 @@ function finishTool(st: TurnState, id: string, ok: boolean): void {
     ok,
     durationMs: nowMs() - rec.startAt,
   });
+}
+
+/**
+ * Whether the harness has a tool call open — rendered as started, not yet reported terminal.
+ *
+ * The silence watchdog's one piece of evidence that a quiet turn is working rather than wedged.
+ * Reads the same ledger flushPendingTools closes out, so "open" means exactly what the tool bubbles
+ * on screen mean.
+ */
+function hasOpenToolCall(st: TurnState): boolean {
+  for (const rec of st.toolLedger.values()) {
+    if (rec.started && !rec.finished) return true;
+  }
+  return false;
 }
 
 /** Turn end: started-but-unfinished close as success; has-params-but-not-started get start+finish; pure pending shells (never ran) skipped. */

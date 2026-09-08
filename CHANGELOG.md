@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-08
+
 ### Added
 
 - **A conversation's topic takes the name the agent gave it.** A Telegram forum topic keeps whatever

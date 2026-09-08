@@ -75,6 +75,19 @@ export interface TurnRunnerDeps {
    * both of which live in the registry. Never awaited by the turn — see the onTitle callback.
    */
   recordTitle?(id: ConversationId, title: string): Promise<void>;
+  /**
+   * A name for this conversation derived from what the USER said, offered after a turn in case the
+   * harness never names it itself.
+   *
+   * Needed because `recordTitle` only ever fires for harnesses that emit ACP `session_info_update`.
+   * Verified on the deployed set: `claude` sends it, opencode carries the variant in its schema but
+   * never emits one, dsh does not have it, and the agy protocol has no notion of a title at all —
+   * so three of four agents would leave every topic with its creation-time name forever.
+   *
+   * The registry decides whether to use it (only when nothing has named the conversation yet), so
+   * a real harness title always wins and this never overwrites one.
+   */
+  suggestTitle?(id: ConversationId, seed: string): void;
 }
 
 /**
@@ -249,6 +262,12 @@ export class TurnRunner {
         // only here (not in `finally`) so an interrupted or failed turn doesn't claim the harness
         // stayed silent — see recordTurnComplete.
         this.deps.recordTurnComplete?.(conversationId);
+        // Offer a name drawn from the user's own words, for the three harnesses out of four that
+        // never send one. Only after a SUCCESSFUL turn — naming a topic after a message that
+        // errored out would label it with the thing that did not happen. The registry ignores this
+        // once anything has named the conversation, so a harness that does report a title is
+        // never overridden by it.
+        if (!isCommandTurn) this.deps.suggestTitle?.(conversationId, this.buildThreadName(batch));
         console.log(`[turn] ${conversationId} turn complete`);
       }
     } catch (err) {

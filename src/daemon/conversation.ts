@@ -110,6 +110,40 @@ const WORKDIR_NAMES = new Set(['cd', 'dir', 'workdir']);
  */
 const TITLE_NAMES = new Set(['title', 'rename', 'topic']);
 
+/**
+ * Shape a lane name: `[<agent>] <subject>`.
+ *
+ * Two problems, one function.
+ *
+ * The tag answers "which agent is this topic": a column of topics all named after their subject
+ * says nothing about who is answering in each, and that is the first thing you need when several
+ * are running at once. It is the agent id (`cc`, `oc`, `dsh`, `agy`) because that is what the user
+ * types to bind one.
+ *
+ * The stripping fixes a leak. mergePrompt prefixes each message with `[<authorName>] ` so an agent
+ * can tell speakers apart in a group batch — and the harness, summarising that text, dutifully
+ * carried the speaker's display name into the title. Observed: a topic renamed to
+ * `[no id] 合并到main并重试` where `no id` is the user's own Telegram name. Leading bracketed groups
+ * are removed repeatedly, which also makes the function idempotent: re-titling an already-tagged
+ * name replaces the tag instead of stacking a second one.
+ *
+ * The risk is a genuine title that opens with a bracket losing it. Accepted: the tag is prepended
+ * either way, so the result stays well-formed, and a harness-written `[…]` at position zero is far
+ * more likely to be this leak than intent.
+ */
+export function formatLaneTitle(agentId: string, raw: string): string {
+  let subject = raw.replace(/\s+/g, ' ').trim();
+  while (subject.startsWith('[')) {
+    const close = subject.indexOf(']');
+    if (close < 0) break;
+    subject = subject.slice(close + 1).trimStart();
+  }
+  // Nothing but brackets: keep the original rather than emit a bare tag, which would name every
+  // such conversation identically.
+  if (!subject) subject = raw.replace(/\s+/g, ' ').trim();
+  return `[${agentId}] ${subject}`.trim();
+}
+
 /** What the merger was doing when `/stop` arrived. */
 type StopOutcome = 'running' | 'collecting' | 'idle';
 
@@ -358,6 +392,7 @@ export class ConversationRegistry {
         // reply inside it continues here instead of starting an empty one (see adoptThread).
         adoptThread: (id, address, platformId) => this.adoptThread(id, address, platformId),
         recordTitle: (id, title) => this.applyConversationTitle(id, title),
+        suggestTitle: (id, seed) => this.seedConversationTitle(id, seed),
       },
       this.hooks
     );
@@ -669,7 +704,17 @@ export class ConversationRegistry {
     }
 
     const agentId = this.boundAgentFor(key, fallbackAgent);
-    const failure = await this.retitleLane(key, agentId, address, platformId, wanted, true);
+    // Tagged like the automatic path, so a hand-named topic still says which agent answers in it —
+    // the tag is the part that has to be uniform to be worth reading down a topic list. Idempotent,
+    // so `/title [cc] foo` does not end up double-tagged.
+    const failure = await this.retitleLane(
+      key,
+      agentId,
+      address,
+      platformId,
+      formatLaneTitle(agentId, wanted),
+      true
+    );
     if (failure) return `Could not rename this topic: ${failure}`;
     return `Renamed this topic to "${wanted}" and pinned it. \`/title auto\` to let the agent name it again.`;
   }
@@ -708,7 +753,42 @@ export class ConversationRegistry {
     const platformId = state.activePlatform ?? state.platform;
     if (this.config.platforms[platformId]?.autoRenameThread === false) return;
     if (this.store?.titlePinned(id)) return;
-    await this.retitleLane(id, state.agentId, state.activeAddress, platformId, title);
+    await this.retitleLane(
+      id,
+      state.agentId,
+      state.activeAddress,
+      platformId,
+      formatLaneTitle(state.agentId, title)
+    );
+  }
+
+  /**
+   * Name a conversation after the user's own words, but only if nothing has named it yet.
+   *
+   * The fallback for the three harnesses out of four that never report a title: opencode carries
+   * the ACP `session_info_update` variant in its schema and does not emit one, dsh lacks it, and
+   * the agy protocol has no title at all. Without this, `/oc`, `/dsh` and `/agy` topics kept their
+   * creation-time name no matter how long they ran — which is exactly what was observed.
+   *
+   * "Only if nothing has named it" is what keeps this subordinate to the real thing. On `claude`
+   * the harness's title usually lands on the second turn, so a topic gets the user's phrasing
+   * immediately and the harness's summary once it exists — two renames on that path, deliberately,
+   * because a correctly-named topic sooner is worth one extra rename.
+   */
+  private seedConversationTitle(id: ConversationId, seed: string): void {
+    const state = this.conversations.get(id);
+    if (!state?.activeAddress || !seed.trim()) return;
+    const platformId = state.activePlatform ?? state.platform;
+    if (this.config.platforms[platformId]?.autoRenameThread === false) return;
+    // Anything already recorded — a harness title, or a pinned `/title` — outranks a guess.
+    if (this.store?.conversationTitle(id) !== undefined) return;
+    void this.retitleLane(
+      id,
+      state.agentId,
+      state.activeAddress,
+      platformId,
+      formatLaneTitle(state.agentId, seed)
+    );
   }
 
   /**

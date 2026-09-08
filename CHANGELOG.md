@@ -5,6 +5,25 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Topic names now start with the agent, and no longer leak the speaker's name.** Two problems
+  reported against 1.3.0's rename. Names are shaped `[<agent>] <subject>` — `[cc]`, `[oc]`, `[dsh]`,
+  `[agy]` — because a column of topics named only after their subject says nothing about who is
+  answering in each, which is the first thing you need when several run at once. And a leading
+  bracketed group is stripped before the tag goes on: `mergePrompt` prefixes every message with
+  `[<authorName>] ` so an agent can tell speakers apart in a group batch, and the harness summarised
+  that into the title, producing topics called `[no id] 合并到main并重试` after the user's own
+  Telegram display name. Stripping repeatedly also makes the shaping idempotent, so re-titling
+  replaces the tag rather than stacking another.
+
+- **`/oc`, `/dsh` and `/agy` topics are named at all.** Only `claude` emits ACP
+  `session_info_update`; opencode carries the variant in its schema and never sends one, dsh lacks
+  it, and the agy protocol has no notion of a title — so three agents out of four kept their
+  creation-time topic name no matter how long they ran. A conversation nothing has named now takes
+  one from the user's own opening message after its first successful turn. Strictly subordinate: a
+  real harness title always overrides it, and it never fires for a slash command or a failed turn.
+
 ## [1.3.0] - 2026-09-08
 
 ### Added

@@ -161,14 +161,14 @@ describe('renaming a topic to the title the agent generated', () => {
     const r = rig({ titlesPerTurn: [['Fix the ask timeout']] });
     await r.send('hello');
     expect(r.renames).toEqual([
-      { address: { channel: '-1001234567890', thread: '99' }, name: 'Fix the ask timeout' },
+      { address: { channel: '-1001234567890', thread: '99' }, name: '[cc] Fix the ask timeout' },
     ]);
   });
 
   it('remembers what it set, so the name survives a daemon restart unchanged', async () => {
     const r = rig({ titlesPerTurn: [['Fix the ask timeout']] });
     await r.send('hello');
-    expect(r.store.conversationTitle(r.key)).toBe('Fix the ask timeout');
+    expect(r.store.conversationTitle(r.key)).toBe('[cc] Fix the ask timeout');
   });
 
   // The harness re-reports its title on many turns, and every rename costs an API call plus a
@@ -185,7 +185,7 @@ describe('renaming a topic to the title the agent generated', () => {
     const r = rig({ titlesPerTurn: [['First guess'], ['Sharper title']] });
     await r.send('one');
     await r.send('two');
-    expect(r.renames.map((x) => x.name)).toEqual(['First guess', 'Sharper title']);
+    expect(r.renames.map((x) => x.name)).toEqual(['[cc] First guess', '[cc] Sharper title']);
   });
 
   // A restart reattaches every conversation it has on disk. Without the persisted title it would
@@ -203,8 +203,8 @@ describe('renaming a topic to the title the agent generated', () => {
   it('takes the last title when a turn reports several', async () => {
     const r = rig({ titlesPerTurn: [['draft', 'revised', 'final']] });
     await r.send('hello');
-    expect(r.renames.map((x) => x.name)).toEqual(['draft', 'revised', 'final']);
-    expect(r.store.conversationTitle(r.key)).toBe('final');
+    expect(r.renames.map((x) => x.name)).toEqual(['[cc] draft', '[cc] revised', '[cc] final']);
+    expect(r.store.conversationTitle(r.key)).toBe('[cc] final');
   });
 });
 
@@ -242,7 +242,7 @@ describe('when it must leave the name alone', () => {
 
     const working = rig({ titlesPerTurn: [['Try one']], storeFile: failing.file });
     await working.send('hello again');
-    expect(working.renames.map((x) => x.name)).toEqual(['Try one']);
+    expect(working.renames.map((x) => x.name)).toEqual(['[cc] Try one']);
   });
 });
 
@@ -250,7 +250,7 @@ describe('/title', () => {
   it('renames on demand and says so', async () => {
     const r = rig();
     await r.send('/title 我自己起的名字');
-    expect(r.renames.map((x) => x.name)).toEqual(['我自己起的名字']);
+    expect(r.renames.map((x) => x.name)).toEqual(['[cc] 我自己起的名字']);
     expect(r.replies().at(-1)).toContain('我自己起的名字');
   });
 
@@ -261,7 +261,7 @@ describe('/title', () => {
     await r.send('hello again'); // the agent reports its title again
     // Without the pin the third entry would be 'Agent title' — an explicit command undone by the
     // next turn, which reads as a broken command whatever the rename policy says.
-    expect(r.renames.map((x) => x.name)).toEqual(['Agent title', 'Mine']);
+    expect(r.renames.map((x) => x.name)).toEqual(['[cc] Agent title', '[cc] Mine']);
     expect(r.store.titlePinned(r.key)).toBe(true);
   });
 
@@ -284,7 +284,7 @@ describe('/title', () => {
     expect(r.store.titlePinned(r.key)).toBe(false);
 
     await r.send('hello'); // the agent now gets to name it
-    expect(r.renames.map((x) => x.name)).toEqual(['Mine', 'Agent title']);
+    expect(r.renames.map((x) => x.name)).toEqual(['[cc] Mine', '[cc] Agent title']);
   });
 
   it('says naming is already automatic when it is', async () => {
@@ -320,5 +320,94 @@ describe('/title', () => {
     const r = rig({ canRename: false });
     await r.send('/title Nope');
     expect(r.replies().at(-1)).toContain('cannot rename');
+  });
+});
+
+/**
+ * The tag, and the leak it hides.
+ *
+ * Reported after the first deployment: topics were being named `[no id] 合并到main并重试`, where
+ * `no id` is the user's OWN Telegram display name. mergePrompt prefixes each message with
+ * `[<authorName>] ` so an agent can tell speakers apart in a group batch, and the harness — asked
+ * to summarise that text — carried the speaker into the title.
+ */
+describe('how a lane name is shaped', () => {
+  it('tags the name with the agent answering in it', async () => {
+    const r = rig({ titlesPerTurn: [['Fix the ask timeout']] });
+    await r.send('hello');
+    expect(r.renames.at(-1)!.name).toBe('[cc] Fix the ask timeout');
+  });
+
+  it('drops the speaker prefix the harness copied out of the prompt', async () => {
+    const r = rig({ titlesPerTurn: [['[no id] 合并到main并重试，刚才网络有问题']] });
+    await r.send('hello');
+    expect(r.renames.at(-1)!.name).toBe('[cc] 合并到main并重试，刚才网络有问题');
+    expect(r.renames.at(-1)!.name).not.toContain('no id');
+  });
+
+  // Otherwise every rename of an already-tagged conversation would stack another tag, and the
+  // dedupe against the stored name would never match.
+  it('replaces its own tag instead of stacking a second one', async () => {
+    const r = rig({ titlesPerTurn: [['[cc] Already tagged']] });
+    await r.send('hello');
+    expect(r.renames.at(-1)!.name).toBe('[cc] Already tagged');
+  });
+
+  it('keeps a bracketed name that has nothing else in it, rather than emitting a bare tag', async () => {
+    const r = rig({ titlesPerTurn: [['[????]']] });
+    await r.send('hello');
+    expect(r.renames.at(-1)!.name).toBe('[cc] [????]');
+  });
+
+  it('tags a name the user typed too, so the column reads uniformly', async () => {
+    const r = rig();
+    await r.send('/title 我自己起的名字');
+    expect(r.renames.at(-1)!.name).toBe('[cc] 我自己起的名字');
+  });
+});
+
+/**
+ * The other half of the report: `/oc` topics were never renamed at all.
+ *
+ * Only `claude` emits ACP `session_info_update`. opencode carries the variant in its schema and
+ * never sends one, dsh lacks it, and the agy protocol has no title — three agents out of four, all
+ * of which kept their topic's creation-time name forever. The fallback names them from what the
+ * user said.
+ */
+describe('agents that never report a title of their own', () => {
+  it('names the topic from the user\'s own words when the harness stays silent', async () => {
+    const r = rig(); // no titlesPerTurn: the agent reports nothing, like opencode
+    await r.send('帮我看看这个报错');
+    expect(r.renames.at(-1)!.name).toBe('[cc] 帮我看看这个报错');
+  });
+
+  it('does not keep re-naming on every later turn', async () => {
+    const r = rig();
+    await r.send('first thing');
+    await r.send('second thing');
+    await r.send('third thing');
+    expect(r.renames).toHaveLength(1);
+    expect(r.renames.at(-1)!.name).toBe('[cc] first thing');
+  });
+
+  // The guess is strictly subordinate: a harness that does name itself must win, or `claude`
+  // conversations would be stuck with their opening line.
+  it('is overridden by a real harness title when one arrives', async () => {
+    const r = rig({ titlesPerTurn: [[], ['The actual subject']] });
+    await r.send('opening line');
+    await r.send('more');
+    expect(r.renames.map((x) => x.name)).toEqual(['[cc] opening line', '[cc] The actual subject']);
+  });
+
+  it('never names a topic after a slash command', async () => {
+    const r = rig();
+    await r.send('/title auto'); // gateway-answered, no turn
+    expect(r.renames).toHaveLength(0);
+  });
+
+  it('respects autoRenameThread being off', async () => {
+    const r = rig({ autoRenameThread: false });
+    await r.send('hello');
+    expect(r.renames).toHaveLength(0);
   });
 });

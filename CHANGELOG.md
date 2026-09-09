@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-09-09
+
 ### Changed
 
 - **A topic takes its name while the turn is still running.** 1.5.0 asked for the name after a

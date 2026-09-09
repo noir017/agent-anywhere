@@ -26,6 +26,7 @@ import TelegramAdapter from '@satorijs/adapter-telegram';
 import type { Bot, Session, Universal } from '@satorijs/core';
 
 import type { ConversationAddress } from '../../core/conversation.js';
+import { collectErrors, RateLimitedError } from '../../core/outbound-errors.js';
 import type { MessageRef, SlashCommandSpec } from '../../types.js';
 import type { PlatformCapabilities } from '../adapter.js';
 import type { PlatformProfile, ResolvedConversation } from '../profile.js';
@@ -400,6 +401,43 @@ export function mapTelegramReactionEmoji(emoji: string): string {
 }
 
 /**
+ * Telegram's 429, as the core understands it.
+ *
+ * Telegram answers a flood with `{ok:false, error_code:429, description:"Too Many Requests: retry
+ * after 229", parameters:{retry_after:229}}`. The structured field is the one you would want — and
+ * it is exactly the one that does not survive.
+ *
+ * HYRUM'S LAW. `@satorijs/adapter-telegram/lib/index.cjs:74-78` (v3.x, read 2026-09-09) rethrows a
+ * BRAND-NEW `Error` with no `cause`:
+ *
+ *   throw new Error(`Telegram API error ${response.data.error_code}. ${response.data.description}`)
+ *
+ * `parameters.retry_after` is discarded there, so the only surviving witness to the number is the
+ * description text Telegram happens to repeat it in. Hence the regex over `.message`, which is
+ * parsing a string no one promised to keep stable. `telegram.contract.test.ts` drives the real
+ * adapter wrapper against Telegram's actual 429 envelope so an upgrade that reformats the message
+ * (or, better, starts preserving the field) fails loudly instead of silently reverting the daemon
+ * to a blind 10 s backoff against a 229 s wait.
+ *
+ * Only 429 maps. A 400 (MESSAGE_TOO_LONG, "chat not found") must pass through untouched: typing a
+ * permanent failure as a rate limit turns a loud one-time error into a silent retry loop.
+ */
+function classifyTelegramError(e: unknown): unknown {
+  for (const err of collectErrors(e)) {
+    const text = err instanceof Error ? err.message : '';
+    if (!/Telegram API error 429\b/.test(text)) continue;
+    // Seconds in the description; absent on the rare 429 that states no wait, which still maps —
+    // "this is a rate limit" is actionable on its own, and the caller falls back to its backoff.
+    const m = /retry after (\d+)/i.exec(text);
+    return new RateLimitedError(text, {
+      retryAfterMs: m ? Number(m[1]) * 1000 : undefined,
+      cause: e,
+    });
+  }
+  return e;
+}
+
+/**
  * Telegram profile instance. Selected by createSatoriAdapter per cfg.platform.type.
  */
 export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig> {
@@ -434,6 +472,8 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
     type: 'telegram',
     satoriPlatform: 'telegram',
     capabilities,
+
+    classifyError: classifyTelegramError,
 
     // Telegram counts the entity-parsed visible text; table→bullets rendering can expand it, so the
     // chunker must measure the rendered visible length, not the raw markdown char count.

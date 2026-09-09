@@ -5,6 +5,66 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Tool progress no longer disappears during a long run of tool calls.** IM platforms cap a
+  message two ways — how long it may be, and how often it may be rewritten. The length half was
+  fixed for the tool bubble in 1.1.1; the rewrite half never was. Under `accumulate` grouping the
+  renderer edited one bubble on every tool start *and* every tool finish, with no throttle and no
+  backoff, and `paint()` rethrew anything that was not a `MessageNotEditableError`. A run of
+  back-to-back tool calls is therefore two writes per tool into one chat: Telegram answered
+  `429 Too Many Requests`, the rethrow was swallowed by the render chain as one
+  `[turn] render side effect failed:` line, and the update was gone for good — nothing re-triggers
+  a paint until the next tool event, so the bubble froze on stale progress. One daemon run logged
+  78 of them, with `retry after` climbing to 229 seconds.
+
+  Painting is now asynchronous and retried. `onToolStart`/`onToolFinish` update the line set and
+  return, off the turn's side-effect chain, so a rate-limited chat can no longer stall the reply
+  behind a progress bubble. Any failure that is not a seal keeps every piece of state and arms a
+  retry, and delivery is tracked by a revision watermark rather than a boolean — a ✓ recorded while
+  a write is in flight was not delivered by that write, and the old flag claimed it was.
+
+- **All outbound writes to one chat now share one budget.** The 429s were never any single
+  writer's fault. `StreamBuffer` throttled itself to ~1 edit/1200 ms, `ToolRenderer` did not
+  throttle at all, and the reactions, acks, menus and the agent's own `agent-anywhere send-message`
+  calls were unmetered by construction — but the platform counts all of them as a single stream per
+  chat, so no writer could see the quantity actually being limited. A new `core/outbound-pacer.ts`
+  (token bucket per chat, one FIFO, in-place coalescing of queued edits) is applied once to every
+  adapter in `Daemon`'s constructor, so all ~38 outbound call sites are metered without touching
+  any of them. Keyed on `platform:channel` and never the thread, because a Telegram forum topic
+  shares its parent chat's flood budget.
+
+  Under congestion the lanes differ: the reply is never dropped however long it waits, a tool
+  bubble may be superseded by a newer paint or dropped once stale, and a typing beat is dropped
+  immediately. A finishing turn stops *waiting* for its bubbles after `outbound.finalizeWaitMs`
+  without cancelling them, so a chat paused for 229 s can no longer hold the turn — and the user's
+  ✅ — open for the same 229 s. `stop()` drains the queue before the adapters go down.
+
+- **A stated `retry_after` is obeyed instead of guessed at.** `stream.maxBackoffMs` defaults to
+  10 s, which is a blind guess about how long a rate limit lasts and was 22× short of the 229 s
+  Telegram actually asked for. Profiles now translate their own failures through a
+  `PlatformProfile.classifyError` seam applied to *every* outbound call, so Telegram's 429 becomes
+  a typed `RateLimitedError` carrying the number and both writers wait exactly that long. The
+  number is recovered by regex over the error message because `@satorijs/adapter-telegram` rethrows
+  a fresh `Error` and discards `parameters.retry_after`; `telegram.contract.test.ts` fails loudly
+  if that format ever changes. Lark's `230072` mapping moves behind the same seam and now covers
+  sends and card patches, not just `editMessage`.
+
+- **A backoff holds back the character threshold too.** `StreamBuffer` gated only its idle timer on
+  the backoff, so a rate-limited stream that kept producing text still retried every
+  `stream.charThreshold` characters — deepening the limit rather than letting it expire.
+
+- **Running the test suite no longer breaks the reverse CLI of the daemon on the same machine.**
+  `ensureReverseCliShim()` derives the shim from `process.argv[1]` — a good clue to "how was I
+  launched", but only when the process really is the CLI. In a vitest worker `argv[1]` is
+  tinypool's worker entry, and the shim is written to `~/.config/agent-anywhere/bin`, a path shared
+  with whatever daemon is running on that machine. So `npm test` repointed the live daemon's shim
+  at a test-runner entry, and because that directory leads every agent's `PATH`, every
+  `send-message` / `ask` / `send-file` from every live conversation began failing instantly with a
+  stack from inside tinypool. The shim is now written only when `argv[1]` is recognisably this CLI
+  (a global-install symlink, `dist/cli.js`, or `src/cli.ts`); anything else leaves the file
+  untouched and falls back to whatever `PATH` already offers.
+
 ## [1.3.1] - 2026-09-08
 
 ### Fixed

@@ -8,6 +8,7 @@ import type { AgentFactory, AgentStreamHandlers, AgentUsage, FollowUpSink } from
 import { StreamBuffer } from '../core/stream-buffer.js';
 import { ToolRenderer } from '../core/tool-renderer.js';
 import { describeOutboundError, MessageNotEditableError } from '../core/outbound-errors.js';
+import { outboundLane } from './paced-adapter.js';
 import { formatRuntimeFooter } from '../core/runtime-footer.js';
 import { ingestAttachments, type AttachmentInput } from '../core/attachment-ingest.js';
 import { createAttachmentIngestDeps } from './attachment-io.js';
@@ -135,6 +136,8 @@ interface Render {
   enqueue(fn: () => Promise<void> | void): void;
   /** Drain the chain and seal the last message, appending `footer` when there is a body. */
   finalize(footer: string): Promise<void>;
+  /** Interrupted: stop the tool painter so an armed retry doesn't outlive the turn. */
+  abort(): void;
 }
 
 /**
@@ -247,6 +250,10 @@ export class TurnRunner {
         // Interrupted by a newer message: finalize the partial reply cleanly — drop the streaming
         // reply with no footer (it didn't finish), and skip the command fallback. The continuing
         // batch starts a fresh turn and produces its own reply + ✅.
+        //
+        // The tool painter is stopped first: an armed retry belongs to a turn that is over, and
+        // firing it would repaint an abandoned bubble underneath the next turn's output.
+        render.abort();
         await render.finalize('');
         console.log(`[turn] ${conversationId} turn interrupted (continuing with newer input)`);
       } else {
@@ -313,11 +320,13 @@ export class TurnRunner {
         enqueue(() => ref.stream.push(delta));
       },
       onToolStart: (evt) =>
-        // Before a tool: finish the current text as its own bubble (no footer: not the last segment), then send the tool bubble.
+        // Before a tool: finish the current text as its own bubble (no footer: not the last segment), then
+        // register the tool. Registering is synchronous — the bubble is delivered by the renderer's own
+        // painter, off this chain, so a rate-limited chat cannot stall the reply behind a progress write.
         enqueue(async () => {
           ref.producedOutput = true;
           await ref.stream.complete();
-          await tools.onToolStart(evt);
+          tools.onToolStart(evt);
         }),
       onToolFinish: (evt) => enqueue(() => tools.onToolFinish(evt)),
       onSegmentBreak: () =>
@@ -373,6 +382,9 @@ export class TurnRunner {
     // StreamBuffer factory closure: sink bound to this address, callable repeatedly to rotate a
     // fresh buffer per segment — trailing text below a tool bubble goes to a new message, not editing the prior one.
     const makeStream = (): StreamBuffer => this.makeStreamBuffer(platform, address);
+    // Tool bubbles are billed to the same per-chat budget as everything else, but in the lane that
+    // may be dropped under congestion — see OutboundClass.
+    const progressLane = outboundLane(platform, 'progress');
 
     // Render-level mutable container: stream (active text buffer, rotated at segment boundaries),
     // producedOutput (whether it emitted visible output) and usage (latest context snapshot the
@@ -403,17 +415,25 @@ export class TurnRunner {
         // neither is a MessageNotEditableError, so the whole block of progress was dropped).
         maxMessageLength: platform.capabilities.maxMessageLength,
         measureLength: (s) => platform.measureRendered(s),
+        retryIntervalMs: this.config.tools.retryIntervalMs,
+        maxRetryMs: this.config.tools.maxRetryMs,
+        maxRetryAfterMs: this.config.outbound.maxRetryAfterMs,
       },
 
       {
-        sendBubble: (text) => platform.sendMessage(address, text),
+        // The 'progress' lane: a tool bubble is a running commentary, so under congestion it may
+        // be superseded or dropped, where the reply may not. Everything else about this sink is
+        // ordinary — the pacing lives in the adapter (daemon/paced-adapter.ts).
+        sendBubble: (text) => progressLane.sendMessage(address, text),
         // accumulate mode flushes whole tool progress/completion into one bubble (address closure).
         // Capability-gated: on platforms with editMessage=false (QQ/LINE/WeCom) editMessage throws, so
         // pass undefined to let ToolRenderer degrade to separate (one new bubble per tool) instead of
         // throwing on every accumulate edit. Symmetric with StreamBuffer's noEdit inference.
         editBubble: platform.capabilities.editMessage
-          ? (bubble, text) => platform.editMessage(bubble, text)
+          ? (bubble, text) => progressLane.editMessage(bubble, text)
           : undefined,
+        now: this.clock.now,
+        schedule: this.clock.schedule,
       }
     );
 
@@ -431,9 +451,21 @@ export class TurnRunner {
       ref,
       enqueue,
       handlers: this.buildStreamHandlers(conversationId, ref, makeStream, tools, enqueue),
+      abort: () => tools.abort(),
       finalize: async (footer: string) => {
         await effects; // wait for all queued side effects to land
+        // Submit the segment's final tool state before sealing the body, so the last ✓ is not
+        // discarded with the line set that carried it.
+        tools.resetSegment();
         await ref.stream.complete(footer ? { footer } : undefined);
+        // Then STOP WAITING for the tool bubbles — bounded, because a chat the platform has
+        // paused for minutes must not hold the turn (and its ✅) open for the same minutes.
+        await tools.settle(this.config.outbound.finalizeWaitMs);
+        // Past that deadline the renderer is done trying. `settle` returns immediately when
+        // everything landed, so this is a no-op in the normal case; it matters when it is not,
+        // because an armed retry keeps the whole render alive on a timer and would go on
+        // repainting a finished turn's bubble for the life of the process.
+        tools.abort();
       },
     };
   }
@@ -705,13 +737,18 @@ export class TurnRunner {
    * Start the typing keep-alive loop: fire once immediately, then re-fire every typingIntervalMs.
    * Returns a cancel handle (called at turn end to stop re-scheduling). Each startTyping is
    * fire-and-forget and swallows errors — typing never gates the turn.
+   *
+   * On the 'typing' lane, so a beat is DROPPED rather than queued when the chat has no budget: an
+   * indicator that arrives after the message it was announcing is worse than one that never does,
+   * and the platform expires it on its own anyway.
    */
   private startTypingLoop(platform: PlatformAdapter, address: ConversationAddress): () => void {
+    const lane = outboundLane(platform, 'typing');
     let cancel: (() => void) | null = null;
     let stopped = false;
     const beat = (): void => {
       if (stopped) return;
-      void platform.startTyping(address).catch(() => {});
+      void lane.startTyping(address).catch(() => {});
       cancel = this.clock.schedule(beat, this.config.inbound.typingIntervalMs);
     };
     beat();

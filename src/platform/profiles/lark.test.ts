@@ -284,51 +284,45 @@ describe('lark profile delivery contract (send/edit reach Lark as converted mark
  * rate limit: once 230072 comes back, that message is done forever, so the writer has to seal it
  * and continue in a new one. Reported as a transient failure instead, it produced the truncated
  * reply this classification exists to prevent.
+ *
+ * Asserted on `classifyError` rather than through `editMessage`, because that is where the mapping
+ * now lives: satori-core applies it to EVERY outbound call, so a 230072 raised by a card patch is
+ * classified too. Wiring it into one method was the old bug.
  */
 describe('lark edit-limit classification (230072 → MessageNotEditableError)', () => {
   const profile = createLarkProfile();
-
-  /** Bot whose editMessage throws `err`. */
-  function throwingBot(err: unknown): SendBot {
-    return {
-      sendMessage: () => Promise.resolve(['om_1']),
-      editMessage: () => Promise.reject(err),
-    } as unknown as SendBot;
-  }
-
-  const ref = { address: { channel: 'oc_1' }, messageId: 'om_1' };
 
   it('declares the cap as a capability so writers can spend it deliberately', () => {
     expect(profile.capabilities.maxEditsPerMessage).toBe(20);
   });
 
-  it('reads the code off the HTTP error body', async () => {
+  it('is wired as the profile-wide classifier, not into a single method', () => {
+    expect(profile.classifyError).toBeTypeOf('function');
+  });
+
+  it('reads the code off the HTTP error body', () => {
     const http = Object.assign(new Error('Bad Request'), {
       response: { data: { code: 230072, msg: 'The message has reached the number of times it can be edited.' } },
     });
-    await expect(profile.editMessage!(throwingBot(http), ref, 'x')).rejects.toBeInstanceOf(
+    expect(profile.classifyError!(http)).toBeInstanceOf(MessageNotEditableError);
+  });
+
+  it('reads the code out of an AggregateError-wrapped message (how satori actually throws it)', () => {
+    const inner = new Error(
+      'Bad Request (Lark error code 230072: The message has reached the number of times it can be edited.)'
+    );
+    expect(profile.classifyError!(new AggregateError([inner], ''))).toBeInstanceOf(
       MessageNotEditableError
     );
   });
 
-  it('reads the code out of an AggregateError-wrapped message (how satori actually throws it)', async () => {
-    const inner = new Error(
-      'Bad Request (Lark error code 230072: The message has reached the number of times it can be edited.)'
-    );
-    await expect(
-      profile.editMessage!(throwingBot(new AggregateError([inner], '')), ref, 'x')
-    ).rejects.toBeInstanceOf(MessageNotEditableError);
-  });
-
-  it('leaves any other failure transient — a rate limit must not fragment the reply', async () => {
+  it('leaves any other failure transient — a rate limit must not fragment the reply', () => {
     const rateLimited = Object.assign(new Error('Too Many Requests'), {
       response: { data: { code: 99991400, msg: 'rate limited' } },
     });
-    const thrown = await profile
-      .editMessage!(throwingBot(rateLimited), ref, 'x')
-      .catch((e: unknown) => e);
-    expect(thrown).toBe(rateLimited);
-    expect(thrown).not.toBeInstanceOf(MessageNotEditableError);
+    const classified = profile.classifyError!(rateLimited);
+    expect(classified).toBe(rateLimited);
+    expect(classified).not.toBeInstanceOf(MessageNotEditableError);
   });
 });
 

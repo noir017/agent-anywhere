@@ -185,6 +185,20 @@ export interface PlatformProfile<P extends PlatformConfig = PlatformConfig> {
    * platform that sends the raw text unchanged. */
   measureRendered?(text: string): number;
   /**
+   * Translate this platform's own failure vocabulary into the core's (`core/outbound-errors.ts`).
+   *
+   * Called by satori-core around EVERY outbound call, so a profile declares its mapping ONCE
+   * instead of wrapping method by method. That is not a style preference: Lark's 230072 →
+   * `MessageNotEditableError` mapping was applied inside `editMessage` and nowhere else, so the
+   * same rejection raised by a send or a card patch stayed an anonymous transient.
+   *
+   * Return the error unchanged when nothing matches. Returning a DIFFERENT error must be
+   * conservative in one direction: a permanent failure wrongly typed as a rate limit merely wastes
+   * a retry, while a permanent one typed as transient loses the message (which is the bug the
+   * whole vocabulary exists to prevent) — and typing a 400 as either is worse than both.
+   */
+  classifyError?(e: unknown): unknown;
+  /**
    * Inbound attachment fetch override: for a platform whose media elements are NOT public URLs.
    *
    * The daemon's generic downloader speaks http(s) and nothing else (deliberately — every hop of

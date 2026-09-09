@@ -101,6 +101,24 @@ Three capability fields are easy to conflate:
 `maxSlashCommands` caps a registration batch; the excess is registered as nothing but
 **logged**, and still invokable by typing.
 
+## `classifyError` — the platform's failures in the core's words
+
+A profile declares ONE translator from its own error vocabulary into
+[`core/outbound-errors.ts`](../core/README.md#outbound-errorsts), and `satori-core` applies
+it around every outbound call the adapter makes.
+
+One translator, not one per method, because the alternative was tried and rotted: Lark's
+`230072` → `MessageNotEditableError` mapping lived inside `editMessage` and nowhere else, so
+the identical rejection raised by a card patch reached the writers as an anonymous transient
+and was retried forever. Two profiles use it today — Lark for `230072`, Telegram for `429`
+(recovering the flood wait from the message text, since satori's adapter throws away
+`parameters.retry_after`; pinned by `telegram.contract.test.ts`).
+
+Be conservative about what you translate *into*. A permanent failure wrongly typed as a rate
+limit merely wastes a retry; a permanent one typed as transient loses the message — and
+typing an ordinary `400` as either turns a loud one-time error into a silent retry loop.
+Return the error unchanged when nothing matches.
+
 ## `resolveConversation` — the one place a platform describes its thread model
 
 Some platforms need more than a channel id to address a message. A Telegram forum topic

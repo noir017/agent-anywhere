@@ -1,5 +1,5 @@
 import type { MessageRef } from '../types.js';
-import { MessageNotEditableError } from './outbound-errors.js';
+import { MessageNotEditableError, retryAfterMsOf } from './outbound-errors.js';
 
 /**
  * Outbound buffer for one turn's reply text. Two delivery modes, chosen by `mode`.
@@ -47,10 +47,19 @@ import { MessageNotEditableError } from './outbound-errors.js';
  * turn complete, losing everything after the cap.
  *
  * Transient failures (rate limit, network) back the interval off exponentially and keep the open
- * message. The final flush refuses to leave text undelivered behind a failure it can route around —
- * it seals and sends the remainder instead. Overflow is split without breaking code fences.
+ * message — except when the platform STATES how long to wait (`RateLimitedError.retryAfterMs`),
+ * which overrides the exponential cap because it is a fact rather than a guess. The final flush
+ * refuses to leave text undelivered behind a failure it can route around — it seals and sends the
+ * remainder instead. Overflow is split without breaking code fences.
  * `[SILENT]` as the whole reply suppresses all output.
  */
+
+/**
+ * Ceiling on a platform-stated wait when the caller names none. Five minutes is longer than any
+ * flood wait observed (Telegram's worst so far: 229 s) and short enough that a nonsense value
+ * cannot silence a conversation for the rest of the process.
+ */
+const DEFAULT_MAX_RETRY_AFTER_MS = 300_000;
 
 export interface StreamBufferOptions {
   /**
@@ -64,8 +73,18 @@ export interface StreamBufferOptions {
   charThreshold: number;
   /** `'live'` only: flush once this long has passed since the last write. */
   flushIntervalMs: number;
-  /** `'live'` only: cap for the exponential backoff after a transient failure. */
+  /**
+   * `'live'` only: cap for the exponential backoff after a transient failure.
+   *
+   * Caps only the BLIND guess. A wait the platform states overrides it — see maxRetryAfterMs.
+   */
   maxBackoffMs: number;
+  /**
+   * Ceiling on a wait the PLATFORM states (`RateLimitedError.retryAfterMs`), which overrides
+   * `maxBackoffMs` rather than being capped by it — see onTransientFailure. Bounded so one absurd
+   * value cannot wedge the buffer for the rest of the process. Undefined = 5 minutes.
+   */
+  maxRetryAfterMs?: number;
   silentToken: string;
   maxMessageLength: number;
   /**
@@ -111,6 +130,12 @@ export class StreamBuffer {
   private open: OpenMessage | null = null;
   private lastWriteAt = 0;
   private currentBackoff: number;
+  /**
+   * Earliest time a non-final flush may touch the platform again. Set by a transient failure;
+   * cleared by a success. Distinct from `currentBackoff` (which is a duration) because the char
+   * threshold has to be held back too, and that check has no elapsed-time term of its own.
+   */
+  private pausedUntil = 0;
   private cancelTimer: (() => void) | null = null;
   private aborted = false;          // no more output once the turn is interrupted
   // Serialize flushes: chain each onto the previous so complete()'s final flush
@@ -172,21 +197,35 @@ export class StreamBuffer {
     if (this.aborted) return;
     if (this.opts.mode === 'once') return; // delivery happens in complete(), so don't even arm a timer
     if (this.isSilent()) return;
+    const now = this.sink.now();
+
+    // A failed write said "not yet", and that outranks BOTH triggers. Backing off only the timer
+    // left the char threshold as an open door: a stream that keeps producing text retried every
+    // `charThreshold` chars straight through the wait, which is how a rate limit gets deeper
+    // instead of expiring. Only the final flush may ignore this (see doFlush).
+    if (now < this.pausedUntil) {
+      this.armTimer(this.pausedUntil - now);
+      return;
+    }
+
     const pendingChars = this.acc.length - this.deliveredLength();
-    const elapsed = this.sink.now() - this.lastWriteAt;
+    const elapsed = now - this.lastWriteAt;
 
     if (pendingChars >= this.opts.charThreshold || elapsed >= this.currentBackoff) {
       void this.flush(false);
       return;
     }
     // Not triggered: arm a fallback timer so an idle stream still flushes after the interval.
-    if (!this.cancelTimer) {
-      const wait = Math.max(0, this.currentBackoff - elapsed);
-      this.cancelTimer = this.sink.schedule(() => {
-        this.cancelTimer = null;
-        void this.flush(false);
-      }, wait);
-    }
+    this.armTimer(Math.max(0, this.currentBackoff - elapsed));
+  }
+
+  /** Arm the single fallback flush timer, if one is not already pending. */
+  private armTimer(wait: number): void {
+    if (this.cancelTimer) return;
+    this.cancelTimer = this.sink.schedule(() => {
+      this.cancelTimer = null;
+      void this.flush(false);
+    }, wait);
   }
 
   /** Enqueue a flush onto the serial chain; the returned Promise resolves when it settles. */
@@ -254,7 +293,7 @@ export class StreamBuffer {
           this.seal();
           continue;
         }
-        this.onTransientFailure();
+        this.onTransientFailure(err);
         return;
       }
       this.onWriteSuccess();
@@ -299,11 +338,26 @@ export class StreamBuffer {
   private onWriteSuccess(): void {
     this.lastWriteAt = this.sink.now();
     this.currentBackoff = this.opts.flushIntervalMs; // reset backoff on success
+    this.pausedUntil = 0;
   }
 
-  /** Rate limit / network: keep the message open and retry later, more slowly. */
-  private onTransientFailure(): void {
-    this.currentBackoff = Math.min(this.currentBackoff * 2, this.opts.maxBackoffMs);
+  /**
+   * Rate limit / network: keep the message open and retry later, more slowly.
+   *
+   * Sets both the interval (how long) and the deadline (until when), because the two triggers in
+   * maybeFlush need different shapes of the same answer.
+   */
+  private onTransientFailure(err: unknown): void {
+    // A wait the platform NAMED is data, not a guess, so it overrides maxBackoffMs instead of
+    // being capped by it. Telegram has answered `retry after 229`; against the 10 s default cap
+    // the buffer would retry 22 times too early and re-earn the flood limit each time. The
+    // separate maxRetryAfterMs ceiling keeps a nonsense value from wedging the buffer forever.
+    const stated = retryAfterMsOf(err);
+    this.currentBackoff =
+      stated !== undefined
+        ? Math.min(stated, this.opts.maxRetryAfterMs ?? DEFAULT_MAX_RETRY_AFTER_MS)
+        : Math.min(this.currentBackoff * 2, this.opts.maxBackoffMs);
+    this.pausedUntil = this.sink.now() + this.currentBackoff;
   }
 
 

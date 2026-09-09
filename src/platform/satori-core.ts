@@ -326,7 +326,7 @@ export async function createSatoriAdapter(
     throw new Error(`[${profile.type}] unsupported operation: ${op}`);
   };
 
-  return {
+  const adapter: PlatformAdapter = {
     platform: instance.id,
     platformType: profile.type,
     capabilities: profile.capabilities,
@@ -496,4 +496,34 @@ export async function createSatoriAdapter(
       await ctx.stop();
     },
   };
+
+  return classifying(adapter, profile.classifyError);
+}
+
+/**
+ * Apply the profile's error classification (see `PlatformProfile.classifyError`) to every call the
+ * adapter makes, so the core's failure vocabulary is spoken by ALL of them and not just the one
+ * method whose author happened to think of it.
+ *
+ * Wraps by reflection rather than method by method deliberately: a per-method list is a second
+ * copy of the adapter surface, and the copy is what rots. The Lark edit-limit mapping lived inside
+ * `editMessage` and nowhere else for exactly that reason.
+ *
+ * Only a rejected promise is intercepted — a synchronous member (`measureRendered`, `onMessage`,
+ * the capability fields) is passed through untouched rather than being promoted to a promise.
+ */
+function classifying(adapter: PlatformAdapter, classify?: (e: unknown) => unknown): PlatformAdapter {
+  if (!classify) return adapter;
+  const out: Record<string, unknown> = { ...adapter };
+  for (const [name, member] of Object.entries(adapter)) {
+    if (typeof member !== 'function') continue;
+    out[name] = (...args: unknown[]): unknown => {
+      const result = (member as (...a: unknown[]) => unknown).apply(adapter, args);
+      if (!(result instanceof Promise)) return result;
+      return result.catch((e: unknown) => {
+        throw classify(e);
+      });
+    };
+  }
+  return out as unknown as PlatformAdapter;
 }

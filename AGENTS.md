@@ -177,3 +177,52 @@ Do not weaken these without saying so explicitly in the PR:
 - User-visible changes get a `CHANGELOG.md` entry under `## [Unreleased]`
   (Keep a Changelog format). The entries are prose explaining the *why*, matching the
   comment style — see the existing ones before writing yours.
+
+## Shipping
+
+**Do not stop at "the change is written" and wait to be told to commit.** Once the work is
+done and verified, carry it to the last step you are able to reach, and say where you
+stopped. Half-delivered work is the expensive state: the operator has to reconstruct what
+you did before they can finish it.
+
+Deployment spans two repositories and three steps. **Do steps 1 and 2. Never do step 3.**
+
+| # | step | who |
+|---|---|---|
+| 1 | `npm run release -- X.Y.Z` → push `dev` + the tag → `release.yml` publishes a GitHub Release (tarball + `SHA256SUMS`) | **you** |
+| 2 | in the `uniagent` repo: `gh workflow run bump-agent-anywhere.yml -f version=X.Y.Z` → multi-arch image to GHCR | **you** |
+| 3 | on the oracle host: rebuild the container | **the operator, by hand** |
+
+**Step 3 is not yours, and not because of caution.** The daemon running in that container is
+the process serving the conversation that asked for the change, and the supervisor's `stop`
+reaps orphaned agent children too — so restarting it kills the session issuing the restart,
+mid-command. You cannot verify your own deploy; you can only report that it is ready.
+
+Notes that decide whether steps 1–2 are even correct:
+
+- **`npm run release` is the whole of "commit + compile".** It stamps the CHANGELOG, bumps
+  `package.json`, runs typecheck/lint/test/build as local gates, commits, and tags — and
+  deliberately does **not** push. Do not hand-roll those edits: four things have to agree
+  and every way they can disagree fails *after* the tag is public.
+- **A code change must take a new version number.** The image pins the tarball's SHA256, so
+  re-cutting an existing version produces different bytes under the same tag and simply
+  fails to bake in.
+- **Docs- and tests-only changes do not get a release.** Commit and push them and stop
+  there: the image bakes a published tarball, so nothing that cannot reach `dist/` can
+  reach the running daemon, and burning a version number on it only adds noise between the
+  releases that mean something.
+- **Verify before releasing, not after.** `npm run release` runs the gates, but gates are
+  not verification — exercise the changed behaviour first. The one thing you genuinely
+  cannot exercise is a running daemon (see step 3); say so plainly instead of implying it
+  was checked.
+
+Report what you did in the order it happened, with the version, and end with the exact
+command the operator needs for step 3.
+
+> **Running the test suite touches this machine's live daemon.** `ensureReverseCliShim()`
+> writes `~/.config/agent-anywhere/bin/agent-anywhere`, a path shared with whatever daemon
+> is actually running here, and that directory leads its agents' `PATH`. It now refuses to
+> write unless `argv[1]` really is this CLI (`isCliEntry`) — before that guard, a test run
+> repointed the shim at vitest's worker entry and every live `send-message` / `ask` /
+> `send-file` failed with a stack from inside tinypool. If you touch that file, keep the
+> guard and keep `reverse-cli-shim.test.ts` green.

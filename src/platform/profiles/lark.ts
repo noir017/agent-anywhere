@@ -80,6 +80,10 @@ function larkErrorCodes(e: unknown): number[] {
  * Translate Lark's edit-limit rejection into the core's permanent-failure type so the writers seal
  * the message and continue in a new one. Anything else passes through untouched — a transient
  * failure must stay transient, or every rate limit would fragment the reply.
+ *
+ * Wired as the profile's `classifyError`, so satori-core applies it to EVERY outbound call. It used
+ * to be called from `editMessage` alone, which meant the same 230072 raised by a card patch
+ * (`editButtons`) reached the writers as an anonymous transient and was retried forever.
  */
 function asEditLimitError(e: unknown): unknown {
   if (!larkErrorCodes(e).includes(LARK_EDIT_LIMIT_CODE)) return e;
@@ -835,6 +839,8 @@ export function createLarkProfile(): PlatformProfile<LarkPlatformConfig> {
     satoriPlatform: 'lark',
     capabilities,
 
+    classifyError: asEditLimitError,
+
     // Lark counts the markdown content string; table→bullets rendering can expand it, so chunk by the
     // rendered string length, not the source.
     measureRendered: (text: string) => toLarkMarkdown(text).length,
@@ -965,11 +971,9 @@ export function createLarkProfile(): PlatformProfile<LarkPlatformConfig> {
     },
 
     async editMessage(bot: Bot, ref: MessageRef, text: string): Promise<void> {
-      try {
-        await bot.editMessage(ref.address.channel, ref.messageId, toLarkMarkdown(text));
-      } catch (e) {
-        throw asEditLimitError(e);
-      }
+      // No local try/catch: classifyError (wired below, applied by satori-core to every call) is
+      // what turns a 230072 into MessageNotEditableError now.
+      await bot.editMessage(ref.address.channel, ref.messageId, toLarkMarkdown(text));
     },
 
     async reply(bot: Bot, ref: MessageRef, text: string): Promise<MessageRef> {

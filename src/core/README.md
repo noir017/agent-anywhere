@@ -43,6 +43,8 @@ conversation, not part of its name — see [`daemon/README.md`](../daemon/README
 | `inbound-merger.ts` | Per-conversation state machine: coalesce bursts, queue while busy, interrupt |
 | `stream-buffer.ts` | Outbound text: throttled in-place editing, chunking, backoff, degradation |
 | `tool-renderer.ts` | Tool-call bubbles: 4 modes × 2 grouping strategies |
+| `outbound-pacer.ts` | One write budget per chat: token buckets, one FIFO, in-place edit coalescing |
+| `outbound-errors.ts` | The four failure classes the delivery layer needs from the platforms |
 | `runtime-footer.ts` | The `cc · 18k / 1M (2%) · claude-opus-4-5` tagline |
 | `attachment-ingest.ts` | Inbound attachment orchestration (download/save injected) |
 | `command-translate.ts` | The generic slash vocabulary and its per-harness translation |
@@ -176,6 +178,12 @@ saw a reply truncated mid-sentence with a ✅ on it.
 - **Transient failures** (rate limit, network) back the interval off exponentially up to
   `maxBackoffMs` and keep the message open. Only the platform can say a failure is
   permanent, which is what `MessageNotEditableError` is for (see `outbound-errors.ts`).
+  When the platform states a **number** (`RateLimitedError.retryAfterMs`), that number wins
+  over `maxBackoffMs`: the cap is a guess about how long a limit lasts, and Telegram has
+  been observed asking for 229 s against a 10 s default. The backoff holds back **both**
+  triggers, not just the timer — gating only the timer left the char threshold as an open
+  door, so a stream that kept producing text retried every `charThreshold` characters
+  straight through the wait and deepened the limit instead of letting it expire.
 - **The final flush never gives up**: with no later flush to recover, any failure it can
   route around is routed around — it seals the open message and sends the remainder rather
   than leaving the answer truncated.
@@ -188,16 +196,84 @@ saw a reply truncated mid-sentence with a ✅ on it.
 
 ## `outbound-errors.ts`
 
-The two-word vocabulary the delivery layer needs from the platforms: a failure is either
-**transient** (retry the same message) or **`MessageNotEditableError`** (that message is
-finished — seal it). Profiles translate their own codes: Lark maps `230072` in
-`lark.ts`. Everything else stays transient on purpose, so a rate limit never fragments a
-reply into extra messages.
+The vocabulary the delivery layer needs from the platforms. It started as two words and is
+now four, because two turned out to hide two different distinctions:
 
-Also home to `describeOutboundError`, which walks `AggregateError.errors` — satori's
-MessageEncoder throws one whose own `.message` is empty, so logging `e.message` yielded a
-blank reason and failing tool bubbles logged as `[turn] render side effect failed: ` with
-nothing after the colon.
+| class | meaning | what the writer does |
+|---|---|---|
+| *(untyped)* | transient, unquantified — 5xx, socket reset | back off blindly, keep the message |
+| `MessageNotEditableError` | permanent, **message**-scoped | seal it, continue in a new message |
+| `RateLimitedError` | transient, **chat**-scoped, and *quantified* | wait exactly `retryAfterMs` |
+| `WriteDroppedError` | never attempted — the pacer discarded it | state is untouched; write again |
+
+Profiles translate their own codes through `PlatformProfile.classifyError`: Lark maps
+`230072`, Telegram maps `429` (and recovers `retry after N` from the message text, because
+satori's adapter throws away `parameters.retry_after` — see the contract test). Everything
+else stays untyped on purpose, so a rate limit never fragments a reply into extra messages.
+
+`retryAfterMsOf(e)` reads the stated wait, walking `AggregateError.errors` for it — the
+profile's typed error can reach the writer as a *child* rather than as the thrown value.
+
+Also home to `describeOutboundError`, which walks the same tree — satori's
+MessageEncoder throws an AggregateError whose own `.message` is empty, so logging
+`e.message` yielded a blank reason and failing tool bubbles logged as
+`[turn] render side effect failed: ` with nothing after the colon.
+
+## Sealing vs. pacing
+
+The two concepts most easily confused, and conflating them is exactly the mistake the old
+`ToolRenderer.paint()` encoded when it rethrew a 429:
+
+|  | **sealing** | **pacing** |
+|---|---|---|
+| scope | one message | one chat |
+| duration | permanent | temporary |
+| question | "can this message take more?" | "can this chat take more *right now*?" |
+| answer | continue in a NEW message | wait, then send the SAME thing |
+| lives in | `stream-buffer.ts` / `tool-renderer.ts` | `outbound-pacer.ts` |
+
+The three sealing rules stay three. Pacing is not a fourth: a rate limit never means a
+message is finished, and treating it that way either fragments a reply into extra messages
+or — the bug that was actually shipped — drops the write entirely.
+
+## `outbound-pacer.ts`
+
+One write budget per chat, shared by *everything*: the reply, the tool bubbles, the
+reactions, the acks, the menus, and the agent's own reverse commands. The platform counts
+them as a single stream, so a per-writer throttle cannot bound them no matter how it is
+tuned — the quantity being limited is a sum, and no summand can see it. That is how a
+`StreamBuffer` politely throttled to 1 edit/1200 ms and a `ToolRenderer` with no throttle at
+all combined into 78 × `429 Too Many Requests` in one daemon run, `retry after` reaching
+229 seconds.
+
+```
+submit(job) ─▶ [ per-chat FIFO ] ─▶ bucket (chat) ─▶ bucket (instance) ─▶ run()
+                     │
+                     └─ a queued EDIT is replaced in place by a newer edit to the same message
+```
+
+- **Keyed on `<platformInstance>:<channel>`, never the thread.** A Telegram forum topic
+  shares its parent chat's flood budget; keying by lane would hand every topic a full
+  allowance and reproduce the flood one level down.
+- **Token bucket, not a fixed interval.** An idle chat writes immediately; a busy one
+  paces. `burst` is sized so a whole ordinary turn goes out with no delay at all and only
+  sustained traffic is metered — the failure this exists to prevent was hundreds of writes,
+  not a dozen.
+- **Coalescing needs no API.** An edit is a statement about a message's final content, so
+  two queued edits to one message collapse to the newer; a send creates a new object whose
+  ref the caller needs back, so a send is never coalesced. The replacement keeps the queue
+  **position** the older version earned, which is what keeps a bubble above the text
+  submitted after it.
+- **Only some writes may be dropped.** `reply` never is, however long the lane is stuck.
+  `progress` (tool bubbles) is dropped when superseded or stale — the next paint carries
+  the current state, and a bubble showing where the agent was eight seconds ago is worse
+  than one that skips ahead. `typing` is dropped the moment it cannot go out immediately.
+- **A drop is reported, never swallowed.** `WriteDroppedError` leaves the caller's state
+  untouched, which is what makes "a progress update is never lost" structural rather than
+  lucky.
+
+The pacer is pure; `daemon/paced-adapter.ts` applies it to every `PlatformAdapter` method
+and is the one place a `RateLimitedError` becomes a lane pause.
 
 ## `tool-renderer.ts`
 
@@ -232,6 +308,36 @@ The renderer owns **only** the bubbles. The message body belongs to `StreamBuffe
 `TurnRunner` coordinates the handoff: complete the current body buffer, emit the bubble,
 then rotate in a fresh body buffer so trailing text becomes a new message instead of
 editing the one above the bubble.
+
+### Painting is asynchronous, and a failed write is never lost
+
+Sealing answers "this bubble can take no more". It does not answer "this **chat** can take
+no more right now", and the renderer used to have no answer for that at all: it repainted
+synchronously on every tool start *and* every finish, with no throttle, and rethrew
+anything that was not a `MessageNotEditableError`. Under a run of back-to-back tool calls
+that is two writes per tool into one chat. Telegram answered `429`, the rethrow reached the
+turn's side-effect chain, and the update was gone — nothing re-triggers a paint until the
+next tool event, so the bubble sat frozen on stale progress for minutes.
+
+So `onToolStart` / `onToolFinish` are now `void`: they mutate the line set and return, and a
+single painter drains it. Three consequences worth knowing:
+
+- **Nothing blocks the reply.** Painting is off `TurnRunner`'s side-effect chain, so a
+  paused lane cannot stall the body text behind a progress bubble. `finalize` calls
+  `settle(finalizeWaitMs)`, which stops *waiting* without *cancelling* — a queued write
+  still lands, just after the ✅.
+- **Every failure that is not a seal arms a retry**, at the platform's own `retryAfterMs`
+  when it named one, else an exponential backoff. A write the pacer discarded
+  (`WriteDroppedError`) is treated identically: not delivered, therefore still pending.
+- **Delivery is a revision watermark, not a flag.** `deliveredRev` is the highest revision
+  of the line set that actually reached the platform. A `finishDelivered` boolean was
+  correct only while writes were synchronous: a ✓ recorded *while* a paint is in flight is
+  not delivered by that paint, and marking it so would let the next seal drop a line the
+  user never saw finish. For the same reason `resetSegment()` defers its clear until the
+  segment's final state has landed.
+
+`onToolStart` used to return "did a new bubble appear", documented as driving the segment
+break. `TurnRunner` never read it, and it cannot be answered synchronously now. It is gone.
 
 ## `command-translate.ts`
 

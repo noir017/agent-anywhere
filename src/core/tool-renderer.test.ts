@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import type { MessageRef, ToolEvent, ToolFinishEvent } from '../types.js';
-import { MessageNotEditableError } from './outbound-errors.js';
+import { MessageNotEditableError, RateLimitedError, WriteDroppedError } from './outbound-errors.js';
 import {
   ToolRenderer,
   formatDuration,
@@ -8,12 +8,22 @@ import {
   type ToolRendererOptions,
 } from './tool-renderer.js';
 
-/** Mock BubbleSink recording sendBubble / editBubble calls. */
+/**
+ * Mock BubbleSink with a manual clock.
+ *
+ * Painting is asynchronous now, so a test has to say when the writes it queued are allowed to
+ * settle (`flush`) and when time is allowed to pass (`advanceTo`). That is the point of the
+ * change: `onToolStart` no longer waits for the platform.
+ */
 function makeSink(opts: { withEdit: boolean }) {
   const sends: string[] = [];
   const edits: Array<{ ref: MessageRef; text: string }> = [];
   let counter = 0;
   let refuseAfter = Infinity;
+  let nowVal = 0;
+  let pending: Array<{ fn: () => void; at: number; cancelled: boolean }> = [];
+  /** Queued failures for the next edits, oldest first. */
+  const editFailures: unknown[] = [];
 
   const sink: BubbleSink = {
     async sendBubble(text: string): Promise<MessageRef> {
@@ -21,20 +31,65 @@ function makeSink(opts: { withEdit: boolean }) {
       counter += 1;
       return { address: { channel: 'c' }, messageId: `m${counter}` };
     },
+    now: () => nowVal,
+    schedule(fn: () => void, ms: number) {
+      const entry = { fn, at: nowVal + ms, cancelled: false };
+      pending.push(entry);
+      return () => {
+        entry.cancelled = true;
+      };
+    },
   };
   if (opts.withEdit) {
     sink.editBubble = async (ref: MessageRef, text: string): Promise<void> => {
+      const scripted = editFailures.shift();
+      if (scripted !== undefined) throw scripted;
       if (edits.length >= refuseAfter) throw new MessageNotEditableError('edit limit reached');
       edits.push({ ref, text });
     };
   }
+
+  /** Let every queued write settle (the painter awaits between writes). */
+  const flush = async (): Promise<void> => {
+    for (let i = 0; i < 30; i++) await Promise.resolve();
+  };
+
   return {
     sink,
     sends,
     edits,
+    flush,
+    /** Advance to `t`, firing timers in due order, then settle. */
+    async advanceTo(t: number): Promise<void> {
+      await flush();
+      for (let guard = 0; guard < 200; guard++) {
+        pending = pending.filter((e) => !e.cancelled);
+        const next = pending
+          .filter((e) => e.at <= t)
+          .reduce<(typeof pending)[number] | undefined>(
+            (best, e) => (best === undefined || e.at < best.at ? e : best),
+            undefined
+          );
+        if (!next) break;
+        pending = pending.filter((e) => e !== next);
+        nowVal = Math.max(nowVal, next.at);
+        next.fn();
+        await flush();
+      }
+      nowVal = Math.max(nowVal, t);
+      await flush();
+    },
+    /** Whether a timer is armed and still in the future — i.e. a retry is pending. */
+    hasArmedTimer(): boolean {
+      return pending.some((e) => !e.cancelled);
+    },
     /** Make editBubble start refusing (as Lark does) once n edits have landed. */
     refuseEditsAfter(n: number) {
       refuseAfter = n;
+    },
+    /** The next edit throws `err`. */
+    failNextEdit(err: unknown) {
+      editFailures.push(err);
     },
   };
 }
@@ -71,11 +126,12 @@ describe('formatDuration', () => {
 
 describe('separate mode', () => {
   it('two different tools → two sendBubble calls, no editBubble', async () => {
-    const { sink, sends, edits } = makeSink({ withEdit: true });
+    const { sink, sends, edits, flush } = makeSink({ withEdit: true });
     const r = new ToolRenderer(makeOpts({ grouping: 'separate' }), sink);
 
-    expect(await r.onToolStart(start('Read', 'src/a.ts'))).toBe(true);
-    expect(await r.onToolStart(start('Edit', 'src/b.ts'))).toBe(true);
+    r.onToolStart(start('Read', 'src/a.ts'));
+    r.onToolStart(start('Edit', 'src/b.ts'));
+    await flush();
 
     expect(sends).toHaveLength(2);
     expect(edits).toHaveLength(0);
@@ -84,11 +140,12 @@ describe('separate mode', () => {
   });
 
   it('onToolFinish is a safe no-op under separate', async () => {
-    const { sink, sends, edits } = makeSink({ withEdit: true });
+    const { sink, sends, edits, flush } = makeSink({ withEdit: true });
     const r = new ToolRenderer(makeOpts({ grouping: 'separate' }), sink);
 
-    await r.onToolStart(start('Read', 'src/a.ts', 0));
-    await r.onToolFinish(finish('Read', true, 1200, 0));
+    r.onToolStart(start('Read', 'src/a.ts', 0));
+    r.onToolFinish(finish('Read', true, 1200, 0));
+    await flush();
 
     expect(sends).toHaveLength(1);
     expect(edits).toHaveLength(0);
@@ -97,11 +154,13 @@ describe('separate mode', () => {
 
 describe('accumulate mode', () => {
   it('two starts → one sendBubble + one editBubble, bubble holds two lines', async () => {
-    const { sink, sends, edits } = makeSink({ withEdit: true });
+    const { sink, sends, edits, flush } = makeSink({ withEdit: true });
     const r = new ToolRenderer(makeOpts({ grouping: 'accumulate' }), sink);
 
-    expect(await r.onToolStart(start('Read', 'src/a.ts', 0))).toBe(true);
-    expect(await r.onToolStart(start('Edit', 'src/b.ts', 1))).toBe(false);
+    r.onToolStart(start('Read', 'src/a.ts', 0));
+    await flush();
+    r.onToolStart(start('Edit', 'src/b.ts', 1));
+    await flush();
 
     expect(sends).toHaveLength(1);
     expect(edits).toHaveLength(1);
@@ -112,12 +171,13 @@ describe('accumulate mode', () => {
   });
 
   it('onToolFinish marks the matching line with ✓ and duration', async () => {
-    const { sink, edits } = makeSink({ withEdit: true });
+    const { sink, edits, flush } = makeSink({ withEdit: true });
     const r = new ToolRenderer(makeOpts({ grouping: 'accumulate' }), sink);
 
-    await r.onToolStart(start('Read', 'src/a.ts', 0));
-    await r.onToolStart(start('Edit', 'src/b.ts', 1));
-    await r.onToolFinish(finish('Read', true, 1200, 0));
+    r.onToolStart(start('Read', 'src/a.ts', 0));
+    r.onToolStart(start('Edit', 'src/b.ts', 1));
+    r.onToolFinish(finish('Read', true, 1200, 0));
+    await flush();
 
     const text = edits[edits.length - 1]!.text;
     const readLine = text.split('\n').find((l) => l.startsWith('📖'))!;
@@ -127,11 +187,13 @@ describe('accumulate mode', () => {
   });
 
   it('ok=false → ✗', async () => {
-    const { sink, edits } = makeSink({ withEdit: true });
+    const { sink, edits, flush } = makeSink({ withEdit: true });
     const r = new ToolRenderer(makeOpts({ grouping: 'accumulate' }), sink);
 
-    await r.onToolStart(start('Bash', 'ls', 0));
-    await r.onToolFinish(finish('Bash', false, 832, 0));
+    r.onToolStart(start('Bash', 'ls', 0));
+    await flush();
+    r.onToolFinish(finish('Bash', false, 832, 0));
+    await flush();
 
     const text = edits[edits.length - 1]!.text;
     expect(text).toContain('✗');
@@ -140,13 +202,14 @@ describe('accumulate mode', () => {
   });
 
   it('with no index, locates by appearance order / same name', async () => {
-    const { sink, edits } = makeSink({ withEdit: true });
+    const { sink, edits, flush } = makeSink({ withEdit: true });
     const r = new ToolRenderer(makeOpts({ grouping: 'accumulate', mode: 'all' }), sink);
 
-    await r.onToolStart(start('Read', 'src/a.ts'));
-    await r.onToolStart(start('Read', 'src/b.ts'));
+    r.onToolStart(start('Read', 'src/a.ts'));
+    r.onToolStart(start('Read', 'src/b.ts'));
     // No index → hits the first unfinished line with the same name.
-    await r.onToolFinish(finish('Read', true, 500));
+    r.onToolFinish(finish('Read', true, 500));
+    await flush();
 
     const lines = edits[edits.length - 1]!.text.split('\n');
     expect(lines[0]).toBe('📖 Read: "src/a.ts" ✓ 500ms');
@@ -154,33 +217,38 @@ describe('accumulate mode', () => {
   });
 
   it('under verbose, JSON is attached below the line (only once)', async () => {
-    const { sink, sends } = makeSink({ withEdit: true });
+    const { sink, sends, flush } = makeSink({ withEdit: true });
     const r = new ToolRenderer(makeOpts({ grouping: 'accumulate', mode: 'verbose' }), sink);
 
-    await r.onToolStart({ name: 'Read', inputPreview: 'src/a.ts', input: { path: 'src/a.ts' }, index: 0 });
+    r.onToolStart({ name: 'Read', inputPreview: 'src/a.ts', input: { path: 'src/a.ts' }, index: 0 });
+    await flush();
 
     expect(sends[0]).toContain('```json');
     expect(sends[0]).toContain('"path": "src/a.ts"');
   });
 
   it('with no sink.editBubble, degrades to separate (a new bubble each time)', async () => {
-    const { sink, sends, edits } = makeSink({ withEdit: false });
+    const { sink, sends, edits, flush } = makeSink({ withEdit: false });
     const r = new ToolRenderer(makeOpts({ grouping: 'accumulate' }), sink);
 
-    expect(await r.onToolStart(start('Read', 'src/a.ts', 0))).toBe(true);
-    expect(await r.onToolStart(start('Edit', 'src/b.ts', 1))).toBe(true);
+    r.onToolStart(start('Read', 'src/a.ts', 0));
+    r.onToolStart(start('Edit', 'src/b.ts', 1));
+    await flush();
 
     expect(sends).toHaveLength(2);
     expect(edits).toHaveLength(0);
   });
 
   it('after resetSegment the next segment starts a new bubble', async () => {
-    const { sink, sends } = makeSink({ withEdit: true });
+    const { sink, sends, flush } = makeSink({ withEdit: true });
     const r = new ToolRenderer(makeOpts({ grouping: 'accumulate' }), sink);
 
-    await r.onToolStart(start('Read', 'src/a.ts', 0));
+    r.onToolStart(start('Read', 'src/a.ts', 0));
+    await flush();
     r.resetSegment();
-    expect(await r.onToolStart(start('Edit', 'src/b.ts', 0))).toBe(true);
+    await flush();
+    r.onToolStart(start('Edit', 'src/b.ts', 0));
+    await flush();
 
     expect(sends).toHaveLength(2);
     // The second segment's bubble holds only the new line, not the prior segment.
@@ -188,30 +256,233 @@ describe('accumulate mode', () => {
   });
 });
 
+/**
+ * The headline regression. Under a run of back-to-back tool calls the renderer wrote twice per
+ * tool into one chat with no pacing; Telegram answered 429 (`retry after` up to 229 s) and
+ * `paint()` rethrew, so the update was logged and gone — the bubble froze on stale progress with
+ * nothing left to re-trigger a paint. 78 updates were lost this way in one daemon run.
+ */
+describe('a rate-limited write is retried, never lost', () => {
+  it('a 429 no longer loses the update: the newest state lands on the retry', async () => {
+    const { sink, edits, flush, advanceTo, failNextEdit } = makeSink({ withEdit: true });
+    const r = new ToolRenderer(
+      makeOpts({ grouping: 'accumulate', retryIntervalMs: 1_200 }),
+      sink
+    );
+
+    r.onToolStart(start('Read', 'a.ts', 0));
+    await flush();
+
+    failNextEdit(new RateLimitedError('Too Many Requests', { retryAfterMs: 5_000 }));
+    r.onToolFinish(finish('Read', true, 500, 0));
+    await flush();
+    expect(edits).toHaveLength(0); // the write failed...
+
+    await advanceTo(5_000);
+    expect(edits).toHaveLength(1); // ...and the retry carried it
+    expect(edits[0]!.text).toBe('📖 Read: "a.ts" ✓ 500ms');
+  });
+
+  it('waits the time the platform NAMED, not the configured interval', async () => {
+    const { sink, edits, flush, advanceTo, failNextEdit } = makeSink({ withEdit: true });
+    const r = new ToolRenderer(
+      makeOpts({ grouping: 'accumulate', retryIntervalMs: 1_200 }),
+      sink
+    );
+
+    r.onToolStart(start('Read', 'a.ts', 0));
+    await flush();
+    failNextEdit(new RateLimitedError('flood', { retryAfterMs: 229_000 }));
+    r.onToolFinish(finish('Read', true, 500, 0));
+    await flush();
+
+    await advanceTo(10_000); // way past retryIntervalMs, nowhere near the stated wait
+    expect(edits).toHaveLength(0);
+
+    await advanceTo(229_000);
+    expect(edits).toHaveLength(1);
+  });
+
+  it('clamps an absurd stated wait so the bubble cannot freeze forever', async () => {
+    const { sink, edits, flush, advanceTo, failNextEdit } = makeSink({ withEdit: true });
+    const r = new ToolRenderer(
+      makeOpts({ grouping: 'accumulate', maxRetryAfterMs: 60_000 }),
+      sink
+    );
+
+    r.onToolStart(start('Read', 'a.ts', 0));
+    await flush();
+    failNextEdit(new RateLimitedError('flood', { retryAfterMs: 86_400_000 }));
+    r.onToolFinish(finish('Read', true, 500, 0));
+    await flush();
+
+    await advanceTo(60_000);
+    expect(edits).toHaveLength(1);
+  });
+
+  it('an unquantified failure backs off exponentially, capped at maxRetryMs', async () => {
+    const { sink, edits, flush, advanceTo, failNextEdit } = makeSink({ withEdit: true });
+    const r = new ToolRenderer(
+      makeOpts({ grouping: 'accumulate', retryIntervalMs: 1_000, maxRetryMs: 2_500 }),
+      sink
+    );
+
+    r.onToolStart(start('Read', 'a.ts', 0));
+    await flush();
+
+    failNextEdit(new Error('socket hang up'));
+    failNextEdit(new Error('socket hang up'));
+    failNextEdit(new Error('socket hang up'));
+    r.onToolFinish(finish('Read', true, 500, 0));
+    await flush();
+
+    await advanceTo(1_000); // 1st retry: fails (2nd scripted), backoff → 2000
+    expect(edits).toHaveLength(0);
+    await advanceTo(3_000); // 2nd retry: fails (3rd scripted), backoff → 2500 (capped, not 4000)
+    expect(edits).toHaveLength(0);
+    await advanceTo(5_500); // 3rd retry, 2500 after the last: the sink is out of failures
+    expect(edits).toHaveLength(1);
+  });
+
+  it('a write the pacer dropped is treated as undelivered, so the next paint carries it', async () => {
+    const { sink, edits, flush, advanceTo, failNextEdit } = makeSink({ withEdit: true });
+    const r = new ToolRenderer(makeOpts({ grouping: 'accumulate', retryIntervalMs: 800 }), sink);
+
+    r.onToolStart(start('Read', 'a.ts', 0));
+    await flush();
+    failNextEdit(new WriteDroppedError('timeout', { retryAfterMs: 3_000 }));
+    r.onToolFinish(finish('Read', true, 500, 0));
+    await flush();
+    expect(edits).toHaveLength(0);
+
+    await advanceTo(3_000);
+    expect(edits[0]!.text).toContain('✓'); // the ✓ was never marked delivered, so it came back
+  });
+
+  it('abort() cancels an armed retry: a finished turn stops repainting', async () => {
+    const { sink, edits, flush, advanceTo, failNextEdit } = makeSink({ withEdit: true });
+    const r = new ToolRenderer(makeOpts({ grouping: 'accumulate' }), sink);
+
+    r.onToolStart(start('Read', 'a.ts', 0));
+    await flush();
+    failNextEdit(new RateLimitedError('flood', { retryAfterMs: 1_000 }));
+    r.onToolFinish(finish('Read', true, 500, 0));
+    await flush();
+
+    r.abort();
+    await advanceTo(60_000);
+    expect(edits).toHaveLength(0);
+  });
+});
+
+describe('painting is off the caller’s critical path', () => {
+  it('onToolStart does not wait for the platform to answer', () => {
+    // A sink that never answers: if onToolStart awaited delivery, this call would never return —
+    // which is exactly what used to put every progress write in front of the user's reply.
+    const sink: BubbleSink = {
+      sendBubble: () => new Promise<MessageRef>(() => undefined),
+      editBubble: () => new Promise<void>(() => undefined),
+      now: () => 0,
+      schedule: () => () => undefined,
+    };
+    const r = new ToolRenderer(makeOpts({ grouping: 'accumulate' }), sink);
+
+    r.onToolStart(start('Read', 'a.ts', 0));
+    r.onToolFinish(finish('Read', true, 500, 0));
+    r.onToolStart(start('Bash', 'ls', 1));
+    expect(true).toBe(true); // reaching here at all is the assertion
+  });
+
+  it('a burst of tool events collapses into far fewer writes than events', async () => {
+    const { sink, sends, edits, flush } = makeSink({ withEdit: true });
+    const r = new ToolRenderer(makeOpts({ grouping: 'accumulate' }), sink);
+
+    // 20 back-to-back tool calls: the shape that produced two writes per tool and 78 × 429.
+    for (let i = 0; i < 20; i++) {
+      r.onToolStart(start('Read', `f${i}.ts`, i));
+      r.onToolFinish(finish('Read', true, 100, i));
+    }
+    await flush();
+
+    expect(sends).toHaveLength(1);
+    expect(edits.length).toBeLessThanOrEqual(2); // was 40 writes
+    expect(edits[edits.length - 1]!.text.split('\n')).toHaveLength(20); // all of it still shown
+  });
+
+  it('settle() resolves once everything has landed', async () => {
+    const { sink, flush } = makeSink({ withEdit: true });
+    const r = new ToolRenderer(makeOpts({ grouping: 'accumulate' }), sink);
+
+    r.onToolStart(start('Read', 'a.ts', 0));
+    const settled = r.settle(10_000);
+    await flush();
+    await expect(settled).resolves.toBeUndefined();
+  });
+
+  it('settle() gives up on its deadline rather than holding the turn open', async () => {
+    const { sink, flush, advanceTo, failNextEdit } = makeSink({ withEdit: true });
+    const r = new ToolRenderer(makeOpts({ grouping: 'accumulate' }), sink);
+
+    r.onToolStart(start('Read', 'a.ts', 0));
+    await flush();
+    failNextEdit(new RateLimitedError('flood', { retryAfterMs: 229_000 }));
+    r.onToolFinish(finish('Read', true, 500, 0));
+    await flush();
+
+    const settled = r.settle(15_000);
+    await advanceTo(15_000);
+    await expect(settled).resolves.toBeUndefined(); // the turn is free; the write still lands later
+  });
+
+  it('resetSegment waits for the segment’s last ✓ instead of discarding it', async () => {
+    const { sink, edits, flush, advanceTo, failNextEdit } = makeSink({ withEdit: true });
+    const r = new ToolRenderer(makeOpts({ grouping: 'accumulate' }), sink);
+
+    r.onToolStart(start('Read', 'a.ts', 0));
+    await flush();
+    // The finish lands while the lane is stuck; the turn ends immediately after.
+    failNextEdit(new RateLimitedError('flood', { retryAfterMs: 2_000 }));
+    r.onToolFinish(finish('Read', true, 500, 0));
+    await flush();
+    r.resetSegment();
+    await flush();
+    expect(edits).toHaveLength(0);
+
+    await advanceTo(2_000);
+    // Clearing the line set immediately would have thrown this ✓ away with it.
+    expect(edits[0]!.text).toBe('📖 Read: "a.ts" ✓ 500ms');
+  });
+});
+
 describe('accumulate: sealing a bubble that can take no more edits', () => {
   it('spending maxEdits opens a new bubble carrying only the unsettled lines', async () => {
-    const { sink, sends, edits } = makeSink({ withEdit: true });
+    const { sink, sends, edits, flush } = makeSink({ withEdit: true });
     // Budget of 1 edit per bubble: send, one edit, then the next update must open a new bubble.
     const r = new ToolRenderer(makeOpts({ grouping: 'accumulate', maxEdits: 1 }), sink);
 
-    await r.onToolStart(start('Read', 'a.ts', 0)); // sends bubble 1
-    await r.onToolFinish(finish('Read', true, 500, 0)); // edit 1/1 → ✓ delivered
+    r.onToolStart(start('Read', 'a.ts', 0)); // sends bubble 1
+    await flush();
+    r.onToolFinish(finish('Read', true, 500, 0)); // edit 1/1 → ✓ delivered
+    await flush();
     expect(sends).toHaveLength(1);
     expect(edits).toHaveLength(1);
 
     // Budget spent → seal. The finished Read line stays in bubble 1 and is not repeated.
-    expect(await r.onToolStart(start('Bash', 'ls', 1))).toBe(true);
+    r.onToolStart(start('Bash', 'ls', 1));
+    await flush();
     expect(sends).toHaveLength(2);
     expect(sends[1]).toBe('💻 Bash: "ls"');
     expect(edits[0]!.text).toBe('📖 Read: "a.ts" ✓ 500ms');
   });
 
   it('a finish that arrives with no budget left is carried into the new bubble, not lost', async () => {
-    const { sink, sends } = makeSink({ withEdit: true });
+    const { sink, sends, flush } = makeSink({ withEdit: true });
     const r = new ToolRenderer(makeOpts({ grouping: 'accumulate', maxEdits: 0 }), sink);
 
-    await r.onToolStart(start('Bash', 'sleep 1', 0)); // bubble 1, no edits allowed at all
-    await r.onToolFinish(finish('Bash', true, 1200, 0));
+    r.onToolStart(start('Bash', 'sleep 1', 0)); // bubble 1, no edits allowed at all
+    await flush();
+    r.onToolFinish(finish('Bash', true, 1200, 0));
+    await flush();
 
     // The ✓ could not be edited into bubble 1, so the line moves to a bubble that can show it.
     expect(sends).toHaveLength(2);
@@ -219,55 +490,54 @@ describe('accumulate: sealing a bubble that can take no more edits', () => {
   });
 
   it('a platform refusing an edit seals the bubble and repaints into a new one', async () => {
-    const { sink, sends, edits, refuseEditsAfter } = makeSink({ withEdit: true });
+    const { sink, sends, edits, flush, refuseEditsAfter } = makeSink({ withEdit: true });
     const r = new ToolRenderer(makeOpts({ grouping: 'accumulate' }), sink);
 
-    await r.onToolStart(start('Read', 'a.ts', 0));
+    r.onToolStart(start('Read', 'a.ts', 0));
+    await flush();
     refuseEditsAfter(0); // every edit from here on is rejected permanently (Lark 230072)
 
-    expect(await r.onToolStart(start('Bash', 'ls', 1))).toBe(true);
+    r.onToolStart(start('Bash', 'ls', 1));
+    await flush();
     expect(edits).toHaveLength(0);
     expect(sends).toHaveLength(2);
     // Still-running Read is unsettled, so it is carried over rather than stranded.
     expect(sends[1]).toBe('📖 Read: "a.ts"\n💻 Bash: "ls"');
   });
 
-  it('a transient edit error still propagates (the caller decides, no silent seal)', async () => {
-    const sends: string[] = [];
-    const sink: BubbleSink = {
-      async sendBubble(text: string): Promise<MessageRef> {
-        sends.push(text);
-        return { address: { channel: 'c' }, messageId: `m${sends.length}` };
-      },
-      editBubble: async (): Promise<void> => {
-        throw new Error('rate-limited');
-      },
-    };
-    const r = new ToolRenderer(makeOpts({ grouping: 'accumulate' }), sink);
+  it('a line finished while a write was in flight is not marked delivered by that write', async () => {
+    const { sink, sends, edits, flush } = makeSink({ withEdit: true });
+    // maxEdits 0 forces a seal on the very next paint, which is what reads the delivery state.
+    const r = new ToolRenderer(makeOpts({ grouping: 'accumulate', maxEdits: 0 }), sink);
 
-    await r.onToolStart(start('Read', 'a.ts', 0));
-    await expect(r.onToolStart(start('Bash', 'ls', 1))).rejects.toThrow('rate-limited');
-    expect(sends).toHaveLength(1); // no new bubble: a rate limit is not a seal
+    r.onToolStart(start('Read', 'a.ts', 0));
+    // No flush: the send is in flight. The ✓ recorded now was NOT part of it.
+    r.onToolFinish(finish('Read', true, 500, 0));
+    await flush();
+
+    // A boolean "delivered" flag would have been set by the send and the ✓ dropped on the seal.
+    expect(edits).toHaveLength(0);
+    expect(sends[sends.length - 1]).toContain('✓ 500ms');
   });
 });
 
 describe('accumulate: sealing a bubble that is full', () => {
   it('outgrowing maxMessageLength seals the bubble and continues in a new one', async () => {
-    const { sink, sends, edits } = makeSink({ withEdit: true });
+    const { sink, sends, edits, flush } = makeSink({ withEdit: true });
     // '📖 Read: "a.ts"' is 15 chars; two lines plus the newline is 31. A 40-char ceiling
     // therefore holds two lines but not three.
-    const r = new ToolRenderer(
-      makeOpts({ grouping: 'accumulate', maxMessageLength: 40 }),
-      sink
-    );
+    const r = new ToolRenderer(makeOpts({ grouping: 'accumulate', maxMessageLength: 40 }), sink);
 
-    await r.onToolStart(start('Read', 'a.ts', 0));
-    await r.onToolStart(start('Read', 'b.ts', 1));
+    r.onToolStart(start('Read', 'a.ts', 0));
+    await flush();
+    r.onToolStart(start('Read', 'b.ts', 1));
+    await flush();
     expect(sends).toHaveLength(1);
     expect(edits).toHaveLength(1);
 
     // The third line would overflow, so the bubble is sealed rather than rejected on the wire.
-    expect(await r.onToolStart(start('Read', 'c.ts', 2))).toBe(true);
+    r.onToolStart(start('Read', 'c.ts', 2));
+    await flush();
     expect(sends).toHaveLength(2);
     // All three are still running, so all three are unsettled and carry over — then the oldest
     // are dropped to fit, leaving the newest progress, which is what the user is waiting on.
@@ -275,23 +545,24 @@ describe('accumulate: sealing a bubble that is full', () => {
   });
 
   it('a delivered line is dropped on the length seal, so the new bubble stays small', async () => {
-    const { sink, sends } = makeSink({ withEdit: true });
-    const r = new ToolRenderer(
-      makeOpts({ grouping: 'accumulate', maxMessageLength: 40 }),
-      sink
-    );
+    const { sink, sends, flush } = makeSink({ withEdit: true });
+    const r = new ToolRenderer(makeOpts({ grouping: 'accumulate', maxMessageLength: 40 }), sink);
 
-    await r.onToolStart(start('Read', 'a.ts', 0));
-    await r.onToolFinish(finish('Read', true, 500, 0)); // ✓ delivered into bubble 1
-    await r.onToolStart(start('Bash', 'ls', 1));
+    r.onToolStart(start('Read', 'a.ts', 0));
+    await flush();
+    r.onToolFinish(finish('Read', true, 500, 0)); // ✓ delivered into bubble 1
+    await flush();
+    r.onToolStart(start('Bash', 'ls', 1));
+    await flush();
 
     // Bubble 1 already shows the finished Read, so the seal carries only the running Bash.
-    expect(await r.onToolStart(start('Edit', 'src/x.ts', 2))).toBe(true);
+    r.onToolStart(start('Edit', 'src/x.ts', 2));
+    await flush();
     expect(sends[sends.length - 1]).not.toContain('Read');
   });
 
   it('measures the RENDERED length, not the raw one', async () => {
-    const { sink, sends } = makeSink({ withEdit: true });
+    const { sink, sends, flush } = makeSink({ withEdit: true });
     // A profile whose rendering doubles the visible length: 15 raw chars measure as 30, so a
     // single line already fills a 40-char message and the second one must open a new bubble.
     const r = new ToolRenderer(
@@ -303,13 +574,15 @@ describe('accumulate: sealing a bubble that is full', () => {
       sink
     );
 
-    await r.onToolStart(start('Read', 'a.ts', 0));
-    expect(await r.onToolStart(start('Read', 'b.ts', 1))).toBe(true);
+    r.onToolStart(start('Read', 'a.ts', 0));
+    await flush();
+    r.onToolStart(start('Read', 'b.ts', 1));
+    await flush();
     expect(sends).toHaveLength(2);
   });
 
   it('separate mode clamps a bubble no seal can shrink', async () => {
-    const { sink, sends } = makeSink({ withEdit: false });
+    const { sink, sends, flush } = makeSink({ withEdit: false });
     const r = new ToolRenderer(
       makeOpts({ mode: 'verbose', grouping: 'separate', maxMessageLength: 30 }),
       sink
@@ -317,42 +590,61 @@ describe('accumulate: sealing a bubble that is full', () => {
 
     // verbose appends the args JSON, which alone blows past the limit; there is no line set to
     // seal in separate mode, so the only honest option is to clamp and still deliver something.
-    await r.onToolStart({ name: 'Read', inputPreview: 'a.ts', index: 0, input: { path: 'x'.repeat(200) } });
+    r.onToolStart({ name: 'Read', inputPreview: 'a.ts', index: 0, input: { path: 'x'.repeat(200) } });
+    await flush();
     expect(sends).toHaveLength(1);
     expect(sends[0]!.length).toBeLessThanOrEqual(30);
     expect(sends[0]!.endsWith('…')).toBe(true);
   });
 
   it('is unbounded when no limit is configured', async () => {
-    const { sink, sends, edits } = makeSink({ withEdit: true });
+    const { sink, sends, edits, flush } = makeSink({ withEdit: true });
     const r = new ToolRenderer(makeOpts({ grouping: 'accumulate' }), sink);
 
-    for (let i = 0; i < 20; i++) await r.onToolStart(start('Read', `f${i}.ts`, i));
+    for (let i = 0; i < 20; i++) {
+      r.onToolStart(start('Read', `f${i}.ts`, i));
+      await flush();
+    }
     expect(sends).toHaveLength(1); // one bubble, edited throughout
     expect(edits.length).toBe(19);
   });
-});
 
+  it('an identical repaint spends no write at all', async () => {
+    const { sink, edits, flush } = makeSink({ withEdit: true });
+    const r = new ToolRenderer(makeOpts({ grouping: 'accumulate', mode: 'new' }), sink);
+
+    r.onToolStart(start('Read', 'a.ts', 0));
+    await flush();
+    // Deduped by 'new', so the line set does not change — and a write saying the same thing is
+    // a token spent for nothing.
+    r.onToolStart(start('Read', 'b.ts', 1));
+    await flush();
+    expect(edits).toHaveLength(0);
+  });
+});
 
 describe('new dedupe', () => {
   it('separate: consecutive same name sends only one', async () => {
-    const { sink, sends } = makeSink({ withEdit: true });
+    const { sink, sends, flush } = makeSink({ withEdit: true });
     const r = new ToolRenderer(makeOpts({ grouping: 'separate', mode: 'new' }), sink);
 
-    expect(await r.onToolStart(start('Read', 'src/a.ts'))).toBe(true);
-    expect(await r.onToolStart(start('Read', 'src/b.ts'))).toBe(false);
-    expect(await r.onToolStart(start('Edit', 'src/c.ts'))).toBe(true);
+    r.onToolStart(start('Read', 'src/a.ts'));
+    r.onToolStart(start('Read', 'src/b.ts'));
+    r.onToolStart(start('Edit', 'src/c.ts'));
+    await flush();
 
     expect(sends).toHaveLength(2);
   });
 
   it('accumulate: consecutive same name does not enter the line set', async () => {
-    const { sink, sends, edits } = makeSink({ withEdit: true });
+    const { sink, sends, edits, flush } = makeSink({ withEdit: true });
     const r = new ToolRenderer(makeOpts({ grouping: 'accumulate', mode: 'new' }), sink);
 
-    expect(await r.onToolStart(start('Read', 'src/a.ts', 0))).toBe(true);
-    expect(await r.onToolStart(start('Read', 'src/b.ts', 1))).toBe(false); // deduped
-    expect(await r.onToolStart(start('Edit', 'src/c.ts', 2))).toBe(false); // added to line + edit
+    r.onToolStart(start('Read', 'src/a.ts', 0));
+    await flush();
+    r.onToolStart(start('Read', 'src/b.ts', 1)); // deduped
+    r.onToolStart(start('Edit', 'src/c.ts', 2)); // added to line + edit
+    await flush();
 
     expect(sends).toHaveLength(1);
     expect(edits).toHaveLength(1);

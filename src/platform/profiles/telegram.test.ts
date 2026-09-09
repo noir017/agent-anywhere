@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest';
+
+import { RateLimitedError } from '../../core/outbound-errors.js';
 import {
   mapTelegramReactionEmoji,
   specsToTelegramCommands,
@@ -673,5 +675,50 @@ describe('private-chat topic buttons land in the topic, not the DM root', () => 
     expect(calls.send[0]!.reply_markup).toBeDefined();
     // The exact old-code payload was a composite string as chat_id; it can no longer be formed.
     expect(calls.send[0]!.chat_id).not.toBe('5865716608:7529');
+  });
+});
+
+/**
+ * The 429 mapping. Telegram is the platform whose flood limit the daemon actually hit: 78 rejected
+ * writes in one run, `retry after` up to 229 s, every one of them logged and the update lost.
+ * Typing it lets the writers wait the stated time instead of the 10 s they were guessing.
+ *
+ * (The regex's dependency on satori's message format is pinned separately, in
+ * telegram.contract.test.ts.)
+ */
+describe('telegram error classification (429 → RateLimitedError)', () => {
+  const profile = createTelegramProfile();
+
+  it('recovers the stated wait, in ms', () => {
+    const e = profile.classifyError!(
+      new Error('Telegram API error 429. Too Many Requests: retry after 229')
+    );
+    expect(e).toBeInstanceOf(RateLimitedError);
+    expect((e as RateLimitedError).retryAfterMs).toBe(229_000);
+  });
+
+  it('still types a 429 that states no wait — the class alone is actionable', () => {
+    const e = profile.classifyError!(new Error('Telegram API error 429. Too Many Requests'));
+    expect(e).toBeInstanceOf(RateLimitedError);
+    expect((e as RateLimitedError).retryAfterMs).toBeUndefined();
+  });
+
+  it('finds it inside an AggregateError, the shape satori wraps encoder failures in', () => {
+    const inner = new Error('Telegram API error 429. Too Many Requests: retry after 30');
+    const e = profile.classifyError!(new AggregateError([inner], ''));
+    expect((e as RateLimitedError).retryAfterMs).toBe(30_000);
+  });
+
+  it('leaves a 400 alone — a permanent failure typed as a rate limit becomes a silent retry loop', () => {
+    const tooLong = new Error('Telegram API error 400. Bad Request: MESSAGE_TOO_LONG');
+    expect(profile.classifyError!(tooLong)).toBe(tooLong);
+
+    const gone = new Error('Telegram API error 400. Bad Request: chat not found');
+    expect(profile.classifyError!(gone)).toBe(gone);
+  });
+
+  it('leaves an unrelated failure alone', () => {
+    const net = new Error('socket hang up');
+    expect(profile.classifyError!(net)).toBe(net);
   });
 });

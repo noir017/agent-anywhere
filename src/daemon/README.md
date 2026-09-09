@@ -17,6 +17,7 @@ session id, agy's conversation id). One conversation holds one session *per agen
 | `conversation.ts` | `ConversationRegistry` — per-conversation state, agent binding, access + gating, command translation |
 | `settings-store.ts` | The write half of `/setting`: validate, patch config.yaml, apply to the live `Config` |
 | `turn-runner.ts` | One turn end to end: prompt, streaming, tools, footer, errors |
+| `paced-adapter.ts` | Wraps every `PlatformAdapter` in the shared per-chat write budget |
 | `agent.ts` | `AgentFactory` / `AgentSession` / `AgentStreamHandlers` interfaces. Dependency-free. |
 | `agent-factory.ts` | Dispatch: which runtime serves which agent |
 | `agent-acp.ts` | ACP runtime (claude, codex, opencode, gemini, custom) |
@@ -249,6 +250,23 @@ chain — rendering is best-effort — rather than escaping as unhandled rejecti
 "current buffer" and "did we produce output" cannot be bare `let`s (a mutable binding is
 not shared across that function boundary). They live in one mutable object read and
 written by both ends. Never cache `ref.stream` — it is rotated at segment boundaries.
+
+**Outbound lanes.** Every write a turn makes goes through the shared per-chat budget (see
+[`paced-adapter.ts`](#paced-adapterts)), but not every write is worth the same wait:
+
+| lane | what goes on it | under congestion |
+|---|---|---|
+| `reply` (default) | the body, the footer, error notices, reactions | queued, never dropped |
+| `progress` | tool bubbles | superseded by a newer paint, or dropped when stale |
+| `typing` | the keep-alive beats | dropped immediately |
+
+That is also why `finalize` ends with `tools.settle(outbound.finalizeWaitMs)` followed by
+`tools.abort()`. `settle` returns the moment everything has landed, so in the ordinary case
+neither call does anything. When it does not — a chat Telegram has paused for 229 s — the
+turn completes and gets its ✅ instead of being held open for the same 229 s, and the
+renderer stops trying. The `abort()` is not optional bookkeeping: an armed retry keeps the
+whole render alive on a timer, so without it a finished turn would go on repainting its
+bubble for the life of the process.
 
 Turn outcomes:
 
@@ -503,6 +521,18 @@ SIGTERM mid-turn).
 [`src/ipc/README.md`](../ipc/README.md).
 
 ## `daemon.ts` responsibilities
+
+**Outbound pacing is applied once, in the constructor.** `this.platforms` is not the map
+the caller passed but a copy in which every adapter is wrapped by
+`withOutboundPacing`. That single wrap is what puts the reply, the tool bubbles, the
+reactions, the acks, the menus and the agent's own reverse commands on one shared per-chat
+budget — the ~38 call sites across `conversation.ts`, `daemon.ts` and `turn-runner.ts`
+need no changes, and a path added later is paced by default rather than by remembering.
+
+`stop()` **drains** the pacer before stopping the adapters: a queued write is somebody's
+reply, and a lane that happened to be paused at shutdown must not lose it. Bounded by
+`outbound.drainMs` so a chat the platform has silenced for minutes cannot hold the
+shutdown for the same minutes.
 
 **Slash registration is fixed at startup**, derived from config alone
 (`buildRegisteredSpecs`), deliberately *not* the union of what agents report — see

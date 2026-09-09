@@ -45,6 +45,8 @@ import {
   type SettingRow,
 } from '../core/settings.js';
 import type { PlatformAdapter } from '../platform/adapter.js';
+import { OutboundPacer } from '../core/outbound-pacer.js';
+import { withOutboundPacing } from './paced-adapter.js';
 import type {
   AgentCommand,
   ButtonInteraction,
@@ -367,10 +369,23 @@ export class Daemon {
    */
   private lastResolvedConversationId: ConversationId | undefined;
 
+  /**
+   * Platform adapters keyed by instance id (one daemon drives all configured instances), each
+   * wrapped in the shared outbound pacer.
+   *
+   * Wrapped HERE, once, rather than at the call sites: `ConversationRegistry`, `TurnRunner` and
+   * `handleReverse` all read this map, so one wrap puts the reply, the tool bubbles, the reactions,
+   * the menus and the agent's own reverse commands on the single per-chat budget the platform
+   * actually enforces. Adapters given to the constructor are not mutated; this is a new map.
+   */
+  private readonly platforms: Map<string, PlatformAdapter>;
+
+  /** The budget itself. Held so `stop()` can drain what is still queued. */
+  private readonly pacer: OutboundPacer;
+
   constructor(
     private readonly config: Config,
-    /** Platform adapters keyed by instance id (one daemon drives all configured instances). */
-    private readonly platforms: Map<string, PlatformAdapter>,
+    platforms: Map<string, PlatformAdapter>,
     agents: AgentFactory,
     socketPath: string,
     /** Persistent conversation state (agent binding + each agent's own session id). */
@@ -385,7 +400,12 @@ export class Daemon {
       },
     };
 
-    this.registry = new ConversationRegistry(config, platforms, agents, clock, {
+    this.pacer = new OutboundPacer(config.outbound, clock);
+    this.platforms = new Map(
+      [...platforms].map(([id, adapter]) => [id, withOutboundPacing(adapter, this.pacer)])
+    );
+
+    this.registry = new ConversationRegistry(config, this.platforms, agents, clock, {
       // A conversation's agent reported its command list → record it under that AGENT (feeds pickers).
       onAvailableCommands: (_id, agentId, cmds) => this.onAgentCommands(agentId, cmds),
       // A harness picker (/claude, /opencode) was invoked in a conversation of that harness.
@@ -469,6 +489,18 @@ export class Daemon {
     this.signalCleanup?.();
     this.signalCleanup = null;
     await this.ipc.stop();
+    // Deliver what the pacer is still holding BEFORE the adapters go down: a queued write is
+    // somebody's reply, and a lane that was paced or paused at the wrong moment must not lose it
+    // just because the process is leaving. Bounded by outbound.drainMs so a chat the platform has
+    // silenced for minutes cannot hold the shutdown for the same minutes.
+    const drained = await this.pacer
+      .drain(this.config.outbound.drainMs)
+      .catch(() => ({ delivered: 0, abandoned: 0 }));
+    if (drained.delivered > 0 || drained.abandoned > 0) {
+      console.log(
+        `[daemon] outbound drain: ${drained.delivered} delivered, ${drained.abandoned} abandoned`
+      );
+    }
     for (const [id, adapter] of this.platforms) {
       await adapter.stop().catch((e) =>
         console.error(`[daemon] failed to stop platform instance "${id}":`, e instanceof Error ? e.message : e)

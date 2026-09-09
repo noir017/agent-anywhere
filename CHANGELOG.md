@@ -5,6 +5,25 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **A topic takes its name while the turn is still running.** 1.5.0 asked for the name after a
+  turn ended successfully, which made it arrive one whole turn late — and a turn is not a moment:
+  the ones worth opening a topic for run for minutes, and you spend all of them looking at a topic
+  column that still says whatever the topic was created as.
+
+  Nothing in the naming path needed the turn's outcome. The seed is the opening message and the
+  lane is recorded before the agent is asked anything, so the call now starts there and the rename
+  lands as soon as the model answers — a second or two in, beside the work rather than after it.
+  Everything else is unchanged: once per conversation, same endpoint, same fallback, still never
+  awaited by the turn.
+
+  One behaviour goes with it. The old trigger required a *successful* turn, so that a topic could
+  not be labelled with something that failed; a conversation whose first turn errors is now named
+  anyway. That guard was on the wrong text — the name comes from the request, which is no less what
+  the topic is about for the harness having failed to answer it, and a topic whose first turn broke
+  is exactly the one you need to find again in the column. Slash-command turns are still skipped.
+
 ## [1.5.0] - 2026-09-09
 
 ### Changed

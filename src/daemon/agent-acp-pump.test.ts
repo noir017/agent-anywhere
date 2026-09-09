@@ -117,8 +117,9 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     text(sessionId, 'started the script in the background');
     resultUsage(sessionId, 1000);
     reply(msg.id, { stopReason: 'end_turn' });
-    // The trailing title the SDK generates in a background task, after the turn it names. Used to
-    // be reachable only as next-turn residue.
+    // A trailing notification the gateway does not render, landing between the turn and the
+    // background output. Kept in the fake because "an ignored update arrives mid-burst" is exactly
+    // the condition under which a reader that dispatches on type can lose the updates after it.
     setTimeout(() => notify(sessionId, { sessionUpdate: 'session_info_update', title: 'The long script' }), 20);
     // ...and then the background work reporting in, with no prompt in flight. THIS is what used to
     // be dropped.
@@ -136,21 +137,17 @@ function collector(): {
   handlers: AgentStreamHandlers;
   turn: string[];
   tools: string[];
-  titles: string[];
 } {
   const turn: string[] = [];
   const tools: string[] = [];
-  const titles: string[] = [];
   return {
     turn,
     tools,
-    titles,
     handlers: {
       onText: (d) => void turn.push(d),
       onToolStart: (e) => void tools.push(e.name),
       onToolFinish: () => {},
       onSegmentBreak: () => {},
-      onTitle: (t) => void titles.push(t),
     },
   };
 }
@@ -195,17 +192,14 @@ function sinkSpy(): {
   install(session: AgentSession): void;
   text: string[];
   tools: string[];
-  titles: string[];
   closes: () => number;
 } {
   const text: string[] = [];
   const tools: string[] = [];
-  const titles: string[] = [];
   let closes = 0;
   return {
     text,
     tools,
-    titles,
     closes: () => closes,
     install: (session) =>
       session.setFollowUpSink?.({
@@ -214,7 +208,6 @@ function sinkSpy(): {
           onToolStart: (e) => void tools.push(e.name),
           onToolFinish: () => {},
           onSegmentBreak: () => {},
-          onTitle: (t) => void titles.push(t),
         }),
         close: () => void closes++,
       }),
@@ -230,9 +223,8 @@ const sealed = (): Promise<void> => new Promise((r) => setTimeout(r, 1_700));
 describe('the ACP update reader keeps reading after a turn ends', () => {
   it('delivers post-turn output to the follow-up sink, not into the void', async () => {
     const { session } = rig();
-    const captured: { text: string[]; titles: string[]; closes: number } = {
+    const captured: { text: string[]; closes: number } = {
       text: [],
-      titles: [],
       closes: 0,
     };
     session.setFollowUpSink?.({
@@ -241,7 +233,6 @@ describe('the ACP update reader keeps reading after a turn ends', () => {
         onToolStart: () => {},
         onToolFinish: () => {},
         onSegmentBreak: () => {},
-        onTitle: (t) => void captured.titles.push(t),
       }),
       close: () => void captured.closes++,
     });
@@ -266,26 +257,6 @@ describe('the ACP update reader keeps reading after a turn ends', () => {
     // And the burst IS eventually closed, which is what makes it visible at all in the default
     // `once` delivery mode (nothing is sent until the buffer completes).
     expect(captured.closes).toBe(1);
-  });
-
-  it('reports a trailing session title in real time instead of a turn late', async () => {
-    const { session } = rig();
-    const titles: string[] = [];
-    session.setFollowUpSink?.({
-      handlers: () => ({
-        onText: () => {},
-        onToolStart: () => {},
-        onToolFinish: () => {},
-        onSegmentBreak: () => {},
-        onTitle: (t) => void titles.push(t),
-      }),
-      close: () => {},
-    });
-
-    await session.runTurn({ prompt: 'hello', sessionToken: 'tok' }, collector().handlers);
-    await settle();
-
-    expect(titles).toEqual(['The long script']);
   });
 
   it('routes a later turn\'s output back to that turn, not to the sink', async () => {

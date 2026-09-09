@@ -486,6 +486,40 @@ export const ConfigSchema = z
           .default({}),
       })
       .default({}),
+
+    /**
+     * How a conversation's chat lane (a Telegram forum topic, a Discord thread) gets its name.
+     *
+     * A conversation is named ONCE, from its opening message, after its first successful turn, and
+     * then left alone until `/title` or `/new`. Whether it happens at all is per-platform
+     * (`autoRenameThread`); this block is only about where the name comes from.
+     *
+     * Without `llm` the name is the opening message cut to 40 characters — a substring, not a
+     * summary, and it shows. Point `llm` at any OpenAI-compatible `/chat/completions` endpoint to
+     * get a real one; a flash-tier model is the right size for the job and costs ~60 tokens per
+     * conversation. A failed call falls back to the substring, so naming never depends on it.
+     */
+    title: z
+      .object({
+        llm: z
+          .object({
+            /** Base URL up to and including the version segment, e.g. `http://newapi:3000/v1`. */
+            baseUrl: z.string().min(1),
+            apiKey: z.string().min(1),
+            model: z.string().min(1),
+            /**
+             * Deadline for the naming call.
+             *
+             * Generous on purpose. Nothing waits on it — the reply has already been delivered —
+             * so the only thing a tight deadline buys is a conversation stuck with the fallback
+             * name for good. A flash-tier model answers in 1-4s; the outliers are the upstream
+             * having a moment, and those are exactly the ones worth waiting out.
+             */
+            timeoutMs: z.number().int().positive().default(45_000),
+          })
+          .optional(),
+      })
+      .default({}),
   })
   // Referential-integrity + cross-field checks (fail-fast at load). Otherwise a typo
   // would surface only when that agent/platform is used, as an obscure runtime error.

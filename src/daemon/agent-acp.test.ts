@@ -19,14 +19,12 @@ function recorder(): {
   commands: unknown[];
   usage: AgentUsage[];
   models: string[];
-  titles: string[];
   configOptions: Array<SessionConfigOption[] | null | undefined>;
 } {
   const events: string[] = [];
   const commands: unknown[] = [];
   const usage: AgentUsage[] = [];
   const models: string[] = [];
-  const titles: string[] = [];
   const configOptions: Array<SessionConfigOption[] | null | undefined> = [];
   const st: TurnState = {
     handlers: {
@@ -37,14 +35,13 @@ function recorder(): {
       onAvailableCommands: (c) => commands.push(c),
       onUsage: (u) => usage.push(u),
       onModel: (m) => models.push(m),
-      onTitle: (t) => titles.push(t),
     },
     lastSegment: 'none',
     toolLedger: new Map(),
     toolIndexSeq: 0,
     onConfigOptions: (o) => configOptions.push(o),
   };
-  return { st, events, commands, usage, models, titles, configOptions };
+  return { st, events, commands, usage, models, configOptions };
 }
 
 const feed = (st: TurnState, u: unknown) => translateUpdate(u as SessionUpdate, st);
@@ -494,38 +491,28 @@ describe('dsh harness preset', () => {
 });
 
 /**
- * `session_info_update` — the harness's own name for the conversation.
+ * `session_info_update` — the harness's own name for the conversation, deliberately ignored.
  *
- * This notification used to land in translateUpdate's `default: break` and be dropped, which is
- * why a Telegram topic kept whatever name it was created with forever while the harness had been
- * generating an accurate title all along.
+ * The gateway used to follow it and rename the chat lane on every change. It does not any more:
+ * claude-agent-acp regenerates the title as a session moves on, so topics drifted to whatever had
+ * been discussed most recently. Conversations are now named once from their opening message (see
+ * ConversationRegistry.nameConversation), and this notification falls through to `default: break`.
  */
-describe('translateUpdate session_info_update (the harness names the conversation)', () => {
-  it('reports the title', () => {
+describe('translateUpdate session_info_update (ignored)', () => {
+  it('renders nothing and reports nothing', () => {
     const r = recorder();
     feed(r.st, { sessionUpdate: 'session_info_update', title: 'Fix the ask timeout' });
-    expect(r.titles).toEqual(['Fix the ask timeout']);
+    expect(r.events).toEqual([]);
+    expect(r.usage).toEqual([]);
+    expect(r.models).toEqual([]);
   });
 
-  it('trims a title the harness padded', () => {
-    const r = recorder();
-    feed(r.st, { sessionUpdate: 'session_info_update', title: '  spaced out \n' });
-    expect(r.titles).toEqual(['spaced out']);
-  });
-
-  // The field is `string | null` in the schema, and an update carrying only `updatedAt` is a
-  // legitimate partial. Neither is a title, and renaming a topic to "null" would be memorable.
-  it('ignores a cleared or absent title rather than renaming to nothing', () => {
+  // The field is `string | null` in the schema and an update carrying only `updatedAt` is a
+  // legitimate partial. Neither shape may reach the default branch as anything but a no-op.
+  it('is a no-op for a cleared or absent title too', () => {
     const r = recorder();
     feed(r.st, { sessionUpdate: 'session_info_update', title: null });
     feed(r.st, { sessionUpdate: 'session_info_update', updatedAt: '2026-09-08T00:00:00Z' });
-    feed(r.st, { sessionUpdate: 'session_info_update', title: '   ' });
-    expect(r.titles).toEqual([]);
-  });
-
-  it('renders nothing into the reply — a title is metadata, not content', () => {
-    const r = recorder();
-    feed(r.st, { sessionUpdate: 'session_info_update', title: 'Fix the ask timeout' });
     expect(r.events).toEqual([]);
   });
 });

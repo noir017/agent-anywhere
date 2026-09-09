@@ -42,19 +42,6 @@ export interface AgentStreamHandlers {
    * Fired once after session startup and again on any `config_option_update`.
    */
   onModel?(model: string): void;
-  /**
-   * The harness's own name for this conversation (ACP `session_info_update.title`).
-   *
-   * Where it comes from: claude-agent-acp generates a session title in a background task, persists
-   * it, and notifies when it changes. So it names the conversation's subject rather than any one
-   * turn, arrives at most once per turn, and is usually absent on the first one.
-   *
-   * Consumed to retitle the chat lane the conversation occupies — a Telegram forum topic, which
-   * otherwise keeps its creation-time name for as long as it exists. Optional because most
-   * harnesses report nothing of the kind (dsh does not, and the agy protocol has no notion of a
-   * title at all), so a conversation with no title is the normal case, not a failure.
-   */
-  onTitle?(title: string): void;
 }
 
 /**

@@ -85,25 +85,20 @@ export interface TurnRunnerDeps {
    */
   recordTurnComplete?(id: ConversationId): void;
   /**
-   * The harness named this conversation; do whatever the gateway does with that.
+   * Name this conversation after the opening message, once.
    *
    * A dep rather than a hook because the answer needs the conversation's address and the store,
-   * both of which live in the registry. Never awaited by the turn — see the onTitle callback.
-   */
-  recordTitle?(id: ConversationId, title: string): Promise<void>;
-  /**
-   * A name for this conversation derived from what the USER said, offered after a turn in case the
-   * harness never names it itself.
+   * both of which live in the registry — which is also where the "only if nothing has named it
+   * yet" rule lives, so this may be called after every turn and will act on at most one of them.
    *
-   * Needed because `recordTitle` only ever fires for harnesses that emit ACP `session_info_update`.
-   * Verified on the deployed set: `claude` sends it, opencode carries the variant in its schema but
-   * never emits one, dsh does not have it, and the agy protocol has no notion of a title at all —
-   * so three of four agents would leave every topic with its creation-time name forever.
+   * The seed is the user's raw text, NOT a name: the registry summarises it (see core/title-namer).
+   * Passing it whole is the point — a name generated from a pre-truncated seed can only ever be a
+   * rewording of the first line.
    *
-   * The registry decides whether to use it (only when nothing has named the conversation yet), so
-   * a real harness title always wins and this never overwrites one.
+   * Never awaited by the turn. Renaming a lane is a side effect on the platform, not part of the
+   * reply, and a slow or failing editForumTopic must not delay a single character of the answer.
    */
-  suggestTitle?(id: ConversationId, seed: string): void;
+  nameConversation?(id: ConversationId, seed: string): void;
   /**
    * Where to put output that arrives with no turn running (background work reporting in), or
    * undefined when this conversation has never had a turn and so has no lane to write to.
@@ -268,12 +263,11 @@ export class TurnRunner {
         // only here (not in `finally`) so an interrupted or failed turn doesn't claim the harness
         // stayed silent — see recordTurnComplete.
         this.deps.recordTurnComplete?.(conversationId);
-        // Offer a name drawn from the user's own words, for the three harnesses out of four that
-        // never send one. Only after a SUCCESSFUL turn — naming a topic after a message that
-        // errored out would label it with the thing that did not happen. The registry ignores this
-        // once anything has named the conversation, so a harness that does report a title is
-        // never overridden by it.
-        if (!isCommandTurn) this.deps.suggestTitle?.(conversationId, this.buildThreadName(batch));
+        // Name the topic after this conversation's opening message. Only after a SUCCESSFUL turn —
+        // naming a topic after a message that errored out would label it with the thing that did
+        // not happen. The registry ignores this once the conversation has a name, so of all the
+        // turns that call it, only the first one does anything.
+        if (!isCommandTurn) this.deps.nameConversation?.(conversationId, this.buildTitleSeed(batch));
         console.log(`[turn] ${conversationId} turn complete`);
       }
     } catch (err) {
@@ -355,13 +349,6 @@ export class TurnRunner {
       // Same for the live model name (see TurnRef.model for why it beats the configured value).
       onModel: (model) => {
         ref.model = model;
-      },
-      // The harness's name for this conversation. Renaming the chat lane is a side effect on the
-      // platform, not part of the reply, so it is deliberately NOT enqueued onto the render chain:
-      // a slow or failing editForumTopic must not delay a single character of the answer, and a
-      // chat whose topic keeps its old name is a far smaller problem than one that stops streaming.
-      onTitle: (title) => {
-        void this.deps.recordTitle?.(conversationId, title);
       },
     };
   }
@@ -594,10 +581,6 @@ export class TurnRunner {
         const live = peek();
         if (live) live.ref.model = model;
       },
-      onTitle: (title) => {
-        touch();
-        void this.deps.recordTitle?.(conversationId, title);
-      },
     };
   }
 
@@ -806,6 +789,23 @@ export class TurnRunner {
       .trim();
     if (flat.length <= 40) return flat;
     return flat.slice(0, 39) + '…';
+  }
+
+  /**
+   * The text a conversation is named from: what the user actually said, whole.
+   *
+   * Deliberately NOT buildThreadName. That one cuts to 40 characters because a thread being created
+   * needs a name right now and there is nothing to summarise it with; this one is summarised by a
+   * model, and handing it a pre-cut seed would cap the result at a rewording of the first line.
+   *
+   * Identity prefixes are left out for the same reason mergePrompt's are: `[Alice]` is context for
+   * the agent, and a summariser fed it will put the speaker's name in the topic title.
+   */
+  private buildTitleSeed(batch: InboundMessage[]): string {
+    return batch
+      .map((m) => m.content)
+      .join('\n')
+      .trim();
   }
 
   /**

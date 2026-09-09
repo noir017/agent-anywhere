@@ -68,6 +68,7 @@ import { scanWorkdirs, isDirectory } from './workdir-scan.js';
 import { resolveAgentCwd, resolveConversationCwd } from './agent-common.js';
 import { formatRuntimeFooter, formatTokens } from '../core/runtime-footer.js';
 import { InboundMerger } from '../core/inbound-merger.js';
+import { fallbackTitle, generateTitle } from '../core/title-namer.js';
 import { shouldRespond, type GateConfig } from '../core/inbound-gate.js';
 import { TurnRunner } from './turn-runner.js';
 import type { ConversationStore } from './conversation-store.js';
@@ -103,8 +104,8 @@ const WORKDIR_NAMES = new Set(['cd', 'dir', 'workdir']);
 /**
  * `/title` — rename the chat lane this conversation lives in.
  *
- * The manual half of the automatic rename (applyConversationTitle): the automatic one follows the
- * harness, and this one overrides it when the harness's guess is wrong or the user simply wants
+ * The manual half of the automatic naming (nameConversation): the automatic one summarises the
+ * opening message, and this one overrides it when the summary is wrong or the user simply wants
  * their own name on the topic. `rename` is accepted too, because that is what the action is called
  * everywhere else in a chat client.
  */
@@ -120,16 +121,17 @@ const TITLE_NAMES = new Set(['title', 'rename', 'topic']);
  * are running at once. It is the agent id (`cc`, `oc`, `dsh`, `agy`) because that is what the user
  * types to bind one.
  *
- * The stripping fixes a leak. mergePrompt prefixes each message with `[<authorName>] ` so an agent
- * can tell speakers apart in a group batch — and the harness, summarising that text, dutifully
- * carried the speaker's display name into the title. Observed: a topic renamed to
- * `[no id] 合并到main并重试` where `no id` is the user's own Telegram name. Leading bracketed groups
- * are removed repeatedly, which also makes the function idempotent: re-titling an already-tagged
- * name replaces the tag instead of stacking a second one.
+ * The stripping keeps a bracket at position zero from meaning two things at once. It was added for
+ * a leak that no longer exists — the harness titles the gateway used to follow were summaries of
+ * mergePrompt's output, so they carried the `[<authorName>] ` speaker prefix into the name, and a
+ * topic was observed renamed to `[no id] 合并到main并重试` after the user's own Telegram name. Names
+ * now come from a model given the raw message, or from `/title`, and both can still open with a
+ * bracket of their own. Leading bracketed groups are removed repeatedly, which also makes the
+ * function idempotent: re-titling an already-tagged name replaces the tag instead of stacking a
+ * second one.
  *
  * The risk is a genuine title that opens with a bracket losing it. Accepted: the tag is prepended
- * either way, so the result stays well-formed, and a harness-written `[…]` at position zero is far
- * more likely to be this leak than intent.
+ * either way, so the result stays well-formed, and it keeps the tag unambiguous.
  */
 export function formatLaneTitle(agentId: string, raw: string): string {
   let subject = raw.replace(/\s+/g, ' ').trim();
@@ -304,6 +306,14 @@ export class ConversationRegistry {
    * minute for the life of the daemon. Cleared with the rest of the conversation's state.
    */
   private unresumableWarned = new Set<ConversationId>();
+  /**
+   * Conversations with a naming call in flight.
+   *
+   * The store gate ("has this been named") cannot cover the window on its own: nothing is recorded
+   * until the platform accepts the rename, and the model call in front of that takes a second or
+   * two — long enough for a second turn to finish underneath it and start a duplicate.
+   */
+  private namingInFlight = new Set<ConversationId>();
 
   constructor(
     private readonly config: Config,
@@ -408,8 +418,7 @@ export class ConversationRegistry {
         // autoThread opened a thread mid-turn: alias its key to this conversation so the user's
         // reply inside it continues here instead of starting an empty one (see adoptThread).
         adoptThread: (id, address, platformId) => this.adoptThread(id, address, platformId),
-        recordTitle: (id, title) => this.applyConversationTitle(id, title),
-        suggestTitle: (id, seed) => this.seedConversationTitle(id, seed),
+        nameConversation: (id, seed) => this.nameConversation(id, seed),
       },
       this.hooks
     );
@@ -708,16 +717,17 @@ export class ConversationRegistry {
   }
 
   /**
-   * `/title` — show this conversation's name, set it, or hand naming back to the agent.
+   * `/title` — show this conversation's name, set it, or have it named afresh.
    *
    * Bare, it reports what the lane was last renamed to, which is the only thing knowable: Telegram
    * offers no way to read a topic's current name back, so a name typed into the Telegram UI is
    * invisible here. The wording says "last set by me" rather than "the title" for exactly that
    * reason — claiming to know the topic's name would be a lie roughly half the time.
    *
-   * A name PINS it: the automatic rename stops following the harness for this conversation, because
-   * a command whose effect the next turn reverts is indistinguishable from a broken command.
-   * `/title auto` releases the pin without changing the current name.
+   * `/title auto` forgets the recorded name, which is what re-arms the automatic naming: a
+   * conversation is named once and only while it has no name on record, so releasing the record is
+   * the only way to ask for another. The lane keeps its current name until the next reply produces
+   * one, because clearing it to nothing in the meantime would be strictly worse than a stale name.
    *
    * Unlike the automatic path this is never silently skipped: an explicit command gets an explicit
    * answer, including the reason it failed. The address is the incoming message's own, not
@@ -735,20 +745,20 @@ export class ConversationRegistry {
     const current = this.store?.conversationTitle(key);
 
     if (wanted.toLowerCase() === 'auto') {
-      if (!this.store?.titlePinned(key)) {
-        return 'This topic already follows the agent\'s own title.';
+      if (!current) {
+        return 'I have not named this topic yet — it gets a name after the next reply.';
       }
-      this.store.unpinConversationTitle(key);
-      return `Handing naming back to the agent — it stays "${current ?? 'as it is'}" until the agent picks a new one.`;
+      this.store?.releaseConversationTitle(key);
+      return `Forgot the name I gave this topic ("${current}"). It keeps that name until the next reply, which will name it afresh.`;
     }
 
     if (!wanted) {
       if (!current) {
-        return 'I have not named this topic. `/title <name>` to set it, or let the agent name it after its next reply.';
+        return 'I have not named this topic. `/title <name>` to name it now, or it gets named automatically after the next reply.';
       }
       return this.store?.titlePinned(key)
-        ? `This topic is named "${current}", pinned — the agent will not rename it. \`/title auto\` to let it.`
-        : `This topic was last named "${current}" by me, following the agent. \`/title <name>\` to pin your own.`;
+        ? `This topic is named "${current}" — you set it, and it will not be renamed. \`/title auto\` to have it named afresh.`
+        : `I named this topic "${current}" from its opening message, and will not rename it again. \`/title <name>\` to set your own.`;
     }
 
     const agentId = this.boundAgentFor(key, fallbackAgent);
@@ -764,82 +774,88 @@ export class ConversationRegistry {
       true
     );
     if (failure) return `Could not rename this topic: ${failure}`;
-    return `Renamed this topic to "${wanted}" and pinned it. \`/title auto\` to let the agent name it again.`;
+    return `Renamed this topic to "${wanted}". \`/title auto\` to have it named automatically again.`;
   }
 
   // ───────────────────────── conversation title (thread/topic rename) ─────────────────────────
 
   /**
-   * The harness named this conversation: rename the chat lane it lives in to match.
+   * Name this conversation's chat lane after its opening message — once, and then never again.
    *
    * Why this exists at all: a Telegram forum topic keeps whatever name it was created with for as
-   * long as it exists, so a topic-per-task workflow ends up as a column of names typed before the
-   * work started — while the harness has been generating an accurate title the whole time and
-   * sending it over ACP, where the gateway dropped it on the floor.
+   * long as it exists, so a topic-per-task workflow ends up as a column of names typed before any
+   * of the work happened.
    *
-   * Everything about this is best-effort, and every early return is a decision:
+   * ── Once ────────────────────────────────────────────────────────────────────────────────────
+   * Called after every successful turn, and acts on the first one only. The predecessor followed
+   * the harness's ACP `session_info_update` instead, which re-reports as a session moves on: topics
+   * drifted to whatever had been discussed most recently, which is not what a name is for. The user
+   * navigates the topic column by memory of where things are, so a name that keeps moving costs
+   * more than one that is slightly off. `/title` and `/new` are the ways to get a different one.
    *
+   * ── Best-effort, every early return a decision ──────────────────────────────────────────────
    * - no lane on record — the conversation has never run a turn, so there is nothing to point at.
-   * - no `thread` — the address IS the chat. Renaming a whole Telegram group because an agent
-   *   summarised one conversation in it would be indefensible, so a lane is required.
-   * - unchanged — the harness re-reports the same title on many turns, and each rename costs an
-   *   API call plus a visible "topic renamed" service message in the chat.
+   * - no `thread` (checked in retitleLane) — the address IS the chat. Renaming a whole Telegram
+   *   group because an agent summarised one conversation in it would be indefensible.
+   * - already named — the once rule. Also what makes this safe to call unconditionally.
+   * - naming in flight — the model call is slow enough (a second or two) for a fast follow-up turn
+   *   to arrive underneath it, and the store gate cannot catch that because nothing is recorded
+   *   until the platform accepts the rename.
    * - `autoRenameThread: false` — the user curates lane names by hand (see the setting).
-   * - pinned — this conversation's name was set with `/title`. An explicit command that the next
-   *   turn silently reverts is a bug under any rename policy, so it wins until `/title auto`.
-   * - the API refused — a non-forum chat, a revoked admin right, a rate limit. A conversation whose
-   *   topic still has its old name is a cosmetic problem; a turn that fails because of one is not.
+   * - the API refused — a non-forum chat, a revoked admin right, a rate limit. Nothing is recorded,
+   *   so the next turn tries again.
    *
-   * Reads the lane rather than `activeAddress` because the title usually arrives AFTER the turn it
-   * describes: claude-agent-acp generates it in a background task and reports it from its turn-end
-   * idle handler, so by the time it lands the turn's address has already been cleared.
+   * Reads the lane rather than `activeAddress`: the naming call outlives the turn that triggered
+   * it, by which time the turn's address has been cleared.
    *
    * NOT guarded on "did a human rename this in the Telegram UI": Telegram exposes no way to read a
    * topic's current name, so that question is unanswerable and pretending otherwise would just
    * move the failure somewhere less obvious. `/title` and the setting are the ways to opt out.
    */
-  private async applyConversationTitle(id: ConversationId, title: string): Promise<void> {
-    const state = this.conversations.get(id);
+  private nameConversation(id: ConversationId, seed: string): void {
     const lane = this.laneOf(id);
-    if (!state || !lane) return;
+    if (!this.conversations.has(id) || !lane || !seed.trim()) return;
     if (this.config.platforms[lane.platformId]?.autoRenameThread === false) return;
-    if (this.store?.titlePinned(id)) return;
-    await this.retitleLane(
-      id,
-      state.agentId,
-      lane.address,
-      lane.platformId,
-      formatLaneTitle(state.agentId, title)
-    );
+    if (this.store?.conversationTitle(id) !== undefined) return;
+    if (this.namingInFlight.has(id)) return;
+    this.namingInFlight.add(id);
+    void (async () => {
+      try {
+        const subject = await this.summarizeTitle(seed);
+        if (!subject) return;
+        // Re-read rather than close over what was true when the call started. `/title` may have
+        // pinned a name of the user's own while the model was thinking — silently reverting a
+        // command the user just typed is a bug under any naming policy — and a `/oc` in the same
+        // window would leave the tag naming the agent that has just stopped answering here.
+        if (this.store?.conversationTitle(id) !== undefined) return;
+        const state = this.conversations.get(id);
+        const target = this.laneOf(id);
+        if (!state || !target) return;
+        await this.retitleLane(
+          id,
+          state.agentId,
+          target.address,
+          target.platformId,
+          formatLaneTitle(state.agentId, subject)
+        );
+      } finally {
+        this.namingInFlight.delete(id);
+      }
+    })();
   }
 
   /**
-   * Name a conversation after the user's own words, but only if nothing has named it yet.
+   * The subject half of a lane name: a summary of the opening message when `title.llm` is
+   * configured and answers, else the message itself cut to length.
    *
-   * The fallback for the three harnesses out of four that never report a title: opencode carries
-   * the ACP `session_info_update` variant in its schema and does not emit one, dsh lacks it, and
-   * the agy protocol has no title at all. Without this, `/oc`, `/dsh` and `/agy` topics kept their
-   * creation-time name no matter how long they ran — which is exactly what was observed.
-   *
-   * "Only if nothing has named it" is what keeps this subordinate to the real thing. On `claude`
-   * the harness's title usually lands on the second turn, so a topic gets the user's phrasing
-   * immediately and the harness's summary once it exists — two renames on that path, deliberately,
-   * because a correctly-named topic sooner is worth one extra rename.
+   * The fallback is deliberately taken on failure rather than leaving the conversation unnamed. A
+   * poor name that gets recorded ends the naming attempt; no name means every subsequent turn
+   * re-runs the call, which against a misconfigured endpoint is an unbounded stream of them.
    */
-  private seedConversationTitle(id: ConversationId, seed: string): void {
-    const state = this.conversations.get(id);
-    const lane = this.laneOf(id);
-    if (!state || !lane || !seed.trim()) return;
-    if (this.config.platforms[lane.platformId]?.autoRenameThread === false) return;
-    // Anything already recorded — a harness title, or a pinned `/title` — outranks a guess.
-    if (this.store?.conversationTitle(id) !== undefined) return;
-    void this.retitleLane(
-      id,
-      state.agentId,
-      lane.address,
-      lane.platformId,
-      formatLaneTitle(state.agentId, seed)
-    );
+  private async summarizeTitle(seed: string): Promise<string> {
+    const llm = this.config.title.llm;
+    if (!llm) return fallbackTitle(seed);
+    return (await generateTitle(llm, seed)) ?? fallbackTitle(seed);
   }
 
   /**
@@ -848,6 +864,10 @@ export class ConversationRegistry {
    * Shared by the automatic path and `/title`, so the two cannot disagree about what a successful
    * rename means. Returns why it did not happen, or undefined on success — the automatic caller
    * ignores that and `/title` reports it, which is the only difference between them.
+   *
+   * Deliberately NOT where the once-only rule lives: this renames whatever it is told to. The
+   * caller decides whether a conversation may be named (see nameConversation), because `/title` is
+   * allowed to rename one that already has a name and the automatic path is not.
    */
   private async retitleLane(
     id: ConversationId,
@@ -855,7 +875,7 @@ export class ConversationRegistry {
     address: ConversationAddress,
     platformId: string,
     title: string,
-    /** A name the user typed: recorded as pinned, so the harness stops overriding it. */
+    /** A name the user typed. Recorded as such, so `/title` can say who named the topic. */
     pinned = false
   ): Promise<string | undefined> {
     const platform = this.platforms.get(platformId);
@@ -867,9 +887,6 @@ export class ConversationRegistry {
     }
     const wanted = title.trim();
     if (!wanted) return 'that is an empty title';
-    // Already what we set — but a manual `/title` still has to record the pin, so only the
-    // automatic path may return early here.
-    if (this.store?.conversationTitle(id) === wanted && !pinned) return undefined;
     try {
       await platform.renameThread(address, wanted);
     } catch (e) {

@@ -156,9 +156,9 @@ export class ConversationStore {
   /**
    * The title we last renamed this conversation's lane to, if we ever did.
    *
-   * Compared against a freshly generated title to skip a rename that would change nothing —
-   * worth doing because the harness re-reports its title unchanged on many turns, and each
-   * rename is an API call plus a "topic renamed" service message in the chat.
+   * Load-bearing, not just a cache: a conversation is named once, and "has a title on record" is
+   * exactly the condition that says it already happened. It also survives a restart, which is what
+   * stops a daemon coming back up and re-naming every conversation it has on disk.
    */
   conversationTitle(key: string): string | undefined {
     return this.map.get(key)?.title;
@@ -176,15 +176,27 @@ export class ConversationStore {
     this.flush();
   }
 
-  /** Whether this conversation's title was set by hand and should stop following the harness. */
+  /**
+   * Whether this conversation's name was typed by the user rather than generated.
+   *
+   * Reporting only: since naming happens once and only while no title is recorded, a recorded name
+   * blocks the next one whoever wrote it. The flag is what lets `/title` say which of the two
+   * happened instead of guessing.
+   */
   titlePinned(key: string): boolean {
     return this.map.get(key)?.titlePinned === true;
   }
 
-  /** Hand naming back to the harness (`/title auto`), keeping the current name until it says otherwise. */
-  unpinConversationTitle(key: string): void {
+  /**
+   * Forget this conversation's name (`/title auto`), so the next reply names it afresh.
+   *
+   * The lane is deliberately NOT renamed here: it keeps the name it has until a new one exists,
+   * because a topic briefly called nothing is worse than one briefly called the wrong thing.
+   */
+  releaseConversationTitle(key: string): void {
     const rec = this.map.get(key);
-    if (!rec?.titlePinned) return;
+    if (!rec || (rec.title === undefined && rec.titlePinned === undefined)) return;
+    delete rec.title;
     delete rec.titlePinned;
     this.flush();
   }

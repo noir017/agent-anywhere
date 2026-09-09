@@ -124,9 +124,9 @@ describe('follow-up rendering (background work reporting after the turn)', () =>
     expect(h.sent[2]).toBe('the script finished: 3 tests failed');
   });
 
-  // The load-bearing negative. claude-agent-acp reports a session title after EVERY turn, so if
-  // metadata opened a message, every conversation would collect an empty "background update"
-  // bubble on every exchange.
+  // The load-bearing negative. A harness reports a context snapshot after EVERY turn and again
+  // whenever background work continues, so if metadata opened a message, every conversation would
+  // collect an empty "background update" bubble on every exchange.
   it('sends nothing when the only out-of-turn event is metadata', async () => {
     const h = rig();
     h.reg.route(inbound('hello', 'm1'));
@@ -134,7 +134,6 @@ describe('follow-up rendering (background work reporting after the turn)', () =>
     h.sent.length = 0;
 
     const handlers = h.sink().handlers();
-    handlers.onTitle?.('Fix the long script');
     handlers.onUsage?.({ used: 1000, size: 200_000 });
     handlers.onModel?.('opus-4-8');
     h.sink().close();

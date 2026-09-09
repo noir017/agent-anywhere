@@ -5,6 +5,43 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **A topic is now named once, by a model, from its opening message.** 1.3.1 named a topic by
+  following the harness's ACP `session_info_update` title, and 1.4.0 shipped a fallback for the
+  three harnesses out of four that emit none — the first 39 characters of the opening message. Both
+  produced names the user could not navigate by. The harness title is regenerated as a session
+  moves on, so a topic drifted to whatever had been discussed most recently rather than what the
+  topic is for; and the fallback is a substring, not a summary, so `帮我看下这个报错` and the first
+  line of a pasted stack trace both became topic names.
+
+  Naming now happens exactly once per conversation — after its first successful turn, from the whole
+  opening message — and never again until `/title` or `/new`. The harness's title is no longer read
+  at all: `AgentStreamHandlers.onTitle` and the `session_info_update` case in the ACP translator are
+  gone, and the notification falls through to `default: break`.
+
+  The summary comes from any OpenAI-compatible endpoint, configured under a new top-level `title`
+  block:
+
+  ```yaml
+  title:
+    llm:
+      baseUrl: http://newapi:3000/v1
+      apiKey: ${OPENAI_API_KEY}
+      model: gemini-3-flash-lite
+      timeoutMs: 45000            # optional
+  ```
+
+  One call per conversation, ~60 tokens, 1-4s on a flash-tier model, and nothing waits on it — the
+  reply has already been delivered. Leave `title.llm` out and the name is the 1.4.0 substring, which
+  is also what a failed call falls back to, so naming never depends on the endpoint being up.
+
+- **`/title auto` now re-arms naming instead of releasing a pin.** With naming gated on "does this
+  conversation have a name on record", releasing the pin would have changed nothing. It now forgets
+  the recorded name, so the next reply names the topic afresh; the lane keeps its current name in
+  the meantime, because a topic briefly called nothing is worse than one briefly called the wrong
+  thing.
+
 ## [1.4.0] - 2026-09-09
 
 ### Fixed

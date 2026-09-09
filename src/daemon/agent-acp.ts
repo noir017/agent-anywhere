@@ -1376,18 +1376,6 @@ interface ToolRec {
 }
 
 /**
- * Report a `session_info_update`'s title, if it carries one.
- *
- * Its own function rather than inline in the switch because the guards are the interesting part:
- * the schema types `title` as `string | null`, and an update carrying only `updatedAt` is a valid
- * partial. Neither is a title, and a topic renamed to "null" would be memorable.
- */
-function reportSessionTitle(u: Extract<SessionUpdate, { sessionUpdate: 'session_info_update' }>, st: TurnState): void {
-  const title = typeof u.title === 'string' ? u.title.trim() : '';
-  if (title) st.handlers.onTitle?.(title);
-}
-
-/**
  * Hand a `config_option_update` back to the session and re-report the live model.
  *
  * The whole option list goes back, not just the model name: `/model` needs the choices to build a
@@ -1449,17 +1437,11 @@ export function translateUpdate(u: SessionUpdate, st: TurnState): void {
       reportConfigOptions(u, st);
       break;
 
-    // The harness's own name for this conversation. claude-agent-acp polls the SDK's
-    // background-generated session title at each turn's end and notifies only when it changed, so
-    // this arrives at most once per turn and usually names the turn BEFORE it (the title is written
-    // asynchronously, so the first turn typically has none yet). Used to retitle the chat lane the
-    // conversation lives in — a Telegram forum topic — which otherwise keeps whatever name it was
-    // created with forever.
-    case 'session_info_update':
-      reportSessionTitle(u, st);
-      break;
-
-    // agent_thought_chunk / plan* / *_update etc.: not rendered (consistent with existing behavior).
+    // agent_thought_chunk / plan* / session_info_update / *_update etc.: not rendered.
+    //
+    // `session_info_update` carries the harness's own name for the conversation, and is ignored on
+    // purpose: the gateway names a conversation once from its opening message (see
+    // ConversationRegistry.nameConversation) rather than following a title that keeps moving.
     default:
       break;
   }

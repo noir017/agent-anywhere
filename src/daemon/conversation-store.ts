@@ -188,7 +188,7 @@ export class ConversationStore {
   }
 
   /**
-   * Forget this conversation's name (`/title auto`), so the next reply names it afresh.
+   * Forget this conversation's name (`/title auto`), so the next message names it afresh.
    *
    * The lane is deliberately NOT renamed here: it keeps the name it has until a new one exists,
    * because a topic briefly called nothing is worse than one briefly called the wrong thing.

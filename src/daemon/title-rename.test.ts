@@ -105,11 +105,20 @@ function rig(
     llm?: boolean;
     /** Reuse an existing store file, to model a daemon restart. */
     storeFile?: string;
+    /** Hold every turn open until `releaseTurn()` is called, to model work that takes a while. */
+    holdTurn?: boolean;
+    /** Make every turn throw, to model a harness that cannot answer. */
+    turnFails?: string;
   } = {}
 ) {
   const renames: Array<{ address: ConversationAddress; name: string }> = [];
   const sent: string[] = [];
   const sessions = new Map<string, AgentSession>();
+
+  let release = (): void => {};
+  const held = new Promise<void>((r) => {
+    release = r;
+  });
 
   const agents: AgentFactory = {
     getOrCreate(conversationId) {
@@ -118,6 +127,8 @@ function rig(
         s = {
           conversationId,
           runTurn: async (_input, handlers: AgentStreamHandlers) => {
+            if (opts.holdTurn) await held;
+            if (opts.turnFails) throw new Error(opts.turnFails);
             handlers.onText('done');
           },
           abort: () => {},
@@ -194,7 +205,7 @@ function rig(
     await drain();
   };
   const replies = (): string[] => sent.filter((t) => !t.startsWith('🤖'));
-  return { send, renames, replies, store, file, key: 'tg#-1001234567890#99' };
+  return { send, renames, replies, store, file, key: 'tg#-1001234567890#99', releaseTurn: release };
 }
 
 describe('naming a topic from its opening message', () => {
@@ -271,6 +282,37 @@ describe('naming a topic from its opening message', () => {
     await new Promise((res) => setTimeout(res, 120));
     expect(namer.calls).toHaveLength(1);
     expect(r.renames).toHaveLength(1);
+  });
+});
+
+/**
+ * When the rename lands, relative to the turn that triggered it.
+ *
+ * Naming used to be fired after a successful turn, which made the name arrive one whole turn late —
+ * and a turn is not a moment: the interesting ones run for minutes, and the user spends all of them
+ * looking at a topic column that still says whatever the topic was created as. The seed and the
+ * lane are both known before the agent is even asked, so there is nothing to wait for.
+ */
+describe('naming runs beside the turn, not after it', () => {
+  it('renames while the turn is still running', async () => {
+    stubNamer({ replies: ['Fix the ask timeout'] });
+    const r = rig({ holdTurn: true });
+    await r.send('ask 一直超时');
+    // The agent has not answered yet — no reply has been sent — and the topic already has its name.
+    expect(r.replies().join('')).not.toContain('done');
+    expect(r.renames.map((x) => x.name)).toEqual(['[cc] Fix the ask timeout']);
+    r.releaseTurn();
+  });
+
+  // The old rule was "only after a turn that succeeded", so that a topic could not be labelled with
+  // something that failed. That guarded the wrong text: the seed is the user's own request, which is
+  // no less what the topic is about for the harness having failed to answer it — and a conversation
+  // whose first turn errors is exactly the one the user needs to find again in the column.
+  it('names a conversation whose first turn fails', async () => {
+    stubNamer({ replies: ['Fix the ask timeout'] });
+    const r = rig({ turnFails: 'harness exited before it started' });
+    await r.send('ask 一直超时');
+    expect(r.renames.map((x) => x.name)).toEqual(['[cc] Fix the ask timeout']);
   });
 });
 

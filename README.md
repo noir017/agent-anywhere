@@ -264,13 +264,19 @@ it survives a restart and a `/new`, and applies to every agent that answers ther
 
 A Telegram forum topic keeps whatever name it was created with for as long as it
 exists, so a topic-per-task workflow becomes a column of names typed *before* any
-of the work happened. So the gateway names it: after a topic's first successful
-reply, its opening message is summarised into a name, **once**.
+of the work happened. So the gateway names it: the opening message is summarised
+into a name, **once**.
+
+The summary is asked for the moment the turn starts, not when it ends, and the
+topic is renamed as soon as the answer comes back — a second or two in, while the
+agent is still working. Waiting for the turn would mean waiting out the work
+itself, and the topic column is least useful when it is stale about the thing
+happening right now.
 
 ```
 /title                  →  what this topic was last named, and by whom
 /title ask 超时          →  name it yourself instead
-/title auto             →  forget that name; the next reply names it afresh
+/title auto             →  forget that name; the next message names it afresh
 ```
 
 Once, deliberately. An earlier version followed the harness's own session title,

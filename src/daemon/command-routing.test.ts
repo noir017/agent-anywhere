@@ -126,6 +126,10 @@ function rig(cfg: Config = baseConfig, persistedAgent?: string) {
       conversationCwd: () => undefined,
       setConversationCwd: () => {},
       clearAgentSessions: () => {},
+      // Naming reads these on the way into every turn; a stub without them would fail the turn.
+      conversationTitle: () => undefined,
+      titlePinned: () => false,
+      setConversationTitle: () => {},
     } as never
   );
 

@@ -726,8 +726,9 @@ export class ConversationRegistry {
    *
    * `/title auto` forgets the recorded name, which is what re-arms the automatic naming: a
    * conversation is named once and only while it has no name on record, so releasing the record is
-   * the only way to ask for another. The lane keeps its current name until the next reply produces
-   * one, because clearing it to nothing in the meantime would be strictly worse than a stale name.
+   * the only way to ask for another. The lane keeps its current name until the next message
+   * produces one, because clearing it to nothing in the meantime would be strictly worse than a
+   * stale name.
    *
    * Unlike the automatic path this is never silently skipped: an explicit command gets an explicit
    * answer, including the reason it failed. The address is the incoming message's own, not
@@ -746,15 +747,15 @@ export class ConversationRegistry {
 
     if (wanted.toLowerCase() === 'auto') {
       if (!current) {
-        return 'I have not named this topic yet — it gets a name after the next reply.';
+        return 'I have not named this topic yet — it gets a name after the next message.';
       }
       this.store?.releaseConversationTitle(key);
-      return `Forgot the name I gave this topic ("${current}"). It keeps that name until the next reply, which will name it afresh.`;
+      return `Forgot the name I gave this topic ("${current}"). It keeps that name until the next message, which will name it afresh.`;
     }
 
     if (!wanted) {
       if (!current) {
-        return 'I have not named this topic. `/title <name>` to name it now, or it gets named automatically after the next reply.';
+        return 'I have not named this topic. `/title <name>` to name it now, or it gets named automatically after the next message.';
       }
       return this.store?.titlePinned(key)
         ? `This topic is named "${current}" — you set it, and it will not be renamed. \`/title auto\` to have it named afresh.`
@@ -787,11 +788,17 @@ export class ConversationRegistry {
    * of the work happened.
    *
    * ── Once ────────────────────────────────────────────────────────────────────────────────────
-   * Called after every successful turn, and acts on the first one only. The predecessor followed
+   * Called at the start of every turn, and acts on the first one only. The predecessor followed
    * the harness's ACP `session_info_update` instead, which re-reports as a session moves on: topics
    * drifted to whatever had been discussed most recently, which is not what a name is for. The user
    * navigates the topic column by memory of where things are, so a name that keeps moving costs
    * more than one that is slightly off. `/title` and `/new` are the ways to get a different one.
+   *
+   * ── Beside the turn, not after it ───────────────────────────────────────────────────────────
+   * Nothing here reads the answer, so nothing here has to wait for one: the whole body runs off the
+   * turn's thread and the lane is renamed the moment the model replies, seconds into a turn that
+   * may run for minutes. That is the point of the split — the topic column is how the user finds
+   * the work that is currently happening, and it is least useful when it is stale.
    *
    * ── Best-effort, every early return a decision ──────────────────────────────────────────────
    * - no lane on record — the conversation has never run a turn, so there is nothing to point at.
@@ -813,35 +820,42 @@ export class ConversationRegistry {
    * move the failure somewhere less obvious. `/title` and the setting are the ways to opt out.
    */
   private nameConversation(id: ConversationId, seed: string): void {
-    const lane = this.laneOf(id);
-    if (!this.conversations.has(id) || !lane || !seed.trim()) return;
-    if (this.config.platforms[lane.platformId]?.autoRenameThread === false) return;
-    if (this.store?.conversationTitle(id) !== undefined) return;
-    if (this.namingInFlight.has(id)) return;
-    this.namingInFlight.add(id);
-    void (async () => {
-      try {
-        const subject = await this.summarizeTitle(seed);
-        if (!subject) return;
-        // Re-read rather than close over what was true when the call started. `/title` may have
-        // pinned a name of the user's own while the model was thinking — silently reverting a
-        // command the user just typed is a bug under any naming policy — and a `/oc` in the same
-        // window would leave the tag naming the agent that has just stopped answering here.
-        if (this.store?.conversationTitle(id) !== undefined) return;
-        const state = this.conversations.get(id);
-        const target = this.laneOf(id);
-        if (!state || !target) return;
-        await this.retitleLane(
-          id,
-          state.agentId,
-          target.address,
-          target.platformId,
-          formatLaneTitle(state.agentId, subject)
-        );
-      } finally {
-        this.namingInFlight.delete(id);
-      }
-    })();
+    try {
+      const lane = this.laneOf(id);
+      if (!this.conversations.has(id) || !lane || !seed.trim()) return;
+      if (this.config.platforms[lane.platformId]?.autoRenameThread === false) return;
+      if (this.store?.conversationTitle(id) !== undefined) return;
+      if (this.namingInFlight.has(id)) return;
+      this.namingInFlight.add(id);
+      void (async () => {
+        try {
+          const subject = await this.summarizeTitle(seed);
+          if (!subject) return;
+          // Re-read rather than close over what was true when the call started. `/title` may have
+          // pinned a name of the user's own while the model was thinking — silently reverting a
+          // command the user just typed is a bug under any naming policy — and a `/oc` in the same
+          // window would leave the tag naming the agent that has just stopped answering here.
+          if (this.store?.conversationTitle(id) !== undefined) return;
+          const state = this.conversations.get(id);
+          const target = this.laneOf(id);
+          if (!state || !target) return;
+          await this.retitleLane(
+            id,
+            state.agentId,
+            target.address,
+            target.platformId,
+            formatLaneTitle(state.agentId, subject)
+          );
+        } finally {
+          this.namingInFlight.delete(id);
+        }
+      })();
+    } catch (e) {
+      // The gates above run on the turn's own thread, one line before the agent is asked anything.
+      // Anything they throw would cost the user their answer to buy a topic name — the wrong trade
+      // in every case, so it is logged and the turn proceeds unnamed.
+      console.warn(`[title] could not start naming ${id}: ${e instanceof Error ? e.message : e}`);
+    }
   }
 
   /**

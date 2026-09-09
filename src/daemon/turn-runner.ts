@@ -89,14 +89,17 @@ export interface TurnRunnerDeps {
    *
    * A dep rather than a hook because the answer needs the conversation's address and the store,
    * both of which live in the registry — which is also where the "only if nothing has named it
-   * yet" rule lives, so this may be called after every turn and will act on at most one of them.
+   * yet" rule lives, so this may be called at the start of every turn and will act on at most one
+   * of them.
    *
    * The seed is the user's raw text, NOT a name: the registry summarises it (see core/title-namer).
    * Passing it whole is the point — a name generated from a pre-truncated seed can only ever be a
    * rewording of the first line.
    *
-   * Never awaited by the turn. Renaming a lane is a side effect on the platform, not part of the
-   * reply, and a slow or failing editForumTopic must not delay a single character of the answer.
+   * Never awaited by the turn, and called before the agent runs rather than after it: the model
+   * call and the rename happen alongside the turn, so the topic takes its name as soon as the name
+   * exists instead of when the work finishes. A slow or failing editForumTopic must not delay a
+   * single character of the answer.
    */
   nameConversation?(id: ConversationId, seed: string): void;
   /**
@@ -213,6 +216,29 @@ export class TurnRunner {
     // token→conversation→lane, during the turn and after it.
     this.deps.setLane(conversationId, address, platformId);
 
+    // producedOutput (whether the turn emitted visible output) lives in the ref below. Used for the
+    // command zero-output fallback: a few built-ins (e.g. /compact) produce a marker-only shell stripped
+    // to null by the harness, leaving the turn idle and the IM side waiting silently.
+    const lastContent = last.content?.trim() ?? '';
+    const isCommandTurn = looksLikeCommand(lastContent);
+
+    // Name the topic from this conversation's opening message, starting NOW rather than at turn
+    // end. Everything the namer needs is already known — the seed is what the user just typed, and
+    // the lane was recorded a line above — so waiting for the answer only delays the rename by the
+    // length of the turn, which for real work is minutes: the user watches the topic column under
+    // the old name for the entire time the thing they asked about is being done.
+    //
+    // Fire-and-forget on purpose (see TurnRunnerDeps.nameConversation): the model call and the
+    // rename run beside the turn, and the topic changes the moment the name comes back. The
+    // registry ignores this once the conversation has a name, so of all the turns that call it,
+    // only the first one does anything.
+    //
+    // The predecessor waited for a SUCCESSFUL turn so that a topic could not be labelled with
+    // something that failed. That reasoning was about the wrong text: the seed is the user's own
+    // request, and a request is no less what the topic is about for the harness having failed to
+    // answer it. Command turns are still skipped — `/model` names nothing.
+    if (!isCommandTurn) this.deps.nameConversation?.(conversationId, this.buildTitleSeed(batch));
+
     // Typing keep-alive: Discord's typing indicator self-expires ~10s, so re-fire every typingIntervalMs
     // (fire-and-forget, never gates the turn). Cancelled + stopTyping in finally.
     const stopTypingLoop = this.startTypingLoop(platform, address);
@@ -229,12 +255,6 @@ export class TurnRunner {
     agent.setFollowUpSink?.(this.followUpSink(conversationId));
     const prompt = await this.buildPrompt(batch, platform);
     console.log(`[turn] ${conversationId} starting turn (${batch.length} message(s))`);
-
-    // producedOutput (whether the turn emitted visible output) lives in the ref above. Used for the
-    // command zero-output fallback: a few built-ins (e.g. /compact) produce a marker-only shell stripped
-    // to null by the harness, leaving the turn idle and the IM side waiting silently.
-    const lastContent = batch[batch.length - 1]?.content?.trim() ?? '';
-    const isCommandTurn = looksLikeCommand(lastContent);
 
     try {
       await agent.runTurn(
@@ -263,11 +283,6 @@ export class TurnRunner {
         // only here (not in `finally`) so an interrupted or failed turn doesn't claim the harness
         // stayed silent — see recordTurnComplete.
         this.deps.recordTurnComplete?.(conversationId);
-        // Name the topic after this conversation's opening message. Only after a SUCCESSFUL turn —
-        // naming a topic after a message that errored out would label it with the thing that did
-        // not happen. The registry ignores this once the conversation has a name, so of all the
-        // turns that call it, only the first one does anything.
-        if (!isCommandTurn) this.deps.nameConversation?.(conversationId, this.buildTitleSeed(batch));
         console.log(`[turn] ${conversationId} turn complete`);
       }
     } catch (err) {

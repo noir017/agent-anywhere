@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-09-09
+
 ### Fixed
 
 - **Tool progress no longer disappears during a long run of tool calls.** IM platforms cap a

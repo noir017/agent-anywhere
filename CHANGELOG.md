@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-09-09
+
 ### Changed
 
 - **A topic is now named once, by a model, from its opening message.** 1.3.1 named a topic by

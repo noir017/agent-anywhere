@@ -7,6 +7,9 @@ here.
 `README.md` / `README.zh-CN.md` are the *user*-facing docs (install, configure, run).
 This file and the module READMEs are the *contributor*-facing docs.
 
+`CLAUDE.md` is a symlink to this file, so Claude Code picks it up automatically. There is
+one document, not two — edit `AGENTS.md`.
+
 ## What this project is
 
 A gateway daemon that connects chat platforms (Discord, Telegram, Slack, Lark, QQ,
@@ -191,7 +194,7 @@ Deployment spans two repositories and three steps. **Do steps 1 and 2. Never do 
 |---|---|---|
 | 1 | `npm run release -- X.Y.Z` → push `dev` + the tag → `release.yml` publishes a GitHub Release (tarball + `SHA256SUMS`) | **you** |
 | 2 | in the `uniagent` repo: `gh workflow run bump-agent-anywhere.yml -f version=X.Y.Z` → multi-arch image to GHCR | **you** |
-| 3 | on the oracle host: rebuild the container | **the operator, by hand** |
+| 3 | on the oracle host: `uniagent update` | **the operator, by hand** |
 
 **Step 3 is not yours, and not because of caution.** The daemon running in that container is
 the process serving the conversation that asked for the change, and the supervisor's `stop`
@@ -217,7 +220,11 @@ Notes that decide whether steps 1–2 are even correct:
   was checked.
 
 Report what you did in the order it happened, with the version, and end with the exact
-command the operator needs for step 3.
+command the operator needs for step 3 — which is `uniagent update`, run on the oracle
+host, verbatim. It is a wrapper the operator maintains; do not expand it into the
+`docker compose pull && up -d` it happens to run today, and do not reconstruct some other
+invocation from memory. If this line ever stops being true, fix it here rather than
+guessing at the call site.
 
 > **Running the test suite touches this machine's live daemon.** `ensureReverseCliShim()`
 > writes `~/.config/agent-anywhere/bin/agent-anywhere`, a path shared with whatever daemon

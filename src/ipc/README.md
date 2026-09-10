@@ -50,12 +50,12 @@ add a command by hand-registering it in `cli.ts`.
 The catalog: `send-message`, `reply`, `edit-message`, `send-file`, `react`, `delete`,
 `fetch-messages`, `create-thread`, `ask`.
 
-## Only `send-file` is injected
+## Only `send-file` is injected everywhere
 
-`inject` is set on exactly one spec, and the rest of the catalog is reachable only by
-typing it (`agent-anywhere --help` lists everything; scripts keep working). The flag
-governs one thing: what is spent from the model's attention before it has read the user's
-first word.
+`inject` is set on two specs — `send-file` as `'always'` and `ask` as `'no-native-ask'` —
+and the rest of the catalog is reachable only by typing it (`agent-anywhere --help` lists
+everything; scripts keep working). The flag governs one thing: what is spent from the
+model's attention before it has read the user's first word.
 
 The hint used to carry all nine commands with full usage — about 350 tokens of chat-bot
 operating manual in the **first text block** of every session's opening turn. The cost was
@@ -69,11 +69,17 @@ Most of it was redundant anyway:
 |---|---|
 | `send-message`, `reply` | The agent's plain text already streams into the chat. A command to send text is a slower way to do what happens by itself. |
 | `edit-message` | The daemon already live-edits the turn's message. |
-| `ask` | Superseded by ACP `elicitation/create` — the harness's own question tool, rendered as buttons. The model needs no instructions for a tool it already has. |
 | `react`, `delete`, `create-thread`, `fetch-messages` | Chat-client chrome, not the work the agent was asked to do. |
 
 `send-file` stays because it is the one act the text channel cannot perform: a file has to
 be uploaded, not described.
+
+`ask` is conditional because its replacement is. On `claude` the model asks over ACP
+`elicitation/create` and the daemon renders that as the same buttons, so advertising the
+CLI would offer a second, worse route to one destination. On `opencode` and `dsh` — probed
+2026-09-11, neither sends any reverse request — there is no such tool, and without the
+hint their models can only ask in prose. Unprobed harnesses are treated as unable to ask:
+being wrong that way costs one hint line, the other way costs the user their buttons.
 
 `CHANNEL_OPTION` (`-c, --channel <id>`) is appended to every command. Empty means "the
 current conversation", which is the default an agent should almost always use — the

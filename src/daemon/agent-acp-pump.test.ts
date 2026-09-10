@@ -65,6 +65,12 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
       status: 'completed',
       rawInput: { command: 'ls' },
     });
+    // A LONG history, on request. Size is the whole point: the gate that suppresses replay used to
+    // be a race between the reader draining this and the turn setting its "prompted" flag, so a
+    // two-message replay was always won and a real conversation's was not.
+    if (sessionId.includes('long')) {
+      for (let i = 0; i < 300; i++) text(sessionId, 'REPLAYED LINE ' + i);
+    }
     reply(msg.id, {});
     return;
   }
@@ -306,6 +312,28 @@ describe('what must NOT be rendered as background output', () => {
     expect(everything).not.toContain('REPLAYED HISTORY');
     expect(sink.tools).not.toContain('Bash'); // the replayed tool_call must not open a bubble either
     // ...and the live turn is unaffected: its own answer still arrives.
+    expect(turn.turn.join('')).toBe('started the script in the background');
+  });
+
+  it('does not re-post a LONG replayed history either — the case the old gate lost', async () => {
+    // The regression, 2026-09-11: on a conversation with hours of history, a daemon restart
+    // re-sent the whole thing to Telegram as one turn's reply. The suppression gate was a race —
+    // the reader dropped whatever it reached before runTurn set the "prompted" flag (five updates,
+    // in the live incident) and rendered everything after. Two replayed messages always won that
+    // race, which is why the test above passed throughout. Three hundred do not.
+    const { session } = rig({ resumeFrom: 'stored-session-id-long' });
+    const sink = sinkSpy();
+    sink.install(session);
+
+    const turn = collector();
+    await session.runTurn({ prompt: 'carry on', sessionToken: 'tok' }, turn.handlers);
+    await settle();
+
+    const everything = [...sink.text, ...turn.turn].join(' ');
+    expect(everything).not.toContain('REPLAYED HISTORY');
+    expect(everything).not.toContain('REPLAYED LINE');
+    // The live turn is still delivered in full — the fence delays the flag, it does not swallow
+    // this turn's own output.
     expect(turn.turn.join('')).toBe('started the script in the background');
   });
 

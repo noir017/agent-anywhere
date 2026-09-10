@@ -31,15 +31,13 @@ export interface ReverseCommandSpec {
   /** One-line usage hint for the agent (rendered by buildReverseHint when `inject` is set). */
   hint: string;
   /**
-   * Whether this command's hint is injected into the agent's prompt.
+   * Whether — and where — this command's hint is injected into the agent's prompt.
    *
-   * Only `send-file` sets it, and the reason is that everything else on this list turned out to be
-   * a worse way to do something the gateway already does:
+   * Omitted means never, which is most of the catalog, because each turned out to be a worse way
+   * to do something the gateway already does:
    *  - the agent's plain text IS the reply — it streams into the chat on its own, so `send-message`
    *    and `reply` ask the model to spend a tool call re-sending what was already sent;
    *  - `edit-message` duplicates the live-edited message the daemon maintains for every turn;
-   *  - `ask` is now the harness's own question tool, arriving over ACP `elicitation/create` and
-   *    rendered as buttons — no prompt text needed, and the model already knows how to use it;
    *  - `react` / `delete` / `create-thread` / `fetch-messages` describe a chat client's chrome,
    *    which is not what the model was asked to work on.
    *
@@ -47,8 +45,13 @@ export interface ReverseCommandSpec {
    * this flag governs one thing only: what is spent from the model's attention before it has read
    * the user's first word. The full block was ~350 tokens of "you are an IM bot" ahead of every
    * session's opening question, which is a framing the work rarely needs and never asked for.
+   *
+   * `'always'` — every harness is told.
+   * `'no-native-ask'` — told only to harnesses that cannot ask over ACP `elicitation/create`.
+   *   Exists for `ask`, which is superseded by the model's own question tool where there is one
+   *   (claude) and is still the only way to get buttons where there is not (opencode, dsh).
    */
-  inject?: boolean;
+  inject?: 'always' | 'no-native-ask';
 }
 
 /** The "target channel" option shared by all reverse commands; empty = current session. */
@@ -170,7 +173,7 @@ export const REVERSE_COMMANDS: ReverseCommandSpec[] = [
     }),
     hint: 'Send a file: agent-anywhere send-file <path> [--caption "caption"]',
     // The one capability plain text cannot reach: a file has to be uploaded, not described.
-    inject: true,
+    inject: 'always',
   },
   {
     usage: 'react <messageId> <emoji>',
@@ -248,5 +251,10 @@ export const REVERSE_COMMANDS: ReverseCommandSpec[] = [
       '-o optionA -o optionB [--timeout <ms>, default 10min] (writes the chosen label to stdout; ' +
       'empty stdout plus a stderr note means nobody clicked in time — the question WAS delivered, ' +
       'so follow up in plain text instead of assuming the command is broken)',
+    // Only where the harness has no question tool of its own. On claude the model asks over ACP
+    // elicitation and this hint would advertise a second, worse way to do the same thing; on
+    // opencode and dsh (probed 2026-09-11: neither sends any reverse request) it is the only way
+    // to put buttons in front of the user, and without it they can only ask in prose.
+    inject: 'no-native-ask',
   },
 ];

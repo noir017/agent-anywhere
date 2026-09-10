@@ -366,8 +366,9 @@ advertises ACP's `elicitation.form` capability, which is what unlocks Claude Cod
 prompt to make it work.
 
 Harnesses that do not implement elicitation — `opencode` and `dsh`, as of 1.18.27 and
-0.1.2-rc.1 — degrade gracefully: the model asks in plain text and ends its turn, and you
-answer in the next message.
+0.1.2-rc.1 — keep the `ask` CLI in their hint instead, so their models can still put
+buttons in front of you. Failing that, the model asks in plain text and ends its turn, and
+you answer in the next message.
 
 ## Acting in the chat
 
@@ -381,7 +382,7 @@ agent-anywhere send-file ./report.pdf --caption "Q3 numbers"
 The rest of the CLI is available to the agent but deliberately **not** advertised to it,
 because a command list in the prompt costs attention before the model has read your first
 word: `send-message`, `reply`, `edit-message`, `react`, `delete`, `fetch-messages`,
-`create-thread`, `ask`. Run `agent-anywhere --help` for the full set, and see
+`create-thread`. Run `agent-anywhere --help` for the full set, and see
 [`src/ipc/README.md`](src/ipc/README.md) for why each one is redundant.
 
 If you want an agent to use them fluently, install the bundled

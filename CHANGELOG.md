@@ -5,6 +5,39 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **A daemon restart no longer re-narrates the whole conversation into the chat.** Resuming a
+  stored session replays its entire history as ordinary `session/update` notifications, and the
+  gate that suppresses them (`promptedYet`) was a race: the flag is written by the sender just
+  before `prompt()`, but read by the reader at dequeue time, and between the two there are only a
+  handful of microtask ticks. The reader dropped whatever it reached in that window and rendered
+  everything after it as if it were the new turn's own output.
+
+  The window is proportional to the history, so this was never a rare race — it was one a
+  conversation is guaranteed to lose once it gets long enough. Observed on 2026-09-11 after
+  restarting into 1.7.0: exactly five replayed updates were suppressed and the remainder, hours of
+  conversation, was re-sent to Telegram as one reply.
+
+  The gate is now a fence the reader itself releases. By the time `session/load` returns, every
+  replayed notification is already queued — the agent emits them before answering and one JSON-RPC
+  stream is ordered — so the replay is a finite buffered prefix and "the reader has caught up" is
+  decidable: race each read against a macrotask, which can only win when nothing is buffered.
+  `runTurn` waits on that before setting the flag. The regression test replays three hundred
+  messages, where the old gate leaks two hundred and ninety-six.
+
+  Not caused by 1.7.0 — the race predates it, and the release only supplied a conversation long
+  enough to expose it. The existing test replayed two messages, which always won.
+
+### Changed
+
+- **`ask` is advertised again on harnesses that cannot ask for themselves.** 1.7.0 dropped it from
+  the injected hint on the grounds that the model's own question tool had replaced it, which is
+  true only where that tool exists. `opencode` and `dsh` send no elicitations, so the change
+  silently cost them their buttons: a model that wanted a decision could only ask in prose. The
+  `inject` flag now distinguishes `'always'` from `'no-native-ask'`, so claude still gets a
+  one-line hint and the others get `ask` back.
+
 ## [1.7.0] - 2026-09-11
 
 ### Added

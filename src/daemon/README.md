@@ -528,10 +528,33 @@ environment, working-directory resolution (`agents[].cwd`, or an auto-created
 child termination (SIGTERM, then SIGKILL after `KILL_GRACE_MS` — harness CLIs may ignore
 SIGTERM mid-turn).
 
-`buildReverseHint()` generates the per-turn `<system-reminder>` from the specs in
-`REVERSE_COMMANDS` marked `inject` — currently only `send-file`, so the hint is one line.
-It cannot drift from the actual CLI. See [`src/ipc/README.md`](../ipc/README.md) for why
-the other eight are reachable but not advertised.
+`buildReverseHint(harness)` generates the per-turn `<system-reminder>` from the specs in
+`REVERSE_COMMANDS` marked `inject`. `send-file` is `'always'`; `ask` is `'no-native-ask'`,
+so it reaches only the harnesses that cannot ask over ACP (see below) — on `claude` the
+hint is one line. It cannot drift from the actual CLI. See
+[`src/ipc/README.md`](../ipc/README.md) for why the other seven are reachable but not
+advertised.
+
+### `session/load` replay must not reach the chat
+
+Resuming a stored session replays its whole history as ordinary `session/update`
+notifications. `promptedYet` suppresses rendering until the first prompt — but on its own
+that is a **race**, and losing it re-narrates the entire conversation into the chat
+(2026-09-11: five updates suppressed, hours of history re-sent). The flag is written by
+`runTurn` just before `prompt()` and read by the pump at dequeue time, with only a few
+microtask ticks between them; the reader drops what it reaches and renders the rest.
+
+So the flag now waits on a fence the pump releases (`replayFence`). By the time
+`session/load` returns, every replayed notification is already queued — the agent emits
+them before answering and one JSON-RPC stream is ordered — so the replay is a finite
+buffered prefix, and `readNext` decides "caught up" by racing each read against a
+macrotask: `AsyncQueue.next()` answers a buffered read on a microtask, so a `setImmediate`
+can only win when the queue is empty. **That is an SDK internal** — see the Hyrum's Law
+note on `readNext` and the contract test.
+
+Two rules if you touch this: never start a second `nextUpdate()` while one is outstanding
+(the abandoned promise is the one the queue feeds, so its message is lost), and release
+the fence in `resetHandles` or a turn parked on a dead child waits forever.
 
 ### Asking the user something (ACP elicitation)
 

@@ -451,7 +451,7 @@ function createAgySession(
       // Reverse-command hint: injected once per child, prepended to the first turn's text. Unlike the
       // ACP runtime there is no slash-command carve-out — slash expansion is disabled for this
       // harness, so a leading `/…` is just text and a preceding hint block can't break anything.
-      const hint = hintInjected ? '' : buildReverseHint();
+      const hint = hintInjected ? '' : buildReverseHint(def.harness);
       hintInjected = true;
       const content = hint ? `${hint}\n${input.prompt}` : input.prompt;
 

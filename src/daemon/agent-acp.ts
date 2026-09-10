@@ -586,6 +586,50 @@ function createAcpSession(
    */
   let promptedYet = false;
   /**
+   * Resolves once the pump has consumed every notification `session/load` replayed — i.e. once
+   * `promptedYet` is safe to set. Undefined when this child did not resume anything.
+   *
+   * ── The bug this exists to kill ───────────────────────────────────────────────────────────────
+   * `promptedYet` alone is a RACE, and losing it re-narrates the entire conversation into the chat.
+   * The flag is written by the sender (runTurn, just before `prompt()`) but read by the pump at
+   * dequeue time, and between `beginPump()` and that write there are only a handful of microtask
+   * ticks. A resumed session replays its whole history into the queue first, so the pump drops
+   * however many it manages to reach in that window and renders the rest as if they were this
+   * turn's output. Observed 2026-09-11 on a long conversation: exactly five updates were dropped
+   * and the remainder — hours of history — was re-sent to Telegram as one turn's reply.
+   *
+   * The window is proportional to the history, so it is not a rare race; it is one that a
+   * conversation is guaranteed to lose once it gets long enough.
+   *
+   * ── Why the fence is exact ────────────────────────────────────────────────────────────────────
+   * By the time `session/load` returns, every replayed notification is already in the queue: the
+   * agent emits them before answering, and a single JSON-RPC stream preserves that order. So the
+   * replay is a finite, fully-buffered prefix, and "the pump has caught up" is decidable — see
+   * `replayDrained` in pumpUpdates for how, and for the one SDK internal it leans on.
+   */
+  let replayFence: Promise<void> | undefined;
+  /** Settles `replayFence`; held by the pump, which is the only thing that can know. */
+  let releaseReplayFence: (() => void) | undefined;
+  /** Whether the pump is still working through a `session/load` replay. */
+  let replayPending = false;
+
+  /** Arm the replay fence for a child that just resumed a stored session. */
+  function armReplayFence(): void {
+    replayPending = true;
+    replayFence = new Promise<void>((resolve) => {
+      releaseReplayFence = resolve;
+    });
+  }
+
+  /** Disarm it, releasing anything waiting (child died, or the pump finished the replay). */
+  function clearReplayFence(): void {
+    replayPending = false;
+    releaseReplayFence?.();
+    releaseReplayFence = undefined;
+    replayFence = undefined;
+  }
+
+  /**
    * Whether the harness said it can reload a stored session (initialize → `agentCapabilities.
    * loadSession`). Read once per child and NOT cleared by resetHandles: it describes the harness
    * binary, not the process, and a rebuilt child re-reports the same answer.
@@ -639,6 +683,9 @@ function createAcpSession(
     // A rebuilt child starts from nothing again: its `session/load` replay must not be rendered
     // (see promptedYet).
     promptedYet = false;
+    // The pump that would have released this fence is gone with the child, so release it here or a
+    // turn already parked on it would wait forever — and the next child arms a fresh one anyway.
+    clearReplayFence();
     // The next child re-reports its own model; keeping a stale name would misattribute the footer
     // if the rebuilt session resolves a different one.
     liveModel = undefined;
@@ -820,6 +867,9 @@ function createAcpSession(
           // session/load reports the resumed session's config the same way session/new does.
           liveConfigOptions = loaded?.configOptions ?? undefined;
           liveModel = liveModelName(liveConfigOptions);
+          // Every replayed notification is in the queue by now (see armReplayFence): the agent
+          // sends them before it answers `session/load`, and one JSON-RPC stream is ordered.
+          armReplayFence();
           console.log(`[acp] resumed persisted session for "${def.id}" (${persistedId})`);
         } catch (err) {
           // Stored id no longer loadable (history pruned, cwd moved, harness downgraded): start fresh.
@@ -1030,6 +1080,45 @@ function createAcpSession(
   }
 
   /**
+   * One read from the session queue, which also decides when a `session/load` replay has been
+   * fully consumed and releases the fence runTurn waits on (see replayFence).
+   *
+   * ── How "the queue is empty" is decided, and why it is exact ──────────────────────────────────
+   * By racing the read against a MACROTASK. The SDK's AsyncQueue answers a read that has a value
+   * buffered with `Promise.resolve(value)` — settled on a microtask — and only parks a waiter when
+   * it has none (verified in `@agentclientprotocol/sdk` 0.29.0 `AsyncQueue.next`). The event loop
+   * drains microtasks to exhaustion before running the next macrotask, so a `setImmediate` can win
+   * this race only when nothing is buffered. That makes "the tick won" mean exactly "the replay
+   * prefix is consumed", with no assumption about how fast anything runs.
+   *
+   * ⚠️ HYRUM'S LAW: `AsyncQueue.next()` returning an already-settled promise for buffered values is
+   * an implementation detail, not a documented contract. If a future SDK defers buffered reads by a
+   * macrotask, the tick could win with items still queued and the replay would render again. The
+   * contract test in agent-acp-pump.test.ts pins the behaviour so an upgrade fails there first.
+   * A regression is not catastrophic in any case: the fence can only release EARLY, which degrades
+   * to the pre-existing race rather than to a hang.
+   *
+   * The raced read is retained and returned rather than abandoned. Starting a second `nextUpdate()`
+   * would leave two waiters on one queue, and the FIRST one — the abandoned promise — is the one
+   * the queue hands the next message to, which would then be dropped on the floor.
+   */
+  async function readNext(
+    session: ActiveSession
+  ): Promise<Awaited<ReturnType<ActiveSession['nextUpdate']>>> {
+    const read = session.nextUpdate();
+    if (!replayPending) return read;
+
+    const IDLE = Symbol('idle');
+    const idle = new Promise<typeof IDLE>((resolve) => setImmediate(() => resolve(IDLE)));
+    const first = await Promise.race([read, idle]);
+    if (first !== IDLE) return first;
+
+    console.log(`[acp] ${conversationId}: session/load replay consumed; rendering resumes`);
+    clearReplayFence();
+    return read; // the SAME outstanding read — never start a second waiter (see above)
+  }
+
+  /**
    * The one and only reader of a session's update queue, running from the moment the session is up
    * until its child goes away.
    *
@@ -1067,7 +1156,7 @@ function createAcpSession(
       if (active !== session) return;
       let msg: Awaited<ReturnType<ActiveSession['nextUpdate']>>;
       try {
-        msg = await session.nextUpdate();
+        msg = await readNext(session);
         rejections = 0;
       } catch (e) {
         if (active !== session) return;
@@ -1177,7 +1266,7 @@ function createAcpSession(
       // execution by whether the first text block starts with `/`, and a leading hint block would break
       // it. This turn doesn't consume the hint (hintInjected unchanged), deferring it to a later normal turn.
       const isCommand = looksLikeCommand(input.prompt);
-      const hint = hintInjected || isCommand ? '' : buildReverseHint();
+      const hint = hintInjected || isCommand ? '' : buildReverseHint(def.harness);
       if (!isCommand) hintInjected = true;
 
       // Whatever background output was still rendering belongs to the previous exchange. AWAITED,
@@ -1258,6 +1347,12 @@ function createAcpSession(
       try {
         // ActiveSession.prompt resolves at turn end and enqueues 'stop'; the pump reads the stream.
         // Inside the try so a synchronous throw (a closed stream) still runs the cleanup below.
+        //
+        // Waited on FIRST, because this flag is what stops a resumed session's replayed history
+        // from being rendered as this turn's reply, and it is only sound once the pump has actually
+        // reached the end of that replay (see replayFence — without this the gate is a race that a
+        // long conversation is guaranteed to lose).
+        if (replayFence) await replayFence;
         promptedYet = true; // from here on, renderable output is this session's own (see promptedYet)
         const promptDone = active!.prompt(decorate(input, hint));
         // Pre-attach a no-op rejection handler: when the watchdog wins the race we rethrow without

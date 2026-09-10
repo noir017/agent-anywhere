@@ -328,8 +328,9 @@ config.yaml。
 `elicitation.form` 能力，而这正是解锁 Claude Code `AskUserQuestion` 的开关——不声明的话
 适配器会把那个工具直接禁用。整个过程**没有向提示词注入任何东西**。
 
-不实现 elicitation 的 harness——`opencode` 1.18.27 与 `dsh` 0.1.2-rc.1——会优雅退化：
-模型用纯文本把问题问出来并结束这一轮，你在下一条消息里回答即可。
+不实现 elicitation 的 harness——`opencode` 1.18.27 与 `dsh` 0.1.2-rc.1——提示里改为保留
+`ask` 这条 CLI，模型照样能给你弹按钮；再不行就用纯文本把问题问出来并结束这一轮，
+你在下一条消息里回答即可。
 
 ## 在聊天中行动
 
@@ -341,7 +342,7 @@ agent-anywhere send-file ./report.pdf --caption "Q3 数据"
 
 其余命令智能体依然能用，但**刻意不告诉它**——在模型读到你第一个字之前，一份命令清单
 先花掉的是它的注意力：`send-message`、`reply`、`edit-message`、`react`、`delete`、
-`fetch-messages`、`create-thread`、`ask`。完整列表见 `agent-anywhere --help`，每一条为什么
+`fetch-messages`、`create-thread`。完整列表见 `agent-anywhere --help`，每一条为什么
 冗余见 [`src/ipc/README.md`](src/ipc/README.md)。
 
 如果你希望智能体熟练使用它们，装上内置 [skill](skill/SKILL.md)——它带完整用法，

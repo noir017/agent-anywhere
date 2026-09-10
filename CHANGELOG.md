@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-09-11
+
 ### Added
 
 - **The agent can ask you a question, and wait.** The daemon now advertises ACP's

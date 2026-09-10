@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.7.1] - 2026-09-11
+
 ### Fixed
 
 - **A daemon restart no longer re-narrates the whole conversation into the chat.** Resuming a

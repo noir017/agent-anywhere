@@ -95,6 +95,16 @@ commands.
 
 ### Asking the user (blocking)
 
+**First check whether you already have your own question tool** (Claude Code's
+`AskUserQuestion`, or any harness tool that presents choices). If you do, use it — the
+daemon renders it as the same buttons, and it needs no shell-out. The gateway advertises
+ACP's `elicitation.form` capability precisely so that tool is enabled here; on
+claude-agent-acp it would otherwise be disabled.
+
+The command below is for harnesses that have no such tool. Verified 2026-09-11: `opencode`
+1.18.27 and `dsh` 0.1.2-rc.1 send no elicitations at all, so on those this is the only way
+to get buttons.
+
 ```bash
 agent-anywhere ask "Deploy to production?" -o "Deploy" -o "Dry run" -o "Cancel" [--timeout 120000]
 ```
@@ -106,8 +116,8 @@ Sends a message with buttons and **blocks** until the user clicks or the timeout
 - Empty stdout → timeout / no selection. Pick a sensible default yourself and say so;
   don't re-ask in a loop.
 
-Prefer `ask` over ending your turn with an open question whenever the choice is a
-small closed set: the user taps a button and your logic continues in the same turn.
+Either way, prefer asking over ending your turn with an open question whenever the choice
+is a small closed set: the user taps a button and your logic continues in the same turn.
 
 ## Output & errors
 

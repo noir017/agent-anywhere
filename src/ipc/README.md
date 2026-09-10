@@ -39,7 +39,7 @@ One spec array drives three places, so they cannot drift:
 
 - `cli.ts` registers commander subcommands from it (usage string, options, `build`).
 - `agent-common.ts` `buildReverseHint()` generates the per-turn `<system-reminder>` the
-  agent sees, from each spec's `hint`.
+  agent sees, from the `hint` of each spec **marked `inject`**.
 - `daemon.ts` `handleReverse` dispatches, with an exhaustive `never` guard.
 
 **Adding a reverse command is two edits**: one arm in the `IpcAction` union
@@ -49,6 +49,31 @@ add a command by hand-registering it in `cli.ts`.
 
 The catalog: `send-message`, `reply`, `edit-message`, `send-file`, `react`, `delete`,
 `fetch-messages`, `create-thread`, `ask`.
+
+## Only `send-file` is injected
+
+`inject` is set on exactly one spec, and the rest of the catalog is reachable only by
+typing it (`agent-anywhere --help` lists everything; scripts keep working). The flag
+governs one thing: what is spent from the model's attention before it has read the user's
+first word.
+
+The hint used to carry all nine commands with full usage — about 350 tokens of chat-bot
+operating manual in the **first text block** of every session's opening turn. The cost was
+the framing more than the tokens: a model that opens by reading how to react with emoji
+and page through message history has been told what kind of job this is before it sees the
+job.
+
+Most of it was redundant anyway:
+
+| Command | Why it is not injected |
+|---|---|
+| `send-message`, `reply` | The agent's plain text already streams into the chat. A command to send text is a slower way to do what happens by itself. |
+| `edit-message` | The daemon already live-edits the turn's message. |
+| `ask` | Superseded by ACP `elicitation/create` — the harness's own question tool, rendered as buttons. The model needs no instructions for a tool it already has. |
+| `react`, `delete`, `create-thread`, `fetch-messages` | Chat-client chrome, not the work the agent was asked to do. |
+
+`send-file` stays because it is the one act the text channel cannot perform: a file has to
+be uploaded, not described.
 
 `CHANNEL_OPTION` (`-c, --channel <id>`) is appended to every command. Empty means "the
 current conversation", which is the default an agent should almost always use — the

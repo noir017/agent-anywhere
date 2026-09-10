@@ -2,7 +2,13 @@ import type { Config } from '../config/schema.js';
 import { findAgent } from '../config/schema.js';
 import { looksLikeCommand } from './routing.js';
 import { addressOf, sameAddress, type ConversationAddress } from '../core/conversation.js';
-import type { AgentCommand, ConversationId, InboundMessage } from '../types.js';
+import type {
+  AgentCommand,
+  AgentElicitation,
+  ConversationId,
+  ElicitAnswer,
+  InboundMessage,
+} from '../types.js';
 import type { PlatformAdapter } from '../platform/adapter.js';
 import type { AgentFactory, AgentStreamHandlers, AgentUsage, FollowUpSink } from './agent.js';
 import { StreamBuffer } from '../core/stream-buffer.js';
@@ -187,6 +193,20 @@ export class TurnRunner {
      */
     private readonly hooks?: {
       onAvailableCommands?(id: ConversationId, agentId: string, cmds: AgentCommand[]): void;
+      /**
+       * The agent asked the user a question mid-turn and is blocked on it (ACP elicitation).
+       * Resolves with what the user picked, or a cancel when nobody did.
+       *
+       * Takes the turn's platform and address rather than resolving them from the conversation:
+       * the question belongs in the lane this turn is already answering in — which on autoThread
+       * is a thread that did not exist when the conversation was created.
+       */
+      onElicitRequest?(
+        id: ConversationId,
+        platform: PlatformAdapter,
+        address: ConversationAddress,
+        request: AgentElicitation
+      ): Promise<ElicitAnswer>;
     }
   ) {}
 
@@ -321,7 +341,10 @@ export class TurnRunner {
     ref: TurnRef,
     makeStream: () => StreamBuffer,
     tools: ToolRenderer,
-    enqueue: (fn: () => Promise<void> | void) => void
+    enqueue: (fn: () => Promise<void> | void) => void,
+    /** Where a question to the user is posted — the lane this render is already writing to. */
+    platform: PlatformAdapter,
+    address: ConversationAddress
   ): AgentStreamHandlers {
     return {
       onText: (delta) => {
@@ -364,6 +387,29 @@ export class TurnRunner {
       // Same for the live model name (see TurnRef.model for why it beats the configured value).
       onModel: (model) => {
         ref.model = model;
+      },
+      /**
+       * The agent stopped to ask the user something. Post it as buttons and block this ACP request
+       * until they answer.
+       *
+       * NOT enqueued onto the effects chain, unlike every other handler here: that chain is what
+       * serializes rendering, and parking a minutes-long wait in it would freeze the reply text
+       * behind the question — including the sentence that explains why the question is being
+       * asked. The question is its own message in the same lane, so nothing it does can interleave
+       * with the body stream.
+       *
+       * With no hook wired (tests, a daemon built without one) the answer is `cancel`: the agent
+       * learns nobody answered, rather than waiting on a promise that never settles.
+       */
+      onElicit: async (request) => {
+        const ask = this.hooks?.onElicitRequest;
+        if (!ask) return { action: 'cancel' };
+        try {
+          return await ask(conversationId, platform, address, request);
+        } catch (e) {
+          console.error('[turn] onElicitRequest hook failed:', e instanceof Error ? e.message : e);
+          return { action: 'cancel' };
+        }
       },
     };
   }
@@ -452,7 +498,7 @@ export class TurnRunner {
     return {
       ref,
       enqueue,
-      handlers: this.buildStreamHandlers(conversationId, ref, makeStream, tools, enqueue),
+      handlers: this.buildStreamHandlers(conversationId, ref, makeStream, tools, enqueue, platform, address),
       abort: () => tools.abort(),
       finalize: async (footer: string) => {
         await effects; // wait for all queued side effects to land
@@ -824,17 +870,26 @@ export class TurnRunner {
   }
 
   /**
-   * Merge multiple user messages into one prompt segment, injecting sender identity and quoted context.
+   * Merge multiple user messages into one prompt segment, injecting quoted context and — only
+   * where it distinguishes anybody — sender identity.
    *
    * Rules:
-   *  - If a message has authorName, prefix `[<authorName>] ` so the agent can tell apart speakers in
-   *    multi-party batches; a single message without authorName degrades to plain text (no empty brackets).
+   *  - `[<authorName>] ` prefixes each message in a GROUP or THREAD, where several people can
+   *    speak and the agent has to tell them apart. A direct message carries no prefix: there is
+   *    exactly one human in a DM, so naming them every turn tells the model nothing it cannot see
+   *    and spends the opening of each turn on chat-transcript formatting rather than the question.
+   *    (Absent authorName degrades to plain text, so no empty brackets either.)
    *  - If a message has quotedContent, prepend a quote-context line:
    *    `(replying to <quotedAuthor||someone>: "<quotedContent truncated to 120 chars>")`.
    *  - Multiple messages joined by newlines.
+   *
+   * Keyed on the conversation KIND rather than on "does this batch have two speakers": a batch is
+   * one merge window wide, so in a busy group two people usually land in different batches, and a
+   * per-batch test would drop the names in exactly the conversation that needs them.
    */
   private mergePrompt(batch: InboundMessage[]): string {
     const QUOTE_LIMIT = 120;
+    const multiParty = batch.some((m) => m.conversation.kind !== 'direct');
     return batch
       .map((m) => {
         // Slash commands must reach the agent starting with `/cmd` (the SDK decides command execution by
@@ -848,7 +903,7 @@ export class TurnRunner {
           const quoted = flat.length <= QUOTE_LIMIT ? flat : flat.slice(0, QUOTE_LIMIT - 1) + '…';
           lines.push(`(replying to ${who}: "${quoted}")`);
         }
-        const body = m.authorName ? `[${m.authorName}] ${m.content}` : m.content;
+        const body = multiParty && m.authorName ? `[${m.authorName}] ${m.content}` : m.content;
         lines.push(body);
         return lines.join('\n');
       })

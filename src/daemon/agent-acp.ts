@@ -9,6 +9,8 @@ import type {
 } from '@agentclientprotocol/sdk';
 import type {
   ContentBlock,
+  CreateElicitationRequest,
+  CreateElicitationResponse,
   McpServer,
   PermissionOption,
   RequestPermissionRequest,
@@ -16,6 +18,7 @@ import type {
   SessionConfigOption,
   SessionUpdate,
 } from '@agentclientprotocol/sdk';
+import type { AgentElicitation, ElicitOption, ElicitQuestion } from '../types.js';
 import type { AgentDef, Config } from '../config/schema.js';
 import { findAgent } from '../config/schema.js';
 import type {
@@ -506,6 +509,53 @@ function createAcpSession(
   /** Intentional-abort flag: set by abort(); used to return silently when prompt ends as cancelled. */
   let aborting = false;
   /**
+   * How many elicitations are currently in front of the user, waiting to be answered.
+   *
+   * Read by the turn's silence watchdog: an agent blocked on `elicitation/create` is silent BY
+   * DESIGN, and the person it is waiting for is reading three options on a phone. Without this the
+   * watchdog would reach its deadline mid-decision and abort the turn as hung — killing the very
+   * question it was asked to relay, and doing it more reliably the more carefully the user thought.
+   * A counter rather than a flag because a multi-question form is asked one round at a time.
+   */
+  let awaitingUser = 0;
+
+  /**
+   * Answer an ACP `elicitation/create`: put the agent's question to the user and block until they
+   * pick (see AgentStreamHandlers.onElicit).
+   *
+   * Routed through the RUNNING TURN's handlers, because the question needs a lane to be asked in
+   * and only the turn knows which platform and address this conversation is currently answering
+   * on. Anything that leaves no such lane — no turn open, a url-mode request, a form with nothing
+   * tappable in it — is `cancel`led rather than answered. Cancelling is the honest outcome: it
+   * tells the harness the question went unanswered, which the model then has to deal with, whereas
+   * inventing an accept would hand it a decision the user never made and let it act on it.
+   */
+  async function answerElicitation(params: CreateElicitationRequest): Promise<CreateElicitationResponse> {
+    const ask = turnState?.handlers.onElicit;
+    if (!ask) {
+      console.warn(`[acp] ${conversationId}: elicitation arrived with no turn to ask in; cancelling`);
+      return { action: 'cancel' };
+    }
+    const parsed = parseFormElicitation(params);
+    if (!parsed) {
+      console.warn(`[acp] ${conversationId}: cannot render this elicitation (mode=${params.mode}); cancelling`);
+      return { action: 'cancel' };
+    }
+    awaitingUser++;
+    try {
+      const answer = await ask(parsed);
+      return answer.action === 'accept'
+        ? { action: 'accept', content: answer.content }
+        : { action: answer.action };
+    } catch (e) {
+      // A renderer failure must not leave the agent blocked forever on a reply that will never come.
+      console.error(`[acp] ${conversationId}: failed to put an elicitation to the user:`, e instanceof Error ? e.message : e);
+      return { action: 'cancel' };
+    } finally {
+      awaitingUser--;
+    }
+  }
+  /**
    * Tool ids that were still open when the last cancel landed.
    *
    * A cancelled tool call still emits its `tool_call_update`, and it arrives AFTER the prompt has
@@ -700,10 +750,15 @@ function createAcpSession(
       Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>
     );
 
-    const app = client().onRequest(
-      'session/request_permission',
-      ({ params }): RequestPermissionResponse => decidePermission(params)
-    );
+    const app = client()
+      .onRequest(
+        'session/request_permission',
+        ({ params }): RequestPermissionResponse => decidePermission(params)
+      )
+      .onRequest(
+        'elicitation/create',
+        ({ params }): Promise<CreateElicitationResponse> => answerElicitation(params)
+      );
     const connection = app.connect(stream);
     conn = connection; // assign early so start-failure dispose can close the connection (active stays the sole readiness signal)
     const ctx = connection.agent;
@@ -718,7 +773,25 @@ function createAcpSession(
       const initResult = await ctx.request('initialize', {
         protocolVersion: ACP_PROTOCOL_VERSION,
         // Don't advertise fs/terminal: let the agent use its own tools (Bash → agent-anywhere); the client only receives the stream + answers permission.
-        clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+        //
+        // `elicitation.form` IS advertised, and it is load-bearing rather than decorative: the
+        // claude adapter gates the model's own AskUserQuestion tool on it
+        // (`disallowedTools = elicitationSupport.form ? [] : ["AskUserQuestion"]`), so without this
+        // the model cannot ask the user anything — it guesses, or asks in prose and ends the turn.
+        // Verified live 2026-09-11: with this set, a "which database?" prompt produced a real
+        // `elicitation/create` carrying three options and their rationales.
+        //
+        // The value MUST be an object, not `true`. ACP types this as `ElicitationFormCapabilities`
+        // (see the SDK's schema.json), claude reads it as a truthy check so `{}` satisfies it, and
+        // opencode validates it strictly — `form: true` is rejected with `-32602 Invalid params`
+        // ("expected object, received boolean"), which fails initialize and takes down EVERY
+        // opencode session, not just its elicitations. `url` is deliberately left out: a browser
+        // hand-off has no sensible rendering in a chat message (see parseFormElicitation).
+        clientCapabilities: {
+          fs: { readTextFile: false, writeTextFile: false },
+          terminal: false,
+          elicitation: { form: {} },
+        },
       });
       loadSessionSupported = initResult.agentCapabilities?.loadSession === true;
 
@@ -1135,6 +1208,14 @@ function createAcpSession(
         watchdog = setTimeout(() => onSilence(ms), ms);
       };
       const onSilence = (waited: number): void => {
+        // Blocked on a person, not hung: an elicitation stops the agent by design and the answer
+        // arrives at human speed. Re-arm indefinitely rather than spend the one-shot tool grace —
+        // the wait is already bounded by the ask's own timeout, which resolves to `cancel` and
+        // lets the turn continue, so nothing here can hang forever.
+        if (awaitingUser > 0) {
+          arm(waited);
+          return;
+        }
         // Silence with a tool call still open is not a hung agent, it is a script running — and
         // the harness's own tool limit reaches exactly this deadline, so the collision was
         // guaranteed rather than unlucky (see TOOL_SILENCE_FACTOR).
@@ -1331,6 +1412,81 @@ export function decidePermission(req: RequestPermissionRequest): RequestPermissi
 }
 
 // ───────────────────────── session/update → handlers translation (core) ─────────────────────────
+
+/**
+ * The choosable options of one elicitation form field.
+ *
+ * Single-select fields carry them under `oneOf`, multi-select under `items.anyOf`; both hold
+ * ACP `EnumOption`s. An option with no usable `const` is dropped rather than guessed at: the
+ * answer has to carry that exact value, and sending one the agent never listed is worse than
+ * offering one button fewer.
+ *
+ * Takes `unknown` because `ElicitationPropertySchema` is a union over every primitive type, and
+ * the number/boolean arms carry no enum at all — narrowing here rather than at the call site
+ * keeps the "no options, skip this question" answer in one place.
+ */
+function parseElicitOptions(prop: unknown): ElicitOption[] {
+  const p = prop as { oneOf?: unknown; items?: { anyOf?: unknown } };
+  const raw = Array.isArray(p.oneOf) ? p.oneOf : Array.isArray(p.items?.anyOf) ? p.items.anyOf : [];
+  const options: ElicitOption[] = [];
+  for (const o of raw) {
+    const opt = o as { const?: unknown; title?: unknown; description?: unknown };
+    // `const` is the answer, `title` is display only; either may stand in for a missing other,
+    // but with neither there is nothing to send back and nothing to print on a button.
+    const value = typeof opt.const === 'string' ? opt.const : undefined;
+    const label = typeof opt.title === 'string' && opt.title.length > 0 ? opt.title : value;
+    if (value === undefined || label === undefined) continue;
+    const description = typeof opt.description === 'string' ? opt.description.trim() : '';
+    options.push(description ? { label, value, description } : { label, value });
+  }
+  return options;
+}
+
+/**
+ * Translate an ACP `elicitation/create` into the platform-agnostic question rounds the daemon
+ * renders as buttons. Returns null for anything this client cannot put in front of a user, in
+ * which case the caller declines rather than guessing an answer.
+ *
+ * ── What the wire shape actually is ───────────────────────────────────────────────────────────
+ * A form elicitation carries a JSON Schema, not a question list, so the questions have to be read
+ * back out of it. The layout is claude-agent-acp's `askUserQuestionsToCreateRequest` (verified
+ * against a live payload, see the fixture in agent-acp.test.ts): one `question_<n>` property per
+ * question — `oneOf` of `{const, title, description}` for single-select, `items.anyOf` for
+ * multi-select — each followed by a `question_<n>_custom` free-text "Other" field. The question
+ * text lives in `message` when there is exactly one question, and in each property's
+ * `description` when there are several.
+ *
+ * `_custom` fields are skipped: they are the CLI's "type your own answer instead" box, and a
+ * button row cannot collect free text. Dropping them is safe because the adapter marks them
+ * optional — an accept that omits them is a complete answer, not a partial one.
+ *
+ * A question left with no usable options is dropped, and a form where every question drops
+ * yields null.
+ */
+export function parseFormElicitation(params: CreateElicitationRequest): AgentElicitation | null {
+  // `url` mode points the user at a browser to finish something out of band. There is no useful
+  // rendering of that in a chat message the daemon can then correlate an answer to, so it is
+  // declined rather than half-supported (the client advertises only `form` for the same reason).
+  if (params.mode !== 'form') return null;
+
+  const message = typeof params.message === 'string' ? params.message.trim() : '';
+  const properties = params.requestedSchema?.properties ?? {};
+
+  const questions: ElicitQuestion[] = [];
+  for (const [key, prop] of Object.entries(properties)) {
+    if (key.endsWith('_custom')) continue;
+    const p = prop as { type?: string; title?: string | null; description?: string | null };
+    const options = parseElicitOptions(prop);
+    if (options.length === 0) continue;
+    // Single-question forms carry the question in `message` and leave `description` unset; the
+    // title is a short header, so it is the last resort rather than the first.
+    const prompt = p.description?.trim() || message || p.title?.trim() || key;
+    questions.push({ key, prompt, options, multi: p.type === 'array' });
+  }
+
+  if (questions.length === 0) return null;
+  return { message: message || questions[0]!.prompt, questions };
+}
 
 export interface TurnState {
   handlers: AgentStreamHandlers;

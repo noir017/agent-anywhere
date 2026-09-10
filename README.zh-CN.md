@@ -314,24 +314,38 @@ flash 档模型一两秒出结果，每个会话约 60 token —— 一个话题
 前会先拿整份配置校验一遍 —— `/setting` 不会给你留下一份下次重启加载不了的
 config.yaml。
 
+## 向你提问
+
+当智能体需要一个它替你做不了的决定时，它会**问**——以按钮的形式发进聊天，然后等你点：
+
+> **这个项目用哪个数据库？**
+> **PostgreSQL** — 你这台机器已经在跑 pgvector，直接复用零成本。
+> **MySQL** — 生态更广，但本机还没有现成实例。
+>
+> `[ PostgreSQL ]` `[ MySQL ]`
+
+这是模型自己的提问工具，不是网关外挂的功能：守护进程在握手时声明 ACP 的
+`elicitation.form` 能力，而这正是解锁 Claude Code `AskUserQuestion` 的开关——不声明的话
+适配器会把那个工具直接禁用。整个过程**没有向提示词注入任何东西**。
+
+不实现 elicitation 的 harness——`opencode` 1.18.27 与 `dsh` 0.1.2-rc.1——会优雅退化：
+模型用纯文本把问题问出来并结束这一轮，你在下一条消息里回答即可。
+
 ## 在聊天中行动
 
-纯文本回答自动流式返回。其余操作由智能体调用同一个 CLI 完成，命令默认作用于
-当前会话：
+纯文本回答自动流式返回。智能体被告知的，只有文本通道唯一做不到的那一件事：
 
 ```bash
 agent-anywhere send-file ./report.pdf --caption "Q3 数据"
-agent-anywhere react <messageId> <emoji>
-agent-anywhere fetch-messages --limit 20
-agent-anywhere create-thread <messageId> "排查记录"
-agent-anywhere ask "部署到生产？" -o 部署 -o 演练 -o 取消
 ```
 
-`ask` 阻塞等待用户点击按钮，并把所选标签写到 stdout。此外还有：
-`send-message`、`reply`、`edit-message`、`delete`。
+其余命令智能体依然能用，但**刻意不告诉它**——在模型读到你第一个字之前，一份命令清单
+先花掉的是它的注意力：`send-message`、`reply`、`edit-message`、`react`、`delete`、
+`fetch-messages`、`create-thread`、`ask`。完整列表见 `agent-anywhere --help`，每一条为什么
+冗余见 [`src/ipc/README.md`](src/ipc/README.md)。
 
-守护进程每轮注入一行提示，任何智能体都能自行发现这些命令；完整用法见内置
-[skill](skill/SKILL.md)：
+如果你希望智能体熟练使用它们，装上内置 [skill](skill/SKILL.md)——它带完整用法，
+按需加载，而不是每个会话都注入一遍：
 
 ```bash
 npx skills add https://github.com/l0ng-ai/agent-anywhere/tree/main/skill -g

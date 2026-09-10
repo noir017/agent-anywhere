@@ -349,24 +349,44 @@ templates survive untouched, and a change is validated against the whole config
 before the file is written — `/setting` will not leave you a config.yaml that
 fails to load on the next restart.
 
+## Asking you something
+
+When the agent needs a decision it cannot make for you, it asks — as buttons, in the
+chat, and it waits for the tap:
+
+> **Which database should this project use?**
+> **PostgreSQL** — you already run pgvector here, so reusing it costs nothing.
+> **MySQL** — wider ecosystem, but there is no instance on this box yet.
+>
+> `[ PostgreSQL ]` `[ MySQL ]`
+
+This is the model's own question tool, not a gateway feature bolted on top: the daemon
+advertises ACP's `elicitation.form` capability, which is what unlocks Claude Code's
+`AskUserQuestion` (the adapter keeps it disabled otherwise). Nothing is injected into the
+prompt to make it work.
+
+Harnesses that do not implement elicitation — `opencode` and `dsh`, as of 1.18.27 and
+0.1.2-rc.1 — degrade gracefully: the model asks in plain text and ends its turn, and you
+answer in the next message.
+
 ## Acting in the chat
 
-Plain text streams back automatically. For everything else, the agent invokes
-the same CLI; commands target the current conversation by default:
+Plain text streams back automatically, and the agent is told about exactly one thing it
+cannot do that way:
 
 ```bash
 agent-anywhere send-file ./report.pdf --caption "Q3 numbers"
-agent-anywhere react <messageId> <emoji>
-agent-anywhere fetch-messages --limit 20
-agent-anywhere create-thread <messageId> "debug session"
-agent-anywhere ask "Deploy to production?" -o Deploy -o "Dry run" -o Cancel
 ```
 
-`ask` blocks until the user taps a button and prints the chosen label. Also:
-`send-message`, `reply`, `edit-message`, `delete`.
+The rest of the CLI is available to the agent but deliberately **not** advertised to it,
+because a command list in the prompt costs attention before the model has read your first
+word: `send-message`, `reply`, `edit-message`, `react`, `delete`, `fetch-messages`,
+`create-thread`, `ask`. Run `agent-anywhere --help` for the full set, and see
+[`src/ipc/README.md`](src/ipc/README.md) for why each one is redundant.
 
-A per-turn hint lets any agent discover these commands; the bundled
-[skill](skill/SKILL.md) provides the full playbook:
+If you want an agent to use them fluently, install the bundled
+[skill](skill/SKILL.md) — it carries the full playbook and is loaded on demand rather
+than injected every session:
 
 ```bash
 npx skills add https://github.com/l0ng-ai/agent-anywhere/tree/main/skill -g

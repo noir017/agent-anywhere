@@ -28,8 +28,27 @@ export interface ReverseCommandSpec {
   options: ReverseOption[];
   /** Build one IpcAction from positionals + options. */
   build(positionals: string[], opts: Record<string, unknown>): IpcAction;
-  /** One-line usage hint for the agent (rendered by buildSkillHint). */
+  /** One-line usage hint for the agent (rendered by buildReverseHint when `inject` is set). */
   hint: string;
+  /**
+   * Whether this command's hint is injected into the agent's prompt.
+   *
+   * Only `send-file` sets it, and the reason is that everything else on this list turned out to be
+   * a worse way to do something the gateway already does:
+   *  - the agent's plain text IS the reply — it streams into the chat on its own, so `send-message`
+   *    and `reply` ask the model to spend a tool call re-sending what was already sent;
+   *  - `edit-message` duplicates the live-edited message the daemon maintains for every turn;
+   *  - `ask` is now the harness's own question tool, arriving over ACP `elicitation/create` and
+   *    rendered as buttons — no prompt text needed, and the model already knows how to use it;
+   *  - `react` / `delete` / `create-thread` / `fetch-messages` describe a chat client's chrome,
+   *    which is not what the model was asked to work on.
+   *
+   * They stay registered on the CLI (`agent-anywhere --help` lists them, scripts keep working) —
+   * this flag governs one thing only: what is spent from the model's attention before it has read
+   * the user's first word. The full block was ~350 tokens of "you are an IM bot" ahead of every
+   * session's opening question, which is a framing the work rarely needs and never asked for.
+   */
+  inject?: boolean;
 }
 
 /** The "target channel" option shared by all reverse commands; empty = current session. */
@@ -150,6 +169,8 @@ export const REVERSE_COMMANDS: ReverseCommandSpec[] = [
       channelId: str(opts.channel),
     }),
     hint: 'Send a file: agent-anywhere send-file <path> [--caption "caption"]',
+    // The one capability plain text cannot reach: a file has to be uploaded, not described.
+    inject: true,
   },
   {
     usage: 'react <messageId> <emoji>',

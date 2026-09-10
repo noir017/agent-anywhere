@@ -1,4 +1,11 @@
-import type { AgentCommand, ModelSelector, ToolEvent, ToolFinishEvent } from '../types.js';
+import type {
+  AgentCommand,
+  AgentElicitation,
+  ElicitAnswer,
+  ModelSelector,
+  ToolEvent,
+  ToolFinishEvent,
+} from '../types.js';
 
 // ModelSelector lives in types.ts rather than here: core/model-menu.ts renders it into a paginated
 // button menu, and core may not import daemon/. Re-exported so the runtimes keep one import site.
@@ -42,6 +49,19 @@ export interface AgentStreamHandlers {
    * Fired once after session startup and again on any `config_option_update`.
    */
   onModel?(model: string): void;
+  /**
+   * The agent stopped mid-turn to ask the user something (ACP `elicitation/create`), and is
+   * blocked on the answer. Resolve with the user's choice, `decline`, or `cancel`.
+   *
+   * Turn-scoped rather than session-scoped because the question needs somewhere to be asked: the
+   * turn is what knows the platform and address the conversation is currently answering in. A
+   * question arriving with no turn open has no such lane, and is cancelled by the runtime.
+   *
+   * Optional, and absent means "cancel it": a client that cannot render the question must say so
+   * rather than answer for the user. On the `claude` harness the model then reports the question
+   * as unanswered instead of proceeding on a guess.
+   */
+  onElicit?(request: AgentElicitation): Promise<ElicitAnswer>;
 }
 
 /**

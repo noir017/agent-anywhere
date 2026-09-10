@@ -241,6 +241,18 @@ the footer.
 
 Two mechanisms worth understanding before editing:
 
+**What the prompt actually contains.** `mergePrompt` joins the batch, and it adds only
+what distinguishes something. The `[<authorName>] ` identity prefix goes on in a **group
+or thread**, where several people can speak and the agent has to tell them apart, and is
+omitted in a DM — naming the only human present, every turn, opens each turn with
+chat-transcript formatting instead of the question. The test is the conversation KIND, not
+"does this batch have two speakers": a batch is one merge window wide, so in a busy group
+two people usually land in different batches and a per-batch test would drop the names in
+exactly the conversation that needs them. A quoted reply prepends one
+`(replying to X: "…")` line, attachments append a block, and a slash command is passed
+through bare (the SDK decides native-command execution by the leading `/`). That is the
+whole list — plus the one-line reverse hint on a session's first turn.
+
 **The effects chain.** All stream-event side effects are serialized into one promise
 chain (`enqueue`), so "text push → tool-boundary flush → tool bubble → trailing text"
 execute in strict arrival order with no interleaving. Failures are swallowed into the
@@ -516,9 +528,41 @@ environment, working-directory resolution (`agents[].cwd`, or an auto-created
 child termination (SIGTERM, then SIGKILL after `KILL_GRACE_MS` — harness CLIs may ignore
 SIGTERM mid-turn).
 
-`buildReverseHint()` generates the per-turn `<system-reminder>` from
-`REVERSE_COMMANDS`, so the hint can never drift from the actual CLI. See
-[`src/ipc/README.md`](../ipc/README.md).
+`buildReverseHint()` generates the per-turn `<system-reminder>` from the specs in
+`REVERSE_COMMANDS` marked `inject` — currently only `send-file`, so the hint is one line.
+It cannot drift from the actual CLI. See [`src/ipc/README.md`](../ipc/README.md) for why
+the other eight are reachable but not advertised.
+
+### Asking the user something (ACP elicitation)
+
+The client advertises `clientCapabilities.elicitation.form` at `initialize`, and this is
+load-bearing rather than decorative: **claude-agent-acp keeps the model's own
+`AskUserQuestion` tool disabled unless it is set** (`disallowedTools = elicitationSupport
+.form ? [] : ["AskUserQuestion"]`). Without it a model that needs a decision either picks
+for you or asks in prose and ends its turn.
+
+The value must be an **object**, not `true`. ACP types it as `ElicitationFormCapabilities`;
+claude reads it as a truthy check so `{}` satisfies it, but opencode validates strictly and
+answers `form: true` with `-32602 Invalid params`, which fails `initialize` and takes down
+every opencode session — not just its elicitations.
+
+Path: `elicitation/create` → `parseFormElicitation()` (pure; reads the questions back out
+of the request's JSON Schema) → `AgentStreamHandlers.onElicit` → TurnRunner's
+`onElicitRequest` hook → `daemon.askButtons()`, the same machinery the `ask` reverse
+command uses. Anything unrenderable (url mode, no turn open, no tappable options) is
+`cancel`led rather than answered, so the model learns the question went unanswered instead
+of acting on a choice nobody made.
+
+Two things this costs elsewhere: the turn's silence watchdog treats a pending elicitation
+as "blocked on a human, not hung" and re-arms instead of aborting (`awaitingUser`), and
+option rationales are rendered into the message body because a button label cannot hold a
+sentence.
+
+Probed live 2026-09-11: `claude` sends real elicitations; **`opencode` 1.18.27 and `dsh`
+0.1.2-rc.1 send none at all** (opencode sends no reverse requests whatsoever, not even
+`session/request_permission`). On those two a model that wants to ask writes the question
+as text and ends the turn, which the user answers in the next message — a graceful
+degradation that needs no code.
 
 ## `daemon.ts` responsibilities
 

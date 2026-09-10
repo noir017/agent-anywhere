@@ -19,13 +19,34 @@ import { ensureReverseCliShim } from './reverse-cli-shim.js';
 /** Grace window after SIGTERM; if still alive, SIGKILL fallback (harness CLIs may ignore SIGTERM mid-turn). */
 export const KILL_GRACE_MS = 2_000;
 
-/** Reverse-command usage hint (single source REVERSE_COMMANDS, kept in sync with CLI registration). */
+/**
+ * The only thing the agent is told about running here (single source REVERSE_COMMANDS, filtered to
+ * the specs marked `inject`).
+ *
+ * ── Why this is one line and not the command list it used to be ───────────────────────────────
+ * It used to carry all nine reverse commands with their full usage — about 350 tokens of chat-bot
+ * operating manual, sitting in the FIRST text block of every session's opening turn, ahead of
+ * whatever the user actually asked. The cost was not the tokens; it was the framing. A model that
+ * opens by reading how to react with emoji and fetch message history has been told what kind of
+ * job this is before it sees the job, and it answers accordingly.
+ *
+ * Almost all of it was also redundant. Plain text already streams into the chat, so a command to
+ * send text is a slower way to do nothing new; the daemon already live-edits the turn's message;
+ * and asking the user something is now the harness's own question tool, arriving over ACP
+ * `elicitation/create` and rendered as buttons — the model needs no instructions for a tool it
+ * already has. What remains is the single act the text channel genuinely cannot perform: putting
+ * a file in the chat. See ReverseCommandSpec.inject for the per-command reasoning.
+ *
+ * The other commands are still registered and still work when typed; they are simply not spent
+ * from the model's attention up front.
+ */
 export function buildReverseHint(): string {
+  const injected = REVERSE_COMMANDS.filter((c) => c.inject);
+  if (injected.length === 0) return '';
   return [
     '<system-reminder>',
-    'You are running inside the Agent Anywhere daemon; your plain-text replies stream back to the current IM conversation automatically — just reply normally. For actions beyond text, use Bash to call `agent-anywhere` (on PATH, defaults to the current conversation):',
-    ...REVERSE_COMMANDS.map((c) => `  - ${c.hint}`),
-    'Pass --channel <id> only to push proactively to a different channel.',
+    'Your replies reach the user automatically — just answer normally. For anything text cannot carry, run these with Bash:',
+    ...injected.map((c) => `  - ${c.hint}`),
     '</system-reminder>',
   ].join('\n');
 }

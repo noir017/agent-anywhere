@@ -49,9 +49,12 @@ import { OutboundPacer } from '../core/outbound-pacer.js';
 import { withOutboundPacing } from './paced-adapter.js';
 import type {
   AgentCommand,
+  AgentElicitation,
   ButtonInteraction,
   CommandInteraction,
   ConversationId,
+  ElicitAnswer,
+  ElicitQuestion,
   InboundMessage,
   MessageRef,
   ModelSelector,
@@ -190,6 +193,28 @@ export function buildRegisteredSpecs(cfg: Pick<Config, 'agents'>): SlashCommandS
   // register twice — Telegram rejects the whole setMyCommands batch on a duplicate name.
   const seen = new Set<string>();
   return specs.filter((s) => (seen.has(s.name) ? false : (seen.add(s.name), true)));
+}
+
+/**
+ * The message body posted above one elicitation round's buttons (pure, testable).
+ *
+ * Two things a button row cannot carry, so they go here:
+ *  - the option rationales, which are often the most useful part of the question ("you already
+ *    run pgvector here, so reusing it costs nothing") and are why asking with buttons beats
+ *    asking in prose;
+ *  - a position marker, so a multi-question form reads as 2-of-3 rather than as three unrelated
+ *    questions arriving in a row.
+ *
+ * Options with no rationale contribute no line at all, rather than a label followed by an empty
+ * dash — a form where none of them has one then renders as a bare question, which is right.
+ */
+export function composeElicitPrompt(q: ElicitQuestion, index: number, total: number): string {
+  const heading = total > 1 ? `(${index + 1}/${total}) ${q.prompt}` : q.prompt;
+  const detail = q.options
+    .filter((o) => o.description)
+    .map((o) => `**${o.label}** — ${o.description}`)
+    .join('\n');
+  return detail ? `${heading}\n\n${detail}` : heading;
 }
 
 /** A pending ask request (IPC response blocked, awaiting a button click or timeout). */
@@ -410,6 +435,9 @@ export class Daemon {
       onAvailableCommands: (_id, agentId, cmds) => this.onAgentCommands(agentId, cmds),
       // A harness picker (/claude, /opencode) was invoked in a conversation of that harness.
       onPickerRequest: (id, agentId, msg) => this.onPickerRequest(id, agentId, msg),
+      // The agent stopped mid-turn to ask the user something (ACP elicitation) → buttons.
+      onElicitRequest: (id, platform, address, request) =>
+        this.onElicitRequest(id, platform, address, request),
       // Idle reclaim asks before stopping a child: a pending `ask` is the daemon holding work for a
       // conversation from OUTSIDE any turn, so the merger looks idle while a CLI process sits
       // blocked on a button nobody has pressed yet. (This is the guard PendingAsk.conversationId is
@@ -625,34 +653,108 @@ export class Daemon {
     if (labels.length === 0) {
       return { chosen: null };
     }
+    const chosen = await this.askButtons(
+      platform,
+      address,
+      action.prompt,
+      labels,
+      action.timeoutMs ?? DEFAULT_ASK_TIMEOUT_MS,
+      conversationId
+    );
+    return { chosen };
+  }
+
+  /**
+   * Post one question as buttons and resolve with the label the user tapped (null on timeout).
+   *
+   * Shared by the two ways a question reaches the user: the `ask` reverse command, and the agent's
+   * own ACP elicitation. One implementation because the mechanics are identical down to the
+   * eviction guard — the difference is only who asked and how the answer travels back — and two
+   * copies would inevitably drift on the details that took a bug each to get right (keeping the
+   * posted message's own ref for the ack edit, stripping the buttons on resolve, re-checking the
+   * clicker against the allowlist).
+   */
+  private askButtons(
+    platform: PlatformAdapter,
+    address: ConversationAddress,
+    prompt: string,
+    labels: string[],
+    timeoutMs: number,
+    conversationId?: ConversationId
+  ): Promise<string | null> {
     const reqId = randomUUID().slice(0, 8);
     // custom_id: `ask:` prefix + index (≤100 chars; must not start with `input`).
     const buttons = labels.map((label, i) => ({
       id: `${ASK_PREFIX}${reqId}:${i}`,
       label,
     }));
-    const ref = await platform.sendButtons(address, action.prompt, buttons);
+    return platform.sendButtons(address, prompt, buttons).then(
+      (ref) =>
+        new Promise<string | null>((resolve) => {
+          const timer = setTimeout(() => {
+            this.pendingAsks.delete(reqId);
+            // best-effort: strip buttons and mark timed out (editMessage with text only drops components).
+            void platform.editMessage(ref, `${prompt}\n\n(timed out)`).catch(() => undefined);
+            resolve(null);
+          }, timeoutMs);
+          this.pendingAsks.set(reqId, {
+            resolve,
+            timer,
+            ref,
+            labels,
+            prompt,
+            adapter: platform,
+            conversationId,
+          });
+        })
+    );
+  }
 
-    const timeoutMs = action.timeoutMs ?? DEFAULT_ASK_TIMEOUT_MS;
-    return new Promise<{ chosen: string | null }>((resolve) => {
-      const timer = setTimeout(() => {
-        this.pendingAsks.delete(reqId);
-        // best-effort: strip buttons and mark timed out (editMessage with text only drops components).
-        void platform
-          .editMessage(ref, `${action.prompt}\n\n(timed out)`)
-          .catch(() => undefined);
-        resolve({ chosen: null });
-      }, timeoutMs);
-      this.pendingAsks.set(reqId, {
-        resolve: (label) => resolve({ chosen: label }),
-        timer,
-        ref,
-        labels,
-        prompt: action.prompt,
-        adapter: platform,
-        conversationId,
-      });
-    });
+  /**
+   * The agent stopped mid-turn to ask the user something (ACP elicitation) — put each question to
+   * them as buttons, in order, and hand back what they picked.
+   *
+   * ── Why this exists at all ────────────────────────────────────────────────────────────────────
+   * Because the alternative is the model guessing. The `claude` harness keeps its AskUserQuestion
+   * tool disabled unless the client advertises `elicitation.form` (see agent-acp's initialize), so
+   * before this hook a model that needed a decision either picked for you or asked in prose and
+   * ended its turn. Now it asks, and waits.
+   *
+   * Rounds are sequential and abandoned on the first unanswered one: a form is a set of questions
+   * the agent needs ALL of, so carrying on to ask question three after question two timed out
+   * would collect an answer it cannot use, having already made the user tap twice for nothing.
+   *
+   * Option rationales go in the message body rather than on the buttons. They are frequently the
+   * most useful part of the question ("you already run pgvector here, so reusing it costs
+   * nothing") and a button label cannot hold a sentence on any of the eight platforms.
+   */
+  private async onElicitRequest(
+    conversationId: ConversationId,
+    platform: PlatformAdapter,
+    address: ConversationAddress,
+    request: AgentElicitation
+  ): Promise<ElicitAnswer> {
+    const content: Record<string, string | string[]> = {};
+    for (const [i, q] of request.questions.entries()) {
+      const label = await this.askButtons(
+        platform,
+        address,
+        composeElicitPrompt(q, i, request.questions.length),
+        q.options.map((o) => o.label),
+        DEFAULT_ASK_TIMEOUT_MS,
+        conversationId
+      );
+      if (label === null) {
+        console.log(`[elicit] ${conversationId}: question ${i + 1} went unanswered; cancelling`);
+        return { action: 'cancel' };
+      }
+      // Send back the option's `value`, not the label the button carried: ACP separates display
+      // text from the answer, and an MCP server that made them differ must get what it offered.
+      const picked = q.options.find((o) => o.label === label);
+      if (!picked) return { action: 'cancel' }; // unreachable: labels come from these very options
+      content[q.key] = q.multi ? [picked.value] : picked.value;
+    }
+    return { action: 'accept', content };
   }
 
   /** Button click: resolve the matching model menu, directory menu, settings menu, pending ask, or picker; otherwise ignore. */

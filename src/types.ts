@@ -119,6 +119,72 @@ export interface AgentCommand {
 }
 
 /**
+ * A question the AGENT asked the user, mid-turn, and is blocked on.
+ *
+ * From ACP `elicitation/create` (form mode) — the protocol's way for an agent to stop and ask
+ * rather than guess. On the `claude` harness this is how the model's own `AskUserQuestion` tool
+ * surfaces: the adapter keeps that tool disabled unless the client advertises
+ * `clientCapabilities.elicitation.form`, so declaring the capability is what turns "the model
+ * guesses, or asks in prose and ends its turn" into "the model asks and waits".
+ *
+ * Platform-agnostic on purpose: the ACP wire shape (a JSON Schema of `question_<n>` fields with
+ * `oneOf` enums) is translated at the protocol boundary, so the daemon renders buttons from this
+ * and never sees a schema. Multi-question forms become several rounds, asked in order.
+ */
+export interface AgentElicitation {
+  /** The ask, shown above the first round's buttons (the question text for a single-question form). */
+  message: string;
+  /** One round per question, in the order the agent listed them. Never empty. */
+  questions: ElicitQuestion[];
+}
+
+/** One round of an elicitation: what to ask, and the options to offer as buttons. */
+export interface ElicitQuestion {
+  /** Wire field key the answer must be returned under (`question_<n>`); opaque to the renderer. */
+  key: string;
+  /** Prompt for this round. For a single-question form this repeats AgentElicitation.message. */
+  prompt: string;
+  /** Choosable options. Never empty. */
+  options: ElicitOption[];
+  /**
+   * Whether the wire field takes an array (ACP multi-select). Buttons are one tap, so the daemon
+   * still collects exactly one option and returns it wrapped — the alternative (a stateful
+   * multi-select UI on eight IM platforms) buys little over the model re-asking.
+   */
+  multi: boolean;
+}
+
+/**
+ * One choosable option. `label` and `value` are separate because ACP's `EnumOption` separates
+ * them: `title` is display text and `const` is what the answer must carry. They happen to be
+ * identical for claude's AskUserQuestion bridge (both are the option label), but an MCP server's
+ * own elicitation is free to make them differ, and returning the display text as the answer would
+ * silently give that server a value it never offered.
+ *
+ * `description` is the model's own reasoning for this option, and it is the whole point of asking
+ * with buttons rather than in prose — a real payload reads "you already run pgvector here, so
+ * reusing it costs nothing". Buttons cannot carry it, so the renderer puts it in the message body
+ * above them; dropping it would leave the user picking between bare nouns.
+ */
+export interface ElicitOption {
+  label: string;
+  value: string;
+  description?: string;
+}
+
+/**
+ * The user's verdict on an elicitation, in ACP's own vocabulary.
+ *
+ * `cancel` is the answer for "nobody pressed anything": it tells the agent the question was
+ * abandoned, which the harness reports back to the model as an unanswered tool call — strictly
+ * better than fabricating a choice it will then act on.
+ */
+export type ElicitAnswer =
+  | { action: 'accept'; content: Record<string, string | string[]> }
+  | { action: 'decline' }
+  | { action: 'cancel' };
+
+/**
  * Slash-command registration spec (platform-agnostic minimal description).
  * The adapter maps it to each platform's native command structure (Discord -> Universal.Command).
  */

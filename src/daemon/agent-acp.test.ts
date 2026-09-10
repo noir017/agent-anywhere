@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import type { SessionConfigOption, SessionUpdate } from '@agentclientprotocol/sdk';
+import type { CreateElicitationRequest, SessionConfigOption, SessionUpdate } from '@agentclientprotocol/sdk';
 import {
   dshModelDisplayValue,
   dshModelSelectorValue,
   liveModelName,
   isResultUsage,
+  parseFormElicitation,
   resolveHarness,
   translateUpdate,
   type TurnState,
@@ -562,5 +563,97 @@ describe('isResultUsage (end of a burst of background output)', () => {
         content: { type: 'text', text: 'hi' },
       } as SessionUpdate)
     ).toBe(false);
+  });
+});
+
+describe('parseFormElicitation (agent asks the user, ACP elicitation/create)', () => {
+  /**
+   * Captured live from claude-agent-acp on 2026-09-11 by advertising
+   * `clientCapabilities.elicitation.form` and prompting "MySQL or Postgres? ask me first".
+   * Kept verbatim (Chinese text and all) because the field layout — `question_<n>` +
+   * `question_<n>_custom`, `oneOf` of `{const,title,description}`, question text in `message`
+   * rather than in the property — is what the parser reads, and a hand-written fixture would
+   * have quietly encoded a guess about it.
+   */
+  const REAL: CreateElicitationRequest = {
+    mode: 'form',
+    sessionId: '429f5c2d-f046-4c24-a700-a636ddd5b674',
+    toolCallId: 'toolu_01Gt6JuHbhuaX3BRYAh1Gpps',
+    message: '这个项目用哪个数据库？',
+    requestedSchema: {
+      type: 'object',
+      properties: {
+        question_0: {
+          type: 'string',
+          title: '数据库',
+          oneOf: [
+            { const: 'PostgreSQL', title: 'PostgreSQL', description: '你现有基础设施已经在跑 postgresql15 / pgvector。' },
+            { const: 'MySQL', title: 'MySQL', description: '生态广泛，但当前没有现成实例。' },
+            { const: '先不定，等我看完项目', title: '先不定，等我看完项目' },
+          ],
+        },
+        question_0_custom: {
+          type: 'string',
+          title: 'Other',
+          description: 'Type your own answer instead of choosing an option above (optional).',
+        },
+      },
+    },
+  } as unknown as CreateElicitationRequest;
+
+  it('reads one round out of the real single-question payload', () => {
+    const e = parseFormElicitation(REAL)!;
+    expect(e.message).toBe('这个项目用哪个数据库？');
+    expect(e.questions).toHaveLength(1); // the `_custom` free-text box is not a round
+    const q = e.questions[0]!;
+    expect(q.key).toBe('question_0');
+    // Single-question forms leave `description` unset, so the prompt comes from `message`.
+    expect(q.prompt).toBe('这个项目用哪个数据库？');
+    expect(q.multi).toBe(false);
+    expect(q.options.map((o) => o.value)).toEqual(['PostgreSQL', 'MySQL', '先不定，等我看完项目']);
+  });
+
+  it('keeps each option\'s reasoning, which is why buttons beat prose', () => {
+    const opts = parseFormElicitation(REAL)!.questions[0]!.options;
+    expect(opts[0]!.description).toContain('pgvector');
+    expect(opts[2]!.description).toBeUndefined(); // absent, not empty string
+  });
+
+  it('carries the per-question text when a form asks several things', () => {
+    const e = parseFormElicitation({
+      mode: 'form',
+      sessionId: 's',
+      message: 'Please answer the following questions.',
+      requestedSchema: {
+        type: 'object',
+        properties: {
+          question_0: { type: 'string', description: 'Which database?', oneOf: [{ const: 'pg', title: 'Postgres' }] },
+          question_1: { type: 'array', description: 'Which regions?', items: { anyOf: [{ const: 'eu', title: 'EU' }] } },
+        },
+      },
+    } as unknown as CreateElicitationRequest)!;
+    expect(e.questions.map((q) => q.prompt)).toEqual(['Which database?', 'Which regions?']);
+    expect(e.questions.map((q) => q.multi)).toEqual([false, true]);
+    // `title` is display, `const` is the answer — an MCP server may make them differ.
+    expect(e.questions[0]!.options[0]).toEqual({ label: 'Postgres', value: 'pg' });
+  });
+
+  it('declines what it cannot put in front of a user', () => {
+    // url mode: nothing to render as buttons, and no answer to correlate back.
+    expect(parseFormElicitation({ mode: 'url', sessionId: 's', message: 'go here', elicitationId: 'e', url: 'https://x' } as unknown as CreateElicitationRequest)).toBeNull();
+    // An option with no `const` has no value to send back, so its question has no options left.
+    expect(
+      parseFormElicitation({
+        mode: 'form', sessionId: 's', message: 'pick',
+        requestedSchema: { type: 'object', properties: { question_0: { type: 'string', oneOf: [{ title: 'no const here' }] } } },
+      } as unknown as CreateElicitationRequest)
+    ).toBeNull();
+    // A form with only the free-text box: nothing tappable.
+    expect(
+      parseFormElicitation({
+        mode: 'form', sessionId: 's', message: 'pick',
+        requestedSchema: { type: 'object', properties: { question_0_custom: { type: 'string', title: 'Other' } } },
+      } as unknown as CreateElicitationRequest)
+    ).toBeNull();
   });
 });

@@ -5,6 +5,67 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **The agent can ask you a question, and wait.** The daemon now advertises ACP's
+  `elicitation.form` capability at `initialize` and renders the resulting
+  `elicitation/create` requests as buttons in the chat.
+
+  This was not a missing feature so much as one the gateway had been switching off. The
+  claude adapter gates the model's own `AskUserQuestion` tool on that capability
+  (`disallowedTools = elicitationSupport.form ? [] : ["AskUserQuestion"]`), so every session
+  this daemon ever opened ran with the model's question tool disabled — and the workaround, an
+  `ask` reverse command plus the longest entry in the injected hint, existed to replace what one
+  line of the handshake had removed. Now the model uses the tool it already knows and nothing is
+  injected to teach it.
+
+  Each option's rationale is rendered into the message body above the buttons, because that text
+  ("you already run pgvector here, so reusing it costs nothing") is often the most useful part of
+  the question and no platform's button label can hold a sentence. Multi-question forms are asked
+  one round at a time, and abandoned on the first unanswered round rather than collecting answers
+  the agent cannot use. A turn with a question outstanding is no longer treated as hung: the
+  silence watchdog re-arms while waiting on a person, which it previously did not, and would have
+  aborted the turn mid-decision.
+
+  The capability value must be an object (`{ form: {} }`), not `true` — verified against the ACP
+  schema and both harnesses. `form: true` is accepted by claude and by dsh, but opencode
+  validates it strictly and rejects the whole `initialize` with `-32602`, which would have taken
+  down every opencode session rather than just its elicitations.
+
+  Probed live: `claude` sends real elicitations; **`opencode` 1.18.27 and `dsh` 0.1.2-rc.1 send
+  none** (opencode sends no reverse requests at all, not even `session/request_permission`). On
+  those two the model asks in prose and ends its turn, which the user answers in the next
+  message — no code needed for the fallback.
+
+### Changed
+
+- **The per-turn hint is one line instead of thirteen.** It used to list all nine reverse
+  commands with their full usage: roughly 350 tokens of chat-bot operating manual, in the *first
+  text block* of every session's opening turn, ahead of whatever the user had actually asked. The
+  cost was the framing more than the tokens — a model that opens by reading how to react with
+  emoji and page through message history has been told what kind of job this is before it sees
+  the job.
+
+  Most of the list was also redundant. Plain text already streams into the chat, so `send-message`
+  and `reply` are slower ways to do what happens by itself; `edit-message` duplicates the message
+  the daemon already live-edits; `ask` is now the harness's own tool; and `react` / `delete` /
+  `create-thread` / `fetch-messages` describe a chat client's chrome rather than the work. What
+  remains is `send-file`, the one act the text channel cannot perform.
+
+  The other eight commands are **not removed**. They are still registered, still in
+  `agent-anywhere --help`, and still work when typed or scripted — a new `inject` flag on
+  `ReverseCommandSpec` governs only what reaches the prompt, so `REVERSE_COMMANDS` stays the
+  single source of truth.
+
+- **A DM no longer prefixes every message with your name.** The `[<authorName>] ` prefix exists
+  so an agent in a busy group can tell two speakers apart; in a one-to-one conversation it named
+  the only human present, on every turn, and opened each turn with chat-transcript formatting
+  instead of the question. It is now added in groups and threads only.
+
+  Keyed on the conversation kind rather than on "does this batch contain two speakers": a batch is
+  one merge window wide, so in a busy group two people usually land in different batches, and the
+  per-batch test would have dropped the names in exactly the conversation that needs them.
+
 ## [1.6.0] - 2026-09-09
 
 ### Changed

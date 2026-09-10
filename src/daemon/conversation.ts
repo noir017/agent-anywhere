@@ -22,7 +22,13 @@ import {
   formatAddress,
   type ConversationAddress,
 } from '../core/conversation.js';
-import type { AgentCommand, ConversationId, InboundMessage } from '../types.js';
+import type {
+  AgentCommand,
+  AgentElicitation,
+  ConversationId,
+  ElicitAnswer,
+  InboundMessage,
+} from '../types.js';
 import type { PlatformAdapter } from '../platform/adapter.js';
 import type { AgentFactory, AgentSession, AgentUsage } from './agent.js';
 import type { ModelSelector } from '../types.js';
@@ -333,6 +339,17 @@ export class ConversationRegistry {
      */
     private readonly hooks?: {
       onAvailableCommands?(id: ConversationId, agentId: string, cmds: AgentCommand[]): void;
+      /**
+       * The agent asked the user a question mid-turn and is blocked on it (ACP elicitation).
+       * Passed straight through to TurnRunner, which supplies the turn's own lane — the registry
+       * never sees one of these, it only carries the hook.
+       */
+      onElicitRequest?(
+        id: ConversationId,
+        platform: PlatformAdapter,
+        address: ConversationAddress,
+        request: AgentElicitation
+      ): Promise<ElicitAnswer>;
       onPickerRequest?(id: ConversationId, agentId: string, msg: InboundMessage): void;
       onModelMenuRequest?(
         id: ConversationId,

@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.8.2] - 2026-09-11
+
 ### Fixed
 
 - **`/skills` puts each skill on its own line.** It joined them with commas, which turns 26 names

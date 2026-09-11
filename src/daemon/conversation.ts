@@ -118,6 +118,16 @@ const WORKDIR_NAMES = new Set(['cd', 'dir', 'workdir']);
 const TITLE_NAMES = new Set(['title', 'rename', 'topic']);
 
 /**
+ * `/skills` — list the bound agent's OWN commands, which the gateway menu deliberately does not
+ * carry (see buildRegisteredSpecs: one fixed set, not the union of what agents report).
+ *
+ * Answered by the gateway rather than forwarded because the answer is gateway-held state: the list
+ * arrives over ACP into `agentCommands` and the harness has no command that would print it back.
+ * `skill` singular is accepted and not registered — the HARNESS_COMMANDS.aliases trade.
+ */
+const SKILLS_NAMES = new Set(['skills', 'skill']);
+
+/**
  * Shape a lane name: `[<agent>] <subject>`.
  *
  * Two problems, one function.
@@ -336,6 +346,8 @@ export class ConversationRegistry {
      * onModelMenuRequest: same division for a bare `/model` on a platform that can carry a menu —
      * the registry hands over the live selector (it is the only side holding the AgentSession) and
      * the daemon posts, pages and acks the buttons.
+     * onSkillsRequest: fired by `/skills`. Same split again — the reported command lists live on
+     * the daemon (agentCommands), so the registry can only say which agent the question is about.
      */
     private readonly hooks?: {
       onAvailableCommands?(id: ConversationId, agentId: string, cmds: AgentCommand[]): void;
@@ -351,6 +363,7 @@ export class ConversationRegistry {
         request: AgentElicitation
       ): Promise<ElicitAnswer>;
       onPickerRequest?(id: ConversationId, agentId: string, msg: InboundMessage): void;
+      onSkillsRequest?(id: ConversationId, agentId: string, msg: InboundMessage): void;
       onModelMenuRequest?(
         id: ConversationId,
         agentId: string,
@@ -1139,6 +1152,17 @@ export class ConversationRegistry {
       );
       return true;
     }
+    // `/skills` — the agent's own vocabulary, as opposed to `/help`, which is the gateway's. The
+    // two are disjoint on purpose and neither can show the other's: the gateway cannot enumerate a
+    // harness's commands from config, and the harness has never heard of /new or /cd.
+    if (setting && SKILLS_NAMES.has(setting.name.toLowerCase())) {
+      const agentId = this.boundAgentFor(key, fallbackAgent);
+      // Posted by the daemon, which is where the reported lists live (agentCommands). Same hook
+      // shape as onPickerRequest, and the same reason: this registry holds no ACP state.
+      this.hooks?.onSkillsRequest?.(key, agentId, msg);
+      return true;
+    }
+
     return false;
   }
 

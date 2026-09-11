@@ -66,6 +66,7 @@ export const DAEMON_COMMANDS: SlashCommandSpec[] = [
   { name: 'cd', description: 'Choose the working directory (starts a fresh session there)' },
   { name: 'setting', description: 'Change a saved setting (default agent, model, session)' },
   { name: 'title', description: 'Name this topic (it is named automatically otherwise)' },
+  { name: 'skills', description: "List the current agent's own commands" },
   { name: 'help', description: 'List the commands this gateway understands' },
 ];
 

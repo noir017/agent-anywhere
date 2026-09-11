@@ -106,8 +106,10 @@ export interface CommandInteraction {
 /**
  * An available command dynamically reported by the agent (ACP).
  * From session/update's `available_commands_update`; a platform-agnostic minimal shape.
- * The daemon registers it as each platform's native slash (see daemon registration logic) and,
- * when invoked, forwards `/<name> <input>` back to the agent as a prompt verbatim (the daemon doesn't interpret the command).
+ * NOT what the platform menu is built from — that set is fixed at startup from config alone (see
+ * daemon buildRegisteredSpecs). This list feeds `/skills` and the harness pickers; when one of its
+ * names is invoked the daemon forwards `/<name> <input>` back to the agent as a prompt verbatim
+ * (the daemon doesn't interpret the command).
  */
 export interface AgentCommand {
   /** Command name (no leading /, e.g. `create_plan`). */

@@ -5,6 +5,37 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **`/skills` lists the commands the current agent actually offers.** The platform menu is one
+  fixed set derived from config, so a harness's own commands — skills above all — have never
+  appeared in it, and the only way to see them was the bare agent command (`/cc`), which first
+  wants a directory and only then shows a button menu. That left the 26 skills this machine shares
+  between claude and opencode effectively undiscoverable from a phone.
+
+  It answers with text, not buttons, and that is the design rather than a shortcut. claude reports
+  65 commands here while Discord caps an interactive message at 25 buttons, so a picker is a paging
+  UI, and paging through 66 entries to find a name is worse than reading a list. The deeper reason
+  is that buttons cannot carry free text: a tapped one would have to park a pending selection on
+  the conversation and wait for the next message to complete it, buying a state machine, an expiry
+  policy, and a bug where an unrelated message arrives first and gets absorbed. None of it is
+  needed — typing `/server-ops check the disk` already reaches the agent untouched, because a name
+  outside the generic vocabulary passes straight through. Invocation was never the gap; discovery
+  was.
+
+  The list is everything the agent reported minus what the gateway menu already covers (58 of
+  claude's 65 here, 1.2 kB — one message on every platform). It is deliberately not narrowed to
+  "skills": ACP carries no marker for one, `available_commands_update` sends only
+  `{name, description, input}`, and the skill directories cannot stand in for it either, since
+  claude reads a tree of symlinks while opencode reads a different tree named in its own config and
+  the two sets differ. A hand-kept blacklist of built-ins would rot on every harness release, so
+  the catalogue says what it is instead of guessing.
+
+  An agent that has reported nothing gets a reply naming both causes, because the daemon cannot
+  tell them apart: no session has been built yet (the list arrives on session build, not at
+  startup), or the harness reports none at all — agy speaks no ACP, and dsh sends no
+  `available_commands_update`.
+
 ## [1.7.1] - 2026-09-11
 
 ### Fixed

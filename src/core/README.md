@@ -48,6 +48,7 @@ conversation, not part of its name — see [`daemon/README.md`](../daemon/README
 | `runtime-footer.ts` | The `cc · 18k / 1M (2%) · claude-opus-4-5` tagline |
 | `attachment-ingest.ts` | Inbound attachment orchestration (download/save injected) |
 | `command-translate.ts` | The generic slash vocabulary and its per-harness translation |
+| `skills-catalog.ts` | `/skills`: the bound agent's own commands as text |
 | `settings.ts` | `/setting` as data: which config.yaml fields are editable, what they accept, when a change lands |
 | `model-menu.ts` | `/model` as data: paging, labels, button ids, matching, and every string it says |
 | `workdir-menu.ts` | `/cd` as data: the same shape, for the directory a conversation works in |
@@ -522,6 +523,32 @@ the `EXPERIENCE` knobs because they are not in the file at all.
 
 The write half lives in [`daemon/settings-store.ts`](../daemon/README.md) — this module
 decides, that one touches the file.
+
+## `skills-catalog.ts`
+
+Backs `/skills`. Read the header comment in the file — it records why this is text and not a
+picker.
+
+The short version: a picker was the obvious design and does not fit. claude reports 65
+commands here, Discord caps an interactive message at 25 buttons, and buttons cannot carry
+free text — so a tapped one would have to park a pending selection and wait for the next
+message to complete it, buying a state machine and an expiry policy. None of that is needed,
+because typing `/server-ops check the disk` already reaches the agent: a name outside the
+generic vocabulary passes through untouched (`ConversationRegistry.route`). Invocation was
+never the gap; discovery was, and a list answers it in one message.
+
+The catalogue is **everything the agent reported**, minus what the registered menu already
+covers, in reported order (claude lists skills first, built-ins last, and that grouping beats
+sorting). It is not narrowed to skills because nothing on the wire says which is which:
+`available_commands_update` carries only `{name, description, input}`. The skill directories
+cannot substitute either — claude reads a tree of symlinks, opencode reads a different tree
+named in its own config, and the sets differ — so the harness's own report is the only
+authority.
+
+Names only, no per-command descriptions: 58 entries render to ~1.2 kB, inside Discord's 2000,
+while adding prose pushes the same list past 4 kB and would force either truncation or a
+multi-message reply every time. The daemon still chunks the result, for a harness with more or
+longer names than any seen so far.
 
 ## `paging.ts`
 

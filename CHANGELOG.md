@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-09-11
+
 ### Added
 
 - **`/skills` lists the commands the current agent actually offers.** The platform menu is one

@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-09-11
+
 ### Changed
 
 - **`/skills` reads the skill directories instead of asking the agent.** 1.8.0 answered from

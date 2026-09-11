@@ -175,16 +175,20 @@ export function agentCommandToSpec(cmd: AgentCommand): SlashCommandSpec | null {
 /**
  * The complete set of slash commands this deployment registers (pure, testable).
  *
- * Fixed at startup, derived only from config — deliberately NOT the union of what agents report.
- * Native slash is global (Telegram setMyCommands is per-bot, Discord per-application) while agents
- * are per-session, so a union menu could neither say who owned an entry nor route one correctly:
- * an agent-specific command invoked from it fell through to `routing.default`. It also churned,
- * since a harness re-reports its full list on every session/new, session/load, session/resume and
- * session/fork — plus a mid-session `commands_changed` — so the last harness to BUILD a session won
- * the menu. Not every turn (prompt() reports nothing), but an idle reclaim re-loads the session, so
- * on a two-harness deployment the menu was never stable either way.
- * Verified against @agentclientprotocol/claude-agent-acp dist/acp-agent.js (the four
- * sendAvailableCommandsUpdate call sites + the commands_changed arm), 2026-09-11.
+ * ONE menu, shared by every agent. It is derived from config alone and computed once at startup;
+ * what agents report over ACP does not feed it (that goes to `agentCommands`, which serves only the
+ * harness pickers — see onAgentCommands). So a harness's command list can arrive as often as it
+ * likes without the menu moving.
+ *
+ * A menu entry the bound harness has no equivalent for is answered with an explicit "not supported"
+ * and no turn — see translateCommand in core/command-translate.ts. That refusal is what lets one
+ * menu cover agents with different vocabularies.
+ *
+ * Why not the union of what agents report: native slash is global (Telegram setMyCommands is
+ * per-bot, Discord per-application) while agents are per-session, so a union menu could say neither
+ * who owned an entry nor where to send it — an agent-specific command invoked from it fell through
+ * to `routing.default`, running opencode's `customize-opencode` on the claude agent. It also had no
+ * stable content, since whichever harness last built a session overwrote it.
  *
  * Three layers, in registration order:
  *  - daemon commands (/new, /clear, /help) — intercepted before any agent

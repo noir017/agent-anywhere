@@ -9,11 +9,10 @@ import type { ConversationId, InboundMessage } from '../types.js';
  * Generic-command interception in SessionRegistry.route().
  *
  * These pin the behavior of a real two-harness deployment (`cc` = claude, `oc` = opencode), where
- * registering the union of agent-reported commands misfired three ways: the menu flipped to
- * whichever harness last built a session (a list is reported on session/new, /load, /resume and
- * /fork, not per turn, so an idle reclaim was enough), same-named commands from different harnesses
- * collided, and an agent-specific command invoked from the menu ran on `routing.default` instead of
- * the agent that offered it.
+ * registering the union of agent-reported commands misfired three ways: whichever harness last
+ * built a session overwrote the menu, same-named commands from different harnesses collided, and an
+ * agent-specific command invoked from the menu ran on `routing.default` instead of the agent that
+ * offered it. One config-derived menu plus an explicit refusal per harness replaces all three.
  *
  * The assertions that matter are the negative ones — a rejected command must NOT reach the merger
  * and must NOT emit a header, because both would announce a turn that never happens.

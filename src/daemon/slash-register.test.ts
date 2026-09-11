@@ -76,10 +76,9 @@ describe('buildRegisteredSpecs', () => {
   });
 
   it('does not depend on what agents report, so the menu cannot churn', () => {
-    // Same config → same set, whatever any agent has said. Previously the last harness to BUILD a
-    // session owned the menu (a harness reports its list on session/new, /load, /resume, /fork and
-    // on commands_changed — not per turn), which flipped between 42 and 5 entries on a two-harness
-    // deployment: an idle reclaim alone was enough to hand it over.
+    // Same config → same set, whatever any agent has said and however often it says it. Previously
+    // the menu was the union of those reports and whichever harness last built a session overwrote
+    // it, flipping between 42 and 5 entries on a two-harness deployment.
     const c = cfg(agent('cc', 'claude'), agent('oc', 'opencode'));
     expect(buildRegisteredSpecs(c)).toEqual(buildRegisteredSpecs(c));
   });

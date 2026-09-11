@@ -543,10 +543,12 @@ never the gap; discovery was.
 once a session has been built, and the daemon holds it in memory — so every restart emptied it
 and the first `/skills` after an update reported nothing. Disk is readable cold.
 
-Names only, no descriptions. A skill's `description` frontmatter is written for a model
-deciding whether to load it and runs to hundreds of characters (`server-ops` alone is over
-300), so 26 of them fit in no platform's message. 26 names render to ~700 bytes. The daemon
-still chunks the result, for a machine with more skills than any seen so far.
+Names only, no descriptions, **one per line**. A skill's `description` frontmatter is written
+for a model deciding whether to load it and runs to hundreds of characters (`server-ops` alone
+is over 300), so 26 of them fit in no platform's message. One-per-line costs nothing over a
+comma-joined run — it trades `, ` for `\n`, 560 bytes against 709 — and a comma-joined run of
+26 names is unscannable on a phone. The daemon still chunks the result, for a machine with more
+skills than any seen so far.
 
 ## `paging.ts`
 

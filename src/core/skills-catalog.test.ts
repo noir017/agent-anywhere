@@ -35,11 +35,20 @@ describe('formatSkillCatalog', () => {
     expect(formatSkillCatalog('dsh', [])).not.toContain('undefined');
   });
 
+  it('puts each skill on its own line', () => {
+    // A comma-joined run of 26 names is unscannable on a phone, and one-per-line costs nothing —
+    // it trades `, ` for `\n`. This is the assertion that fails if compactness is optimised for
+    // again.
+    const text = formatSkillCatalog('cc', [skill('server-ops'), skill('grilling')]);
+    expect(text).toContain('\n`/server-ops`\n`/grilling`');
+    expect(text).not.toContain(', ');
+  });
+
   it('fits one message at the size a real machine actually installs', () => {
-    // Measured 2026-09-11: 26 skills under ~/.claude/skills, averaging 12.4 chars. Discord's 2000
-    // is the tightest platform limit. This is the assertion that fails if per-skill descriptions
-    // are ever added back — `server-ops` alone has a 300-char description, so 26 of them do not fit
-    // in any platform's message.
+    // Measured 2026-09-11: 26 skills under ~/.claude/skills, averaging 12.4 chars, rendering to
+    // ~560 chars one per line. Discord's 2000 is the tightest platform limit. This is the assertion
+    // that fails if per-skill descriptions are ever added — `server-ops` alone has a 300-char
+    // description, so 26 of them fit in no platform's message.
     const many = Array.from({ length: 26 }, (_, i) => skill(`skill-name-${i}`));
     expect(formatSkillCatalog('cc', many).length).toBeLessThan(2000);
   });

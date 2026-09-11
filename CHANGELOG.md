@@ -5,6 +5,14 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **`/skills` puts each skill on its own line.** It joined them with commas, which turns 26 names
+  into a wall of text with nothing to scan down and no way to pick one out at a glance — unusable
+  on the phone the command exists for. The justification given for it was compactness, and that was
+  simply wrong: one-per-line only trades `, ` for `\n`, so the real list went from 709 characters to
+  684. There was never anything to trade away.
+
 ## [1.8.1] - 2026-09-11
 
 ### Changed

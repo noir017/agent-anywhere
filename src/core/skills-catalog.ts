@@ -26,22 +26,26 @@ export interface CatalogEntry {
 /**
  * Render the catalogue for one agent.
  *
+ * One skill per line. A comma-joined run of 26 names is unreadable on a phone — nothing to scan
+ * down, no way to pick a name out at a glance — and it saves nothing, since one-per-line only
+ * trades `, ` for `\n` (709 chars against 560 for the 26 installed here). The first version of
+ * this joined with commas to be compact; compactness was never the constraint.
+ *
  * Names only, no descriptions. A skill's `description` frontmatter is written for a model deciding
- * whether to load it and runs to several lines — `server-ops` alone is over 300 characters — so
- * including them would blow past every platform's per-message limit on a list this size. Names are
- * what a reader needs in order to type the next message; the agent itself can explain any one.
+ * whether to load it and runs to hundreds of characters — `server-ops` alone is over 300 — so 26 of
+ * them fit in no platform's message. Names are what a reader needs in order to type the next
+ * message; the agent itself can explain any one.
  *
  * The example uses a real name from the list rather than a placeholder, because the one thing a
  * reader has to learn here is that the name takes a request after it.
  */
 export function formatSkillCatalog(agentLabel: string, skills: readonly CatalogEntry[]): string {
-  const names = skills.map((s) => `\`/${s.name}\``).join(', ');
-  const example = skills[0]?.name;
   const lines = [
     `**${agentLabel}** has ${skills.length} skill${skills.length === 1 ? '' : 's'}:`,
     '',
-    names,
+    ...skills.map((s) => `\`/${s.name}\``),
   ];
+  const example = skills[0]?.name;
   if (example) {
     lines.push('', `Type one with your request after it — e.g. \`/${example} <what you want>\`.`);
   }

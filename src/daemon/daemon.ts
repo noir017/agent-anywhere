@@ -179,7 +179,12 @@ export function agentCommandToSpec(cmd: AgentCommand): SlashCommandSpec | null {
  * Native slash is global (Telegram setMyCommands is per-bot, Discord per-application) while agents
  * are per-session, so a union menu could neither say who owned an entry nor route one correctly:
  * an agent-specific command invoked from it fell through to `routing.default`. It also churned,
- * since each agent re-reports its full list every turn and the last reporter won the menu.
+ * since a harness re-reports its full list on every session/new, session/load, session/resume and
+ * session/fork — plus a mid-session `commands_changed` — so the last harness to BUILD a session won
+ * the menu. Not every turn (prompt() reports nothing), but an idle reclaim re-loads the session, so
+ * on a two-harness deployment the menu was never stable either way.
+ * Verified against @agentclientprotocol/claude-agent-acp dist/acp-agent.js (the four
+ * sendAvailableCommandsUpdate call sites + the commands_changed arm), 2026-09-11.
  *
  * Three layers, in registration order:
  *  - daemon commands (/new, /clear, /help) — intercepted before any agent

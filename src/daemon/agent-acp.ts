@@ -1660,9 +1660,13 @@ export function translateUpdate(u: SessionUpdate, st: TurnState): void {
         ingestTool(st, u.toolCallId, { title: u.title, kind: u.kind, rawInput: u.rawInput, status: u.status });
       break;
 
-    // Agent reports its available-commands list: normalize to AgentCommand[] for the upper layer (daemon
-    // registers native slash). The protocol may send this multiple times (ready/changed), each a full
-    // list, so the upper layer just overwrites.
+    // Agent reports its available-commands list: normalize to AgentCommand[] for the upper layer,
+    // which feeds the harness PICKERS only — native slash registration is fixed at startup from
+    // config and does not read this (see daemon.ts buildRegisteredSpecs / onAgentCommands).
+    // Sent once per session build (session/new, /load, /resume, /fork) and again on a mid-session
+    // `commands_changed` — e.g. skills discovered as the agent moves into a subdirectory. Never on
+    // prompt(). Each is a full list, so the upper layer just overwrites.
+    // Verified against @agentclientprotocol/claude-agent-acp dist/acp-agent.js, 2026-09-11.
     case 'available_commands_update': {
       const cmds = (u.availableCommands ?? []).map((c) => ({
         name: c.name,

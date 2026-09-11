@@ -47,11 +47,14 @@ import {
 import type { PlatformAdapter } from '../platform/adapter.js';
 import { OutboundPacer } from '../core/outbound-pacer.js';
 import { splitIntoChunks } from '../core/stream-buffer.js';
+import { formatEmptyCatalog, formatSkillCatalog } from '../core/skills-catalog.js';
+import { resolveConversationCwd } from './agent-common.js';
 import {
-  formatEmptyCatalog,
-  formatSkillCatalog,
-  selectCatalogCommands,
-} from '../core/skills-catalog.js';
+  agentHome,
+  opencodeSkillDirs,
+  scanSkillDirs,
+  skillDirsFor,
+} from './skills-scan.js';
 import { withOutboundPacing } from './paced-adapter.js';
 import type {
   AgentCommand,
@@ -429,7 +432,7 @@ export class Daemon {
     agents: AgentFactory,
     socketPath: string,
     /** Persistent conversation state (agent binding + each agent's own session id). */
-    store?: ConversationStore
+    private readonly store?: ConversationStore
   ) {
     // Real runtime clock; core classes never read the system clock directly (for testability).
     const clock = {
@@ -886,37 +889,39 @@ export class Daemon {
   }
 
   /**
-   * `/skills` — post the bound agent's own command list as text.
+   * `/skills` — post the skills installed for the bound agent, read off disk.
    *
-   * The text/buttons choice and why the list is not narrowed to "skills" are argued in
-   * core/skills-catalog.ts; this end only supplies the data and splits the result to fit.
+   * Disk rather than the agent's own ACP report, because the report only exists once a session has
+   * been built and the daemon holds it in memory: every restart emptied it, so the first `/skills`
+   * after an update answered "has not reported any commands" (seen 2026-09-11, on the deploy of
+   * this very feature). See skills-scan.ts for what is read and the coupling that buys.
    *
-   * Read from `agentCommands` with no fallback: a harness reports its list when it builds a
-   * session, so an agent that has never run in any conversation has none, and spawning one to
-   * answer a list request is the trade onPickerRequest already declined.
+   * The conversation's own directory is used, not the agent's root, so a `/cd`-ed conversation sees
+   * that project's skills — the same directory its next session will start in.
    */
-  private onSkillsRequest(_conversationId: ConversationId, agentId: string, msg: InboundMessage): void {
+  private onSkillsRequest(conversationId: ConversationId, agentId: string, msg: InboundMessage): void {
     const adapter = this.platforms.get(msg.conversation.platform);
     if (!adapter) return;
     const address = addressOf(msg.conversation);
 
     const def = findAgent(this.config, agentId);
     const label = agentDisplayName(def, agentId);
-    const reported = this.agentCommands.get(agentId) ?? [];
-    const offered = selectCatalogCommands(reported, genericNativeNames(def?.harness));
 
-    const body =
-      offered.length === 0 ? formatEmptyCatalog(label) : formatSkillCatalog(label, offered);
-
-    // The catalogue is the one gateway reply whose length scales with somebody else's config, so
-    // it is the one that has to chunk. splitIntoChunks is what the stream path uses, so a long
-    // list breaks the same way a long answer does rather than inventing a second rule.
-    const limit = adapter.capabilities.maxMessageLength;
-    const parts = limit > 0 ? splitIntoChunks(body, limit) : [body];
-    if (parts.length > 1) {
-      console.log(`[skills] ${label}: ${offered.length} commands sent as ${parts.length} messages`);
-    }
     void (async () => {
+      const home = agentHome(def);
+      const cwd = def ? resolveConversationCwd(def, conversationId, this.store) : home;
+      const configured = def?.harness === 'opencode' ? await opencodeSkillDirs(home, process.env) : [];
+      const dirs = skillDirsFor(def, { home, cwd, configured });
+      const found = await scanSkillDirs(dirs);
+
+      const body = found.length === 0 ? formatEmptyCatalog(label, dirs) : formatSkillCatalog(label, found);
+      console.log(`[skills] ${label}: ${found.length} from ${dirs.length} dir(s)`);
+
+      // The one gateway reply whose length scales with somebody else's config, so the one that has
+      // to chunk. splitIntoChunks is what the stream path uses, so a long list breaks the same way
+      // a long answer does rather than inventing a second rule.
+      const limit = adapter.capabilities.maxMessageLength;
+      const parts = limit > 0 ? splitIntoChunks(body, limit) : [body];
       for (const part of parts) await adapter.sendMessage(address, part);
     })().catch((e) => console.error('[skills] reply failed:', e instanceof Error ? e.message : e));
   }

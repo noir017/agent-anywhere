@@ -1,74 +1,32 @@
 import { describe, expect, it } from 'vitest';
 
-import {
-  formatEmptyCatalog,
-  formatSkillCatalog,
-  selectCatalogCommands,
-} from './skills-catalog.js';
-import type { AgentCommand } from '../types.js';
+import { formatEmptyCatalog, formatSkillCatalog, type CatalogEntry } from './skills-catalog.js';
 
 /**
- * The `/skills` catalogue.
+ * The `/skills` catalogue text.
  *
- * The cases that matter are the filtering rules (what the list must NOT repeat) and the shape of
- * the empty answer, which is the one a user hits by accident — `/skills` before the agent has ever
- * run is the common first encounter with this command.
+ * The empty case carries as much weight as the populated one: it is what a user hits when the
+ * harness installs no skills, and the previous version of this command answered it with a sentence
+ * that sent people to wait for something that was never going to arrive.
  */
 
-const cmd = (name: string, description = ''): AgentCommand => ({ name, description });
-
-describe('selectCatalogCommands', () => {
-  it('drops names the gateway menu already reaches', () => {
-    const out = selectCatalogCommands(
-      [cmd('server-ops'), cmd('compact'), cmd('deep-research'), cmd('usage')],
-      new Set(['compact', 'usage'])
-    );
-    expect(out.map((c) => c.name)).toEqual(['server-ops', 'deep-research']);
-  });
-
-  it('matches the menu set case-insensitively', () => {
-    // A harness is free to report `/Compact`; the generic set is lowercase by construction, so a
-    // case-sensitive compare would leak a duplicate entry for the same command.
-    const out = selectCatalogCommands([cmd('Compact'), cmd('Grilling')], new Set(['compact']));
-    expect(out.map((c) => c.name)).toEqual(['Grilling']);
-  });
-
-  it('keeps only the first of a repeated name', () => {
-    // claude reports a skill and a built-in under one name when a skill shadows it. Listing it
-    // twice reads as two different commands.
-    const out = selectCatalogCommands([cmd('review', 'skill'), cmd('review', 'built-in')], new Set());
-    expect(out).toHaveLength(1);
-    expect(out[0]?.description).toBe('skill');
-  });
-
-  it('preserves the reported order rather than sorting', () => {
-    // Not cosmetic: claude reports skills first and built-ins last, so reported order puts the
-    // entries someone wrote themselves at the top of the message.
-    const out = selectCatalogCommands([cmd('zebra'), cmd('alpha'), cmd('middle')], new Set());
-    expect(out.map((c) => c.name)).toEqual(['zebra', 'alpha', 'middle']);
-  });
-
-  it('survives an empty menu set', () => {
-    expect(selectCatalogCommands([cmd('a'), cmd('b')], new Set())).toHaveLength(2);
-  });
-});
+const skill = (name: string, dir = '/home/u/.claude/skills'): CatalogEntry => ({ name, dir });
 
 describe('formatSkillCatalog', () => {
   it('lists every name and counts them', () => {
-    const text = formatSkillCatalog('cc', [cmd('server-ops'), cmd('grilling')]);
-    expect(text).toContain('**cc** offers 2 commands');
+    const text = formatSkillCatalog('cc', [skill('server-ops'), skill('grilling')]);
+    expect(text).toContain('**cc** has 2 skills');
     expect(text).toContain('`/server-ops`');
     expect(text).toContain('`/grilling`');
   });
 
   it('teaches the calling convention with a real name from the list', () => {
     // A placeholder example would leave the reader guessing whether the name takes an argument.
-    const text = formatSkillCatalog('cc', [cmd('server-ops')]);
-    expect(text).toContain('`/server-ops <what you want>`');
+    expect(formatSkillCatalog('cc', [skill('server-ops')])).toContain('`/server-ops <what you want>`');
   });
 
-  it('says "command" for a list of one', () => {
-    expect(formatSkillCatalog('oc', [cmd('init')])).toContain('offers 1 command:');
+  it('says "skill" for a list of one', () => {
+    expect(formatSkillCatalog('oc', [skill('init')])).toContain('has 1 skill:');
   });
 
   it('emits no example line when there is nothing to exemplify', () => {
@@ -77,22 +35,28 @@ describe('formatSkillCatalog', () => {
     expect(formatSkillCatalog('dsh', [])).not.toContain('undefined');
   });
 
-  it('fits one message at the size a real harness actually reports', () => {
-    // Measured 2026-09-11: claude reports 65 commands here, averaging 12.4 chars, and the rendered
-    // catalogue is 1242 chars — inside Discord's 2000 limit, which is the tightest of the
-    // platforms. This is the assertion that fails if per-command descriptions are ever added back
-    // (they push the same list past 4 kB). It is headroom, not a guarantee: a harness with longer
-    // or more numerous names overflows, which is why the daemon chunks the result.
-    const many = Array.from({ length: 65 }, (_, i) => cmd(`skill-name-${i}`));
+  it('fits one message at the size a real machine actually installs', () => {
+    // Measured 2026-09-11: 26 skills under ~/.claude/skills, averaging 12.4 chars. Discord's 2000
+    // is the tightest platform limit. This is the assertion that fails if per-skill descriptions
+    // are ever added back — `server-ops` alone has a 300-char description, so 26 of them do not fit
+    // in any platform's message.
+    const many = Array.from({ length: 26 }, (_, i) => skill(`skill-name-${i}`));
     expect(formatSkillCatalog('cc', many).length).toBeLessThan(2000);
   });
 });
 
 describe('formatEmptyCatalog', () => {
-  it('names both causes, because the daemon cannot tell them apart', () => {
-    const text = formatEmptyCatalog('dsh');
-    expect(text).toContain('**dsh**');
-    expect(text).toContain('send it a message');
-    expect(text).toMatch(/agy and dsh/);
+  it('names the directories it searched, so the operator has something to check', () => {
+    const text = formatEmptyCatalog('cc', ['/home/u/.claude/skills', '/srv/proj/.claude/skills']);
+    expect(text).toContain('`/home/u/.claude/skills`');
+    expect(text).toContain('`/srv/proj/.claude/skills`');
+    expect(text).toContain('SKILL.md');
+  });
+
+  it('says something different when the harness has no known location at all', () => {
+    // agy and dsh reach here. Printing "looked in " with an empty list would read as a bug.
+    const text = formatEmptyCatalog('ag', []);
+    expect(text).toContain('no skills directory this gateway knows how to read');
+    expect(text).not.toContain('Looked in');
   });
 });

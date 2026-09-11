@@ -25,6 +25,7 @@ session id, agy's conversation id). One conversation holds one session *per agen
 | `agent-common.ts` | Protocol-agnostic helpers shared by both runtimes |
 | `conversation-store.ts` | Persisted per conversation: the bound agent, each agent's own session id, and the directory it works in |
 | `workdir-scan.ts` | The `/cd` option list: an agent's configured root plus the projects one level inside it |
+| `skills-scan.ts` | The `/skills` list: where each harness keeps its installed skills, read off disk |
 | `conversation-token-registry.ts` | Per-conversation reverse-command token ↔ conversation id |
 | `attachment-io.ts` | Real attachment IO + the SSRF guards |
 | `reverse-cli-shim.ts` | Guarantees `agent-anywhere` is on the agent's PATH |

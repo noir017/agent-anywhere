@@ -5,6 +5,33 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **`/skills` reads the skill directories instead of asking the agent.** 1.8.0 answered from
+  `available_commands_update`, the list a harness pushes when it BUILDS a session. That list is
+  authoritative and it is also missing exactly when someone wants it: the daemon holds it in
+  memory, so every restart empties it and the first `/skills` after an update answers "has not
+  reported any commands" until some conversation happens to run a turn. Observed within the hour
+  on 1.8.0's own deploy, asked in a fresh Telegram topic — the update restarts the daemon, which
+  is precisely when a user goes looking.
+
+  Disk has neither problem: it is readable before any agent has started and it survives a restart.
+  A skill is a directory containing `SKILL.md`, found under `~/.claude/skills` and the
+  conversation's own `<cwd>/.claude/skills` for claude, and under whatever `skills` names in
+  `opencode.json` for opencode. Entries are followed through symlinks, because 25 of the 26 here
+  are links into a shared tree and an `lstat` check would find none of them.
+
+  What it lists changed with the source, and for the better: the harness's own bundled commands
+  are gone. 1.8.0 showed 58 entries for claude, of which only 26 were installed skills and the
+  rest (`/compact`, `/deep-research`, …) ship with the product and are already reachable from the
+  menu or the harness picker. "The skills I installed" is both what was asked for and the only
+  thing disk can answer honestly.
+
+  The cost, taken knowingly: this reads another tool's private layout, so a harness that moves its
+  skills directory silently empties the catalogue. An empty answer therefore names the directories
+  it searched, and a harness with no known location (agy, dsh) says that rather than implying the
+  skills are missing.
+
 ## [1.8.0] - 2026-09-11
 
 ### Added

@@ -652,3 +652,129 @@ describe('new dedupe', () => {
     expect(text).toBe('📖 Read: "src/a.ts"\n✏️ Edit: "src/c.ts"');
   });
 });
+
+/**
+ * `placed()` — the ordering barrier the body text holds on.
+ *
+ * The distinction it encodes is the whole reason it is cheap: a SEND takes a position in the chat
+ * and therefore has to be ordered against the reply, while an EDIT rewrites a message that already
+ * has one and never does. So these pin that it waits for exactly the first kind and not a tick
+ * longer — a barrier that also waited for edits would put every ✓ in front of the user's answer,
+ * which is the flood this renderer's asynchronous painting exists to prevent.
+ */
+describe('placed', () => {
+  it('resolves immediately when nothing is waiting to be posted', async () => {
+    const { sink } = makeSink({ withEdit: true });
+    const r = new ToolRenderer(makeOpts({ grouping: 'accumulate' }), sink);
+    await expect(r.placed(1000)).resolves.toBeUndefined();
+  });
+
+  it('holds until the bubble has actually been sent', async () => {
+    // The send is gated by hand: with a sink that resolves on its own there is no window in which
+    // "the write is out but not acknowledged" exists, and the assertion would be about the mock.
+    let release!: (ref: MessageRef) => void;
+    const sent: string[] = [];
+    const gated: BubbleSink = {
+      sendBubble: (text) => {
+        sent.push(text);
+        return new Promise<MessageRef>((r) => (release = r));
+      },
+      editBubble: async () => undefined,
+      now: () => 0,
+      schedule: () => () => undefined,
+    };
+    const r = new ToolRenderer(makeOpts({ grouping: 'accumulate' }), gated);
+
+    r.onToolStart(start('Read', 'src/a.ts', 0));
+    let released = false;
+    void r.placed(10_000).then(() => {
+      released = true;
+    });
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    expect(sent).toHaveLength(1);
+    expect(released).toBe(false); // written, but the bubble holds no position yet
+
+    release({ address: { channel: 'c' }, messageId: 'm1' });
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(released).toBe(true);
+  });
+
+  it('does not hold for an edit — a ✓ never has to precede the reply', async () => {
+    const { sink, edits, flush } = makeSink({ withEdit: true });
+    const r = new ToolRenderer(makeOpts({ grouping: 'accumulate' }), sink);
+
+    r.onToolStart(start('Read', 'src/a.ts', 0));
+    await flush(); // bubble placed
+
+    r.onToolFinish(finish('Read', true, 100, 0)); // an edit is now pending
+    await expect(r.placed(1000)).resolves.toBeUndefined();
+    await flush();
+    expect(edits).toHaveLength(1); // …and it still lands, just not in front of anyone
+  });
+
+  it('holds again when a seal means the carried lines need a fresh bubble', async () => {
+    const { sink, sends, flush, refuseEditsAfter } = makeSink({ withEdit: true });
+    const r = new ToolRenderer(makeOpts({ grouping: 'accumulate' }), sink);
+
+    r.onToolStart(start('Read', 'src/a.ts', 0));
+    await flush();
+    refuseEditsAfter(0); // the platform declares this bubble un-editable
+    r.onToolStart(start('Edit', 'src/b.ts', 1));
+
+    // The line set now has no bubble to live in, so the next write is a SEND and must be ordered.
+    const wait = r.placed(1000);
+    await flush();
+    await expect(wait).resolves.toBeUndefined();
+    expect(sends).toHaveLength(2);
+  });
+
+  it('gives up at the deadline rather than holding the reply behind a paused chat', async () => {
+    const stalled: BubbleSink = {
+      sendBubble: () => new Promise<MessageRef>(() => undefined), // never settles
+      now: () => 0,
+      schedule(fn: () => void, ms: number) {
+        const t = setTimeout(fn, ms);
+        return () => clearTimeout(t);
+      },
+    };
+    const r = new ToolRenderer(makeOpts({ grouping: 'accumulate' }), stalled);
+    r.onToolStart(start('Read', 'src/a.ts', 0));
+    // The wait ends on its own; the reply is worth more than the reading order.
+    await expect(r.placed(20)).resolves.toBeUndefined();
+  });
+
+  it('releases an aborted turn instead of stranding whatever is waiting on it', async () => {
+    const stalled: BubbleSink = {
+      sendBubble: () => new Promise<MessageRef>(() => undefined),
+      now: () => 0,
+      schedule: () => () => undefined, // no timer will ever fire it
+    };
+    const r = new ToolRenderer(makeOpts({ grouping: 'accumulate' }), stalled);
+    r.onToolStart(start('Read', 'src/a.ts', 0));
+    const wait = r.placed(10_000);
+    r.abort();
+    await expect(wait).resolves.toBeUndefined();
+  });
+
+  it('separate grouping: holds for a standalone bubble in flight', async () => {
+    let release!: (ref: MessageRef) => void;
+    const gated: BubbleSink = {
+      sendBubble: () => new Promise<MessageRef>((r) => (release = r)),
+      now: () => 0,
+      schedule: () => () => undefined,
+    };
+    const r = new ToolRenderer(makeOpts({ grouping: 'separate' }), gated);
+    r.onToolStart(start('Read', 'src/a.ts', 0));
+
+    let released = false;
+    void r.placed(10_000).then(() => {
+      released = true;
+    });
+    await Promise.resolve();
+    expect(released).toBe(false);
+
+    release({ address: { channel: 'c' }, messageId: 'm1' });
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(released).toBe(true);
+  });
+});

@@ -341,6 +341,26 @@ single painter drains it. Three consequences worth knowing:
 `onToolStart` used to return "did a new bubble appear", documented as driving the segment
 break. `TurnRunner` never read it, and it cannot be answered synchronously now. It is gone.
 
+### One thing is still ordered: taking a position
+
+Asynchronous painting bought a flood fix and sold a reordering, and the second half went
+unnoticed for a while because no test looked at interleaving. The painter runs one write
+*behind* the turn's side-effect chain, so the bubble for a tool could be posted after the
+body text of the segment that came next — a turn reading "now let me check the profile" →
+"found it, three profiles declare it" → and only then the search that found them. With no
+rate pressure at all; the normal case, not a congestion edge.
+
+`placed(timeoutMs)` is the barrier, and the distinction it rests on is what keeps it cheap:
+**only a SEND takes a position in the chat.** An edit rewrites a message that already holds
+one, so a late ✓ is harmless and stays off the chain exactly as before. So `TurnRunner`
+waits for placement — and for nothing else — before sending the next body message: at most
+one wait per bubble, started the moment the tool is registered and therefore overlapping the
+tool's own execution.
+
+Bounded, like `settle`, and with the same preference: past the deadline the reply goes on
+and the bubble lands where it lands. Order is what gets given up under a paused chat; the
+answer never is.
+
 ## `command-translate.ts`
 
 Read the header comment in the file — it records the bug that motivated the design.

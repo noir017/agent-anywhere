@@ -31,6 +31,24 @@ import { createAttachmentIngestDeps } from './attachment-io.js';
 const FOLLOW_UP_MARKER = '⏱ background update — picking up where the last reply left off';
 
 /**
+ * How long the body text waits for a tool bubble to take its place in the chat.
+ *
+ * Bought for reading order: without it the bubble for a tool can be posted below the text of the
+ * segment that came after it, because the painter runs one write behind this chain (see
+ * ToolRenderer.placed). Paid at most once per bubble, and it overlaps the tool's own execution —
+ * the wait starts the moment the tool is registered, and the tool has not run yet.
+ *
+ * A constant rather than a setting, on the rule in the config README: it is a deadline nobody would
+ * tune, and the two ends of the range are not a preference. Too short and it buys nothing; too long
+ * and a chat the platform has paused holds the reply hostage to a progress bubble — which is the
+ * failure the asynchronous painter was introduced to end. Two seconds is comfortably more than a
+ * round trip on every platform here and comfortably less than a user waiting on an answer notices.
+ * Past it, the reply goes on and the bubble lands wherever it lands: order is the thing worth
+ * giving up, never the answer.
+ */
+const BUBBLE_PLACEMENT_WAIT_MS = 2_000;
+
+/**
  * Collaborator capabilities TurnRunner needs (DI interface).
  *
  * Deliberately exposes only what running one turn needs, not the whole ConversationRegistry — to
@@ -355,10 +373,16 @@ export class TurnRunner {
         // Before a tool: finish the current text as its own bubble (no footer: not the last segment), then
         // register the tool. Registering is synchronous — the bubble is delivered by the renderer's own
         // painter, off this chain, so a rate-limited chat cannot stall the reply behind a progress write.
+        //
+        // The one thing that IS waited for is the bubble taking its place in the chat. The painter runs
+        // a write behind this chain, so without the wait the next segment's text could be sent first and
+        // the bubble would appear below the text describing what it found. See ToolRenderer.placed for
+        // why only a SEND has to be ordered and an edit never does.
         enqueue(async () => {
           ref.producedOutput = true;
           await ref.stream.complete();
           tools.onToolStart(evt);
+          await tools.placed(BUBBLE_PLACEMENT_WAIT_MS);
         }),
       onToolFinish: (evt) => enqueue(() => tools.onToolFinish(evt)),
       onSegmentBreak: () =>
@@ -505,6 +529,9 @@ export class TurnRunner {
         // Submit the segment's final tool state before sealing the body, so the last ✓ is not
         // discarded with the line set that carried it.
         tools.resetSegment();
+        // …and if a bubble is still waiting to be POSTED — a seal mid-run carries its lines into a
+        // fresh one — let it land before the closing text, for the reason onToolStart waits.
+        await tools.placed(BUBBLE_PLACEMENT_WAIT_MS);
         await ref.stream.complete(footer ? { footer } : undefined);
         // Then STOP WAITING for the tool bubbles — bounded, because a chat the platform has
         // paused for minutes must not hold the turn (and its ✅) open for the same minutes.

@@ -168,6 +168,10 @@ export class ToolRenderer {
   private retryBackoff: number;
   /** Resolvers waiting on settle(). */
   private settleWaiters: Array<() => void> = [];
+  /** Resolvers waiting on placed(). */
+  private placeWaiters: Array<() => void> = [];
+  /** Standalone (separate-grouping) sends still in flight; each one is an unplaced bubble. */
+  private standaloneInFlight = 0;
   private aborted = false;
 
   constructor(
@@ -279,6 +283,8 @@ export class ToolRenderer {
     this.lastPaintedText = null;
     this.closeAtRev = null;
     this.deliveredRev = this.rev;
+    // Nothing is owed a send any more — the line set that would have needed one is gone.
+    this.releasePlaceWaiters();
   }
 
   /**
@@ -302,12 +308,63 @@ export class ToolRenderer {
     });
   }
 
+  /**
+   * Resolve once no bubble is still waiting to be POSTED, or `timeoutMs` has passed.
+   *
+   * ── Why this exists, and why it is not settle() ───────────────────────────────
+   * Painting asynchronously fixed a flood and introduced a reordering: the painter runs one write
+   * behind the turn's side-effect chain, so the bubble for a tool could be posted *after* the body
+   * text of the segment that came next. A turn read bottom-up as "now let me check the profile" →
+   * "found it, three profiles declare it" → and only then the Grep that found them. Reproduced with
+   * no rate pressure at all; it is the normal case, not a congestion edge.
+   *
+   * The narrow thing being fixed is worth stating precisely, because it is what keeps the wait
+   * cheap: **only a SEND can land in the wrong place.** An edit rewrites a message that already
+   * holds its position, so it may stay off the chain, late and unordered, exactly as before. So
+   * this waits for placement — a bubble taking its spot in the chat — and for nothing else. At
+   * most one such wait per bubble, and it overlaps the tool's own execution.
+   *
+   * Bounded for the same reason settle() is, and with the same preference: if the platform is
+   * making us wait, the reply matters more than the reading order. Past the deadline the body goes
+   * on and the bubble lands wherever it lands.
+   */
+  placed(timeoutMs: number): Promise<void> {
+    if (!this.awaitingPlacement) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      let done = false;
+      const finish = (): void => {
+        if (done) return;
+        done = true;
+        cancel();
+        resolve();
+      };
+      const cancel = this.sink.schedule(finish, timeoutMs);
+      this.placeWaiters.push(finish);
+    });
+  }
+
+  /**
+   * Whether a bubble still has to be SENT (as opposed to edited) before it is on screen.
+   *
+   * True in exactly two states: an accumulate line set with no bubble carrying it yet (a fresh
+   * segment, or one whose bubble was just sealed and whose lines are being carried into a new
+   * one), and a standalone send still in flight under `separate` grouping.
+   */
+  private get awaitingPlacement(): boolean {
+    if (this.aborted || this.opts.mode === 'off') return false;
+    if (this.standaloneInFlight > 0) return true;
+    return this.lines.length > 0 && this.bubbleRef === null;
+  }
+
   /** Turn interrupted: stop painting and drop anything armed. */
   abort(): void {
     this.aborted = true;
     this.cancelRetry?.();
     this.cancelRetry = null;
     this.releaseWaiters();
+    // An aborted renderer owes nothing, so anything holding a message back for a bubble that is
+    // never coming is let go too — an interrupted turn must not leave the reply waiting.
+    this.releasePlaceWaiters();
   }
 
   // --- painting ---
@@ -325,6 +382,20 @@ export class ToolRenderer {
   private releaseWaiters(): void {
     const waiters = this.settleWaiters;
     this.settleWaiters = [];
+    for (const w of waiters) w();
+  }
+
+  /**
+   * Let go of anyone waiting on placed(), once nothing is owed a send.
+   *
+   * Called from every point that can flip `awaitingPlacement` false — a successful send, a rotate
+   * that drops the line set, an abort — rather than polled, so the body's next message is held for
+   * exactly as long as the bubble takes and not a tick longer.
+   */
+  private releasePlaceWaiters(): void {
+    if (this.awaitingPlacement) return;
+    const waiters = this.placeWaiters;
+    this.placeWaiters = [];
     for (const w of waiters) w();
   }
 
@@ -383,6 +454,10 @@ export class ToolRenderer {
       if (!editing) {
         this.bubbleRef = await this.sink.sendBubble(text);
         this.bubbleEdits = 0;
+        // The bubble now holds a position in the chat, so whatever is waiting to write BELOW it
+        // may go (see placed()). Released here rather than at the end of the paint loop: the
+        // ordering constraint is satisfied by the send, not by the rest of the painting.
+        this.releasePlaceWaiters();
       } else {
         await this.sink.editBubble!(this.bubbleRef!, text);
         this.bubbleEdits++;
@@ -432,12 +507,15 @@ export class ToolRenderer {
   private emitStandalone(text: string): void {
     this.rev++;
     this.painting = true;
+    this.standaloneInFlight++;
     void this.sink
       .sendBubble(text)
       .catch(() => undefined)
       .finally(() => {
         this.deliveredRev = this.rev;
         this.painting = false;
+        this.standaloneInFlight--;
+        this.releasePlaceWaiters();
         if (this.idle()) this.releaseWaiters();
       });
   }

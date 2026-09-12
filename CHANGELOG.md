@@ -5,6 +5,27 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **A turn reads in the order it happened again.** Tool bubbles are painted asynchronously so that a
+  rate-limited chat cannot stall the reply behind a progress write — but the painter runs one write
+  *behind* the turn's side-effect chain, so a tool's bubble could be posted below the body text of
+  the segment that came after it. A transcript read "now let me check the profile" → "found it,
+  three profiles declare it" → and only then the search that found them. Reproduced with no rate
+  pressure at all: the normal case, not a congestion edge.
+
+  The fix rests on a distinction that keeps it cheap: only a SEND takes a position in the chat, while
+  an edit rewrites a message that already has one. So the body now waits for a bubble to be *placed*
+  before sending its next message, and for nothing else — a late ✓ still lands late and unordered, as
+  it always did. At most one wait per bubble, started when the tool is registered and therefore
+  overlapping the tool's own run, and bounded at two seconds: past that the reply goes on and the
+  bubble lands where it lands. Order is what gets given up under a paused chat, never the answer.
+
+  The reason this survived a careful review of that file is worth recording: `tool-flood.test.ts`
+  drives the whole stack but asserts on `[...sends, ...edits]` — a shape in which interleaving
+  cannot be expressed. The new `render-order.test.ts` logs every write to one array in the order the
+  platform saw it.
+
 ## [1.9.0] - 2026-09-12
 
 ### Changed

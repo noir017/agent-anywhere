@@ -807,6 +807,12 @@ export function createLarkProfile(): PlatformProfile<LarkPlatformConfig> {
   //   { id } in button.behaviors[].value. Click returns it via card.action.trigger,
   //   recovered through the internal/session hook. See sendButtons /
   //   mountButtonEvents / buildLarkButtonCard / extractCardAction.
+  // menuPageSize: deliberately NOT declared, which means menus here stay at core's conservative
+  //   PAGE_SIZE. Telegram/Discord/Slack raised theirs against a documented component limit; Lark
+  //   publishes no element cap for a card's action module that I could cite, and the cards here are
+  //   hand-built rather than encoder-produced, so a bigger page would be a guess about how much a
+  //   card will carry — and the way that guess fails is a menu the tenant rejects outright. Declare
+  //   it once someone has measured it on a real tenant, the way maxEditsPerMessage was.
   // maxMessageLength≈10000: Lark single-message content JSON is ~10000 chars.
   // maxEditsPerMessage=20: measured on this tenant — the 21st im.message.update on one message
   //   returns 230072 and never succeeds again. Declaring it lets the writers seal a message before

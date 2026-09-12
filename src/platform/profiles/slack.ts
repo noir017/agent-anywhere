@@ -478,6 +478,10 @@ export function createSlackProfile(): PlatformProfile<SlackPlatformConfig> {
     // advanced in place (see editButtons). Same Tier-3 rate limit as editMessage above; page
     // clicks are nowhere near it.
     editButtons: true,
+    // An actions block holds up to 25 elements, so 12 items plus the two page buttons fit in one.
+    // Same number as Telegram and Discord on purpose: the page size a user sees should not depend
+    // on which chat app they happen to be reading from.
+    menuPageSize: 12,
     // slash: registerCommands is a no-op (Slack slash must be registered in the App panel, no
     // runtime API); receiving wraps the socket for slash_commands frames. Like buttons, Socket Mode only.
     slashCommands: true,

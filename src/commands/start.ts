@@ -4,6 +4,7 @@ import { Daemon } from '../daemon/daemon.js';
 import { createPlatformAdapters } from '../platform/platform-factory.js';
 import { createAgentFactory } from '../daemon/agent-factory.js';
 import { ConversationStore, migrateLegacySessions } from '../daemon/conversation-store.js';
+import { WorkdirUsageStore } from '../daemon/workdir-usage.js';
 import { ensureReverseCliShim } from '../daemon/reverse-cli-shim.js';
 import { conversationKey } from '../core/conversation.js';
 
@@ -35,9 +36,13 @@ export async function runStart(): Promise<void> {
   // so a restart resumes it. Only /new forgets any of it.
   const store = new ConversationStore(path.join(configDir(), 'conversations.json'));
   migrateLegacy(cfg, store);
+  // How often each directory has been chosen with `/cd`, so the menu leads with the projects this
+  // machine actually works in. Separate from the conversation store because it is a fact about the
+  // MACHINE, not about one topic — a brand-new conversation gets the benefit of it immediately.
+  const workdirUsage = new WorkdirUsageStore(path.join(configDir(), 'workdir-usage.json'));
   // Dispatches per agent to the ACP runtime or the agy runtime (see agent-factory).
   const agents = createAgentFactory(cfg, socket, store);
-  const daemon = new Daemon(cfg, platforms, agents, socket, store);
+  const daemon = new Daemon(cfg, platforms, agents, socket, store, workdirUsage);
 
   await daemon.run();
   console.log(`🚀 Agent Anywhere daemon is running (socket: ${socket})`);

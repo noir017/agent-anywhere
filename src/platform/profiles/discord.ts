@@ -201,6 +201,11 @@ export function createDiscordProfile(): PlatformProfile<DiscordPlatformConfig> {
     thread: true,
     buttons: true,
     editButtons: true, // PATCH /channels/{c}/messages/{id} takes `components` (Message.EditParams)
+    // 25 components per message, 5 per row (buildActionRows wraps): 12 items plus the two page
+    // buttons is three rows of the five available, well inside it. Matched to Telegram's number
+    // rather than maximised — the same menu should not be a different shape per platform without a
+    // reason, and Discord's own limit is not the binding one here.
+    menuPageSize: 12,
     slashCommands: true,
     maxSlashCommands: 100, // Discord per-scope application command limit
     // The adapter auto-emits a DEFERRED interaction response on INTERACTION_CREATE; without a

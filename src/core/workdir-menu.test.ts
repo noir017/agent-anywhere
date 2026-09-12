@@ -52,6 +52,23 @@ describe('page arithmetic', () => {
     expect(workdirIndexOf(OPTIONS, '/home/u/elsewhere')).toBe(-1);
     expect(workdirIndexOf(OPTIONS, undefined)).toBe(-1);
   });
+
+  // The reason `/cd` is worth using on a phone at all: a workspace this size is ONE page on a
+  // platform that declared it can carry twelve, so choosing a directory is a tap and not a hunt.
+  it('honours a platform page size, and stops paging when the list fits one', () => {
+    expect(workdirPageCount(OPTIONS.length, 12)).toBe(1);
+    expect(workdirPageOf(7, 12)).toBe(0);
+    const view = buildWorkdirMenu({ reqId: 'ab12cd34', options: OPTIONS, page: 0, pageSize: 12 });
+    expect(picks(view.buttons)).toHaveLength(OPTIONS.length);
+    expect(navs(view.buttons)).toEqual([]); // no ◀/▶ for a single page
+    expect(view.pageCount).toBe(1);
+  });
+
+  it('keeps indices absolute at any page size', () => {
+    const view = buildWorkdirMenu({ reqId: 'ab12cd34', options: OPTIONS, page: 1, pageSize: 3 });
+    expect(picks(view.buttons)[0]!.id).toBe('wdr:ab12cd34:3');
+    expect(view.pageCount).toBe(3);
+  });
 });
 
 describe('menu rendering', () => {

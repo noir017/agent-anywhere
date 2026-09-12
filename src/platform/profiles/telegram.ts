@@ -464,6 +464,12 @@ export function createTelegramProfile(): PlatformProfile<TelegramPlatformConfig>
     renameThread: true,
     buttons: true,
     editButtons: true, // editMessageText carries reply_markup, so a menu can advance in place
+    // One button per row (see sendComposite), so a page costs `size + 2` rows of screen — the
+    // inline keyboard itself has no limit worth reaching. Twelve keeps a menu to fourteen rows,
+    // about one phone screen with a flick, and puts a workspace of ten projects on a single page:
+    // `/cd` exists to answer "which project is this topic about", and paging to find the answer is
+    // the thing that made it tiresome.
+    menuPageSize: 12,
     slashCommands: true,
     maxSlashCommands: 100, // Telegram setMyCommands limit (names allow only [a-z0-9_], see registerCommands)
   };

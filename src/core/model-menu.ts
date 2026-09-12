@@ -22,9 +22,13 @@ import { PAGE_SIZE, pageCount, pageOf, pageSlice, truncateLabel, wrapPage } from
 export type ModelOption = ModelSelector['options'][number];
 
 /**
- * Models per page. The arithmetic is shared with the `/setting` menu (core/paging.ts), which has
- * the same one-button-per-row Telegram constraint; this alias keeps the model-menu vocabulary
- * reading as itself at the call sites.
+ * Models per page when the caller names no platform size. The arithmetic is shared with the
+ * `/setting` menu (core/paging.ts), which has the same one-button-per-row Telegram constraint; this
+ * alias keeps the model-menu vocabulary reading as itself at the call sites.
+ *
+ * A platform that declares `menuPageSize` overrides it — the daemon passes that number down, and
+ * passes the SAME number again on every page click (see PendingModelMenu.pageSize), because a menu
+ * drawn at one size and paged at another turns to the wrong page.
  */
 export const MODEL_PAGE_SIZE = PAGE_SIZE;
 
@@ -57,13 +61,13 @@ export interface ModelMenuView {
 }
 
 /** How many pages a list of this size needs (at least one, so an empty list still renders). */
-export function modelPageCount(total: number): number {
-  return pageCount(total);
+export function modelPageCount(total: number, size?: number): number {
+  return pageCount(total, size);
 }
 
 /** The page a given index falls on. */
-export function modelPageOf(index: number): number {
-  return pageOf(index);
+export function modelPageOf(index: number, size?: number): number {
+  return pageOf(index, size);
 }
 
 /** Position of `value` in the list, or -1 — including when the harness reports a model it does not list. */
@@ -146,9 +150,11 @@ export function buildModelMenu(menu: {
   options: ModelOption[];
   current?: string;
   page: number;
+  /** Items per page; omitted means this platform declared none (core/paging.ts PAGE_SIZE). */
+  pageSize?: number;
 }): ModelMenuView {
   const { reqId, options, current } = menu;
-  const pageTotal = modelPageCount(options.length);
+  const pageTotal = modelPageCount(options.length, menu.pageSize);
   // Wrap into range, tolerating a negative or out-of-range request.
   const page = wrapPage(menu.page, pageTotal);
 
@@ -158,7 +164,7 @@ export function buildModelMenu(menu: {
     nameCounts.set(name, (nameCounts.get(name) ?? 0) + 1);
   }
 
-  const { start, items } = pageSlice(options, page);
+  const { start, items } = pageSlice(options, page, menu.pageSize);
   const buttons = items.map((o, i) => ({
     id: modelPickButtonId(reqId, start + i),
     label: truncateLabel(
@@ -174,11 +180,12 @@ export function buildModelMenu(menu: {
   }
 
   // The shortcut is repeated on every page on purpose: it is the only way to reach a model without
-  // paging to it, and the page a user happens to be on is the one they will read.
+  // paging to it, and the page a user happens to be on is the one they will read. The page counter
+  // itself only appears when there is more than one page (see buildWorkdirMenu).
   const text =
     `Model: ${current ?? 'unknown'}\n` +
-    `${options.length} available · page ${page + 1}/${pageTotal} — tap one, ` +
-    'or `/model <part of a name>`.';
+    `${options.length} available${pageTotal > 1 ? ` · page ${page + 1}/${pageTotal}` : ''} — ` +
+    'tap one, or `/model <part of a name>`.';
 
   return { text, buttons, page, pageCount: pageTotal };
 }

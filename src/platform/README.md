@@ -67,6 +67,7 @@ Three rules keep this from rotting:
 | `editButtons` | ✓ | ✓ | ✓ | ✓ | – | – | – | – |
 | `slashCommands` | ✓ | ✓ | ✓ | – | – | – | – | – |
 | `maxMessageLength` | 2000 | 4096 | 3000 | 10000 | 1000 | 5000 | 2000 | 3500 |
+| `menuPageSize` | 12 | 12 | 12 | – | – | – | – | – |
 
 **`editButtons` is not `editMessage && buttons`.** It is its own field because the
 conjunction is right by accident and wrong in mechanism. Lark has both, yet its
@@ -75,6 +76,18 @@ card — buttons live on a card and are replaced through `im.message.patch`. QQ 
 have buttons and no edit endpoint at all (LINE has no delete either, so not even
 delete-and-repost is available). A caller that needs to advance a posted menu — the
 paginated `/model` picker — checks this field and degrades to a text answer otherwise.
+
+**`menuPageSize` is a declaration, not a preference.** It says how many items one page of
+a button menu (`/cd`, `/model`, `/setting`) may hold here, and the limits are nowhere near
+each other: Discord allows 25 components per message, Telegram's inline keyboard is
+effectively unbounded but costs one screen ROW per button (one per row — a shared row
+squeezes long labels into unreadable slivers), LINE bundles at most 4 per template, QQ 5
+per row. A dash above means the profile declares nothing, which core reads as the
+conservative `PAGE_SIZE` (6) rather than as "no limit" — the failure mode of guessing high
+is the platform rejecting the whole message, so a platform nobody has measured stays small.
+Lark is a deliberate dash: its cards are hand-built here and it publishes no citable
+element cap for a card's action module. `core/paging.ts` clamps whatever is declared to
+what one Discord message can physically carry.
 
 **`renameThread` is not `thread` either**, for the same shape of reason. Four platforms
 report `thread: true` and give four different answers to "can this lane be renamed":

@@ -70,7 +70,9 @@ import {
   type WorkdirChoiceResult,
   type WorkdirOption,
 } from '../core/workdir-menu.js';
-import { scanWorkdirs, isDirectory } from './workdir-scan.js';
+import { scanWorkdirs, isDirectory, type WorkdirScan } from './workdir-scan.js';
+import { rankByFrecency } from '../core/frecency.js';
+import type { WorkdirUsageStore } from './workdir-usage.js';
 import { resolveAgentCwd, resolveConversationCwd } from './agent-common.js';
 import { formatRuntimeFooter, formatTokens } from '../core/runtime-footer.js';
 import { InboundMerger } from '../core/inbound-merger.js';
@@ -413,7 +415,15 @@ export class ConversationRegistry {
       hasPendingWork?(id: ConversationId): boolean;
     },
     /** Persistent conversation state (agent binding + each agent's own session id). */
-    private readonly store?: ConversationStore
+    private readonly store?: ConversationStore,
+    /**
+     * How often each directory has been chosen with `/cd`, used to order the menu.
+     *
+     * Optional, and absence is a supported deployment rather than a degraded one: with no usage
+     * store the directory list stays in the scan's alphabetical order, which is what it was before
+     * ranking existed. Tests construct registries without one for exactly that reason.
+     */
+    private readonly workdirUsage?: WorkdirUsageStore
   ) {
     // Inject only the capabilities TurnRunner needs (read-only views + activeAddress write entry),
     // rather than passing the whole registry and creating a circular dependency.
@@ -1679,6 +1689,33 @@ ${formatTokens(left)} left before compaction — ${name}`;
   }
 
   /**
+   * The `/cd` option list for this agent: what is on disk, in the order this machine actually uses.
+   *
+   * The one place scanning and ranking are combined, so the menu and the typed text list cannot
+   * disagree about which directory comes first — the same reason both surfaces are built from
+   * core/workdir-menu.ts's functions.
+   *
+   * The agent's own root keeps the first slot rather than competing for it. It is not a project:
+   * it is the way back out of one (marked ⌂ on the menu), and an escape hatch that moves around
+   * as the ranking shifts is worse than one that is always in the same place. Everything below it
+   * is ordered by frecency, which for a never-used workspace is exactly the scan's alphabetical
+   * order.
+   */
+  private rankedWorkdirs(root: string): WorkdirScan {
+    const scan = scanWorkdirs(root);
+    if (!scan.ok || !this.workdirUsage) return scan;
+    const [first, ...rest] = scan.options;
+    if (!first) return scan;
+    return {
+      ...scan,
+      options: [
+        first,
+        ...rankByFrecency(rest, (o) => o.path, this.workdirUsage.statOf, this.clock.now()),
+      ],
+    };
+  }
+
+  /**
    * Post a directory menu for this conversation, and say whether one went out.
    *
    * Returns false — silently — whenever there is nothing to ask: no platform buttons, no
@@ -1692,7 +1729,7 @@ ${formatTokens(left)} left before compaction — ${name}`;
     const def = findAgent(this.config, agentId);
     if (!this.store || !this.hooks?.onWorkdirMenuRequest || !caps || !def) return false;
 
-    const scan = scanWorkdirs(resolveAgentCwd(def));
+    const scan = this.rankedWorkdirs(resolveAgentCwd(def));
     if (!scan.ok || workdirMenuSurface(caps, scan.options.length) !== 'menu') return false;
 
     this.hooks.onWorkdirMenuRequest(id, agentId, msg, {
@@ -1723,7 +1760,7 @@ ${formatTokens(left)} left before compaction — ${name}`;
     const def = findAgent(this.config, agentId);
     if (!def) return `No agent "${agentId}" is configured, so there is no directory to change.`;
     const root = resolveAgentCwd(def);
-    const scan = scanWorkdirs(root);
+    const scan = this.rankedWorkdirs(root);
     // Reported rather than swallowed: an unreadable root means `agents[].cwd` names something that
     // is not there, and that is a config bug the operator can only fix if they hear about it.
     if (!scan.ok) return workdirUnreadableText(root, scan.reason);
@@ -1785,6 +1822,11 @@ ${formatTokens(left)} left before compaction — ${name}`;
     store.setConversationCwd(id, agentId, path === root ? undefined : path);
     store.clearAgentSessions(id);
     this.agents.dispose(id);
+    // Counted here rather than at the menu, so only a directory actually MOVED TO scores: a `/cd`
+    // that resolved to the current directory returned `unchanged` above without reaching this line,
+    // and that path is how a user dismisses the menu (tap the ● entry). Recorded after the move
+    // rather than before it, so a `missing` directory never earns a place in the ranking.
+    this.workdirUsage?.record(path, this.clock.now());
 
     const state = this.conversations.get(id);
     if (state) {

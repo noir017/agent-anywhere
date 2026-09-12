@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ConversationRegistry } from './conversation.js';
 import { ConversationStore } from './conversation-store.js';
+import { WorkdirUsageStore } from './workdir-usage.js';
 import { resolveConversationCwd } from './agent-common.js';
 import { parseConfig, type Config } from '../config/schema.js';
 import type { PlatformAdapter } from '../platform/adapter.js';
@@ -73,7 +74,7 @@ interface WorkdirMenuCall {
   current: string;
 }
 
-function rig(opts: { buttons?: boolean } = {}) {
+function rig(opts: { buttons?: boolean; usage?: WorkdirUsageStore } = {}) {
   const buttons = opts.buttons ?? true;
   const sent: string[] = [];
   const prompts: string[] = [];
@@ -123,6 +124,7 @@ function rig(opts: { buttons?: boolean } = {}) {
 
   const file = join(mkdtempSync(join(tmpdir(), 'workdir-store-')), 'conversations.json');
   const store = new ConversationStore(file);
+  const usage = opts.usage;
   const reg = new ConversationRegistry(
     cfg,
     new Map([['discord', platform]]),
@@ -133,7 +135,8 @@ function rig(opts: { buttons?: boolean } = {}) {
       onWorkdirMenuRequest: (id, agentId, _msg, menu) =>
         void menus.push({ id, agentId, options: menu.options, current: menu.current }),
     },
-    store
+    store,
+    usage
   );
 
   let n = 0;
@@ -301,6 +304,87 @@ describe('moving a conversation', () => {
     await send('/cd');
     await send('/cd quantlab');
     expect(prompts).toEqual([]);
+  });
+});
+
+/**
+ * The order the directories come back in.
+ *
+ * Alphabetical is the ordering guaranteed to ignore what the user does, and on a phone that meant
+ * paging to reach the project you reach every day. These pin the two halves of the fix: uses are
+ * counted where a move actually happened, and the menu leads with what has been used — while the
+ * root keeps the first slot, because it is the way OUT of a project rather than one of them.
+ */
+describe('ordering by use', () => {
+  const usageStore = (): WorkdirUsageStore =>
+    new WorkdirUsageStore(join(mkdtempSync(join(tmpdir(), 'workdir-usage-')), 'usage.json'));
+
+  it('stays alphabetical for a machine with no history', async () => {
+    const { send, menus } = rig({ usage: usageStore() });
+    await send('/cc');
+    expect(menus[0]!.options.map((o) => o.name)).toEqual([
+      menus[0]!.options[0]!.name,
+      'agent-anywhere',
+      'quantlab',
+      'uniagent',
+    ]);
+  });
+
+  it('leads with the directory that has been used, root still first', async () => {
+    const usage = usageStore();
+    const { send, menus } = rig({ usage });
+    // uniagent sorts last alphabetically; using it should bring it to the top of the projects.
+    await send('/cd uniagent');
+    await send('/new');
+    expect(menus).toHaveLength(1);
+    const names = menus[0]!.options.map((o) => o.name);
+    expect(names[0]).toBe(menus[0]!.options[0]!.name);
+    expect(menus[0]!.options[0]!.root).toBe(true);
+    expect(names.slice(1)).toEqual(['uniagent', 'agent-anywhere', 'quantlab']);
+  });
+
+  it('carries the history across daemon restarts, into a conversation that never chose anything', async () => {
+    const file = join(mkdtempSync(join(tmpdir(), 'workdir-usage-')), 'usage.json');
+    const first = rig({ usage: new WorkdirUsageStore(file) });
+    await first.send('/cd uniagent');
+
+    // A different registry, a different store instance, reading the same file: what a restart is.
+    const { send, menus } = rig({ usage: new WorkdirUsageStore(file) });
+    await send('/cc');
+    expect(menus[0]!.options.map((o) => o.name).slice(1)).toEqual([
+      'uniagent',
+      'agent-anywhere',
+      'quantlab',
+    ]);
+  });
+
+  it('does not count re-picking the directory already in use (that is how a menu is dismissed)', async () => {
+    const usage = usageStore();
+    const { send } = rig({ usage });
+    await send('/cd quantlab');
+    const after = usage.stat(QUANTLAB)!;
+    await send('/cd quantlab'); // `unchanged`: nothing moved, nothing reset
+    expect(usage.stat(QUANTLAB)).toEqual(after);
+  });
+
+  it('does not count a directory that turned out not to exist', async () => {
+    const usage = usageStore();
+    const { reg, send, key } = rig({ usage });
+    await send('/cc');
+    const gone = join(root, 'deleted-since-the-menu-was-drawn');
+    expect(reg.applyWorkdirChoice(key, 'cc', gone)).toEqual({ kind: 'missing', path: gone });
+    expect(usage.stat(gone)).toBeUndefined();
+  });
+
+  it('orders the text list the same way, so both surfaces agree', async () => {
+    const usage = usageStore();
+    const withButtons = rig({ usage });
+    await withButtons.send('/cd uniagent');
+
+    const { send, replies } = rig({ buttons: false, usage });
+    await send('/cd');
+    const text = replies().at(-1)!;
+    expect(text.indexOf('/cd uniagent')).toBeLessThan(text.indexOf('/cd agent-anywhere'));
   });
 });
 

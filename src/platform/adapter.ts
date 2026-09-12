@@ -191,6 +191,21 @@ export interface PlatformCapabilities {
    * all). Same reasoning as canRegisterSlashAtRuntime below.
    */
   editButtons: boolean;
+  /**
+   * How many items one page of a button menu may hold here (`/cd`, `/model`, `/setting`).
+   *
+   * Declared per platform rather than shared, because the limits are not close to each other:
+   * Discord allows 25 components per message, Telegram's inline keyboard is effectively unbounded
+   * but costs one screen ROW per button (its profile puts one per row — a shared row squeezes long
+   * labels into unreadable slivers), LINE bundles at most 4 per template and QQ 5 per row. One
+   * number for all of them has to be the smallest, and the smallest made `/cd` page through a
+   * ten-project workspace two items at a time.
+   *
+   * Absent means "nobody has checked this platform's limits", which core reads as the conservative
+   * PAGE_SIZE rather than as no limit (core/paging.ts `resolvePageSize`, which also clamps a
+   * declared number to what Discord can physically carry). Meaningless when buttons=false.
+   */
+  menuPageSize?: number;
   /** Slash commands (register + receive). */
   slashCommands: boolean;
   /**

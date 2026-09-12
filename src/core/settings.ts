@@ -831,13 +831,15 @@ export function buildSettingValueMenu(menu: {
   row: SettingRow;
   options: SettingOption[];
   page: number;
+  /** Items per page; omitted means this platform declared none (core/paging.ts PAGE_SIZE). */
+  pageSize?: number;
   /** Typed-only hint shown when the setting offers no options (a model with no live list). */
   hint?: string;
 }): SettingsMenuView {
   const { reqId, row, options } = menu;
-  const total = pageCount(options.length);
+  const total = pageCount(options.length, menu.pageSize);
   const page = wrapPage(menu.page, total);
-  const { start, items } = pageSlice(options, page);
+  const { start, items } = pageSlice(options, page, menu.pageSize);
 
   const buttons = items.map((o, i) => ({
     id: settingValueButtonId(reqId, start + i),
@@ -874,10 +876,14 @@ export function buildSettingValueMenu(menu: {
  * poor trade for one line of arithmetic. Page 0 when the current value is not in the list (a model
  * the harness no longer offers, or an alias it never advertised).
  */
-export function settingValuePage(row: SettingRow, options: SettingOption[]): number {
+export function settingValuePage(
+  row: SettingRow,
+  options: SettingOption[],
+  size?: number
+): number {
   const current = currentRaw(row);
   const index = options.findIndex((o) => o.raw === current);
-  return index >= 0 ? pageOf(index) : 0;
+  return index >= 0 ? pageOf(index, size) : 0;
 }
 
 /**

@@ -34,7 +34,10 @@ export interface WorkdirOption {
   root?: boolean;
 }
 
-/** Directories per page. Shared arithmetic with the model and setting menus (core/paging.ts). */
+/**
+ * Directories per page when the caller names no platform size. Shared arithmetic with the model and
+ * setting menus (core/paging.ts); a platform that declares `menuPageSize` overrides it.
+ */
 export const WORKDIR_PAGE_SIZE = PAGE_SIZE;
 
 /** Marks the directory this conversation is currently working in. */
@@ -69,13 +72,13 @@ export interface WorkdirMenuView {
 }
 
 /** How many pages a list of this size needs (at least one, so an empty list still renders). */
-export function workdirPageCount(total: number): number {
-  return pageCount(total);
+export function workdirPageCount(total: number, size?: number): number {
+  return pageCount(total, size);
 }
 
 /** The page a given index falls on. */
-export function workdirPageOf(index: number): number {
-  return pageOf(index);
+export function workdirPageOf(index: number, size?: number): number {
+  return pageOf(index, size);
 }
 
 /** Position of `path` in the list, or -1. */
@@ -131,12 +134,14 @@ export function buildWorkdirMenu(menu: {
   options: WorkdirOption[];
   current?: string;
   page: number;
+  /** Items per page; omitted means this platform declared none (core/paging.ts PAGE_SIZE). */
+  pageSize?: number;
 }): WorkdirMenuView {
   const { reqId, options, current } = menu;
-  const pageTotal = workdirPageCount(options.length);
+  const pageTotal = workdirPageCount(options.length, menu.pageSize);
   const page = wrapPage(menu.page, pageTotal);
 
-  const { start, items } = pageSlice(options, page);
+  const { start, items } = pageSlice(options, page, menu.pageSize);
   const buttons = items.map((o, i) => ({
     id: workdirPickButtonId(reqId, start + i),
     label: truncateLabel((o.path === current ? CURRENT_MARK : o.root ? ROOT_MARK : '') + o.name),
@@ -152,10 +157,14 @@ export function buildWorkdirMenu(menu: {
   // The consequence is stated on the menu itself, not only in the ack, because it is the one thing
   // a user cannot undo by tapping again: the directory a session runs in is fixed when that session
   // starts, so moving means starting over. Better read before the tap than after.
+  //
+  // The page counter appears only when there IS more than one page — which, since platforms began
+  // declaring their own page size, is no longer the common case. "page 1/1" is a line of noise
+  // above the answer, and the setting menu has always left it out for the same reason.
   const text =
     `Working dir: ${current ?? 'unknown'}\n` +
-    `${options.length} available · page ${page + 1}/${pageTotal} — tap one to work there ` +
-    '(starts a fresh session), or `/cd <part of a name>`.';
+    `${options.length} available${pageTotal > 1 ? ` · page ${page + 1}/${pageTotal}` : ''} — ` +
+    'tap one to work there (starts a fresh session), or `/cd <part of a name>`.';
 
   return { text, buttons, page, pageCount: pageTotal };
 }

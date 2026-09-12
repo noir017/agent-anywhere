@@ -244,9 +244,22 @@ second place to declare projects, and a new one appears in the menu by existing
 on disk. The root is always offered, so a conversation can get back out.
 
 ```
-/cd                →  a paginated button menu of the projects under the root
+/cd                →  a button menu of the projects under the root
 /cd quantlab       →  move there by substring, on every platform
 ```
+
+The menu leads with the directories you actually use — a project's rank is how
+often it has been chosen, with each past choice discounted by how long ago it was
+(a fortnight half-life). A plain counter would leave last quarter's project on
+top forever; a plain "most recent" would let one curious click displace the
+project you have lived in all month. Anything never chosen keeps its alphabetical
+place, and the root stays first as the way back out. This is remembered per
+machine, not per conversation, so a brand-new topic gets the benefit of it
+immediately.
+
+A page holds as many directories as the platform can carry — twelve on Telegram,
+Discord and Slack, which is one page for a typical workspace — so choosing is
+usually a tap rather than a page turn.
 
 You are asked the question at the two moments it is free: a bare agent command
 (`/cc`, `/oc`, `/agy`) in a conversation that has never run, and right after

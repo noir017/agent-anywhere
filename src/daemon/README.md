@@ -25,6 +25,7 @@ session id, agy's conversation id). One conversation holds one session *per agen
 | `agent-common.ts` | Protocol-agnostic helpers shared by both runtimes |
 | `conversation-store.ts` | Persisted per conversation: the bound agent, each agent's own session id, and the directory it works in |
 | `workdir-scan.ts` | The `/cd` option list: an agent's configured root plus the projects one level inside it |
+| `workdir-usage.ts` | How often each directory has been chosen with `/cd`, so the menu leads with the ones in use |
 | `skills-scan.ts` | The `/skills` list: where each harness keeps its installed skills, read off disk |
 | `conversation-token-registry.ts` | Per-conversation reverse-command token ↔ conversation id |
 | `attachment-io.ts` | Real attachment IO + the SSRF guards |
@@ -176,6 +177,27 @@ agent's id for that conversation: the topic *is* the conversation, so a reset th
 another agent's history resurface on the next `/oc` would be a surprise rather than a
 reset. A pre-0.3 `sessions.json` is migrated on first start (`migrateLegacySessions`), so
 in-flight work survives the upgrade.
+
+### What `/cd` offers, and in what order
+
+The candidate list is derived, never configured: `workdir-scan.ts` reads `agents[].cwd`
+and the directories one level inside it, so a new project appears in the menu by existing
+on disk. One level, because recursing turns a menu into a file browser; the root is always
+the first option, so a conversation that wandered into a project can get back out.
+
+The ORDER comes from `workdir-usage.ts` (`<configDir>/workdir-usage.json`) — two numbers
+per absolute path, ranked by [`core/frecency.ts`](../core/README.md). It is a separate file
+from `conversations.json` for a reason that is easy to get backwards: how often a directory
+is used is a fact about the **machine**, not about one topic, so a brand-new conversation
+should get the benefit of it on its very first menu. (And `conversations.json` is literally
+a map of conversation key → record, validated entry by entry, so a usage table at its top
+level would be read back as one more malformed conversation and dropped.)
+
+A use is counted where a move actually happened — `setWorkdir` returning `applied`. Not on
+`unchanged`, because re-picking the directory already in use is how a user dismisses the
+menu (it is the one marked ●), and not on `missing`, because a directory that turned out
+not to exist should not earn a place in the ranking. With no usage file, the list is the
+scan's alphabetical order, which is what it was before any of this existed.
 
 ### Auto-thread adoption
 

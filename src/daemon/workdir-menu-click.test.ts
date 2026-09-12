@@ -61,7 +61,12 @@ function config(access?: string[]): Config {
 
 const drain = (): Promise<void> => new Promise((r) => setTimeout(r, 30));
 
-function rig(opts: { access?: string[]; caps?: { buttons?: boolean; editButtons?: boolean } } = {}) {
+function rig(
+  opts: {
+    access?: string[];
+    caps?: { buttons?: boolean; editButtons?: boolean; menuPageSize?: number };
+  } = {}
+) {
   const sent: string[] = [];
   const buttonSends: Array<{ text: string; buttons: Array<{ id: string; label: string }> }> = [];
   const buttonEdits: Array<{ messageId: string; text: string; buttons: Array<{ id: string; label: string }> }> = [];
@@ -109,6 +114,10 @@ function rig(opts: { access?: string[]; caps?: { buttons?: boolean; editButtons?
       slashCommands: true, typing: true, maxMessageLength: 4096,
       buttons: opts.caps?.buttons ?? true,
       editButtons: opts.caps?.editButtons ?? true,
+      // Left undeclared by default so the existing two-page expectations keep describing the
+      // conservative platform; the page-size tests below pass one, and one of them mutates this
+      // object mid-flight to prove a live menu is not resized underneath the user.
+      ...(opts.caps?.menuPageSize !== undefined ? { menuPageSize: opts.caps.menuPageSize } : {}),
     },
     sendMessage: async (address: { channel: string }, text: string) => {
       sent.push(text);
@@ -175,6 +184,8 @@ function rig(opts: { access?: string[]; caps?: { buttons?: boolean; editButtons?
   return {
     send, click, replies, menu, pickIds, navIds, modelIds,
     buttonSends, buttonEdits, disposed, starts, store, key,
+    /** The live capabilities object, so a test can change what the platform claims mid-flight. */
+    capabilities: platform.capabilities as { menuPageSize?: number },
   };
 }
 
@@ -225,6 +236,40 @@ describe('turning the page', () => {
     expect(edit.text).toContain('page 2/2');
     // Second page starts at index 6, not back at 0 — a page turn may never re-point a button.
     expect(edit.buttons[0]!.id.endsWith(':6')).toBe(true);
+  });
+});
+
+/**
+ * How many directories one page holds, and why the daemon freezes that number.
+ *
+ * The whole point of `menuPageSize` is the first test: on Telegram, a workspace this size is one
+ * page, so choosing a directory costs a tap instead of a page turn. The second is the bug the
+ * freezing prevents — a click arrives later, and answering it with a re-read page size would draw
+ * boundaries the message on screen was never built with.
+ */
+describe('page size', () => {
+  it('fits the whole workspace on one page when the platform says it can', async () => {
+    const r = rig({ caps: { menuPageSize: 12 } });
+    await r.send('/cc');
+    expect(r.pickIds()).toHaveLength(PROJECTS.length + 1); // every project, plus the root
+    expect(r.navIds()).toEqual([]); // nothing to turn
+    expect(r.menu().text).not.toContain('page 1/');
+  });
+
+  it('keeps a posted menu at the size it was drawn with, even if the platform changes its mind', async () => {
+    const r = rig({ caps: { menuPageSize: 3 } });
+    await r.send('/cd');
+    expect(r.pickIds()).toHaveLength(3);
+    const [, next] = r.navIds();
+
+    // A config reload (or a profile edit) between the post and the click. The menu on screen still
+    // shows three, so page 1 must still mean indices 3–5 — not 12–23 of a list that has eight.
+    r.capabilities.menuPageSize = 12;
+    await r.click(next!);
+    const edit = r.buttonEdits.at(-1)!;
+    expect(edit.buttons.filter((b) => b.id.startsWith('wdr:'))).toHaveLength(3);
+    expect(edit.buttons[0]!.id.endsWith(':3')).toBe(true);
+    expect(edit.text).toContain('page 2/3');
   });
 });
 

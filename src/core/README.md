@@ -53,6 +53,7 @@ conversation, not part of its name — see [`daemon/README.md`](../daemon/README
 | `model-menu.ts` | `/model` as data: paging, labels, button ids, matching, and every string it says |
 | `workdir-menu.ts` | `/cd` as data: the same shape, for the directory a conversation works in |
 | `paging.ts` | The platform-imposed shape of a button menu: page size, page arithmetic, label budget |
+| `frecency.ts` | How often a thing was chosen, discounted by how long ago — what orders the `/cd` list |
 | `button-id.ts` | The `<prefix><reqId>:<n>` button id grammar every menu shares |
 | `proxy.ts` | The one impure file — see below |
 
@@ -552,12 +553,47 @@ skills than any seen so far.
 
 ## `paging.ts`
 
-Page size, page arithmetic and the label budget, shared by the `/model` and `/setting`
-menus. Both are bounded by the same platform facts: Discord allows 25 components per
-message, and Telegram's profile puts one button per row, so a page costs `size + 2` rows on
-a phone. Page navigation **wraps** rather than disappearing at the edges — hiding ◀ on the
-first page shifts every other button by one position between pages, and a disabled button
-does not exist on Telegram at all.
+Page size, page arithmetic and the label budget, shared by the `/model`, `/setting` and
+`/cd` menus. Page navigation **wraps** rather than disappearing at the edges — hiding ◀ on
+the first page shifts every other button by one position between pages, and a disabled
+button does not exist on Telegram at all.
+
+**The page size comes from the platform, not from here.** `PAGE_SIZE` (6) is only the
+default for a profile that declares no `menuPageSize`, because the limits are nowhere near
+each other: Discord allows 25 components per message, Telegram's inline keyboard is
+effectively unbounded but costs one screen row per button, LINE bundles at most 4 per
+template. One shared number has to be the smallest of those, and the smallest is what made
+`/cd` page through a ten-project workspace two items at a time. `resolvePageSize` applies
+the default and clamps a declared number to `PAGE_SIZE_MAX` (22 — Discord's 25 minus the
+three buttons a menu adds beyond its items).
+
+Every function here takes the size as a parameter, and the daemon **freezes** the resolved
+number alongside the option snapshot when it posts a menu (`PendingModelMenu.pageSize` and
+its siblings). A click arrives later; re-deriving the size then would compute page
+boundaries the message on screen was never drawn with, so `Next ▶` would skip or repeat
+entries.
+
+## `frecency.ts`
+
+`decayedScore` / `bumpedScore` / `rankByFrecency` — the ordering behind the `/cd` menu, so
+the projects this machine actually works in come first. Alphabetical is the one ordering
+guaranteed to ignore what the user does, and on a phone that meant paging to reach the
+directory you reach every day.
+
+Neither half of the obvious pair works on its own: a plain visit counter never forgets, so
+last quarter's project outranks this morning's forever; a plain timestamp forgets
+everything else, so one curious click displaces the project someone has lived in all month.
+The score is therefore a sum over past visits, each discounted by its own age with a
+fortnight half-life.
+
+That sum looks like it needs every visit's timestamp. It does not: exponential decay is
+memoryless, so decaying the running total to `now` and adding 1 gives exactly the same
+number as decaying each visit separately — which is why
+[`daemon/workdir-usage.ts`](../daemon/README.md) stores two numbers per directory instead
+of a log that grows forever. That identity is the whole design and is not visible from
+reading either function, so `frecency.test.ts` pins it against a brute-force sum.
+
+`now` is a parameter, like every other clock in `core/`.
 
 ## `attachment-ingest.ts`
 

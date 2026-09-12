@@ -78,6 +78,8 @@ import {
 import type { AgentFactory } from './agent.js';
 import { ConversationRegistry } from './conversation.js';
 import type { ConversationStore } from './conversation-store.js';
+import type { WorkdirUsageStore } from './workdir-usage.js';
+import { resolvePageSize } from '../core/paging.js';
 import { IpcServer } from '../ipc/server.js';
 import type { IpcAction } from '../ipc/protocol.js';
 import { DEFAULT_ASK_TIMEOUT_MS as PROTOCOL_DEFAULT_ASK_TIMEOUT_MS } from '../ipc/protocol.js';
@@ -301,6 +303,15 @@ interface PendingModelMenu {
   options: ModelOption[];
   /** The model marked ● when the menu was drawn. Display only; never used to decide a switch. */
   current?: string;
+  /**
+   * Items per page, resolved from the posting platform's capabilities when the menu opened.
+   *
+   * Frozen alongside the options, and for the same reason: a click arrives later, and re-deriving
+   * the size then would compute page boundaries the message on screen was never drawn with — so
+   * `Next ▶` would skip or repeat entries. It also means a config reload cannot resize a menu that
+   * is already up.
+   */
+  pageSize: number;
   /** The menu message itself, captured from the send — page turns and the ack both edit it. */
   ref?: MessageRef;
 }
@@ -327,6 +338,8 @@ interface PendingSettingsMenu {
   rows: SettingRow[];
   /** The open setting, with the frozen option list its `stv:` indices point into. */
   open?: { row: SettingRow; options: SettingOption[]; hint?: string };
+  /** Items per page on the value level; frozen for the reason PendingModelMenu.pageSize records. */
+  pageSize: number;
   /** The menu message itself, captured from the send — every level change edits it. */
   ref?: MessageRef;
 }
@@ -353,6 +366,8 @@ interface PendingWorkdirMenu {
   options: WorkdirOption[];
   /** The directory marked ● when the menu was drawn. Display only. */
   current: string;
+  /** Items per page; frozen for the reason PendingModelMenu.pageSize records. */
+  pageSize: number;
   /** The menu message itself, captured from the send — page turns and the ack both edit it. */
   ref?: MessageRef;
 }
@@ -432,7 +447,9 @@ export class Daemon {
     agents: AgentFactory,
     socketPath: string,
     /** Persistent conversation state (agent binding + each agent's own session id). */
-    private readonly store?: ConversationStore
+    private readonly store?: ConversationStore,
+    /** `/cd` usage history, used to order the directory menu. Absent = alphabetical. */
+    workdirUsage?: WorkdirUsageStore
   ) {
     // Real runtime clock; core classes never read the system clock directly (for testability).
     const clock = {
@@ -476,7 +493,7 @@ export class Daemon {
       // or a `/new` that just cleared one.
       onWorkdirMenuRequest: (id, agentId, msg, menu) =>
         this.onWorkdirMenuRequest(id, agentId, msg, menu),
-    }, store);
+    }, store, workdirUsage);
     this.ipc = new IpcServer(socketPath, {
       // resolveAddress is also the sole capture point for the conversation owning this reverse
       // command: IPC only forwards the address to handle. So reverse-lookup by token and stash it
@@ -1084,12 +1101,14 @@ export class Daemon {
     const reqId = randomUUID().slice(0, 8);
     // Copied, not referenced: the harness owns that array and may rebuild it mid-session.
     const options = [...selector.options];
+    const pageSize = resolvePageSize(adapter.capabilities.menuPageSize);
     const pending: PendingModelMenu = {
       conversationId,
       agentId,
       conversation: msg.conversation,
       options,
       current: selector.current,
+      pageSize,
     };
     this.pendingModelMenus.set(reqId, pending);
 
@@ -1098,7 +1117,8 @@ export class Daemon {
       reqId,
       options,
       current: selector.current,
-      page: index >= 0 ? modelPageOf(index) : 0,
+      page: index >= 0 ? modelPageOf(index, pageSize) : 0,
+      pageSize,
     });
     void adapter
       .sendButtons(addressOf(msg.conversation), view.text, view.buttons)
@@ -1180,6 +1200,7 @@ export class Daemon {
         options: menu.options,
         current: menu.current,
         page: click.page,
+        pageSize: menu.pageSize,
       });
       this.editModelMenu(menu, view.text, view.buttons);
       return;
@@ -1224,7 +1245,8 @@ export class Daemon {
       reqId,
       options: menu.options,
       current: menu.current,
-      page: modelPageOf(index),
+      page: modelPageOf(index, menu.pageSize),
+      pageSize: menu.pageSize,
     });
     this.editModelMenu(menu, `${view.text}\n\n${text}`, view.buttons);
   }
@@ -1264,12 +1286,14 @@ export class Daemon {
     const reqId = randomUUID().slice(0, 8);
     // Copied, not referenced: the scan's array must not be shared with a later scan's.
     const options = [...menu.options];
+    const pageSize = resolvePageSize(adapter.capabilities.menuPageSize);
     const pending: PendingWorkdirMenu = {
       conversationId,
       agentId,
       conversation: msg.conversation,
       options,
       current: menu.current,
+      pageSize,
     };
     this.pendingWorkdirMenus.set(reqId, pending);
 
@@ -1278,7 +1302,8 @@ export class Daemon {
       reqId,
       options,
       current: menu.current,
-      page: index >= 0 ? workdirPageOf(index) : 0,
+      page: index >= 0 ? workdirPageOf(index, pageSize) : 0,
+      pageSize,
     });
     const text =
       menu.truncated > 0
@@ -1353,6 +1378,7 @@ export class Daemon {
         options: menu.options,
         current: menu.current,
         page: click.page,
+        pageSize: menu.pageSize,
       });
       this.editWorkdirMenu(menu, view.text, view.buttons);
       return;
@@ -1379,7 +1405,8 @@ export class Daemon {
         reqId: click.reqId,
         options: menu.options,
         current: menu.current,
-        page: workdirPageOf(click.index),
+        page: workdirPageOf(click.index, menu.pageSize),
+        pageSize: menu.pageSize,
       });
       this.editWorkdirMenu(menu, `${view.text}\n\n${text}`, view.buttons);
       return;
@@ -1415,6 +1442,7 @@ export class Daemon {
       conversation: msg.conversation,
       // Copied, not referenced: the caller built these from the live config and may rebuild them.
       rows: [...menu.rows],
+      pageSize: resolvePageSize(adapter.capabilities.menuPageSize),
       ...(menu.open ? { open: { ...menu.open, options: [...menu.open.options] } } : {}),
     };
     this.pendingSettingsMenus.set(reqId, pending);
@@ -1447,6 +1475,7 @@ export class Daemon {
           row: menu.open.row,
           options: menu.open.options,
           page,
+          pageSize: menu.pageSize,
           ...(menu.open.hint ? { hint: menu.open.hint } : {}),
         })
       : buildSettingsMenu({ reqId, rows: menu.rows });
@@ -1570,7 +1599,7 @@ export class Daemon {
     menu.open = { row, options, ...(hint ? { hint } : {}) };
     this.editSettingsMenu(
       menu,
-      ...this.viewParts(reqId, menu, settingValuePage(row, options))
+      ...this.viewParts(reqId, menu, settingValuePage(row, options, menu.pageSize))
     );
   }
 
@@ -1602,7 +1631,7 @@ export class Daemon {
     if (result.kind !== 'saved') {
       this.editSettingsMenu(
         menu,
-        ...this.viewParts(reqId, menu, settingValuePage(open.row, open.options), ack)
+        ...this.viewParts(reqId, menu, settingValuePage(open.row, open.options, menu.pageSize), ack)
       );
       return;
     }

@@ -5,6 +5,41 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **A menu page holds what the platform can carry, not what the tightest platform can.** Page size
+  was one constant (6) shared by `/cd`, `/model` and `/setting`, and a shared constant has to be the
+  smallest of the platforms' limits — LINE bundles at most 4 buttons per template, QQ 5 per row. So
+  a ten-project workspace was two pages, and *choosing a directory* meant paging, every time, on the
+  phone the command exists for. It is now a per-profile capability (`menuPageSize`): Discord,
+  Telegram and Slack declare 12, which is one page for a typical workspace and still well inside
+  Discord's 25-component message limit. A profile that declares nothing keeps the conservative 6,
+  because the way a too-large page fails is the platform rejecting the whole message.
+
+  The resolved size is frozen with the menu when it is posted. A click arrives later, and re-reading
+  the size then would draw page boundaries the message on screen was never built with — `Next ▶`
+  would skip or repeat entries.
+
+  The `page 1/N` counter now appears only when there is more than one page, which the `/setting`
+  menu has always done. On a menu that fits, it was a line of noise above the answer.
+
+- **`/cd` leads with the projects you actually work in.** The list was alphabetical, which is the
+  one ordering guaranteed to ignore what the user does: the two projects being worked on this week
+  sat wherever the alphabet put them. Directories are now ranked by frecency — how often each has
+  been chosen, with every past choice discounted by its age at a fortnight half-life. Neither
+  simpler answer works: a visit counter never forgets, so last quarter's project outranks this
+  morning's forever, and a plain "most recently used" lets one curious click displace the project
+  someone has lived in all month.
+
+  Kept in `<configDir>/workdir-usage.json`, two numbers per directory (exponential decay is
+  memoryless, so a running total is a complete stand-in for an unbounded visit log). Separate from
+  `conversations.json` because how often a directory is used is a fact about the machine, not about
+  one topic — a brand-new conversation gets the benefit on its first menu. A use is counted only
+  where a move actually happened, so re-picking the directory already in use (how the menu is
+  dismissed) and tapping one that has since been deleted both score nothing. The agent's root keeps
+  the first slot: it is the way out of a project rather than one of them. With no usage file the
+  order is the scan's alphabetical one, exactly as before.
+
 ## [1.8.2] - 2026-09-11
 
 ### Fixed

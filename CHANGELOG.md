@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.9.1] - 2026-09-12
+
 ### Fixed
 
 - **A turn reads in the order it happened again.** Tool bubbles are painted asynchronously so that a

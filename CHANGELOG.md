@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-09-12
+
 ### Changed
 
 - **A menu page holds what the platform can carry, not what the tightest platform can.** Page size

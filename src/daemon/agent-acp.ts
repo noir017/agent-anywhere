@@ -1551,9 +1551,11 @@ function parseElicitOptions(prop: unknown): ElicitOption[] {
  * text lives in `message` when there is exactly one question, and in each property's
  * `description` when there are several.
  *
- * `_custom` fields are skipped: they are the CLI's "type your own answer instead" box, and a
- * button row cannot collect free text. Dropping them is safe because the adapter marks them
- * optional — an accept that omits them is a complete answer, not a partial one.
+ * `_custom` fields are not rounds of their own: they are the CLI's "type your own answer instead"
+ * box, and a button row cannot collect free text. They are not dropped either, though — the key is
+ * recorded on the question it belongs to (ElicitQuestion.customKey), because that is the field a
+ * typed reply in the chat is sent back under. Skipping them as rounds is safe because the adapter
+ * marks them optional: an accept that omits them is a complete answer, not a partial one.
  *
  * A question left with no usable options is dropped, and a form where every question drops
  * yields null.
@@ -1576,7 +1578,18 @@ export function parseFormElicitation(params: CreateElicitationRequest): AgentEli
     // Single-question forms carry the question in `message` and leave `description` unset; the
     // title is a short header, so it is the last resort rather than the first.
     const prompt = p.description?.trim() || message || p.title?.trim() || key;
-    questions.push({ key, prompt, options, multi: p.type === 'array' });
+    // Only claim a free-text field the form actually declared, and only when it takes a string:
+    // every other elicitation source (an MCP server's own form) is free to offer none, and
+    // inventing the key would send the agent a field its schema never mentioned.
+    const customKey = `${key}_custom`;
+    const custom = (properties as Record<string, { type?: string } | undefined>)[customKey];
+    questions.push({
+      key,
+      prompt,
+      options,
+      multi: p.type === 'array',
+      ...(custom?.type === 'string' ? { customKey } : {}),
+    });
   }
 
   if (questions.length === 0) return null;

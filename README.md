@@ -378,6 +378,12 @@ advertises ACP's `elicitation.form` capability, which is what unlocks Claude Cod
 `AskUserQuestion` (the adapter keeps it disabled otherwise). Nothing is injected into the
 prompt to make it work.
 
+**When none of the options fit, just type the answer.** A message sent while a question is on
+screen is recorded as the answer to that question instead of starting a new turn — so a form that
+asks three things still asks all three, even if you answer the second one in your own words. Either
+way the question is edited in place: the buttons come off and what you answered is written onto it.
+`/stop` (or `/new`) calls the question off if you would rather not answer it at all.
+
 Harnesses that do not implement elicitation — `opencode` and `dsh`, as of 1.18.27 and
 0.1.2-rc.1 — keep the `ask` CLI in their hint instead, so their models can still put
 buttons in front of you. Failing that, the model asks in plain text and ends its turn, and

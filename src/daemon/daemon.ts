@@ -131,6 +131,15 @@ const PICKER_BUTTON_MAX = 25;
 /** ask button custom_id prefix. Format `ask:<reqId>:<index>` (must not start with `input`). */
 const ASK_PREFIX = 'ask:';
 
+/**
+ * Longest typed answer echoed back onto the question message; longer ones are elided there.
+ *
+ * The echo is a receipt ("this is what I recorded for that question"), not a transcript — the
+ * user's own message is still in the chat right above it. A pasted stack trace answered into a
+ * question would otherwise be repeated in full inside the bubble.
+ */
+const ASK_ECHO_MAX = 300;
+
 /** Harness-picker button custom_id prefix. Format `cmd:<reqId>:<index>`. */
 const PICK_PREFIX = 'cmd:';
 
@@ -237,9 +246,34 @@ export function composeElicitPrompt(q: ElicitQuestion, index: number, total: num
   return detail ? `${heading}\n\n${detail}` : heading;
 }
 
-/** A pending ask request (IPC response blocked, awaiting a button click or timeout). */
+/**
+ * What a pending question resolved to.
+ *
+ * Two shapes, because the answer travels back differently: a tapped option carries the label the
+ * button was drawn with (mapped to the option's own `value` before it reaches the agent), while a
+ * typed answer is whatever the user wrote and goes back through the question's free-text field.
+ * Collapsing them into a bare string is what would let a typed answer be mistaken for an option
+ * the agent listed.
+ */
+export type AskOutcome = { kind: 'option'; label: string } | { kind: 'text'; text: string };
+
+/**
+ * What happened to a conversation while the next round of its form was still being posted.
+ *
+ * See Daemon.elicitGaps for why this window exists and what is held in it.
+ */
+interface ElicitGap {
+  /** Whether every question in this form declared a free-text field (so a typed answer has a home). */
+  acceptsText: boolean;
+  /** An answer typed in the gap, handed to the next question the instant it registers. */
+  parked?: string;
+  /** Why the form was called off in the gap; shown on the next question, which is retired at birth. */
+  cancelled?: string;
+}
+
+/** A pending ask request (IPC response blocked, awaiting a button click, a typed reply, or timeout). */
 interface PendingAsk {
-  resolve: (label: string | null) => void;
+  resolve: (outcome: AskOutcome | null) => void;
   timer: NodeJS.Timeout;
   ref: MessageRef;
   labels: string[];
@@ -247,9 +281,20 @@ interface PendingAsk {
   /** Adapter the ask was sent on (button edits on click/timeout must go back to the same instance). */
   adapter: PlatformAdapter;
   /**
-   * Session that issued this ask (eviction-guard anchor). May be undefined when the sessionId
-   * can't be resolved (token expired / test stub): the guard then doesn't apply to this ask,
-   * matching legacy behavior when no hook is injected — never locks a session on resolve failure.
+   * Whether a message typed into the chat can answer this question instead of a tap.
+   *
+   * False only for an elicitation whose form declared no free-text field (see
+   * ElicitQuestion.customKey): there is nowhere to put the words, so a typed message keeps its old
+   * meaning — it interrupts the turn — rather than being swallowed by a question that cannot
+   * carry it.
+   */
+  acceptsText: boolean;
+  /**
+   * Session that issued this ask (eviction-guard anchor, and what a typed reply is matched
+   * against). May be undefined when the sessionId can't be resolved (token expired / test stub):
+   * the guard then doesn't apply to this ask, matching legacy behavior when no hook is injected —
+   * never locks a session on resolve failure. Such an ask is also unreachable by typed reply,
+   * since there is no conversation to attribute one to.
    */
   conversationId?: ConversationId;
 }
@@ -376,8 +421,24 @@ interface PendingWorkdirMenu {
 export class Daemon {
   private registry: ConversationRegistry;
   private ipc: IpcServer;
-  /** Pending ask requests: reqId → wait handle. Resolved and deleted on click or timeout. */
+  /** Pending ask requests: reqId → wait handle. Resolved and deleted on click, typed reply or timeout. */
   private pendingAsks = new Map<string, PendingAsk>();
+  /**
+   * Conversations inside a multi-round elicitation, and the answer that landed in the gap.
+   *
+   * The gap is real: between two rounds the previous question has already resolved and the next one
+   * is still being posted, so for one network round trip the conversation has nothing pending. A
+   * message arriving exactly then would fall through to the merger and interrupt the very turn the
+   * form belongs to — the bug this whole path exists to fix, reappearing in a window of a few
+   * hundred milliseconds. So it is parked here and handed to the next round the moment it registers.
+   *
+   * `acceptsText` is decided for the WHOLE form (every question declaring a free-text field) rather
+   * than per round, because in the gap the next question is not yet known — parking on a form whose
+   * next question cannot carry words would consume a message with nowhere to put it. `cancelled`
+   * holds a `/stop` that landed in the same window, for the same reason in reverse: there was no
+   * question on screen to call off yet.
+   */
+  private elicitGaps = new Map<ConversationId, ElicitGap>();
   /**
    * Latest command list reported per AGENT (not per session): the set is a property of the harness
    * and its config, so every session of one agent reports the same list. Feeds the harness pickers;
@@ -484,6 +545,12 @@ export class Daemon {
         }
         return false;
       },
+      // A message typed while a question is on screen answers the question instead of starting a
+      // turn (which would have interrupted the one the question belongs to).
+      answerPendingAsk: (id, text) => this.answerPendingAskWithText(id, text),
+      // `/stop` and `/new` abandon whatever is still being asked here, so nothing is left pinned,
+      // clickable, or able to swallow the next message.
+      cancelPendingAsks: (id, reason) => this.cancelPendingAsks(id, reason),
       // A bare `/model` on a platform that can carry (and later edit) buttons.
       onModelMenuRequest: (id, agentId, msg, selector) =>
         this.onModelMenuRequest(id, agentId, msg, selector),
@@ -697,11 +764,14 @@ export class Daemon {
       action.timeoutMs ?? DEFAULT_ASK_TIMEOUT_MS,
       conversationId
     );
-    return { chosen };
+    // The reverse `ask` speaks in labels, and a typed answer is simply the label the user wrote —
+    // the CLI's contract is "what the human answered", not "which of your options they picked", and
+    // the prompt came from the agent itself rather than from a schema it has to validate against.
+    return { chosen: chosen === null ? null : chosen.kind === 'option' ? chosen.label : chosen.text };
   }
 
   /**
-   * Post one question as buttons and resolve with the label the user tapped (null on timeout).
+   * Post one question as buttons and resolve with what the user answered (null on timeout).
    *
    * Shared by the two ways a question reaches the user: the `ask` reverse command, and the agent's
    * own ACP elicitation. One implementation because the mechanics are identical down to the
@@ -716,8 +786,9 @@ export class Daemon {
     prompt: string,
     labels: string[],
     timeoutMs: number,
-    conversationId?: ConversationId
-  ): Promise<string | null> {
+    conversationId?: ConversationId,
+    acceptsText = true
+  ): Promise<AskOutcome | null> {
     const reqId = randomUUID().slice(0, 8);
     // custom_id: `ask:` prefix + index (≤100 chars; must not start with `input`).
     const buttons = labels.map((label, i) => ({
@@ -726,13 +797,8 @@ export class Daemon {
     }));
     return platform.sendButtons(address, prompt, buttons).then(
       (ref) =>
-        new Promise<string | null>((resolve) => {
-          const timer = setTimeout(() => {
-            this.pendingAsks.delete(reqId);
-            // best-effort: strip buttons and mark timed out (editMessage with text only drops components).
-            void platform.editMessage(ref, `${prompt}\n\n(timed out)`).catch(() => undefined);
-            resolve(null);
-          }, timeoutMs);
+        new Promise<AskOutcome | null>((resolve) => {
+          const timer = setTimeout(() => this.settleAsk(reqId, null, '(timed out)'), timeoutMs);
           this.pendingAsks.set(reqId, {
             resolve,
             timer,
@@ -740,10 +806,135 @@ export class Daemon {
             labels,
             prompt,
             adapter: platform,
+            acceptsText,
             conversationId,
           });
+          if (conversationId !== undefined) this.settleFromGap(reqId, conversationId, acceptsText);
         })
     );
+  }
+
+  /**
+   * Settle one pending question: unblock whoever is waiting on it and take it off the screen.
+   *
+   * Every exit goes through here — tapped, typed, timed out, called off — because each of its three
+   * steps has been forgotten on this path at least once: a timer left running fires against a
+   * request that is gone, an unresolved promise parks an agent turn forever, and an un-retired
+   * bubble keeps live buttons under an answered question. Returns false when the question was
+   * already settled, which is the normal race (a tap landing just after a timeout).
+   */
+  private settleAsk(reqId: string, outcome: AskOutcome | null, shown: string): boolean {
+    const pending = this.pendingAsks.get(reqId);
+    if (!pending) return false;
+    clearTimeout(pending.timer);
+    this.pendingAsks.delete(reqId);
+    pending.resolve(outcome);
+    this.retireAsk(pending, shown);
+    return true;
+  }
+
+  /**
+   * Replay onto a just-posted question whatever happened to its conversation while it was in flight
+   * (see elicitGaps): an answer typed in the gap, or a cancellation that arrived when there was
+   * nothing on screen to cancel. Both address a question that did not exist yet, so they wait on the
+   * gap and are applied here, the instant one does.
+   */
+  private settleFromGap(reqId: string, conversationId: ConversationId, acceptsText: boolean): void {
+    const gap = this.elicitGaps.get(conversationId);
+    if (!gap) return;
+    if (gap.cancelled !== undefined) {
+      this.settleAsk(reqId, null, `(${gap.cancelled})`);
+      return;
+    }
+    if (acceptsText && gap.parked !== undefined) {
+      const parked = gap.parked;
+      gap.parked = undefined;
+      this.answerPendingAskWithText(conversationId, parked);
+    }
+  }
+
+  /**
+   * Take a question off the screen: strip its buttons and record what became of it, best-effort.
+   *
+   * `editButtons` with an EMPTY array rather than a text-only `editMessage`, for the reason spelled
+   * out on editModelMenu: only Discord and Telegram drop components when a message is edited to
+   * plain text — on Slack and Lark the buttons of an already-answered question stayed live, and a
+   * second tap on them hits a `pendingAsks` entry that is gone (silently doing nothing, which reads
+   * as the bot ignoring you). Platforms without editButtons degrade to the text-only edit, which is
+   * the best they can do.
+   */
+  private retireAsk(pending: PendingAsk, outcome: string): void {
+    const text = `${pending.prompt}\n\n${outcome}`;
+    const edit = pending.adapter.capabilities.editButtons
+      ? pending.adapter.editButtons(pending.ref, text, [])
+      : pending.adapter.editMessage(pending.ref, text);
+    void edit.catch(() => undefined);
+  }
+
+  /**
+   * A message typed into a conversation that has a question on screen: record it as the answer.
+   *
+   * Returns true when it was consumed, in which case no turn runs — which is the whole point. A
+   * typed reply used to reach the merger, and the merger's job is to interrupt the running turn:
+   * the agent was killed mid-question, so on a multi-question form every question after the one
+   * being answered was lost. Answering here instead keeps the form going: the elicitation loop
+   * resolves this round and posts the next one.
+   *
+   * The NEWEST matching question wins. Rounds are asked one at a time, so the newest is the one on
+   * screen; the only way to have two is a reverse `ask` from a background process arriving while an
+   * elicitation is up, and there the later bubble is still the one the user is looking at.
+   */
+  private answerPendingAskWithText(conversationId: ConversationId, text: string): boolean {
+    let match: string | undefined;
+    for (const [reqId, pending] of this.pendingAsks) {
+      if (pending.conversationId === conversationId && pending.acceptsText) match = reqId;
+    }
+    if (match === undefined) {
+      // Nothing on screen — but a form may be mid-flight, with its next question still being
+      // posted. Park the answer for it rather than letting the message interrupt the form (see
+      // elicitGaps). A second message in the same gap is not parked: one parked answer belongs to
+      // one question, and guessing which of two it was is worse than the old behavior.
+      const gap = this.elicitGaps.get(conversationId);
+      if (!gap?.acceptsText || gap.parked !== undefined || gap.cancelled !== undefined) return false;
+      gap.parked = text;
+      console.log(`[ask] ${conversationId}: answer parked for the question being posted`);
+      return true;
+    }
+    const echo = text.length > ASK_ECHO_MAX ? `${text.slice(0, ASK_ECHO_MAX)}…` : text;
+    this.settleAsk(match, { kind: 'text', text }, `→ Answered: ${echo}`);
+    console.log(`[ask] ${conversationId}: question answered by a typed reply`);
+    return true;
+  }
+
+  /**
+   * Abandon every question this conversation has on screen (`/stop`, `/new`), and report how many.
+   *
+   * Without this a stopped turn leaves its question behind: the buttons stay live, `hasPendingWork`
+   * keeps the agent pinned for the rest of the ten-minute timeout, and — since a typed reply now
+   * answers the newest pending question — the user's NEXT message would be swallowed as an answer
+   * to a question whose turn no longer exists. Resolving null is the same thing a timeout does, so
+   * the caller blocked on it (an elicitation, or an `ask` over IPC) unblocks normally.
+   *
+   * A form mid-round has nothing on screen to cancel, so the cancellation is recorded on the gap and
+   * applied to the question the moment it appears — otherwise `/stop` timed exactly between two
+   * rounds left the next one posted and clickable for the rest of its timeout.
+   */
+  private cancelPendingAsks(conversationId: ConversationId, reason: string): number {
+    const gap = this.elicitGaps.get(conversationId);
+    if (gap && gap.cancelled === undefined) {
+      // First reason wins: `/stop` cancels, and the turn abort it triggers cancels again a moment
+      // later. What the user did is the useful half of that pair, and it is the one that arrives
+      // first.
+      gap.cancelled = reason;
+      gap.parked = undefined; // an answer to a form nobody is waiting on any more
+    }
+    let cancelled = 0;
+    for (const [reqId, pending] of [...this.pendingAsks]) {
+      if (pending.conversationId !== conversationId) continue;
+      if (this.settleAsk(reqId, null, `(${reason})`)) cancelled++;
+    }
+    if (cancelled > 0) console.log(`[ask] ${conversationId}: ${cancelled} question(s) called off (${reason})`);
+    return cancelled;
   }
 
   /**
@@ -760,6 +951,12 @@ export class Daemon {
    * the agent needs ALL of, so carrying on to ask question three after question two timed out
    * would collect an answer it cannot use, having already made the user tap twice for nothing.
    *
+   * A round can be answered by typing instead of tapping — which is the only usable answer when
+   * none of the options fit, and the reason the question carries an "Other" field at all. The typed
+   * words go back under that field (ElicitQuestion.customKey), where the harness gives them
+   * precedence over the enum; crucially, the turn is NOT interrupted, so the remaining questions
+   * are still asked. Before this, typing at question 2 of 3 killed the turn and lost question 3.
+   *
    * Option rationales go in the message body rather than on the buttons. They are frequently the
    * most useful part of the question ("you already run pgvector here, so reusing it costs
    * nothing") and a button label cannot hold a sentence on any of the eight platforms.
@@ -770,23 +967,57 @@ export class Daemon {
     address: ConversationAddress,
     request: AgentElicitation
   ): Promise<ElicitAnswer> {
+    // Open the between-rounds window for this form (see elicitGaps), and close it whatever happens:
+    // a leaked entry would park a later message against a form that is long over.
+    const gap: ElicitGap = {
+      acceptsText: request.questions.every((q) => q.customKey !== undefined),
+    };
+    this.elicitGaps.set(conversationId, gap);
+    try {
+      return await this.askRounds(conversationId, platform, address, request);
+    } finally {
+      this.elicitGaps.delete(conversationId);
+      // Only reachable when the round that would have taken it never got posted (the send failed,
+      // so askButtons rejected). Said out loud rather than dropped in silence — it is the user's
+      // sentence that is going nowhere.
+      if (gap.parked !== undefined) {
+        console.warn(`[ask] ${conversationId}: a parked answer was never delivered: ${gap.parked}`);
+      }
+    }
+  }
+
+  /** The rounds themselves; split out of onElicitRequest so the gap window has a `finally` to close in. */
+  private async askRounds(
+    conversationId: ConversationId,
+    platform: PlatformAdapter,
+    address: ConversationAddress,
+    request: AgentElicitation
+  ): Promise<ElicitAnswer> {
     const content: Record<string, string | string[]> = {};
     for (const [i, q] of request.questions.entries()) {
-      const label = await this.askButtons(
+      const answer = await this.askButtons(
         platform,
         address,
         composeElicitPrompt(q, i, request.questions.length),
         q.options.map((o) => o.label),
         DEFAULT_ASK_TIMEOUT_MS,
-        conversationId
+        conversationId,
+        q.customKey !== undefined
       );
-      if (label === null) {
+      if (answer === null) {
         console.log(`[elicit] ${conversationId}: question ${i + 1} went unanswered; cancelling`);
         return { action: 'cancel' };
       }
+      if (answer.kind === 'text') {
+        // Only reachable when the question declared a free-text field (askButtons was told so
+        // above), so the key is present; the enum field is left unset on purpose, since sending
+        // both would make the harness pick between two answers for one question.
+        content[q.customKey!] = answer.text;
+        continue;
+      }
       // Send back the option's `value`, not the label the button carried: ACP separates display
       // text from the answer, and an MCP server that made them differ must get what it offered.
-      const picked = q.options.find((o) => o.label === label);
+      const picked = q.options.find((o) => o.label === answer.label);
       if (!picked) return { action: 'cancel' }; // unreachable: labels come from these very options
       content[q.key] = q.multi ? [picked.value] : picked.value;
     }
@@ -822,14 +1053,8 @@ export class Daemon {
     const pending = this.pendingAsks.get(parsed.reqId);
     if (!pending) return;
     if (parsed.index >= pending.labels.length) return;
-    clearTimeout(pending.timer);
-    this.pendingAsks.delete(parsed.reqId);
     const label = pending.labels[parsed.index]!; // bounds-checked above (index < labels.length)
-    pending.resolve(label);
-    // best-effort: strip buttons and mark the chosen option (via the adapter the ask was sent on).
-    void pending.adapter
-      .editMessage(pending.ref, `${pending.prompt}\n\n→ Selected: ${label}`)
-      .catch(() => undefined);
+    this.settleAsk(parsed.reqId, { kind: 'option', label }, `→ Selected: ${label}`);
   }
 
   /**

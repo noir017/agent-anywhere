@@ -149,6 +149,18 @@ export interface ElicitQuestion {
   /** Choosable options. Never empty. */
   options: ElicitOption[];
   /**
+   * Wire field key for this question's free-text "Other" box (`question_<n>_custom`), when the
+   * form offers one. Absent means this question can ONLY be answered by picking an option.
+   *
+   * This is what makes a typed reply answerable at all: the answer travels under THIS key, and the
+   * harness gives it precedence over the enum field (claude-agent-acp's
+   * applyAskElicitationResponse: "a typed custom answer wins over the selection"). Without it the
+   * only way to honour a typed reply would be to send the enum field a value the agent never
+   * offered — which is exactly what ElicitOption's doc says not to do — so a question with no
+   * custom key is left un-typeable rather than answered with a guess.
+   */
+  customKey?: string;
+  /**
    * Whether the wire field takes an array (ACP multi-select). Buttons are one tap, so the daemon
    * still collects exactly one option and returns it wrapped — the alternative (a stateful
    * multi-select UI on eight IM platforms) buys little over the model re-asking.

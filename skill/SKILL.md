@@ -113,6 +113,9 @@ Sends a message with buttons and **blocks** until the user clicks or the timeout
 (default 120 s) expires. stdout is the chosen label verbatim — branch on it directly:
 
 - stdout `Deploy` → the user picked "Deploy".
+- Any other non-empty stdout → the user typed their own answer instead of tapping, which is
+  what they do when none of your options fit. Read it as the answer; it is not a malformed
+  option.
 - Empty stdout → timeout / no selection. Pick a sensible default yourself and say so;
   don't re-ask in a loop.
 

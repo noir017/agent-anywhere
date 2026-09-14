@@ -21,6 +21,7 @@ import {
   describeConversation,
   formatAddress,
   type ConversationAddress,
+  type ConversationRef,
 } from '../core/conversation.js';
 import type {
   AgentCommand,
@@ -177,6 +178,12 @@ const STOP_ACK: Record<StopOutcome, string> = {
   collecting: '⏹ Dropped the message that was about to start a turn. Nothing reached the agent.',
   idle: 'Nothing is running here.',
 };
+
+/**
+ * `/stop` when the only thing waiting here was a question. Its own line because the outcomes above
+ * are read off the merger, which knows nothing about a question posted outside a turn.
+ */
+const STOP_ACK_QUESTION = '⏹ Called off the question above. Nothing else was running.';
 
 /**
  * How often the idle sweeper looks for conversations to reclaim.
@@ -413,6 +420,25 @@ export class ConversationRegistry {
        * forever, and nothing would ever notice.
        */
       hasPendingWork?(id: ConversationId): boolean;
+      /**
+       * A message arrived while this conversation has a question on screen: record it as the
+       * answer to that question. Returns true when it was consumed, in which case no turn runs.
+       *
+       * The registry asks rather than decides because the questions live on the daemon
+       * (pendingAsks) — same split as every other hook here. What the registry owns is the
+       * PLACEMENT of the call in route(): past the access check and the gate (an answer has to come
+       * from someone allowed to talk to the bot, and in a guild channel it still has to be
+       * addressed at us), and past the daemon commands (so `/stop` can still call the question
+       * off), but before the merger — because reaching the merger is precisely the bug.
+       */
+      answerPendingAsk?(id: ConversationId, text: string): boolean;
+      /**
+       * Abandon the questions this conversation has on screen, returning how many were retired.
+       * Called when the user cancels the work they belong to (`/stop`, `/new`); the reason is shown
+       * on the retired bubble. The count is what lets `/stop` avoid answering "nothing is running"
+       * to someone who just called off a question.
+       */
+      cancelPendingAsks?(id: ConversationId, reason: string): number;
     },
     /** Persistent conversation state (agent binding + each agent's own session id). */
     private readonly store?: ConversationStore,
@@ -699,6 +725,17 @@ export class ConversationRegistry {
 
     // Commands the gateway answers itself, before any agent sees them.
     if (this.answerDaemonCommand(key, msg, address, choice.agentId)) return;
+
+    // A question is on screen and this message is the answer to it (see answersPendingQuestion).
+    // Placed here deliberately:
+    //
+    //  - after the daemon commands, so `/stop` and `/new` still reach the user's own escape hatch
+    //    rather than being filed away as an answer to a question they are trying to get out of;
+    //  - before the merger, because the merger interrupts the running turn — and that turn is the
+    //    one blocked on the question. Typing an answer to question 2 of a 3-question form used to
+    //    kill the agent mid-form, so questions 1 and 2 were answered for nothing and question 3
+    //    was never asked.
+    if (this.answersPendingQuestion(key, msg)) return;
 
     // An agent command naming a harness this deployment doesn't run (`/agy` with no agy agent):
     // answered here, never forwarded. Only reachable when resolveAgent declined the name, so a
@@ -1103,6 +1140,9 @@ export class ConversationRegistry {
     // and only because the user asked in so many words.
     if (CONTEXT_CLEAR_RE.test(text)) {
       const agentId = this.boundAgentFor(key, fallbackAgent);
+      // Before the reset: a question still waiting on this conversation belongs to the context
+      // being discarded, and its caller is blocked until somebody answers it.
+      this.hooks?.cancelPendingAsks?.(key, 'context cleared');
       this.resetConversation(key);
       console.log(`[conversation] ${key} context cleared by ${conv.platform}:${conv.user}`);
       ack('context clear', 'Context cleared — the next message starts a fresh conversation.');
@@ -1118,9 +1158,7 @@ export class ConversationRegistry {
     // conversation. Never forwarded either: no harness has a slash command that could cancel the
     // very turn carrying it.
     if (STOP_RE.test(text)) {
-      const outcome = this.stopConversation(key);
-      console.log(`[conversation] ${key} /stop by ${conv.platform}:${conv.user} → ${outcome}`);
-      ack('/stop', STOP_ACK[outcome]);
+      ack('/stop', this.stopAndReport(key, conv));
       return true;
     }
 
@@ -1174,6 +1212,39 @@ export class ConversationRegistry {
     }
 
     return false;
+  }
+
+  /**
+   * `/stop`: end what is running here and say what that was.
+   *
+   * A question on screen is part of what is being stopped — the turn holding it is about to be
+   * cancelled — so it is retired first, rather than left live for the rest of its ten-minute
+   * timeout, where it would also read the next message as its answer. And it counts as work even
+   * when the merger reads idle: a reverse `ask` from a background process blocks outside any turn,
+   * so answering "nothing is running" to the person who just called one off would be flatly untrue.
+   */
+  private stopAndReport(key: ConversationId, conv: ConversationRef): string {
+    const calledOff = this.hooks?.cancelPendingAsks?.(key, 'stopped') ?? 0;
+    const outcome = this.stopConversation(key);
+    console.log(`[conversation] ${key} /stop by ${conv.platform}:${conv.user} → ${outcome}`);
+    return outcome === 'idle' && calledOff > 0 ? STOP_ACK_QUESTION : STOP_ACK[outcome];
+  }
+
+  /**
+   * Whether this message is the answer to a question the daemon has on screen here, in which case
+   * it has been recorded as one and no turn runs (see the hook's doc for why the placement in
+   * route() is the load-bearing part).
+   *
+   * Attachments are NOT an answer: the wire field a typed answer travels in takes a string, so an
+   * image sent here could only be silently dropped. Such a message keeps its old meaning — a new
+   * instruction, interrupting the turn — which is also the way out of a question whose options are
+   * all wrong on a harness that offers no free-text field.
+   */
+  private answersPendingQuestion(key: ConversationId, msg: InboundMessage): boolean {
+    if ((msg.attachments?.length ?? 0) > 0) return false;
+    const answer = msg.content.trim();
+    if (answer.length === 0) return false;
+    return this.hooks?.answerPendingAsk?.(key, answer) ?? false;
   }
 
   /**
@@ -2089,8 +2160,17 @@ ${formatTokens(left)} left before compaction — ${name}`;
         // (a shared-scope conversation's platform may have changed since the merger was built).
         addReaction: (ref, emoji) => this.adapterFor(conversationId).addReaction(ref, emoji),
         runTurn: (batch, signal) => this.turnRunner.runTurn(conversationId, batch, signal),
-        abortTurn: () =>
-          this.agents.getOrCreate(conversationId, this.agentIdOf(conversationId)).abort(),
+        abortTurn: () => {
+          // A turn can be blocked on a question when it is cancelled — the agent is waiting on an
+          // elicitation nobody has answered. The buttons have to go with the turn: left behind they
+          // stay clickable against a request that no longer exists, keep the child pinned by
+          // hasPendingWork for the rest of the ask timeout, and (since a typed reply now answers
+          // the newest pending question) would read the NEXT message as their answer. This is the
+          // one choke point both ways of cancelling pass through — `/stop` and an interrupting
+          // message — so it is where they are retired.
+          this.hooks?.cancelPendingAsks?.(conversationId, 'interrupted');
+          this.agents.getOrCreate(conversationId, this.agentIdOf(conversationId)).abort();
+        },
         // The turn ended and nothing is queued behind it: that instant, not the moment the message
         // arrived, is when this conversation started being idle. Reclaim measures from here, which
         // is why a task that runs for hours is never a candidate while it runs.

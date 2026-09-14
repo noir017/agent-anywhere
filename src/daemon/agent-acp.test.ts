@@ -619,6 +619,24 @@ describe('parseFormElicitation (agent asks the user, ACP elicitation/create)', (
     expect(opts[2]!.description).toBeUndefined(); // absent, not empty string
   });
 
+  it('records the free-text field, which is where a typed reply is sent back', () => {
+    // Not a round of its own (a button row cannot collect free text), but not discarded either:
+    // this key is the only honest place to put an answer the user typed, and the harness prefers
+    // it over the enum field. Without it, honouring a typed reply would mean sending `question_0`
+    // a value the agent never offered.
+    expect(parseFormElicitation(REAL)!.questions[0]!.customKey).toBe('question_0_custom');
+  });
+
+  it('claims no free-text field when the form declared none', () => {
+    // An MCP server's own elicitation: enum options, no "Other" box. Such a question can only be
+    // answered by tapping, and the daemon leaves a typed message meaning what it always meant.
+    const e = parseFormElicitation({
+      mode: 'form', sessionId: 's', message: 'pick',
+      requestedSchema: { type: 'object', properties: { choice: { type: 'string', oneOf: [{ const: 'a', title: 'A' }] } } },
+    } as unknown as CreateElicitationRequest)!;
+    expect(e.questions[0]!.customKey).toBeUndefined();
+  });
+
   it('carries the per-question text when a form asks several things', () => {
     const e = parseFormElicitation({
       mode: 'form',

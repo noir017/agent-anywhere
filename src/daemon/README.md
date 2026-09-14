@@ -599,6 +599,26 @@ command uses. Anything unrenderable (url mode, no turn open, no tappable options
 `cancel`led rather than answered, so the model learns the question went unanswered instead
 of acting on a choice nobody made.
 
+**A question can also be answered by typing.** claude declares a free-text `question_<n>_custom`
+field beside every question (its "Other" box) and prefers it over the enum, so a message typed while
+a question is on screen is recorded there — `ElicitQuestion.customKey` carries the key. The
+interception lives in `ConversationRegistry.route()`, deliberately placed past the gate and past the
+daemon commands but **before the merger**: reaching the merger is the bug. The merger interrupts the
+running turn, and the running turn is the one blocked on the question, so typing an answer to
+question 2 of 3 used to kill the form — the first two answers thrown away, the third never asked,
+and the reply re-run as a fresh instruction. Not consumed: a message carrying attachments (the field
+takes a string), and any question whose form declared no free-text field (sending the words as the
+enum value would hand the agent something it never offered). Both keep the old meaning, which is
+also the way out of a question you cannot answer.
+
+Questions are retired — buttons cleared, outcome written onto the bubble — on every exit: a tap, a
+typed answer, a timeout, `/stop`, `/new`, and any interruption of the turn (`abortTurn`, the one
+choke point both cancellations pass through). Leaving one behind is not cosmetic: its buttons stay
+live against a request that no longer exists, `hasPendingWork` pins the child until the ask times
+out, and the next message would be read as its answer. The clearing goes through `editButtons(ref,
+text, [])` rather than a text-only `editMessage` for the reason given at `editModelMenu` — only
+Discord and Telegram drop components on a plain edit.
+
 Two things this costs elsewhere: the turn's silence watchdog treats a pending elicitation
 as "blocked on a human, not hung" and re-arms instead of aborting (`awaitingUser`), and
 option rationales are rendered into the message body because a button label cannot hold a

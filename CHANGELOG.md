@@ -5,6 +5,34 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Typing an answer no longer kills the question — or the ones after it.** When the agent asks with
+  buttons and none of the options fit, the only usable answer is to type one. That message went to
+  the inbound merger, whose job is to interrupt the running turn — and the running turn is the one
+  blocked on the question. So on a form that asked three things, answering the second in words threw
+  away the first two answers, never asked the third, and re-ran the reply as a fresh instruction
+  stripped of the context that made it an answer. Reported from a real session; reproducible on every
+  multi-question form.
+
+  A message arriving while a question is on screen is now recorded as the answer to that question and
+  consumed there, so the form carries on to the next one. The words travel back under the question's
+  own free-text field — `question_<n>_custom`, which claude-agent-acp declares beside every question
+  and prefers over the enum — rather than being passed off as an option the model listed; that
+  distinction is why the parser now keeps a field it used to drop. Two messages deliberately keep
+  their old meaning: one carrying an attachment (the field takes a string, so the image could only be
+  dropped in silence), and one answering a question whose form declared no free-text field at all (an
+  MCP server's own elicitation). Both interrupt, as before — which is also the way out of a question
+  you cannot answer. `/stop`, `/new` and the daemon's other commands are still read as commands.
+
+- **An answered question stops looking like an open one.** The bubble is now edited on every exit —
+  tapped, typed, timed out, `/stop`, `/new`, or any interruption of the turn it belonged to — with
+  the buttons cleared and the outcome written onto it. Two things were wrong before: the edit went
+  through `editMessage`, which only drops components on Discord and Telegram, so on Slack and Lark
+  the buttons of an already-answered question stayed clickable against a request that no longer
+  existed; and a turn cancelled while blocked on a question left that question behind entirely,
+  pinning the agent's child process for the rest of the ten-minute ask timeout.
+
 ## [1.9.1] - 2026-09-12
 
 ### Fixed

@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-09-14
+
 ### Fixed
 
 - **Typing an answer no longer kills the question — or the ones after it.** When the agent asks with

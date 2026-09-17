@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.11.1] - 2026-09-17
+
 ### Fixed
 
 - **A rate-limited opencode no longer reads as a hung agent.** Reported 2026-09-17: every `oc` turn

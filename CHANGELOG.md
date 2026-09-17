@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.11.2] - 2026-09-17
+
 ### Fixed
 
 - **Telegram images reach the agent.** Every inbound photo, document and voice note was dropped, and

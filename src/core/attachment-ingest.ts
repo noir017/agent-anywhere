@@ -93,9 +93,43 @@ function fenceLang(name: string | undefined): string {
   return '';
 }
 
-/** Display filename fallback. */
+/**
+ * Display filename fallback.
+ *
+ * A `data:` URL needs its own answer: it IS the file rather than a path to one, so the last
+ * `/`-separated chunk — which is what names an ordinary URL — is a slice of base64, and a photo
+ * would be labelled with a kilobyte of it. Satori's adapters produce these for platforms whose
+ * media sits behind an authenticated API (adapter-telegram inlines every inbound photo this way),
+ * so this is the normal case for a Telegram image, not an edge one.
+ */
 function displayName(att: AttachmentInput): string {
-  return att.name && att.name.length > 0 ? att.name : att.url.split('/').pop() || att.url;
+  if (att.name && att.name.length > 0) return att.name;
+  if (isInlineUrl(att.url)) {
+    const mime = att.mime ?? /^data:([^;,]+)/.exec(att.url)?.[1];
+    const ext = mime?.split('/')[1]?.replace(/\+.*$/, '');
+    const kind = mime?.startsWith('image/') ? 'image' : 'file';
+    return ext ? `${kind}.${ext}` : kind;
+  }
+  return att.url.split('/').pop() || att.url;
+}
+
+/** Whether the "URL" is really the bytes themselves. */
+function isInlineUrl(url: string): boolean {
+  return url.startsWith('data:');
+}
+
+/**
+ * A URL short enough to name in a prompt line.
+ *
+ * The failure lines quote the URL so the agent can retry or report it, which is right for an http
+ * one and catastrophic for a `data:` one: quoting it would paste the entire file into the prompt as
+ * base64 — the exact payload the size limits above exist to keep out, arriving through the error
+ * path instead.
+ */
+function displayUrl(url: string): string {
+  if (!isInlineUrl(url)) return url;
+  const comma = url.indexOf(',');
+  return `${comma > 0 ? url.slice(0, comma) : 'data:'},…(${url.length} chars inline)`;
 }
 
 /**
@@ -141,7 +175,7 @@ export async function ingestAttachments(
 
       // Oversized text (known size > maxInjectBytes), binary, image: by download threshold.
       if (att.size !== undefined && att.size > cfg.maxDownloadBytes) {
-        lines.push(`[Attachment ${name} is too large (${att.size} bytes), not downloaded. URL: ${att.url}]`);
+        lines.push(`[Attachment ${name} is too large (${att.size} bytes), not downloaded. URL: ${displayUrl(att.url)}]`);
         continue;
       }
       // size unknown or ≤ maxDownloadBytes: download and persist.
@@ -172,7 +206,7 @@ export async function ingestAttachments(
       );
     } catch {
       // Single failure degrades to a line, doesn't affect the rest.
-      lines.push(`[Attachment ${name} failed to download. URL: ${att.url}]`);
+      lines.push(`[Attachment ${name} failed to download. URL: ${displayUrl(att.url)}]`);
     }
   }
 

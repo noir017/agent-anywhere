@@ -5,6 +5,31 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Telegram images reach the agent.** Every inbound photo, document and voice note was dropped, and
+  almost silently: the log carried one `TypeError: Invalid URL … input: '/photos/file_10.jpg'` and
+  the agent simply received a message with no attachment. Two upstream packages disagree, each
+  reasonable alone — `adapter-telegram` asks for a file by its API-relative path against an
+  `endpoint` carrying the bot token, and `@satorijs/core`'s `http/file` listener runs `new URL()` on
+  whatever it is handed. `plugin-http` emits that listener *before* it resolves the path, so satori
+  sees `/photos/…`, throws, and the adapter turns the throw into an image element with no `src` at
+  all. Not fixable by upgrading: those are the current releases of both (checked 2026-09-17).
+
+  A listener prepended to the same event resolves relative paths first, so satori's own only ever
+  sees the absolute URLs it was written for. It is pinned by a contract test that reproduces the
+  upstream bug itself, so the day upstream guards that call, the test fails and this workaround can
+  be deleted.
+
+  Fixing that exposed the layer behind it. adapter-telegram does not return a link — it downloads the
+  file with the bot token and inlines it as `data:<mime>;base64,…`, a shape the attachment pipeline
+  had never actually been handed, because nothing had ever got that far. The downloader now returns
+  such bytes directly (the SSRF guard has nothing to act on — no host, no DNS, no request — so only
+  the size cap applies, and it is enforced), and the ingest names the file from its mime instead of
+  the last `/`-separated chunk of the URL, which for one of these is a slice of base64. The failure
+  lines quote a truncated form too: quoting a `data:` URL back would paste the entire image into the
+  prompt as base64, through the error path, past every size limit meant to prevent exactly that.
+
 ## [1.11.1] - 2026-09-17
 
 ### Fixed

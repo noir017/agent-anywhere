@@ -40,6 +40,7 @@ Three rules keep this from rotting:
 | `adapter.ts` | `PlatformAdapter` + `PlatformCapabilities` — what `daemon/` sees |
 | `profile.ts` | `PlatformProfile` — the seam every platform implements |
 | `satori-core.ts` | Generic assembly of an adapter from a profile + one instance |
+| `satori-file-url.ts` | Repairs an upstream `http.file()` collision that broke every Telegram download |
 | `platform-factory.ts` | `type` → profile factory dispatch |
 | `config-schemas.ts` | Per-platform credential schemas (+ `ChatGateSchema`) |
 | `profile-helpers.ts` | Shared pure utilities for profiles |
@@ -212,6 +213,22 @@ the filename from the raw event body (a `file` message states it, and the profil
 `file_key` in the same `internal/session` hook that learns topic anchors), the mime and
 extension by sniffing magic bytes. An extension-less blob is a file the agent cannot open, and
 guessing `.jpg` for a png is worse than looking.
+
+The opposite case is a URL that is not a location at all. adapter-telegram downloads an inbound
+file with the bot token and inlines it as `data:<mime>;base64,…`, so for Telegram every photo,
+document and voice note arrives *as its own bytes*. Two layers had to learn that: the downloader
+returns them directly (the SSRF guard has no host to check and no request to make — only the size
+cap applies), and the ingest names the attachment from its mime rather than the last `/`-separated
+chunk of the URL, which here is a slice of base64. The failure lines quote a truncated form for the
+same reason: quoting a `data:` URL back would paste the whole file into the prompt.
+
+Getting that far first needs `satori-file-url.ts`, which repairs an upstream collision: adapter-telegram
+asks for a file by its API-relative path (`/photos/file_13.jpg`) against an `endpoint` carrying the
+token, and `@satorijs/core`'s own `http/file` listener runs `new URL()` on that path *before*
+`plugin-http` resolves it — throwing `ERR_INVALID_URL` and killing every Telegram file download
+before it starts. A listener prepended to the same event resolves relative paths first, so satori's
+only ever sees absolute URLs. It is pinned by a contract test that reproduces the upstream bug, and
+both the fix and this paragraph can go once upstream guards that call.
 
 ## Inbound content an adapter leaves empty
 

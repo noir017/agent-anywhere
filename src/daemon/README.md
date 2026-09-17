@@ -22,6 +22,7 @@ session id, agy's conversation id). One conversation holds one session *per agen
 | `agent-factory.ts` | Dispatch: which runtime serves which agent |
 | `agent-acp.ts` | ACP runtime (claude, codex, opencode, gemini, custom) |
 | `agent-agy.ts` | Antigravity CLI runtime — its own stream-json protocol |
+| `agy-statusline.ts` | The only channel agy reports context usage on: a shim installed into its `statusLine` setting |
 | `agent-common.ts` | Protocol-agnostic helpers shared by both runtimes |
 | `conversation-store.ts` | Persisted per conversation: the bound agent, each agent's own session id, and the directory it works in |
 | `workdir-scan.ts` | The `/cd` option list: an agent's configured root plus the projects one level inside it |
@@ -529,12 +530,16 @@ Protocol mapping (verified empirically against agy 1.1.22):
 | `init.model` | `onModel` — stored at spawn, replayed at the top of every turn |
 | SIGINT | abort (agy has no in-band cancel) |
 
-Launched with `--disable-slash-commands` by default: in stream-json mode a CLI-answered
-slash (`/model`, `/usage`) **aborts the whole session**, and chat users type `/…`
-constantly. `args: ["--disable-slash-commands=false"]` opts back in; all default flags
-are overridable through `args`, since agy's flag parsing is last-wins. Consequently agy
-reports no command list, so `/agy` switches the conversation but its bare form acks the
-binding rather than posting an empty menu.
+Launched WITHOUT `--disable-slash-commands`, which it used to carry. Re-probed on agy
+1.2.0 (2026-09-17): a skill slash expands and answers normally, an unrecognized slash
+reaches the model as plain text, and only the eleven commands `agy -p /help` lists are
+fatal — one of those in the session answers "…is answered by the CLI itself", sets
+`status:ERROR` and exits with code 2, taking every later turn with it. Those eleven are
+listed in `core/command-translate.ts` (`HARNESS_CLI_ANSWERED`) and answered by
+`runAgyCliCommand`, a one-shot `agy -p=/<name>` run in the conversation's directory —
+which is what agy's own error message recommends. So agy's skills work here, while agy
+still pushes no command list over the wire: `/agy` switches the conversation and its bare
+form acks the binding rather than posting an empty menu.
 
 Models: agy names the one it is serving in `init` (`onModel` is replayed each turn, because the
 footer reads a per-turn record). While `agy` has no in-process protocol switch, `agy models` lists
@@ -542,6 +547,12 @@ available choices, and `setModel` switches via a kill-and-respawn strategy: `tea
 child, and the next turn respawns with `--model=<value>` while `--conversation=<id>` restores
 conversation context intact from local disk. `modelSelector()` reports the parsed model list,
 bringing the `/model` menu and command to the agy harness.
+
+Context usage: agy reports none over its protocol, so `agy-statusline.ts` installs a shim into
+agy's `statusLine` setting and `runTurn` reads the recorded snapshot back at the end of each turn,
+feeding the same `onUsage` the ACP runtimes call. Read that file's header before touching it — it
+writes to another product's config, and it carries `isCliEntry` for the reason the reverse-CLI shim
+does.
 
 ### `agent-common.ts`
 
@@ -814,14 +825,22 @@ back to whatever PATH offers.
 
 ## Tests
 
-Sixteen test files. `agent-acp.test.ts` and `agent-agy.test.ts` cover protocol
+Eighteen test files. `agent-acp.test.ts` and `agent-agy.test.ts` cover protocol
 translation; `routing.test.ts`, `command-routing.test.ts`, `session-control.test.ts`,
 `session-reclaim.test.ts`,
 `conversation-store.test.ts`, `conversation-token-registry.test.ts`,
 `multi-platform.test.ts`, `slash-register.test.ts`, `ask-button.test.ts`,
 `picker-click.test.ts`, `model-menu-click.test.ts`, `settings-command.test.ts`,
-`local-commands.test.ts`,
+`local-commands.test.ts`, `agy-cli-command.test.ts`, `agy-statusline.test.ts`,
 `permission.test.ts`, and `attachment-io.test.ts` cover the rest.
+
+Two of those are worth knowing about before you touch the agy harness.
+`agy-cli-command.test.ts` is written as negative assertions — each case asserts that a
+name agy's CLI owns did NOT become a prompt, because the failure it guards is a dead
+session rather than a wrong answer. `agy-statusline.test.ts` executes the shim this
+daemon actually installs, feeding it a frame captured verbatim from agy 1.2.0 and
+reading the numbers back the way the runtime does, so a rewrite of that generated script
+cannot pass by being plausible.
 
 `settings-command.test.ts` is the only suite here that asserts against a real file on disk
 (`AGENT_ANYWHERE_CONFIG_FILE` pointed at a tmp dir), and deliberately so: its most valuable

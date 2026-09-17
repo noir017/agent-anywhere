@@ -3,6 +3,8 @@ import {
   buildAgyArgs,
   consumeNdJsonLines,
   createAgyAgentFactory,
+  formatAgyCliOutput,
+  formatAgyQuota,
   parseAgyModelsOutput,
   toolLabel,
   translateAgyEvent,
@@ -246,8 +248,11 @@ describe('buildAgyArgs', () => {
     expect(args).toContain('--output-format=stream-json');
     // Default --print-timeout is 5m and kills long turns; the daemon's own watchdog bounds them.
     expect(args.some((a) => a.startsWith('--print-timeout='))).toBe(true);
-    // Without this, any `/…` message makes agy exit and the session is lost.
-    expect(args).toContain('--disable-slash-commands');
+    // NOT --disable-slash-commands. Re-probed on agy 1.2.0: a skill slash expands and answers, an
+    // unknown slash reaches the model as text, and only the commands `agy -p /help` lists are fatal
+    // — those are kept out of the session by name (core/command-translate.ts HARNESS_CLI_ANSWERED),
+    // which is what lets agy's skills work here at all.
+    expect(args).not.toContain('--disable-slash-commands');
     // The daemon is a headless client: it auto-approves tools for every harness.
     expect(args).toContain('--dangerously-skip-permissions');
     // Trust the agent's own cwd, else file writes are redirected to agy's scratch dir.
@@ -260,8 +265,8 @@ describe('buildAgyArgs', () => {
   });
 
   it('appends def.args after the presets so a user can override any default (Go is last-wins)', () => {
-    const args = buildAgyArgs(def({ args: ['--disable-slash-commands=false'] }), '/work');
-    expect(args.indexOf('--disable-slash-commands=false')).toBeGreaterThan(args.indexOf('--disable-slash-commands'));
+    const args = buildAgyArgs(def({ args: ['--print-timeout=30m'] }), '/work');
+    expect(args.indexOf('--print-timeout=30m')).toBeGreaterThan(args.indexOf('--print-timeout=8760h'));
   });
 
   it('passes the model only when configured', () => {
@@ -420,5 +425,57 @@ describe('createAgyAgentFactory — model selector and switching', () => {
 
     factory.dispose('conv-1');
     expect(factory.peek('conv-1')).toBeUndefined();
+  });
+});
+
+describe('formatAgyQuota', () => {
+  // Verbatim from `agy -p=/usage` on agy 1.2.0 (2026-09-17).
+  const raw = [
+    'Gemini Models\tWeekly Limit Remaining\t100%\t2026-09-24T06:12:21Z',
+    'Claude and GPT models\tWeekly Limit Remaining\t94%\t2026-09-22T01:42:55Z',
+  ].join('\n');
+  const now = Date.parse('2026-09-17T06:12:21Z');
+
+  it('renders each pool with a bar and a duration until reset', () => {
+    const out = formatAgyQuota(raw, now)!;
+    expect(out).toContain('**Gemini Models** — Weekly Limit Remaining: 100% [████████]');
+    expect(out).toContain('(resets in 7d 0h)');
+    // A UTC timestamp is arithmetic; the duration is the part that is actionable.
+    expect(out).toContain('**Claude and GPT models**');
+    expect(out).toContain('(resets in 4d 19h)');
+  });
+
+  it('fills the bar in proportion to what is left', () => {
+    expect(formatAgyQuota('Pool\tMetric\t50%\t2026-09-24T06:12:21Z', now)).toContain('50% [████░░░░]');
+    expect(formatAgyQuota('Pool\tMetric\t0%\t2026-09-24T06:12:21Z', now)).toContain('0% [░░░░░░░░]');
+  });
+
+  it('declines a shape it does not recognize, so the caller can print it verbatim', () => {
+    // Dropping an answer that failed to parse would be worse than showing the raw rows.
+    expect(formatAgyQuota('some prose agy printed instead', now)).toBeUndefined();
+    expect(formatAgyQuota('', now)).toBeUndefined();
+  });
+});
+
+describe('formatAgyCliOutput', () => {
+  it('says so when the CLI printed nothing — that IS its answer for /agents and /hooks', () => {
+    expect(formatAgyCliOutput('agents', '')).toContain('agy answered with nothing');
+  });
+
+  it('fences output it has no structure for', () => {
+    expect(formatAgyCliOutput('effort', 'high')).toBe('```\nhigh\n```');
+  });
+
+  it('truncates a long answer and points at the host for the rest', () => {
+    // `/changelog` prints the whole release history; no platform takes that in one message.
+    const out = formatAgyCliOutput('changelog', 'x'.repeat(9_000));
+    expect(out.length).toBeLessThan(3_000);
+    expect(out).toContain('agy -p=/changelog');
+  });
+
+  it('routes /usage through the quota renderer', () => {
+    const out = formatAgyCliOutput('usage', 'Gemini Models\tWeekly\t50%\t2026-09-24T06:12:21Z');
+    expect(out).toContain('Quota:');
+    expect(out).not.toContain('```');
   });
 });

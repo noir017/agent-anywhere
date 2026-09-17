@@ -56,9 +56,9 @@ export function formatSkillCatalog(agentLabel: string, skills: readonly CatalogE
  * What to say when nothing was found.
  *
  * Names the directories that were searched, which is the whole of the diagnosis: either the harness
- * installs no skills (agy, dsh — nothing has been found for either) or they live somewhere this
- * does not look, and only the operator can tell which. Saying "no skills" without saying where it
- * looked leaves them with nothing to check.
+ * installs no skills (dsh — nothing has been found for it) or they live somewhere this does not
+ * look, and only the operator can tell which. Saying "no skills" without saying where it looked
+ * leaves them with nothing to check.
  *
  * An empty `dirs` means the harness has no known skills location at all, which is a different
  * sentence — there is no path to print and nothing for the operator to go and inspect.

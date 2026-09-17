@@ -56,6 +56,24 @@ CI runs) *before* creating the tag, so a failure costs you nothing but a re-run.
 
 Pushing is opt-in on purpose: the tag push is the irreversible step.
 
+## `verify-agy.ts` — re-probe the Antigravity harness against a real `agy`
+
+```bash
+npx tsx scripts/verify-agy.ts [<agy conversation id>]
+```
+
+Everything the agy runtime does rests on behaviour measured from the CLI, version by
+version: which flags are safe, which slash names end a session, where skills live, what
+the status line publishes. The unit tests pin those findings against captured fixtures,
+which is the right thing for CI and useless for the question this script answers — *is
+any of it still true on the agy currently installed?*
+
+It installs the status-line shim, lists the skill directories and what was found in them,
+runs three of agy's own CLI commands through `runAgyCliCommand`, prints the launch
+arguments, and — given a conversation id — reads back the usage that conversation
+recorded. It talks to the real CLI and the real home directory, so it is a development
+utility, not a test.
+
 ## Adding a script
 
 Development-only utilities belong here. Anything a *user* needs is a subcommand of the

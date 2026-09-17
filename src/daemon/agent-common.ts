@@ -132,6 +132,28 @@ export function resolveConversationCwd(
 }
 
 /**
+ * The part of an agent child's environment that has nothing to do with a session: the daemon's own
+ * environment, cleaned of the launcher's Claude Code markers, plus the agent's expanded `env` block.
+ *
+ * Split out from buildAgentEnv because the gateway also runs harness CLIs that are NOT sessions —
+ * agy's own slash commands, each answered by a one-shot process (daemon/agent-agy.ts). Those need
+ * the agent's identity (a `HOME` override decides which account's config the CLI reads) and must
+ * NOT get the reverse-command wiring: there is no turn to call back into, and a token in the
+ * environment of a process that cannot use it is a secret spent for nothing.
+ */
+export function buildHarnessEnv(def: AgentDef): Record<string, string | undefined> {
+  // spawn replaces the environment by default, so merge process.env explicitly.
+  const env: Record<string, string | undefined> = { ...process.env };
+  // Strip the launcher's Claude Code session markers: otherwise, if the daemon itself was launched
+  // inside a Claude Code session, the child inherits CLAUDECODE/CLAUDE_CODE_* and the underlying Claude
+  // CLI refuses with "Claude Code cannot be launched inside another Claude Code session".
+  delete env.CLAUDECODE;
+  for (const k of Object.keys(env)) if (k.startsWith('CLAUDE_CODE')) delete env[k];
+  for (const [k, v] of Object.entries(def.env)) env[k] = expandEnv(v);
+  return env;
+}
+
+/**
  * Build the environment for an agent child process: merged process.env + expanded def.env +
  * the per-session reverse-command wiring.
  *
@@ -143,14 +165,7 @@ export function buildAgentEnv(
   sessionToken: string,
   socketPath: string
 ): Record<string, string | undefined> {
-  // spawn replaces the environment by default, so merge process.env explicitly.
-  const env: Record<string, string | undefined> = { ...process.env };
-  // Strip the launcher's Claude Code session markers: otherwise, if the daemon itself was launched
-  // inside a Claude Code session, the child inherits CLAUDECODE/CLAUDE_CODE_* and the underlying Claude
-  // CLI refuses with "Claude Code cannot be launched inside another Claude Code session".
-  delete env.CLAUDECODE;
-  for (const k of Object.keys(env)) if (k.startsWith('CLAUDE_CODE')) delete env[k];
-  for (const [k, v] of Object.entries(def.env)) env[k] = expandEnv(v);
+  const env = buildHarnessEnv(def);
   env.AGENT_ANYWHERE_TURN_TOKEN = sessionToken;
   env.AGENT_ANYWHERE_SOCKET = socketPath;
   // Guarantee the reverse CLI the hint promises: prepend the self-provisioned shim dir so

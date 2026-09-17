@@ -5,6 +5,43 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **agy gets its skills back, and they were never really the problem.** The harness was launched with
+  `--disable-slash-commands` because a slash in a stream-json session can kill it — and that is true,
+  but of eleven names, not of every `/`. Re-probed on agy 1.2.0: a skill slash expands and answers
+  normally, an unrecognised one reaches the model as plain text, and only the commands agy's own CLI
+  intercepts are fatal (`status:ERROR` and process exit 2, which takes the conversation's child and
+  every turn queued behind it). Those eleven are exactly what `agy -p /help` lists, so the flag is
+  gone and the names are kept out of the session by name instead. Typing `/some-skill do the thing`
+  on agy now does what it does on claude.
+
+  The same eleven are no longer refused either: each is answered by a one-shot `agy -p=/<name>` run
+  in the conversation's directory, which is what agy's error message recommends. `/usage` therefore
+  reports real quota — pools, percentages left, and when each resets — and `/credits`, `/effort`,
+  `/config` and the rest answer in chat instead of "not supported". No model is invoked and no turn
+  is spent: the CLI answers these from local state.
+
+- **`/skills` finds agy's skills.** Five locations, which are agy's own rather than a guess:
+  `<cwd>/.agents/skills`, `~/.agents/skills`, `~/.gemini/antigravity-cli/skills`, `~/.gemini/skills`
+  and `~/.gemini/config/skills`. Asking agy instead was tried first and is not usable — `agy -p
+  /skills` answers with six entries here and omits all 25 under `~/.agents/skills`, skills it
+  nonetheless expands when they are typed.
+
+- **The footer finally shows agy's context usage.** agy reports no token counts over its protocol,
+  which is why `/context` on it answered "not supported" and the footer had nothing to print. It does
+  publish them — to whatever `statusLine` command its settings name, in headless runs as well as the
+  TUI (45 invocations across one measured two-turn session, the count climbing from zero to a real
+  number). The daemon now installs a shim into that setting and reads the snapshot back at the end of
+  each turn, so `used / size` reaches the same footer path the ACP harnesses use and `/context`
+  answers like it does everywhere else.
+
+  This writes to another product's config file, which nothing else here does, so: the previous
+  settings are backed up once, every other key is preserved, the shim still draws a status line for
+  the terminal (the same two lines this machine's operator had), and `AGENT_ANYWHERE_NO_AGY_STATUSLINE=1`
+  turns the whole thing off. `doctor` reports whether the setting is wired, since that is the only
+  explanation for an agy conversation with no numbers.
+
 ## [1.10.0] - 2026-09-14
 
 ### Fixed

@@ -401,12 +401,25 @@ misinterpret — strictly worse than telling the user it is unsupported.
 The table's only mechanism is TEXT: it rewrites `/x` and hands it to the agent as a
 prompt. So a capability the harness exposes over the **protocol** rather than as a slash
 command has no native name to translate to, and used to read as "not supported" — even
-though the gateway could answer it outright. Two do:
+though the gateway could answer it outright. Four do:
 
 | command | why there is no native name to translate to | what answers it |
 |---|---|---|
-| `/context` (opencode) | opencode's `/compact`-family commands are TUI-only; ACP mode never sees them | the last `usage_update {used, size}` the agent sent, the same numbers the footer prints |
+| `/context` (opencode, dsh) | opencode's `/compact`-family commands are TUI-only; ACP mode never sees them | the last `usage_update {used, size}` the agent sent, the same numbers the footer prints |
+| `/context` (agy) | agy's protocol carries no token counts at all — it hands them to whatever `statusLine` command its settings name, headless runs included | the snapshot `daemon/agy-statusline.ts` records from that shim, read back at the end of each turn |
+| `/usage` (agy) | agy's own CLI answers it, and forwarding that name into the session **kills the session** | a one-shot `agy -p=/usage`, rendered as quota bars |
 | `/model` (opencode, claude, agy) | opencode and claude expose the selector as a config option; agy reads it from `agy models` and switches via kill-and-respawn with `--model` and `--conversation` | `ConversationRegistry.applyModelCommand` via `AgentSession.modelSelector()` / `setModel()` |
+
+### `HARNESS_CLI_ANSWERED` — the names that must not be forwarded
+
+A separate list from the vocabulary above, answering a different question: not "can this
+be translated" but "would sending this anywhere near the agent break it". On `agy` the
+eleven commands its own CLI answers (`agy -p /help` prints them) end the stream-json
+session and every turn behind it — `status:ERROR`, process exit 2 — so `isCliAnsweredCommand`
+diverts them to a one-shot process instead. Everything else, skills above all, passes
+through untouched; both halves of that were probed on agy 1.2.0 and the evidence is in the
+file. It is a static copy of a list the CLI can produce, and the header says what that
+costs if agy ever adds a twelfth.
 
 `/model` has two surfaces, both built from `model-menu.ts` so they cannot disagree about
 what happened. On a platform that can post buttons **and** edit them afterwards, a bare

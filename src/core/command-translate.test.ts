@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   agentCommandSpecs,
+  isCliAnsweredCommand,
   agentForCommand,
   unconfiguredHarnessCommand,
   buildHelpText,
@@ -55,10 +56,12 @@ describe('translateCommand', () => {
     // A native spelling still wins where the harness really does own the answer.
     expect(translateCommand('context', 'claude')).toEqual({ kind: 'translated', native: 'context' });
     expect(translateCommand('context', 'gemini')).toEqual({ kind: 'translated', native: 'stats' });
-    // agy speaks no ACP, but model is answered locally via kill-and-respawn while /context stays
-    // unsupported because agy does not report usage telemetry.
+    // agy speaks no ACP, but each of these was tracked down to the channel agy does publish on:
+    // the model selector to `agy models` + kill-and-respawn, /usage to a one-shot `agy -p=/usage`,
+    // and /context to the snapshot agy hands its statusLine command (daemon/agy-statusline.ts).
     expect(translateCommand('model', 'agy')).toEqual({ kind: 'local' });
-    expect(translateCommand('context', 'agy')).toEqual({ kind: 'unsupported' });
+    expect(translateCommand('usage', 'agy')).toEqual({ kind: 'local' });
+    expect(translateCommand('context', 'agy')).toEqual({ kind: 'local' });
   });
 
   it('passes through anything outside the generic vocabulary', () => {
@@ -167,9 +170,11 @@ describe('translateCommand — agy', () => {
     // agy answers /compact itself and doing so aborts its stream-json session, so the daemon
     // must reject the generic name instead of passing it through to the agent.
     expect(translateCommand('compact', 'agy')).toEqual({ kind: 'unsupported' });
-    expect(translateCommand('context', 'agy')).toEqual({ kind: 'unsupported' });
-    // /model is handled locally via kill-and-respawn with --model and --conversation
+    // /model via kill-and-respawn with --model and --conversation; /context from the snapshot agy
+    // hands its statusLine command; /usage from a one-shot `agy -p=/usage`.
     expect(translateCommand('model', 'agy')).toEqual({ kind: 'local' });
+    expect(translateCommand('context', 'agy')).toEqual({ kind: 'local' });
+    expect(translateCommand('usage', 'agy')).toEqual({ kind: 'local' });
   });
 
   it('still passes through a non-generic name (a skill or plugin command)', () => {
@@ -265,12 +270,15 @@ describe('buildHelpText', () => {
     expect(text).not.toContain('/usage');
   });
 
-  it('lists only supported generic commands for agy (/model via local handler)', () => {
+  it('lists only supported generic commands for agy (all three via local handlers)', () => {
     const text = buildHelpText(cfg, { agent: 'g', harness: 'agy' });
     expect(text).toContain('Works on the current agent');
+    // Each of these is answered by the gateway, having been traced to the channel agy publishes
+    // it on — so each belongs in the help of an agy conversation, and /compact still does not.
     expect(text).toContain('/model');
+    expect(text).toContain('/context');
+    expect(text).toContain('/usage');
     expect(text).not.toContain('/compact');
-    expect(text).not.toContain('/context');
     // The agent commands still list, because switching away is what a stuck user needs.
     expect(text).toContain('/cc');
   });
@@ -305,5 +313,36 @@ describe('dsh harness commands', () => {
   it('dsh has no native spelling for /compact or /usage', () => {
     expect(translateCommand('compact', 'dsh')).toEqual({ kind: 'unsupported' });
     expect(translateCommand('usage', 'dsh')).toEqual({ kind: 'unsupported' });
+  });
+});
+
+describe('isCliAnsweredCommand', () => {
+  /**
+   * The list is what `agy -p /help` prints. Its job is not completeness for its own sake: a name
+   * missing from it reaches the resident session, and on agy 1.2.0 that ends the session and every
+   * turn queued behind it (status ERROR, process exit 2).
+   */
+  it('names every command agy’s own CLI intercepts', () => {
+    for (const name of [
+      'agents', 'changelog', 'config', 'credits', 'effort',
+      'help', 'hooks', 'model', 'permissions', 'skills', 'usage',
+    ]) {
+      expect(isCliAnsweredCommand(name, 'agy')).toBe(true);
+    }
+  });
+
+  it('leaves skills and unknown names alone — both were probed harmless', () => {
+    expect(isCliAnsweredCommand('omp-handoff', 'agy')).toBe(false);
+    expect(isCliAnsweredCommand('totally-not-a-real-command-xyz', 'agy')).toBe(false);
+  });
+
+  it('is case-insensitive, since a typed command is whatever the user typed', () => {
+    expect(isCliAnsweredCommand('Credits', 'agy')).toBe(true);
+  });
+
+  it('applies to no other harness: they take these over the protocol, not the CLI', () => {
+    expect(isCliAnsweredCommand('model', 'claude')).toBe(false);
+    expect(isCliAnsweredCommand('usage', 'opencode')).toBe(false);
+    expect(isCliAnsweredCommand('model', undefined)).toBe(false);
   });
 });

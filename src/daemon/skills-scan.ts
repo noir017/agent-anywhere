@@ -67,8 +67,26 @@ export function agentHome(def: AgentDef | undefined): string {
  *               project's own skills are exactly the ones relevant to the work being asked for.
  *  - opencode — no convention is assumed: it reads whatever `skills` names in `opencode.json`
  *               (`/home/user/agent-skills/skills` here). Passed in as `configured`.
- *  - others   — none. agy and dsh install no skills that have been found, and inventing a path
- *               would produce a confidently empty list rather than an honest one.
+ *  - agy      — five locations, which is agy's own layout rather than a guess: its "Create new
+ *               skills" help names a workspace dir (`<workspace>/.agents/skills`), a global one
+ *               (`<home>/.gemini/antigravity-cli/skills`) and a shared one (`<home>/.gemini/skills`),
+ *               and `<home>/.gemini/config/skills` was found holding an installed skill that
+ *               `agy -p /skills` lists. `<home>/.agents/skills` is scanned alongside the workspace
+ *               path because an operator whose trusted workspace IS their home writes skills there
+ *               and a `/cd` elsewhere must not hide them. Probed on agy 1.2.0 (2026-09-17): a skill
+ *               under the home path and one under the conversation's own directory both expand when
+ *               typed. Which wins when both define a name was NOT probed; the project's own copy is
+ *               listed first because it is the more specific of the two.
+ *  - dsh      — none. Nothing has been found for it, and inventing a path would produce a
+ *               confidently empty list rather than an honest one.
+ *
+ * agy's bundled skills (`<home>/.gemini/antigravity-cli/builtin/skills` — `generative_ui`,
+ * `antigravity-guide`, …) are deliberately left out, for the reason in this file's header: what was
+ * asked for is the skills the operator installed, not what shipped with the product.
+ *
+ * Asking agy instead was tried and is not an option: `agy -p /skills` answers in 6 entries here
+ * (its 5 builtins plus the one under `.gemini/config/skills`) and omits all 25 under
+ * `~/.agents/skills` — skills it nonetheless expands when typed. Disk is the honest source.
  */
 export function skillDirsFor(
   def: AgentDef | undefined,
@@ -87,11 +105,20 @@ export function skillDirsFor(
         dirs.push(isAbsolute(p) ? p : resolve(opts.cwd, expandHome(p)));
       }
       break;
+    case 'agy':
+      dirs.push(join(opts.cwd, '.agents', 'skills'));
+      dirs.push(join(opts.home, '.agents', 'skills'));
+      dirs.push(join(opts.home, '.gemini', 'antigravity-cli', 'skills'));
+      dirs.push(join(opts.home, '.gemini', 'skills'));
+      dirs.push(join(opts.home, '.gemini', 'config', 'skills'));
+      break;
     default:
       break;
   }
-  // A conversation that never used /cd sits in the agent's own cwd, so the two claude paths can be
-  // the same directory; listing it twice would duplicate every skill in it.
+  // A conversation that never used /cd sits in the agent's own cwd, so a harness's home-level and
+  // project-level paths can be the same directory (claude's two, agy's first two — and on a machine
+  // whose trusted workspace is the home directory, agy's are the same path by construction);
+  // listing it twice would duplicate every skill in it.
   return [...new Set(dirs)];
 }
 

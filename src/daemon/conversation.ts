@@ -6,6 +6,7 @@ import {
   buildHelpText,
   harnessCommandName,
   harnessHasPicker,
+  isCliAnsweredCommand,
   unconfiguredHarnessCommand,
 } from '../core/command-translate.js';
 import {
@@ -74,7 +75,8 @@ import {
 import { scanWorkdirs, isDirectory, type WorkdirScan } from './workdir-scan.js';
 import { rankByFrecency } from '../core/frecency.js';
 import type { WorkdirUsageStore } from './workdir-usage.js';
-import { resolveAgentCwd, resolveConversationCwd } from './agent-common.js';
+import { resolveAgentCwd, resolveConversationCwd, buildHarnessEnv } from './agent-common.js';
+import { formatAgyCliOutput, runAgyCliCommand } from './agent-agy.js';
 import { formatRuntimeFooter, formatTokens } from '../core/runtime-footer.js';
 import { InboundMerger } from '../core/inbound-merger.js';
 import { fallbackTitle, generateTitle } from '../core/title-namer.js';
@@ -449,7 +451,15 @@ export class ConversationRegistry {
      * store the directory list stays in the scan's alphabetical order, which is what it was before
      * ranking existed. Tests construct registries without one for exactly that reason.
      */
-    private readonly workdirUsage?: WorkdirUsageStore
+    private readonly workdirUsage?: WorkdirUsageStore,
+    /**
+     * Runs one of the bound harness's OWN slash commands as a separate process (agy's, today).
+     *
+     * Injected rather than called directly so a test can pin the decision this class actually
+     * makes — that such a name is answered here and never reaches the agent — without spawning a
+     * CLI it does not control. The default is the real thing, so the daemon wires nothing.
+     */
+    private readonly runHarnessCli: typeof runAgyCliCommand = runAgyCliCommand
   ) {
     // Inject only the capabilities TurnRunner needs (read-only views + activeAddress write entry),
     // rather than passing the whole registry and creating a circular dependency.
@@ -1477,7 +1487,17 @@ export class ConversationRegistry {
     const name = agentDisplayName(def, state.agentId);
 
     const result = translateCommand(parsed.name, def?.harness);
-    if (result.kind === 'passthrough') return msg;
+    if (result.kind === 'passthrough') {
+      // Passthrough is what lets a skill name reach the agent untouched — and it is also how a
+      // command the HARNESS's own CLI answers would get there, which on agy kills the session
+      // outright (see isCliAnsweredCommand). Same choke point, opposite handling: run it as its
+      // own process and reply with what it printed.
+      if (isCliAnsweredCommand(parsed.name, def?.harness)) {
+        void this.answerHarnessCliCommand(key, state, parsed.name, msg);
+        return undefined;
+      }
+      return msg;
+    }
 
     if (result.kind === 'local') {
       // No native spelling on this harness, but the gateway can answer from the live ACP session.
@@ -1536,6 +1556,7 @@ export class ConversationRegistry {
     console.log(`[command] /${name} answered locally for ${key} (${state.agentId})`);
     try {
       if (name === 'context') return reply(this.describeContext(state));
+      if (name === 'usage') return await this.answerHarnessCliCommand(key, state, name, msg);
       if (name === 'model') {
         // undefined means the answer went out on another surface — the daemon posted a button
         // menu — so saying anything here would duplicate it.
@@ -1549,9 +1570,57 @@ export class ConversationRegistry {
     }
   }
 
+  /**
+   * Answer a command the bound harness's own CLI owns, by running that CLI as its own process.
+   *
+   * Two different routes arrive here and they mean the same thing: `/usage`, which the generic
+   * vocabulary marks `local` for agy, and any other name in HARNESS_CLI_ANSWERED, which would
+   * otherwise pass through to the agent. Both must stay out of the resident session — writing one
+   * into agy's stream-json stdin ends the process and the conversation with it.
+   *
+   * No turn runs and no model is invoked: these commands are answered by the CLI from local state,
+   * so the cost is one short-lived process. The conversation's directory is passed through because
+   * some answers are workspace-scoped, and the agent's own environment because a `HOME` override
+   * decides which account's config the CLI reads.
+   *
+   * Arguments are deliberately dropped rather than forwarded. Every one of these commands answers a
+   * question in print mode; the forms that TAKE an argument are the interactive ones (`/model
+   * <name>` sets a model), and this gateway offers a menu for that. Passing user text into a
+   * subprocess argv to reach a setter nobody asked for is not a trade worth making.
+   */
+  private async answerHarnessCliCommand(
+    key: ConversationId,
+    state: ConversationState,
+    name: string,
+    msg: InboundMessage
+  ): Promise<void> {
+    const def = findAgent(this.config, state.agentId);
+    const label = agentDisplayName(def, state.agentId);
+    const reply = (text: string): void => {
+      void this.platforms
+        .get(msg.conversation.platform)
+        ?.sendMessage(addressOf(msg.conversation), text)
+        .catch((e) =>
+          console.warn('[command] failed to deliver a harness CLI answer:', e instanceof Error ? e.message : e)
+        );
+    };
+    if (!def || def.harness !== 'agy') {
+      // Unreachable: agy is the only harness in HARNESS_CLI_ANSWERED, and the only one whose
+      // /usage is local. Answered rather than thrown so a future entry fails visibly, not silently.
+      reply(`${label} has no way to answer /${name} outside a turn.`);
+      return;
+    }
+    console.log(`[command] /${name} run as a one-shot agy process for ${key} (${state.agentId})`);
+    const result = await this.runHarnessCli(name, resolveConversationCwd(def, key, this.store), buildHarnessEnv(def));
+    if (!result.ok) {
+      reply(`Could not ask ${label} for /${name}: ${result.error}`);
+      return;
+    }
+    reply(formatAgyCliOutput(name, result.output));
+  }
+
   /** Drop this conversation's context snapshot; the pair moves together or the answer lies. */
-  private forgetUsage(state: ConversationState): void {
-    state.lastUsage = undefined;
+  private forgetUsage(state: ConversationState): void {    state.lastUsage = undefined;
     state.turnCompleted = false;
   }
 
@@ -1580,7 +1649,9 @@ export class ConversationRegistry {
       const fix =
         def?.harness === 'opencode'
           ? ' On opencode that means a model from a custom provider: give it a `limit` block in opencode.json (e.g. `"limit": { "context": 128000 }`) and the numbers appear.'
-          : '';
+          : def?.harness === 'agy'
+            ? ' On agy the numbers come from its status line, which the daemon points at its own shim on startup: check that `statusLine` in `~/.gemini/antigravity-cli/settings.json` still names `agy-statusline`, and that AGENT_ANYWHERE_NO_AGY_STATUSLINE is not set.'
+            : '';
       return (
         `Context: not reported. ${name} finished a turn without sending any usage numbers, and ` +
         `another message will not change that — a harness reports context only for a model whose ` +

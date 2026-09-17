@@ -71,10 +71,28 @@ describe('skillDirsFor', () => {
     expect(dirs).toEqual(['/proj/local-skills']);
   });
 
+  it('scans agy’s five locations, project copy first', () => {
+    // Probed on agy 1.2.0: a skill under the home path and one under the conversation's own
+    // directory both expand when typed, so both are listed; the project's is the more specific.
+    expect(skillDirsFor(def({ harness: 'agy' }), { home: '/h', cwd: '/proj' })).toEqual([
+      '/proj/.agents/skills',
+      '/h/.agents/skills',
+      '/h/.gemini/antigravity-cli/skills',
+      '/h/.gemini/skills',
+      '/h/.gemini/config/skills',
+    ]);
+  });
+
+  it('collapses agy’s workspace and home paths when they are the same directory', () => {
+    // The operator this was written for trusts their home directory as the workspace, so
+    // `<cwd>/.agents/skills` and `<home>/.agents/skills` are one path and 25 skills would double.
+    const dirs = skillDirsFor(def({ harness: 'agy' }), { home: '/h', cwd: '/h' });
+    expect(dirs.filter((d) => d === '/h/.agents/skills')).toHaveLength(1);
+  });
+
   it('returns nothing for a harness with no known location', () => {
-    // agy and dsh. Inventing a path would produce a confidently empty list instead of an honest
+    // dsh. Inventing a path would produce a confidently empty list instead of an honest
     // "this gateway does not know where to look".
-    expect(skillDirsFor(def({ harness: 'agy' }), { home: '/h', cwd: '/p' })).toEqual([]);
     expect(skillDirsFor(def({ harness: 'dsh' }), { home: '/h', cwd: '/p' })).toEqual([]);
     expect(skillDirsFor(undefined, { home: '/h', cwd: '/p' })).toEqual([]);
   });

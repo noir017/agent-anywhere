@@ -102,10 +102,12 @@ interface GenericCommand {
    * aliases (`opusplan`, `best`, a full model id) — and those stay reachable through
    * `agents[].env.ANTHROPIC_MODEL`, which is where this deployment pins its model anyway.
    *
-   * A LIST rather than a flag, and populated only from what was probed live, for the same reason
-   * `native` is: `agy` speaks no ACP at all (it reports neither usage nor config options), so
-   * claiming a local answer there would hand the user "no numbers yet — send a message first"
-   * forever. An honest "not supported" beats an answer that never arrives.
+   * A LIST rather than a flag, and populated only from what was probed live. `agy` is why that
+   * distinction earns its keep: it speaks no ACP, so for a long time it could claim none of these,
+   * and each entry it has since gained came from finding the channel agy actually publishes on —
+   * `agy models` for the selector, `agy -p=/usage` for the quota, its `statusLine` command for the
+   * context window. An honest "not supported" beats an answer that never arrives, and the way out
+   * of one is evidence, not optimism.
    */
   local?: Harness[];
 }
@@ -133,7 +135,12 @@ const GENERIC_COMMANDS: Record<string, GenericCommand> = {
     // reports nothing at all (not a zero window — no notification), and adding `limit.context` to
     // that model makes it report. The local answer is still right for the harness; the empty case is
     // a model-config gap, which is why describeContext names the fix instead of saying "not yet".
-    local: ['opencode', 'dsh'],
+    //
+    // agy arrives at the same place by a different road: it reports no usage over its protocol at
+    // all, but it does hand a context snapshot to whatever `statusLine` command its settings name,
+    // in headless mode as well as the TUI (verified on 1.2.0). The daemon installs a shim there and
+    // reads the numbers back at the end of each turn — see daemon/agy-statusline.ts.
+    local: ['opencode', 'dsh', 'agy'],
   },
   model: {
     description: 'Show or change the model',
@@ -152,6 +159,11 @@ const GENERIC_COMMANDS: Record<string, GenericCommand> = {
   usage: {
     description: 'Show token usage and limits',
     native: { claude: 'usage' },
+    // agy's CLI answers /usage itself, which is precisely why it cannot be forwarded: reaching the
+    // resident session it would kill it (see HARNESS_CLI_ANSWERED). The gateway runs it as its own
+    // one-shot process instead. Probed on 1.2.0 — four tab-separated columns of pool, metric,
+    // remaining percentage and reset timestamp, answered from local state with no model invoked.
+    local: ['agy'],
   },
   doctor: {
     description: "Health-check this agent's own setup",
@@ -305,6 +317,53 @@ export function translateCommand(name: string, harness: Harness | undefined): Co
 /** Whether a name belongs to the generic vocabulary (i.e. is subject to translation). */
 export function isGenericCommand(name: string): boolean {
   return Object.hasOwn(GENERIC_COMMANDS, name.toLowerCase());
+}
+
+/**
+ * Slash names a harness's own CLI intercepts and answers BEFORE the model ever sees them.
+ *
+ * These are not commands the gateway lacks a translation for — they are commands that must never
+ * be written into a resident session at all, because the CLI answering one ends the session. On
+ * agy, a `/model` sent into the stream-json session answers "…is answered by the CLI itself and is
+ * unavailable with --input-format stream-json", sets `status:ERROR`, and EXITS with code 2: the
+ * conversation's child dies and every later turn in that message goes with it. Verified on agy
+ * 1.2.0 (2026-09-17); the same probe confirmed that a skill slash and an unrecognized slash are
+ * both harmless, which is why this is an exact list and not "anything starting with /".
+ *
+ * The list is what `agy -p /help` prints, which is also how to re-derive it:
+ *
+ *   /agents /changelog /config /credits /effort /help /hooks /model /permissions /skills /usage
+ *
+ * A STATIC copy of a list the CLI can produce is a deliberate compromise, and the risk is worth
+ * naming: if agy adds a twelfth command, a user who types it loses their session until this list
+ * catches up. Discovering it at runtime was the alternative and it buys a worse trade — the check
+ * has to answer synchronously while routing a message, so a discovered list would either block the
+ * first message on a subprocess or be empty for the first seconds after a restart, which is exactly
+ * when a daemon is most likely to be handed a command.
+ *
+ * `/help` and `/skills` appear here for completeness and are never reached: both are daemon
+ * commands, intercepted upstream and answered by the gateway itself.
+ */
+const HARNESS_CLI_ANSWERED: Partial<Record<Harness, readonly string[]>> = {
+  agy: [
+    'agents',
+    'changelog',
+    'config',
+    'credits',
+    'effort',
+    'help',
+    'hooks',
+    'model',
+    'permissions',
+    'skills',
+    'usage',
+  ],
+};
+
+/** Whether this harness's CLI would answer `/name` itself — see HARNESS_CLI_ANSWERED. */
+export function isCliAnsweredCommand(name: string, harness: Harness | undefined): boolean {
+  if (!harness) return false;
+  return HARNESS_CLI_ANSWERED[harness]?.includes(name.toLowerCase()) ?? false;
 }
 
 /** The generic commands as registrable slash specs, in a stable (alphabetical) order. */

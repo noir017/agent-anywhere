@@ -134,14 +134,26 @@ reachable through its own `/<agent>` menu rather than registered globally (see
 `agy` is the only preset that does not speak ACP — it has no ACP mode — so it is
 driven over its own documented
 [headless stream-json protocol](https://antigravity.google/docs/cli/headless/)
-instead. Streaming, tool bubbles, multi-turn context and post-restart resume all
-work the same as the ACP harnesses; two details differ:
+instead. Streaming, tool bubbles, multi-turn context, post-restart resume, skills,
+`/model`, `/context` and `/usage` all work as they do on the ACP harnesses. What
+differs is how the last three are obtained, because agy publishes each somewhere
+other than its session:
 
-- **Its own slash commands are disabled.** In stream-json mode a CLI-answered
-  slash (`/model`, `/usage`) aborts the whole session, and chat users type `/…`
-  constantly — so the daemon launches it with `--disable-slash-commands`, which
-  turns such input into ordinary text. Pass
-  `args: ["--disable-slash-commands=false"]` to opt back in.
+- **Its own slash commands run as separate processes.** In stream-json mode a
+  CLI-answered slash (`/model`, `/usage`, `/credits`, …) aborts the whole session,
+  so the daemon answers those eleven names with a one-shot `agy -p=/<name>` and
+  never forwards them. Everything else — above all your **skills** — reaches the
+  session and expands normally.
+- **Context usage comes from agy's status line.** agy reports no token counts over
+  its protocol, but it does hand a context snapshot to the `statusLine` command in
+  `~/.gemini/antigravity-cli/settings.json`. On startup the daemon backs that file
+  up once and points the setting at its own shim, which records the numbers for the
+  footer and still draws a status line for your terminal. Set
+  `AGENT_ANYWHERE_NO_AGY_STATUSLINE=1` to leave the setting alone and go without
+  the numbers.
+- **Skills** are read from `<cwd>/.agents/skills`, `~/.agents/skills`,
+  `~/.gemini/antigravity-cli/skills`, `~/.gemini/skills` and
+  `~/.gemini/config/skills`, so `/skills` lists them and `/<name> <request>` runs one.
 - **`/new` starts a new conversation**, as with every harness. Interrupting a
   turn restarts the child and resumes the same conversation, so context survives.
 

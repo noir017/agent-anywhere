@@ -130,12 +130,21 @@ access:
 
 `agy` 是唯一不说 ACP 的预设——它根本没有 ACP 模式——因此改用它自带的
 [headless stream-json 协议](https://antigravity.google/docs/cli/headless/)驱动。
-流式输出、工具气泡、多轮上下文、重启续接都与 ACP 预设一致，只有两点不同：
+流式输出、工具气泡、多轮上下文、重启续接、skills、`/model`、`/context`、`/usage`
+都与 ACP 预设一致；不同的是后三者从哪里取——agy 把它们各自发布在会话之外：
 
-- **它自带的斜杠命令被禁用。** 在 stream-json 模式下，由 CLI 自己应答的斜杠
-  （`/model`、`/usage`）会直接中止整个会话，而聊天场景里用户频繁输入 `/…`——
-  所以守护进程启动时加了 `--disable-slash-commands`，此类输入会被当作普通文本。
-  想恢复原生行为可传 `args: ["--disable-slash-commands=false"]`。
+- **它自带的斜杠命令改由独立进程应答。** 在 stream-json 模式下，由 CLI 自己应答的
+  斜杠（`/model`、`/usage`、`/credits` 等）会直接中止整个会话，因此守护进程用一次性
+  的 `agy -p=/<name>` 回答这十一个命令，绝不转发进会话。其余输入——首先是你的
+  **skills**——照常进入会话并正常展开。
+- **上下文占用来自 agy 的状态栏。** agy 的协议不上报 token 数，但它会把上下文快照
+  交给 `~/.gemini/antigravity-cli/settings.json` 里配置的 `statusLine` 命令。守护进程
+  启动时会先备份该文件一次，再把这项指向自己的 shim：既把数字记录下来供页脚使用，
+  也照样为你的终端画出状态栏。设 `AGENT_ANYWHERE_NO_AGY_STATUSLINE=1` 可以不动这项
+  配置（代价是没有这些数字）。
+- **skills** 从 `<cwd>/.agents/skills`、`~/.agents/skills`、
+  `~/.gemini/antigravity-cli/skills`、`~/.gemini/skills`、`~/.gemini/config/skills`
+  读取，所以 `/skills` 能列出它们，`/<名字> <请求>` 能直接调用。
 - **`/new` 开启新对话**，与其他 harness 一致。打断当轮会重启子进程并续接同一
   对话，因此上下文不会丢失。
 

@@ -12,6 +12,8 @@ import {
   resolveConversationCwd,
   truncateToolName,
 } from './agent-common.js';
+import { ensureAgyStatusLine, readAgyUsage } from './agy-statusline.js';
+import { agentHome } from './skills-scan.js';
 
 const execFile = promisify(execFileCb);
 
@@ -40,8 +42,12 @@ const execFile = promisify(execFileCb);
  *   init.model                     ↔ onModel (stored at spawn, replayed at the start of every turn)
  *   SIGINT                         ↔ abort (agy has no in-band cancel message)
  *
- * agy reports no command list (and slash expansion is deliberately disabled below), so
- * onAvailableCommands is never called and no native slash commands are registered for this harness.
+ * agy pushes no command list over the wire, so onAvailableCommands is never called and no native
+ * slash commands are registered for this harness. Its own commands are reachable all the same:
+ * `agy -p /help` lists them, and runAgyCliCommand answers each with a one-shot process (see
+ * buildAgyArgs for why they must never enter the resident session). Skills, unlike those, ARE
+ * expanded by the session itself and need nothing from this file — only the flag that used to
+ * suppress them being gone.
  *
  * Models: agy has no in-process switch — the model is fixed by `--model=` at spawn. However,
  * available models can be queried via `agy models`, and switching models is performed via a
@@ -62,11 +68,6 @@ const execFile = promisify(execFileCb);
  * - `--print-timeout`: default is 5m and it KILLS the turn (`status:ERROR, error:"timeout waiting
  *   for response"`), which a long agent task would trip constantly. Set effectively-never here; the
  *   daemon already has its own silence watchdog (`session.turnTimeoutMs`) that bounds hung turns.
- * - `--disable-slash-commands`: without it, any input starting with `/` is intercepted by the CLI
- *   itself, which answers "…is answered by the CLI itself and is unavailable with --input-format
- *   stream-json", sets status=ERROR and EXITS the process (code 2) — losing the session and every
- *   later turn. IM users type `/…` constantly, so this trades agy's own slash/skill expansion for a
- *   session that survives. With it, `/model` reaches the model as plain text and is answered normally.
  * - `--dangerously-skip-permissions`: matches the daemon's existing stance for every harness — it is
  *   a headless client and auto-approves tool requests; access control is `access.allowFrom` (who may
  *   trigger an agent at all), not per-call prompts. Without it, tools that need approval are
@@ -77,8 +78,23 @@ const execFile = promisify(execFileCb);
  * - `-p=`: print (headless) mode. The `=` is REQUIRED: agy uses Go flag parsing, so a bare `-p`
  *   swallows the next argument as its prompt value and then errors out.
  *
+ * NOT passed, though it used to be: `--disable-slash-commands`. The constraint it was added for is
+ * real but much narrower than the flag. Re-probed on agy 1.2.0 (2026-09-17), sending each of these
+ * into one resident stream-json session:
+ *
+ *   `/aa-probe` (a skill under `<home>/.agents/skills`)   → expanded, answered, session alive
+ *   `/aa-proj`  (a skill under `<cwd>/.agents/skills`)    → expanded, answered, session alive
+ *   `/totally-not-a-real-command-xyz hello`               → reached the model as plain text, alive
+ *   `/model`                                              → `status:ERROR` AND process exit code 2
+ *
+ * So only the commands agy's own CLI answers are fatal, and its error names the way out: "run it as
+ * its own --print /model invocation". Those names are listed by `agy -p /help` and enumerated in
+ * core/command-translate.ts, which keeps them out of the session and answers them with one-shot
+ * processes instead — leaving the flag off, which is what brings agy's skills back.
+ *
  * `def.args` is appended AFTER the presets so a user can override any of them — Go's flag parsing is
- * last-wins (verified), e.g. `args: ["--disable-slash-commands=false"]` restores native slash commands.
+ * last-wins (verified), e.g. `args: ["--disable-slash-commands"]` gives up skill expansion in
+ * exchange for a session that survives a `/model` typed by someone bypassing the gateway's menu.
  * `-p=` stays last so it can't consume a user argument.
  */
 export function buildAgyArgs(
@@ -92,7 +108,6 @@ export function buildAgyArgs(
     '--input-format=stream-json',
     '--output-format=stream-json',
     '--print-timeout=8760h',
-    '--disable-slash-commands',
     '--dangerously-skip-permissions',
     `--add-dir=${cwd}`,
     ...(model ? [`--model=${model}`] : []),
@@ -142,6 +157,133 @@ export async function defaultFetchAgyModels(): Promise<Array<{ value: string; na
   }
 }
 
+// ───────────────────────── one-shot CLI commands ─────────────────────────
+
+/**
+ * How long a one-shot `agy -p /<command>` may take before it is given up on.
+ *
+ * Generous because the floor is a cold CLI start (~5s observed for `agy models`), and the ceiling
+ * only has to be short enough that a user does not think the gateway ignored them.
+ */
+const CLI_COMMAND_TIMEOUT_MS = 60_000;
+
+/** Longest CLI answer forwarded whole. `/changelog` is the one that needs this; the rest are short. */
+const CLI_OUTPUT_MAX_CHARS = 2_500;
+
+/**
+ * Run one of agy's own slash commands as its own process and return what it printed.
+ *
+ * This is the path agy itself points at when such a command reaches a stream-json session ("run it
+ * as its own --print /model invocation"), and it is cheap in the way that matters: the CLI answers
+ * these from local state, so no model is invoked, no tokens are spent, and the conversation's
+ * resident child is never touched.
+ *
+ * Probed on agy 1.2.0 (2026-09-17) against all eleven commands `agy -p /help` lists: every one
+ * exits 0 without a terminal, and none blocks waiting for input — including the four that render as
+ * interactive panels in the TUI (`/config`, `/effort`, `/hooks`, `/permissions`), which print their
+ * current state instead. `/agents`, `/hooks` and `/permissions` print NOTHING when there is nothing
+ * configured, which is why an empty answer is reported rather than passed on as an empty message.
+ *
+ * `cwd` is the conversation's directory because some answers are workspace-scoped (`/agents` reads
+ * the workspace's custom agents). Failure is returned, never thrown: this runs inside a chat
+ * command, where the reason belongs in the reply.
+ */
+export async function runAgyCliCommand(
+  name: string,
+  cwd: string,
+  env?: NodeJS.ProcessEnv
+): Promise<{ ok: true; output: string } | { ok: false; error: string }> {
+  try {
+    const { stdout } = await execFile(AGY_COMMAND, [`-p=/${name}`], {
+      cwd,
+      env,
+      timeout: CLI_COMMAND_TIMEOUT_MS,
+      // agy prints the whole changelog for `/changelog`; the default 1MB buffer is ample, but say so.
+      maxBuffer: 1024 * 1024,
+    });
+    return { ok: true, output: stdout.trim() };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/**
+ * Render what a one-shot CLI command printed, as a chat message.
+ *
+ * Everything but `/usage` prints either a short TSV table (`/model`, `/credits`, `/effort`,
+ * `/config`) or markdown (`/changelog`), so the honest rendering is the text itself in a fenced
+ * block — inventing structure per command would be guessing at output this gateway does not own.
+ *
+ * Truncation is announced and points at the host, because the commands whose answers overflow are
+ * exactly the ones a reader might need in full.
+ */
+export function formatAgyCliOutput(name: string, output: string): string {
+  if (!output) {
+    return `\`/${name}\` — agy answered with nothing. That is its answer when there is none configured.`;
+  }
+  if (name === 'usage') {
+    const quota = formatAgyQuota(output);
+    if (quota) return quota;
+  }
+  let body = output;
+  let note = '';
+  if (body.length > CLI_OUTPUT_MAX_CHARS) {
+    body = body.slice(0, CLI_OUTPUT_MAX_CHARS);
+    note = `\n\nTruncated at ${CLI_OUTPUT_MAX_CHARS} characters — run \`agy -p=/${name}\` on the host for all of it.`;
+    console.log(`[agy] truncated the /${name} answer from ${output.length} to ${CLI_OUTPUT_MAX_CHARS} chars`);
+  }
+  return `\`\`\`\n${body}\n\`\`\`${note}`;
+}
+
+/**
+ * `/usage` specifically: four tab-separated columns (pool, metric, remaining %, ISO reset), e.g.
+ *
+ *   Gemini Models\tWeekly Limit Remaining\t100%\t2026-09-24T06:12:21Z
+ *
+ * Worth a renderer of its own because a percentage and a timestamp are what the question was, and
+ * the raw row buries both: the bar makes "how much is left" readable at a glance, and the reset is
+ * rewritten as a duration because "in 6d" is actionable where a UTC timestamp is arithmetic.
+ *
+ * Returns undefined when the shape is not the expected four columns, so the caller falls back to
+ * printing the output verbatim rather than dropping an answer it failed to parse.
+ */
+export function formatAgyQuota(output: string, now: number = Date.now()): string | undefined {
+  const rows = output
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => line.split('\t').map((c) => c.trim()));
+  if (rows.length === 0 || rows.some((r) => r.length !== 4)) return undefined;
+
+  const lines = rows.map((r) => {
+    const [pool, metric, remaining, resetAt] = r as [string, string, string, string];
+    const pct = Number.parseFloat(remaining);
+    const bar = Number.isNaN(pct) ? '' : ` ${quotaBar(pct)}`;
+    return `**${pool}** — ${metric}: ${remaining}${bar}${formatResetIn(resetAt, now)}`;
+  });
+  return `Quota:\n${lines.join('\n')}`;
+}
+
+/** An 8-cell bar for a remaining-percentage, matching the footer's plain-text idiom. */
+function quotaBar(percent: number, width = 8): string {
+  const clamped = Math.max(0, Math.min(100, percent));
+  const filled = Math.round((clamped / 100) * width);
+  return `[${'█'.repeat(filled)}${'░'.repeat(width - filled)}]`;
+}
+
+/** ` (resets in 6d 4h)` for a parseable ISO timestamp in the future, and nothing otherwise. */
+function formatResetIn(iso: string, now: number): string {
+  const at = Date.parse(iso);
+  if (Number.isNaN(at)) return '';
+  const secs = Math.round((at - now) / 1000);
+  if (secs <= 0) return ' (resets now)';
+  const d = Math.floor(secs / 86400);
+  const h = Math.floor((secs % 86400) / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const span = d > 0 ? `${d}d ${h}h` : h > 0 ? `${h}h ${m}m` : `${m}m`;
+  return ` (resets in ${span})`;
+}
+
 // ───────────────────────────────── factory / session ─────────────────────────────────
 
 export function createAgyAgentFactory(
@@ -184,6 +326,12 @@ export function createAgyAgentFactory(
 
   // Eager pre-fetch so the model list is ready when /model is invoked.
   ensureModels();
+
+  // Point agy's status line at this daemon's shim, once per distinct home among the agy agents —
+  // it is the only channel through which agy reports context usage (see agy-statusline.ts).
+  for (const home of new Set(cfg.agents.filter((a) => a.harness === 'agy').map((a) => agentHome(a)))) {
+    ensureAgyStatusLine(home);
+  }
 
   return {
     getOrCreate(sessionId: string, agentId: string): AgentSession {
@@ -414,8 +562,12 @@ function createAgySession(
       return;
     }
 
-    // agy repeats conversation_id on later events; adopt it if `init` somehow lacked one.
-    rememberConversation(msg.step_update?.conversation_id ?? msg.result?.conversation_id);
+    // agy repeats conversation_id on later events; adopt it from there. That fallback stopped
+    // being a fallback: on 1.1.22 the id came with `init`, and on 1.2.0 `init` carries none at all
+    // and the first one to name it is the turn's own `step_update`. Both shapes work because this
+    // reads whichever arrives — worth knowing before "simplifying" either branch away, since a
+    // session with no recorded id resumes blank after a restart and reports no context usage.
+    rememberConversation(msg.step_update?.conversation_id ?? msg.result?.conversation_id ?? msg.conversation_id);
 
     if (!currentTurn) {
       // Never silently: the ACP runtime forwards out-of-turn output to the conversation as a
@@ -485,6 +637,13 @@ function createAgySession(
       } catch (err) {
         if (aborting) return; // intentional abort/dispose is not an error
         throw err;
+      } finally {
+        // Context numbers, read at the end of the turn they describe. agy publishes them only
+        // through its status line (see agy-statusline.ts), so they arrive out of band and the turn
+        // has to go and fetch them — in `finally`, because a turn that failed still consumed the
+        // window, and the footer of the message reporting the failure should say so.
+        const usage = readAgyUsage(lastSeenConversationId);
+        if (usage) handlers.onUsage?.(usage);
       }
     },
 

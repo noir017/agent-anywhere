@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-09-17
+
 ### Added
 
 - **agy gets its skills back, and they were never really the problem.** The harness was launched with

@@ -413,6 +413,21 @@ export class TurnRunner {
         ref.model = model;
       },
       /**
+       * An aside about this turn — the harness logged an error and is retrying.
+       *
+       * Sent immediately and OFF the effects chain, which is the entire point: the chain is drained
+       * by the reply's own rendering, and the turns this fires on are exactly the ones producing no
+       * reply to drain it. Queueing the notice behind the body would hold it until the turn ended,
+       * which is ten minutes too late to be worth saying.
+       *
+       * Best-effort like every other side channel here: a failed send is logged and the turn goes on.
+       */
+      onNotice: (text) => {
+        void platform
+          .sendMessage(address, text)
+          .catch((e) => console.warn('[turn] failed to deliver a notice:', e instanceof Error ? e.message : e));
+      },
+      /**
        * The agent stopped to ask the user something. Post it as buttons and block this ACP request
        * until they answer.
        *

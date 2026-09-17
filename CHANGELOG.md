@@ -5,6 +5,28 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **A rate-limited opencode no longer reads as a hung agent.** Reported 2026-09-17: every `oc` turn
+  sat at "typing" for ten minutes and then failed with `agent "oc" sent no update for 600000ms;
+  treating it as hung and aborting this turn`. The agent was not hung — opencode's free model pool
+  was rate-limiting it and opencode was retrying internally, reporting that neither over ACP nor on
+  its stderr (which the daemon already forwards; `grep -c "Rate limit" daemon.log` → 0). The only
+  record on the machine was opencode's own log file, and the daemon's ACP session id appears in it
+  verbatim, so one conversation's errors can be picked out of a log shared by all of them.
+
+  A turn now asks that log. While it runs, each distinct reason is announced once as its own message
+  (`⚠️ oc hit an error and is retrying: AI_APICallError: Rate limit exceeded…`), so a ten-minute wait
+  explains itself in the first minute instead of at the end. If it does time out, the reason is
+  appended to the failure message — read *before* the subprocess is reaped, since disposing it
+  destroys the session id the lookup needs.
+
+  Deliberately does not end the turn early: a logged error means something went wrong, not that the
+  turn is lost, and opencode often retries and wins. Nothing is guessed either — a moved log, a
+  renamed field or an unparsable line yields no reason and the message stays exactly what it was.
+  Only opencode has a probe; claude rejects the prompt with its own reason already, and agy speaks
+  no ACP. The seam (`daemon/harness-log.ts`) is per-harness so the next silent one is a table entry.
+
 ## [1.11.0] - 2026-09-17
 
 ### Added

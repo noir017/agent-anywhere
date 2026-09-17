@@ -322,6 +322,23 @@ The **per-turn silence watchdog** (`session.turnTimeoutMs`, 10 min) bounds *sile
 not total turn length — the timer resets on every agent update. On trip the subprocess is
 force-disposed and the turn fails.
 
+Silence, though, has more than one cause, and the watchdog can only report the silence.
+`harness-log.ts` closes that gap for harnesses that admit their failures **only to their
+own log file**: opencode retries an upstream rate limit internally, reporting it neither
+over ACP nor on stderr, so every affected turn read as "hung" ten minutes later
+(2026-09-17). The daemon's ACP session id appears verbatim in opencode's log, so one
+conversation's errors can be picked out of a log shared by all of them:
+
+- **During the turn** (60 s poll, only for harnesses with a probe) each distinct reason is
+  announced once through `onNotice` — a separate message, never folded into the agent's
+  own reply.
+- **On timeout** the log is read once more *before* `dispose()`, which would destroy the
+  session id the lookup needs, and the reason is appended to the failure message.
+
+It never ends a turn: a logged error is evidence something went wrong, not that the turn
+is lost — opencode often retries and wins. A missing file, a renamed field or an
+unparsable line yields nothing, which puts the message back to exactly its old text.
+
 ## Agent runtimes
 
 ```

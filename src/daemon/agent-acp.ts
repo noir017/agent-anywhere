@@ -31,6 +31,7 @@ import type {
   RunTurnInput,
 } from './agent.js';
 import { looksLikeCommand } from './routing.js';
+import { harnessLogProbe, readHarnessErrors } from './harness-log.js';
 import type { ConversationStore } from './conversation-store.js';
 import {
   buildAgentEnv,
@@ -225,6 +226,32 @@ const QUEUE_REJECT_BACKOFF_MS = 50;
  * even that belongs in the background, which is now forwarded properly (see FollowUpSink).
  */
 export const TOOL_SILENCE_FACTOR = 2;
+
+/**
+ * How often a turn asks the harness's own log what went wrong (see harness-log.ts).
+ *
+ * A minute is chosen against the thing being waited on, not the thing being read: the failure it
+ * surfaces is a retry loop that lasts until the watchdog fires ten minutes later, so a minute turns
+ * a silent ten-minute wait into one that explains itself early and repeats nothing. Only harnesses
+ * with a probe start the timer at all, and each tick is one bounded tail read.
+ */
+const HARNESS_LOG_POLL_MS = 60_000;
+
+/**
+ * How much of a harness's logged reason reaches the chat.
+ *
+ * turn-runner caps the whole failure message at 300 characters, and the timeout sentence already
+ * spends ~85 of them; a long reason (opencode's connection errors run past 200) would push the cap
+ * over and truncate the message from the RIGHT, cutting the reason's own tail off anyway. Trimming
+ * here instead keeps the sentence intact and loses only the far end of a long reason.
+ */
+const REASON_MAX_CHARS = 150;
+
+/** A harness's logged reason, flattened to one line and trimmed to fit (see REASON_MAX_CHARS). */
+function trimReason(reason: string): string {
+  const flat = reason.replace(/\s+/g, ' ').trim();
+  return flat.length > REASON_MAX_CHARS ? `${flat.slice(0, REASON_MAX_CHARS - 1)}…` : flat;
+}
 
 /**
  * Grace period after the harness reports a completed result before a burst of out-of-turn output
@@ -1255,6 +1282,64 @@ function createAcpSession(
     });
   }
 
+  /**
+   * Watch the harness's own log for the duration of one turn.
+   *
+   * ── Why a turn needs this at all ──────────────────────────────────────────────────────────────
+   * Because the silence watchdog can only report silence, and silence has more than one cause.
+   * Reported 2026-09-17: opencode's model pool started rate-limiting, opencode retried internally
+   * without saying so over ACP or on stderr, and every `oc` turn sat at "typing" for ten minutes
+   * before failing with "sent no update … treating it as hung". The agent was never hung, and the
+   * one place the reason existed was opencode's own log file (see harness-log.ts).
+   *
+   * Deliberately does NOT end the turn. A logged error is evidence that something went wrong, not
+   * that the turn is lost — opencode retries and often wins — so acting on it would trade a
+   * misleading message for a killed turn that would have succeeded. It only says so out loud, and
+   * leaves the verdict to the watchdog that already owns it.
+   *
+   * Each distinct reason is announced once: a retry loop writes the same line every few seconds,
+   * and the point is to end the silence, not to replace it with a stream of duplicates.
+   */
+  function watchHarnessLog(handlers: AgentStreamHandlers): {
+    /** The harness's last word on this turn, re-read at the moment it is asked for. */
+    lastReason: () => Promise<string | undefined>;
+    stop: () => void;
+  } {
+    const startedAt = new Date();
+    const announced = new Set<string>();
+    let latest: string | undefined;
+    /**
+     * `announce` is false for the final read the timeout makes: by then the turn is over, so
+     * "is retrying" would be a false statement, and the reason is about to be delivered anyway as
+     * part of the failure message.
+     */
+    const poll = async (announce: boolean): Promise<void> => {
+      // `active` is read at call time, not captured: a turn can outlive the child it started on.
+      const events = await readHarnessErrors(def, active?.sessionId, startedAt);
+      for (const e of events) {
+        latest = e.reason;
+        if (!announce || announced.has(e.reason)) continue;
+        announced.add(e.reason);
+        console.log(`[acp] ${conversationId}: ${def.harness} logged an error mid-turn: ${e.reason}`);
+        handlers.onNotice?.(`⚠️ ${def.id} hit an error and is retrying: ${trimReason(e.reason)}`);
+      }
+    };
+    const timer = harnessLogProbe(def.harness)
+      ? setInterval(() => void poll(true), HARNESS_LOG_POLL_MS)
+      : undefined;
+    // Never hold the process open for a diagnostic.
+    timer?.unref();
+    return {
+      lastReason: async () => {
+        await poll(false);
+        return latest;
+      },
+      stop: () => {
+        if (timer) clearInterval(timer);
+      },
+    };
+  }
+
   return {
     conversationId,
 
@@ -1336,6 +1421,9 @@ function createAcpSession(
       // `stop` or a stray update can never bleed into the next turn.
       turnState = state;
       onTurnUpdate = rearmWatchdog;
+      // Runs alongside the watchdog for harnesses that admit their failures only to their own log;
+      // for every other harness this allocates a Set and starts no timer.
+      const logWatch = watchHarnessLog(handlers);
       const settled = new Promise<void>((resolve) => {
         endTurnWait = resolve;
       });
@@ -1379,10 +1467,20 @@ function createAcpSession(
         if (aborting) return; // intentional abort is not an error
         // A hung-agent timeout: reap the subprocess so the next turn rebuilds a fresh connection
         // (and so the pump, which is waiting on this queue, lands on a dead one and stands down).
-        if (err instanceof TurnTimeoutError) dispose();
+        if (err instanceof TurnTimeoutError) {
+          // Asked BEFORE dispose(), which clears `active` via resetHandles and with it the session
+          // id this lookup is keyed on. "Hung" is the gateway's guess; the harness may have written
+          // down what actually happened, and if it did, that is what the user should be told.
+          const reason = await logWatch.lastReason();
+          dispose();
+          if (reason) {
+            throw new TurnTimeoutError(`${err.message}. ${def.harness} last logged: ${trimReason(reason)}`);
+          }
+        }
         throw err;
       } finally {
         if (watchdog) clearTimeout(watchdog);
+        logWatch.stop();
         turnState = undefined;
         onTurnUpdate = undefined;
         endTurnWait = undefined;

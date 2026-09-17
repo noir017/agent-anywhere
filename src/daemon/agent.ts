@@ -62,6 +62,18 @@ export interface AgentStreamHandlers {
    * as unanswered instead of proceeding on a guess.
    */
   onElicit?(request: AgentElicitation): Promise<ElicitAnswer>;
+  /**
+   * Something worth saying about this turn that is not part of the agent's reply — today, that the
+   * harness logged an error and is retrying (see harness-log.ts).
+   *
+   * Sent as its own message rather than pushed into the streaming body, because the body belongs to
+   * the agent: folding a gateway diagnostic into it would leave a sentence the agent never wrote
+   * sitting inside its answer, and the footer would then count it as output.
+   *
+   * Optional, and absent means the runtime stays quiet — a client with nowhere to put an aside is
+   * not a reason to fail the turn.
+   */
+  onNotice?(text: string): void;
 }
 
 /**

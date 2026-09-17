@@ -22,6 +22,7 @@ import type {
 import type { PlatformAdapter } from './adapter.js';
 import type { PlatformProfile } from './profile.js';
 import { installProxy } from '../core/proxy.js';
+import { installRelativeFileUrlFix } from './satori-file-url.js';
 
 /**
  * Assemble a generic PlatformAdapter from a profile + one platform instance
@@ -52,6 +53,9 @@ export async function createSatoriAdapter(
   let onCmd: ((ev: CommandInteraction) => void) | null = null;
 
   const ctx = new Context();
+  // Teach http.file() to accept relative paths before any adapter can call it: without this, every
+  // inbound Telegram photo dies in satori's own `http/file` listener. See satori-file-url.ts.
+  installRelativeFileUrlFix(ctx);
   // Install outbound proxy first (reads HTTP(S)_PROXY): undici fetch and ws don't honor
   // the proxy automatically, so without this, connecting to Discord/Telegram etc. from
   // behind a firewall ETIMEDOUTs (bot can't connect, sends go nowhere).

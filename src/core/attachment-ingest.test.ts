@@ -195,3 +195,53 @@ describe('ingestAttachments · metadata discovered during the download', () => {
     expect(res.promptText).toContain('saved to');
   });
 });
+
+/**
+ * Attachments whose "URL" is the file itself.
+ *
+ * Satori's adapters inline media from platforms that keep it behind an authenticated API —
+ * adapter-telegram hands over every inbound photo as `data:<mime>;base64,…`. Two things that read
+ * naturally for an http URL become destructive for one of these: naming the attachment after its
+ * last path segment, and quoting the URL back into the prompt when something fails.
+ */
+describe('ingestAttachments · inline data: URLs', () => {
+  const PHOTO = 'data:image/jpeg;base64,/9j/4AABBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
+
+  it('names an inline image from its type instead of a slice of base64', async () => {
+    const att: AttachmentInput = { type: 'image', url: PHOTO };
+    const deps = makeDeps({ contents: { [PHOTO]: { text: 'jpegbytes' } } });
+    const res = await ingestAttachments([att], CFG, deps);
+
+    expect(res.files[0]?.name).toBe('image.jpeg');
+    expect(res.promptText).toContain('image.jpeg');
+    expect(res.promptText).not.toContain('/9j/4AAB');
+  });
+
+  it('does not paste the whole file into the prompt when a download fails', async () => {
+    // The failure line quotes the URL so the agent can retry it. For a data: URL that quote IS the
+    // file — the payload the size limits exist to keep out, arriving through the error path.
+    const att: AttachmentInput = { type: 'image', url: PHOTO };
+    const deps = makeDeps({ downloadError: { [PHOTO]: true } });
+    const res = await ingestAttachments([att], CFG, deps);
+
+    expect(res.promptText).toContain('failed to download');
+    expect(res.promptText).toContain('data:image/jpeg;base64');
+    expect(res.promptText).not.toContain('/9j/4AAB');
+  });
+
+  it('does not paste it into the oversized line either', async () => {
+    const att: AttachmentInput = { type: 'image', url: PHOTO, size: 99_999 };
+    const res = await ingestAttachments([att], CFG, makeDeps());
+
+    expect(res.promptText).toContain('too large');
+    expect(res.promptText).not.toContain('/9j/4AAB');
+  });
+
+  it('still names an ordinary URL after its last path segment', async () => {
+    const att: AttachmentInput = { type: 'image', url: 'https://cdn.example.com/pics/cat.png' };
+    const deps = makeDeps({ contents: { 'https://cdn.example.com/pics/cat.png': { text: 'png' } } });
+    const res = await ingestAttachments([att], CFG, deps);
+
+    expect(res.files[0]?.name).toBe('cat.png');
+  });
+});

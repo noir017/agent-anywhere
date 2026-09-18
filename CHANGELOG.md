@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.13.0] - 2026-09-18
+
 ### Added
 
 - **The web UI has topics, and they work the way a Telegram forum topic does.** A row of names

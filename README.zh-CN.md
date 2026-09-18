@@ -21,16 +21,18 @@ Code、Codex、OpenCode，以及 Google 的 Antigravity CLI。给机器人发消
  Discord ───┐
  Telegram ──┤     ┌──────────────────────┐
  Slack ─────┤     │        daemon        │       ┌─► claude
- Lark ──────┼────►│  routing · sessions  │◄─────►├─► codex
- QQ ────────┤     │  streaming · access  │       ├─► opencode
+ Lark ──────┤     │  routing · sessions  │◄─────►├─► codex
+ QQ ────────┼────►│  streaming · access  │       ├─► opencode
  LINE ──────┤     └──────────▲───────────┘       ├─► agy
  WeCom ─────┤                │ unix socket       └─► custom
- DingTalk ──┘                └─ agent-anywhere CLI (send-file / ask / react …)
+ DingTalk ──┤                └─ agent-anywhere CLI (send-file / ask / react …)
+ 网页端 ────┘  （守护进程自带的浏览器页面——不用注册机器人，也不用账号）
 ```
 
 ## 特性
 
 - **八个平台，一个进程** —— Discord、Telegram、Slack、飞书、QQ、LINE、企业微信、钉钉；支持多账号。
+- **也可以一个平台都不用** —— 内置网页端：守护进程自己起的一个朴素深色聊天页，用一个共享密钥登录。不用建机器人，不用申请任何东西。
 - **任意 ACP 智能体，外加 agy** —— 内置 Claude Code、Codex、OpenCode 与 Antigravity（`agy`）预设，另有 `custom`；按平台、频道、用户或斜杠命令路由。
 - **原生流式体验** —— 消息原地编辑、工具调用气泡、生命周期回应表情、新消息打断。
 - **在聊天中行动** —— 智能体可发文件、加回应、引用回复、开子区、读历史、发按钮提问。
@@ -74,7 +76,7 @@ version: 1
 
 platforms:                    # 命名实例；键即实例 id
   discord-main:
-    type: discord             # discord|telegram|slack|lark|qq|line|wecom|dingtalk
+    type: discord             # discord|telegram|slack|lark|qq|line|wecom|dingtalk|webui
     token: ${DISCORD_TOKEN}   # 所有字符串支持 ${VAR}
     chat:
       requireMention: true    # 群聊需 @ 机器人
@@ -159,18 +161,52 @@ access:
 
 ## 平台
 
-| | Discord | Telegram | Slack | 飞书 | QQ | LINE | 企业微信 | 钉钉 |
-|---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
-| 流式原地编辑 | ✓ | ✓ | ✓ | ✓ | – | – | – | – |
-| 生命周期回应 | ✓ | ✓ | ✓ | ✓ | ✓ | – | – | – |
-| 输入中指示 | ✓ | ✓ | – | – | – | ✓ | – | – |
-| 原生引用回复 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | – | – |
-| 子区 / 自动开区 | ✓ | ✓ | ✓ | ✓ | – | – | – | – |
-| 按钮（`ask`） | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | – | – |
-| 斜杠命令 | ✓ | ✓ | ✓ | – | – | – | – | – |
+| | Discord | Telegram | Slack | 飞书 | QQ | LINE | 企业微信 | 钉钉 | 网页端 |
+|---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
+| 流式原地编辑 | ✓ | ✓ | ✓ | ✓ | – | – | – | – | ✓ |
+| 生命周期回应 | ✓ | ✓ | ✓ | ✓ | ✓ | – | – | – | ✓ |
+| 输入中指示 | ✓ | ✓ | – | – | – | ✓ | – | – | ✓ |
+| 原生引用回复 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | – | – | ✓ |
+| 子区 / 自动开区 | ✓ | ✓ | ✓ | ✓ | – | – | – | – | – |
+| 按钮（`ask`） | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | – | – | ✓ |
+| 斜杠命令 | ✓ | ✓ | ✓ | – | – | – | – | – | ✓ |
 
 Markdown 按平台分别渲染；缺失的能力平滑降级（不能编辑 → 分段发送，没有按钮 →
 纯文本提问）。Slack、飞书、钉钉默认走 WebSocket 长连接，无需公网回调地址。
+
+### 网页端
+
+守护进程自己提供的一个朴素深色聊天页。不用注册机器人、不用账号、不依赖任何外部
+服务——这是把网关跑起来最快的方式，也是唯一一个完全不需要聊天平台的入口。
+
+```yaml
+platforms:
+  web:
+    type: webui
+    token: ${AA_WEB_TOKEN}    # 必填：登录页要输的共享密钥
+    host: 0.0.0.0             # 默认；想只走 SSH 隧道就填 127.0.0.1
+    port: 8787                # 默认
+    title: Chat               # 默认；浏览器标签页标题
+
+access:
+  allowFrom: ["web:owner"]    # 身份恒为 <实例 id>:owner
+```
+
+打开 `http://<host>:8787`，输入密钥，就得到和其他平台一样的会话：流式回复、工具
+气泡、`/model` `/cd` `/setting` 按钮菜单、`ask` 提问、附件上传与下载。
+
+它只有**一条会话**——没有侧边栏、没有会话列表、没有子区。`/new` 就是重开；要多开
+就在另一个端口再配一个实例。
+
+> [!WARNING]
+> 默认监听所有网卡且是明文 HTTP，所以那个密钥就是你的网络和一个拥有完整工具权限的
+> 智能体之间的全部屏障。要暴露到你掌控范围之外，先在前面加一层带 TLS 的反向代理；
+> 或者设 `host: 127.0.0.1`，用 SSH 隧道访问。
+> 如果确实过反代，务必**关掉响应缓冲**（nginx 里 `proxy_buffering off;`）——被缓冲的
+> SSE 会让整轮回复到结束才一次性出现。
+
+有两件事要有预期：知道密钥的人共用同一条会话；守护进程重启后页面是空的，但智能体
+的上下文还在——聊天记录在内存里，会话本身不在。
 
 ## 聊天命令
 

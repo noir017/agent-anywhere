@@ -4,12 +4,18 @@ Everything platform-specific is funneled through one seam so that eight chat pla
 reuse one generic core. Adding a platform means writing **one profile file and one
 schema** — no changes to `core/`, `daemon/`, the setup wizard, or `doctor`.
 
+The ninth, [`webui/`](webui/README.md), is the exception that proves where the seam ends: it
+is a browser page this daemon serves itself, so there is no bot, no gateway and no `Session`
+to normalise. It implements `PlatformAdapter` directly and is dispatched before `PROFILES` in
+`platform-factory.ts`. See its README for what that costs and where each cost is paid back.
+
 ## Architecture
 
 ```
       daemon  ──uses──►  PlatformAdapter        (adapter.ts — capability interface)
-                              ▲
-                              │ assembled by
+                            ▲   ▲
+                            │   └──implemented directly by──►  webui/  (no Satori at all)
+                            │ assembled by
                      satori-core.ts             (generic: lifecycle, inbound
                               │                  normalization, send/edit/delete,
                               │                  reactions, history)
@@ -45,6 +51,7 @@ Three rules keep this from rotting:
 | `config-schemas.ts` | Per-platform credential schemas (+ `ChatGateSchema`) |
 | `profile-helpers.ts` | Shared pure utilities for profiles |
 | `profiles/*.ts` | The eight platform profiles |
+| `webui/` | The ninth platform, which is not a profile — see its [README](webui/README.md) |
 | `*-markdown.ts`, `markdown-tables.ts` | Per-dialect outbound markdown renderers |
 
 `config-schemas.ts` is kept as a sibling module rather than inside each profile so that
@@ -56,19 +63,19 @@ Three rules keep this from rotting:
 `daemon/` and `core/` never branch on platform identity; they branch on
 `PlatformCapabilities`. Current matrix:
 
-| | Discord | Telegram | Slack | Lark | QQ | LINE | WeCom | DingTalk |
-|---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
-| `editMessage` | ✓ | ✓ | ✓ | ✓ | – | – | – | – |
-| `reaction` | ✓ | ✓ | ✓ | ✓ | ✓ | – | – | – |
-| `typing` | ✓ | ✓ | – | – | – | ✓ | – | – |
-| `reply` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | – | – |
-| `thread` | ✓ | ✓ | ✓ | ✓ | – | – | – | – |
-| `renameThread` | – | ✓ | – | – | – | – | – | – |
-| `buttons` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | – | – |
-| `editButtons` | ✓ | ✓ | ✓ | ✓ | – | – | – | – |
-| `slashCommands` | ✓ | ✓ | ✓ | – | – | – | – | – |
-| `maxMessageLength` | 2000 | 4096 | 3000 | 10000 | 1000 | 5000 | 2000 | 3500 |
-| `menuPageSize` | 12 | 12 | 12 | – | – | – | – | – |
+| | Discord | Telegram | Slack | Lark | QQ | LINE | WeCom | DingTalk | Web UI |
+|---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
+| `editMessage` | ✓ | ✓ | ✓ | ✓ | – | – | – | – | ✓ |
+| `reaction` | ✓ | ✓ | ✓ | ✓ | ✓ | – | – | – | ✓ |
+| `typing` | ✓ | ✓ | – | – | – | ✓ | – | – | ✓ |
+| `reply` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | – | – | ✓ |
+| `thread` | ✓ | ✓ | ✓ | ✓ | – | – | – | – | – |
+| `renameThread` | – | ✓ | – | – | – | – | – | – | – |
+| `buttons` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | – | – | ✓ |
+| `editButtons` | ✓ | ✓ | ✓ | ✓ | – | – | – | – | ✓ |
+| `slashCommands` | ✓ | ✓ | ✓ | – | – | – | – | – | ✓ |
+| `maxMessageLength` | 2000 | 4096 | 3000 | 10000 | 1000 | 5000 | 2000 | 3500 | 20000 |
+| `menuPageSize` | 12 | 12 | 12 | – | – | – | – | – | 12 |
 
 **`editButtons` is not `editMessage && buttons`.** It is its own field because the
 conjunction is right by accident and wrong in mechanism. Lark has both, yet its
@@ -77,6 +84,9 @@ card — buttons live on a card and are replaced through `im.message.patch`. QQ 
 have buttons and no edit endpoint at all (LINE has no delete either, so not even
 delete-and-repost is available). A caller that needs to advance a posted menu — the
 paginated `/model` picker — checks this field and degrades to a text answer otherwise.
+
+The web UI column is what a browser is: almost all of it true, and the two falses are the
+page being one conversation rather than a platform full of them.
 
 **`menuPageSize` is a declaration, not a preference.** It says how many items one page of
 a button menu (`/cd`, `/model`, `/setting`) may hold here, and the limits are nowhere near
@@ -268,6 +278,7 @@ date** — keep doing that.
 | `lark-markdown.ts` | Lark md string | Preserves `\n` (Lark's `md` segment treats them as breaks). No tables, headings, or blockquotes. |
 | `dingtalk-markdown.ts` | DingTalk md string | A single `\n` is **not** a line break — lines are regrouped into blocks joined by `\n\n`. |
 | `plaintext-markdown.ts` | plain text | LINE, QQ, WeCom render nothing; markers are stripped and structure flattened into readable lines. |
+| `web-markdown.ts` | escaped HTML | The built-in web UI. The one target that renders everything — tables stay tables. Also the repo's only XSS boundary: it escapes every character of input before building a tag, and passes no raw HTML through, ever. |
 | `markdown-tables.ts` | shared | The table→bullets degrade shared by the string-emitting converters. |
 
 **Stream safety is mandatory.** Every converter runs on *every* streaming edit, not just
@@ -346,3 +357,9 @@ only the events endpoint.
 
 Then add a `profiles/<name>.test.ts`. Every existing profile has one; nine of the
 module's sixteen test files are profile tests.
+
+None of the above applies to a platform that is not a chat service — one with no bot, no
+gateway and no `Session` to normalise. That is a `PlatformAdapter` implemented directly and a
+branch in `platform-factory.ts` before `PROFILES`, which is what [`webui/`](webui/README.md)
+is. Read its README before writing a second one: the interesting part is not the adapter, it
+is the list of things `satori-core.ts` was silently doing for you.

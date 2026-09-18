@@ -5,6 +5,61 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **A built-in web UI, so the gateway is usable with no chat platform at all.** Every way into this
+  daemon so far needed a bot registered somewhere first — an account, a token, a console, and in
+  three cases a public callback URL. `type: webui` needs a port and a password. The daemon serves a
+  plain dark chat page itself; you open it, type the token once, and get the same conversation every
+  other platform gets: streaming in-place edits, tool bubbles, lifecycle reactions, the `/model`,
+  `/cd` and `/setting` button menus, `ask` questions, and attachments in both directions.
+
+  It is deliberately not a Satori adapter. `satori-core.ts` assembles a platform around a `Bot` —
+  resolve one, call `bot.sendMessage`, normalise a `Session` — and here the daemon owns both ends of
+  the conversation; forced through the profile seam, every method would be a stub around state the
+  module holds anyway. So it implements `PlatformAdapter` directly and `platform-factory.ts`
+  dispatches it before `PROFILES`, which is typed `Record<Exclude<PlatformType, 'webui'>, …>` so the
+  next Satori platform still fails to compile until it is listed. The cost of leaving that seam is
+  that everything `satori-core` did for free has to be done again — the `chat.channels` allowlist,
+  the `[in]` log line, `measureRendered`, and typed outbound failures — and each is re-implemented
+  with a comment naming it, because the failure mode of forgetting one is silence rather than an
+  error. `src/platform/webui/README.md` lists all of them.
+
+  The page is one conversation: no sidebar, no room list, no threads, `/new` to start over. Markdown
+  is rendered server-side by a new converter alongside the other seven (`web-markdown.ts`), and that
+  converter is the repo's only XSS boundary — what it renders is agent output, which carries the
+  bytes of every file the agent read, so it escapes every character before building a tag and passes
+  no raw HTML through, ever. Transport is server-sent events rather than a WebSocket: Node ships no
+  WebSocket server, the browser ships `EventSource`, and the only thing given up is client→server
+  streaming, which nothing wanted.
+
+  Security, stated plainly because the defaults are deliberate. `host` is `0.0.0.0`, because a
+  gateway for reaching your agent from elsewhere is not useful bound to loopback — which is safe
+  only because `token` is mandatory. There is no TLS; put a reverse proxy in front before this
+  crosses a network you do not control (and turn its response buffering off, or server-sent events
+  arrive all at once at the end of the turn). The secret is compared with `timingSafeEqual` and
+  rate-limited to five guesses a minute per source; sessions are `HttpOnly; SameSite=Strict` cookies
+  held in memory. Files the agent sends are reachable only through an opaque token and always served
+  `attachment` + `nosniff` as `application/octet-stream`, so an agent-sent `.html` can never render
+  on this origin. Uploads become `data:` URLs — the shape `adapter-telegram` already produces, so
+  they travel the attachment pipeline's existing branch and its SSRF guard has nothing to act on.
+  `doctor` gained a check for the three ways this ends up configured but dead: a port already held,
+  a non-loopback bind, and an `access.allowFrom` that does not list `<instance id>:owner` — the last
+  of which otherwise presents as a page that accepts your messages and never answers one.
+
+### Fixed
+
+- **A conversation on a platform that cannot rename anything no longer pays for a title it will
+  throw away.** `nameConversation` summarised a topic name with a model call and only then asked
+  `retitleLane` whether the rename could happen — and `retitleLane` refuses both a platform without
+  `capabilities.renameThread` and any address with no lane. So QQ, LINE, WeCom and DingTalk, which
+  declare no rename at all, and every plain channel on the four platforms that do, spent one
+  title-summarising call per new conversation on a string nothing ever read. The capability check now
+  happens before the call rather than after it. `retitleLane` still re-checks both conditions itself,
+  because `/title` owes the user a sentence naming which one fired, and the two answers send them
+  looking in different places.
+
+
 ## [1.11.2] - 2026-09-17
 
 ### Fixed

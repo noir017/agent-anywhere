@@ -567,6 +567,24 @@ export const ConfigSchema = z
         });
       }
     }
+    // Two instances cannot share a port, and the failure without this is ugly: whichever binds
+    // second throws EADDRINUSE at STARTUP, after the first is already live, so the daemon comes
+    // up half-working. It is not a hypothetical pairing either — line, wecom and dingtalk all
+    // default to 127.0.0.1:8080, so two webhook platforms enabled together collide out of the box.
+    const bound = new Map<string, string>();
+    for (const [id, p] of Object.entries(cfg.platforms)) {
+      if (!('port' in p) || p.port === undefined) continue;
+      const where = `${'host' in p ? p.host : ''}:${p.port}`;
+      const taken = bound.get(where);
+      if (taken !== undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['platforms', id, 'port'],
+          message: `platform instances "${taken}" and "${id}" both bind ${where}; give one of them a different port`,
+        });
+      }
+      bound.set(where, id);
+    }
   });
 
 /** The slim, file-backed config (what setup writes and saveConfig serializes). */

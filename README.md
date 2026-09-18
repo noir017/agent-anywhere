@@ -21,16 +21,18 @@ streams its answer into a single, live-edited message.
  Discord ───┐
  Telegram ──┤     ┌──────────────────────┐
  Slack ─────┤     │        daemon        │       ┌─► claude
- Lark ──────┼────►│  routing · sessions  │◄─────►├─► codex
- QQ ────────┤     │  streaming · access  │       ├─► opencode
+ Lark ──────┤     │  routing · sessions  │◄─────►├─► codex
+ QQ ────────┼────►│  streaming · access  │       ├─► opencode
  LINE ──────┤     └──────────▲───────────┘       ├─► agy
  WeCom ─────┤                │ unix socket       └─► custom
- DingTalk ──┘                └─ agent-anywhere CLI (send-file / ask / react …)
+ DingTalk ──┤                └─ agent-anywhere CLI (send-file / ask / react …)
+ Web UI ────┘  (a browser page the daemon serves itself — no bot, no account)
 ```
 
 ## Features
 
 - **Eight platforms, one daemon** — Discord, Telegram, Slack, Lark, QQ, LINE, WeCom, DingTalk; multi-account supported.
+- **Or no platform at all** — a built-in web UI: a plain dark chat page the daemon serves, behind one shared token. Nothing to register, no bot to create.
 - **Any ACP agent, plus agy** — presets for Claude Code, Codex, OpenCode and Antigravity (`agy`), plus `custom`; route by platform, channel, user, or slash command.
 - **Native streaming** — in-place edits, live tool-call bubbles, lifecycle reactions, interrupt on new message.
 - **Chat actions** — the agent sends files, reacts, replies, opens threads, reads history, asks button questions.
@@ -75,7 +77,7 @@ version: 1
 
 platforms:                    # named instances; the key is the instance id
   discord-main:
-    type: discord             # discord|telegram|slack|lark|qq|line|wecom|dingtalk
+    type: discord             # discord|telegram|slack|lark|qq|line|wecom|dingtalk|webui
     token: ${DISCORD_TOKEN}   # every string supports ${VAR}
     chat:
       requireMention: true    # group channels need an @mention
@@ -169,19 +171,57 @@ appended after the defaults, and agy's flag parsing is last-wins).
 
 ## Platforms
 
-| | Discord | Telegram | Slack | Lark | QQ | LINE | WeCom | DingTalk |
-|---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
-| Streaming in-place edit | ✓ | ✓ | ✓ | ✓ | – | – | – | – |
-| Lifecycle reactions | ✓ | ✓ | ✓ | ✓ | ✓ | – | – | – |
-| Typing indicator | ✓ | ✓ | – | – | – | ✓ | – | – |
-| Native reply | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | – | – |
-| Threads / auto-thread | ✓ | ✓ | ✓ | ✓ | – | – | – | – |
-| Buttons (`ask`) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | – | – |
-| Slash commands | ✓ | ✓ | ✓ | – | – | – | – | – |
+| | Discord | Telegram | Slack | Lark | QQ | LINE | WeCom | DingTalk | Web UI |
+|---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
+| Streaming in-place edit | ✓ | ✓ | ✓ | ✓ | – | – | – | – | ✓ |
+| Lifecycle reactions | ✓ | ✓ | ✓ | ✓ | ✓ | – | – | – | ✓ |
+| Typing indicator | ✓ | ✓ | – | – | – | ✓ | – | – | ✓ |
+| Native reply | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | – | – | ✓ |
+| Threads / auto-thread | ✓ | ✓ | ✓ | ✓ | – | – | – | – | – |
+| Buttons (`ask`) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | – | – | ✓ |
+| Slash commands | ✓ | ✓ | ✓ | – | – | – | – | – | ✓ |
 
 Markdown is rendered per platform; missing capabilities degrade gracefully (no
 editing → chunked sends, no buttons → plain-text question). Slack, Lark, and
 DingTalk connect over WebSocket by default — no public callback URL needed.
+
+### Web UI
+
+A plain dark chat page the daemon serves itself. No bot to register, no account,
+no upstream service — it is the fastest way to have a working gateway, and the
+only one that works with no chat platform at all.
+
+```yaml
+platforms:
+  web:
+    type: webui
+    token: ${AA_WEB_TOKEN}    # required: the shared secret the login page asks for
+    host: 0.0.0.0             # default; 127.0.0.1 to keep it to an SSH tunnel
+    port: 8787                # default
+    title: Chat               # default; the browser tab's title
+
+access:
+  allowFrom: ["web:owner"]    # the identity is always <instance id>:owner
+```
+
+Open `http://<host>:8787`, enter the token, and you have the same conversation
+every other platform gets: streaming replies, tool bubbles, the `/model`, `/cd`
+and `/setting` button menus, `ask` questions, file upload and download.
+
+It is **one conversation** — no sidebar, no room list, no threads. `/new` starts
+over; a second conversation is a second instance on a second port.
+
+> [!WARNING]
+> The default binds every interface and speaks plain HTTP, so the token is the
+> only thing between your network and an agent with full tool access. Put a
+> reverse proxy with TLS in front of it before exposing it beyond a network you
+> control, or set `host: 127.0.0.1` and reach it over an SSH tunnel.
+> If you do proxy it, turn response buffering **off** (`proxy_buffering off;` in
+> nginx) — buffered server-sent events show nothing until the turn ends.
+
+Two things to expect: everyone who knows the token shares the one conversation,
+and a daemon restart empties the page while the agent keeps its context — the
+transcript lives in memory, the session does not.
 
 ## Chat commands
 

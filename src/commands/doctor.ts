@@ -8,6 +8,17 @@ import { isLegacyConfig, migrateLegacyConfig } from '../config/migrate.js';
 import { resolveClaudeAdapterEntry, resolveCodexAdapterEntry } from '../daemon/agent-acp.js';
 import { AGY_COMMAND } from '../daemon/agent-agy.js';
 import { agentHome } from '../daemon/skills-scan.js';
+import { OWNER } from '../platform/webui/room.js';
+
+/** Whether a host:port can be bound right now. Binds and releases; never leaves it held. */
+async function portFree(host: string, port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.once('error', () => resolve(false));
+    probe.once('listening', () => probe.close(() => resolve(true)));
+    probe.listen(port, host);
+  });
+}
 
 /**
  * Locate an executable: if it contains a path separator, check the file directly;
@@ -231,7 +242,12 @@ export async function runDoctor(opts: { migrateConfig?: boolean } = {}): Promise
         let anyFail = false;
         let anyWarn = false;
         for (const [id, p] of Object.entries(cfg.platforms)) {
-          if (p.type === 'discord') {
+          if (p.type === 'webui') {
+            // Its credential is a secret the operator chose for a server this process runs;
+            // there is nothing upstream to ask. The port and the allowlist are what can be
+            // wrong here, and both are checked below.
+            lines.push(`${id} (webui): the login token is local — nothing to validate online`);
+          } else if (p.type === 'discord') {
             discordResult = await checkDiscordToken(p.token);
             if (!discordResult.ok) anyFail = true;
             else if (discordResult.level === 'warn') anyWarn = true;
@@ -288,6 +304,46 @@ export async function runDoctor(opts: { migrateConfig?: boolean } = {}): Promise
             'access.allowFrom is empty: ANYONE who can message the bot can trigger an agent with full ' +
             'tool access (Bash / file writes). Set access.allowFrom to lock this down for production.',
         };
+      },
+    },
+    {
+      // The web UI's two ways of being configured-but-dead: a port something else already
+      // holds, and an allowlist that does not name it. Both fail silently at runtime — the
+      // first as a startup error long after the other platforms are live, the second as a
+      // page that accepts your messages and never answers one.
+      name: 'Web UI',
+      run: async () => {
+        if (!cfg) return { ok: false, detail: 'config unavailable, cannot check the web UI' };
+        const uis = Object.entries(cfg.platforms).filter(([, p]) => p.type === 'webui');
+        if (uis.length === 0) return { ok: true, detail: 'no webui instance configured; skipped' };
+        const lines: string[] = [];
+        let warn = false;
+        for (const [id, p] of uis) {
+          if (p.type !== 'webui') continue;
+          const free = await portFree(p.host, p.port);
+          if (!free) {
+            warn = true;
+            lines.push(
+              `${id}: ${p.host}:${p.port} is already in use — that is this web UI if the daemon is running, and a conflict if it is not`
+            );
+          } else {
+            lines.push(`${id}: ${p.host}:${p.port} is free`);
+          }
+          const identity = `${id}:${OWNER}`;
+          if (cfg.access.allowFrom.length > 0 && !cfg.access.allowFrom.includes(identity)) {
+            warn = true;
+            lines.push(
+              `${id}: access.allowFrom does not list "${identity}", so every message typed into this page will be ignored`
+            );
+          }
+          if (p.host !== '127.0.0.1' && p.host !== 'localhost' && p.host !== '::1') {
+            warn = true;
+            lines.push(
+              `${id}: bound to ${p.host} over plain HTTP — the login token is the only thing between the network and an agent with full tool access; put TLS in front of it`
+            );
+          }
+        }
+        return { ok: true, ...(warn ? { level: 'warn' as const } : {}), detail: lines.join('; ') };
       },
     },
     {

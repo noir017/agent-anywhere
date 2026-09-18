@@ -114,6 +114,17 @@ secret: <AppSecret / Client Secret>
 agentId: 123456           # optional; only resolves the bot's display name/avatar
 protocol: ws              # ws = Stream mode (default, no public URL) | http = webhook
 # http-only extras: host, port (DingTalk POSTs to <public host>/dingtalk)
+
+# Web UI — a browser page the daemon serves itself. No bot, no account, no upstream
+# service. One conversation only: no threads, no room list.
+type: webui
+token: <shared secret the login page asks for>   # required
+host: 0.0.0.0             # default; 127.0.0.1 keeps it to an SSH tunnel
+port: 8787                # default
+title: Chat               # default; the browser tab's title
+# Its identity for access.allowFrom is "<this instance id>:owner".
+# It binds every interface and speaks plain HTTP: the token is the only protection.
+# Two instances cannot share a host:port — config validation refuses it.
 ```
 
 ### Fields shared by every platform entry

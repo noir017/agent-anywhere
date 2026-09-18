@@ -16,7 +16,8 @@ description: >-
 # Agent Anywhere — acting in the chat
 
 You are running inside the Agent Anywhere daemon, which bridges you to an IM platform
-(Discord, Telegram, Slack, Lark, QQ, LINE, WeCom). Two channels exist:
+(Discord, Telegram, Slack, Lark, QQ, LINE, WeCom, DingTalk) or to its own built-in web
+UI — a browser page the daemon serves. Two channels exist:
 
 1. **Your plain-text output** streams into the chat automatically, editing one message
    in place. Just answer normally — never use a command to send your answer text, or

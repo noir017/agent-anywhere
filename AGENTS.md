@@ -13,9 +13,10 @@ one document, not two — edit `AGENTS.md`.
 ## What this project is
 
 A gateway daemon that connects chat platforms (Discord, Telegram, Slack, Lark, QQ,
-LINE, WeCom, DingTalk) to a local coding agent (Claude Code, Codex, OpenCode via ACP,
-or Google's Antigravity CLI). A user messages the bot; the agent runs on the operator's
-machine; its answer streams back into a single, live-edited message.
+LINE, WeCom, DingTalk) — plus a browser UI it serves itself — to a local coding agent
+(Claude Code, Codex, OpenCode via ACP, or Google's Antigravity CLI). A user messages the
+bot; the agent runs on the operator's machine; its answer streams back into a single,
+live-edited message.
 
 Node ≥ 20, TypeScript ESM (`"type": "module"`, `module: NodeNext`), strict mode with
 `noUncheckedIndexedAccess`. Published to npm as `agent-anywhere-cli`.
@@ -29,7 +30,7 @@ it. Do not duplicate that content here.
 |---|---|---|
 | `src/config/` | Config schema, loading, `${VAR}` expansion, v0→v1 migration | [README](src/config/README.md) |
 | `src/core/` | Platform-agnostic pure logic: conversation identity, gating, merging, streaming, tool bubbles, footer, attachments, command vocabulary | [README](src/core/README.md) |
-| `src/platform/` | Satori-based IM adapters: the profile seam, 8 platform profiles, per-dialect markdown renderers | [README](src/platform/README.md) |
+| `src/platform/` | IM adapters: the profile seam, 8 Satori platform profiles, per-dialect markdown renderers, and `webui/` — a browser page the daemon serves, implementing `PlatformAdapter` directly | [README](src/platform/README.md) |
 | `src/daemon/` | The running system: routing, conversations, turn orchestration, agent runtimes (ACP + agy) | [README](src/daemon/README.md) |
 | `src/ipc/` | Reverse-command protocol over a unix socket (agent → daemon → chat) | [README](src/ipc/README.md) |
 | `src/commands/` | CLI entry points: `setup`, `doctor`, `start`, reverse commands | [README](src/commands/README.md) |
@@ -53,8 +54,9 @@ Enforced facts, verifiable with grep:
   `daemon/`, or any Satori package. Core is pure: no clock, no `process.env`, no IO —
   all of those are injected. This is what makes it unit-testable without mocks of the
   IM stack.
-- `platform/` imports `core/proxy.ts` only. Profiles never see the whole `Config`,
-  only their own typed `platforms.<id>` entry.
+- `platform/` imports only pure pieces of `core/` — `proxy.ts`, `conversation.ts`,
+  `outbound-errors.ts` — and never `daemon/`. Profiles never see the whole `Config`, only
+  their own typed `platforms.<id>` entry.
 - `config/schema.ts` imports `platform/config-schemas.ts` (the per-platform credential
   schemas). That file is deliberately kept free of Satori imports so config loading
   never drags in the adapter chain.
@@ -153,7 +155,11 @@ Do not weaken these without saying so explicitly in the PR:
 
 - **A platform** → `platform/config-schemas.ts` (schema) + `platform/profiles/<name>.ts`
   (profile) + one line in `platform-factory.ts`. No wizard or daemon change needed.
-  See [src/platform/README.md](src/platform/README.md).
+  See [src/platform/README.md](src/platform/README.md). A platform that is *not* a chat
+  service has no profile: it implements `PlatformAdapter` directly and is dispatched before
+  `PROFILES`, as `platform/webui/` is — read
+  [its README](src/platform/webui/README.md) first, because the work is not the adapter but
+  the list of things `satori-core.ts` was doing for you.
 - **An agent harness** → an arm in `AgentDefSchema.harness` + `resolveHarness` in
   `daemon/agent-acp.ts` if it speaks ACP, or a sibling runtime implementing
   `AgentFactory` if it does not (as `agent-agy.ts` does).

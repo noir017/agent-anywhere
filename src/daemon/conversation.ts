@@ -911,6 +911,15 @@ export class ConversationRegistry {
       const lane = this.laneOf(id);
       if (!this.conversations.has(id) || !lane || !seed.trim()) return;
       if (this.config.platforms[lane.platformId]?.autoRenameThread === false) return;
+      // Ask whether the rename could land BEFORE paying for the name.
+      //
+      // `retitleLane` below already refuses on both counts, but it refuses at the END — after
+      // `summarizeTitle` has spent a model call on a subject nothing will ever use. Every
+      // thread-less platform was paying that once per conversation, forever: QQ, LINE, WeCom and
+      // DingTalk declare no rename at all, and a plain channel on the four that do has no lane to
+      // rename. The two conditions are retitleLane's own first two gates; it stays the authority
+      // on what they mean, and it keeps them because `/title` needs to SAY which one fired.
+      if (!this.canRetitle(lane.platformId, lane.address)) return;
       if (this.store?.conversationTitle(id) !== undefined) return;
       if (this.namingInFlight.has(id)) return;
       this.namingInFlight.add(id);
@@ -970,6 +979,19 @@ export class ConversationRegistry {
    * caller decides whether a conversation may be named (see nameConversation), because `/title` is
    * allowed to rename one that already has a name and the automatic path is not.
    */
+  /**
+   * Whether a rename of this lane could succeed at all, ignoring what it would be renamed to.
+   *
+   * Exists so the automatic namer can check cheaply before spending a model call; see the call
+   * site. `retitleLane` deliberately re-checks rather than calling this and trusting it, because
+   * it owes the user a sentence naming WHICH condition failed.
+   */
+  private canRetitle(platformId: string, address: ConversationAddress): boolean {
+    // Only the declaration is consulted; `renameThread` itself is a required member of
+    // PlatformAdapter that throws when unsupported, so its presence says nothing.
+    return Boolean(this.platforms.get(platformId)?.capabilities.renameThread && address.thread);
+  }
+
   private async retitleLane(
     id: ConversationId,
     agentId: string,

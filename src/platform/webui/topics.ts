@@ -32,6 +32,10 @@ export interface Topic {
   title: string;
   /** Epoch ms of the last message either way; the switcher orders by it. */
   lastAt: number;
+  /** True while an agent turn is actively executing in this topic. */
+  running?: boolean;
+  /** Monotonic count of messages posted into this topic. */
+  msgCount?: number;
 }
 
 /**

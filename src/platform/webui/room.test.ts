@@ -120,6 +120,28 @@ describe('WebRoom: topics are separate conversations', () => {
     expect(last(seen)).toMatchObject({ t: 'topics' });
     expect((last(seen) as { topics: Array<{ title: string }> }).topics.some((t) => t.title === '[cc] a subject')).toBe(true);
   });
+
+  it('tracks running state and msgCount in the topic list', () => {
+    const { room, topic, seen } = attached();
+    expect(room.topicList().find((t) => t.id === topic)?.running).toBe(false);
+    expect(room.topicList().find((t) => t.id === topic)?.msgCount).toBe(0);
+
+    // Typing sets running: true and announces
+    seen.length = 0;
+    room.setTyping(topic, true);
+    expect(room.topicList().find((t) => t.id === topic)?.running).toBe(true);
+    expect(seen.some((s) => s.ev.t === 'topics')).toBe(true);
+
+    // Posting a message increments msgCount
+    room.post(topic, { own: false, html: '<p>hi</p>' }, 'hi');
+    expect(room.topicList().find((t) => t.id === topic)?.msgCount).toBe(1);
+
+    // Stopping typing sets running: false and announces
+    seen.length = 0;
+    room.setTyping(topic, false);
+    expect(room.topicList().find((t) => t.id === topic)?.running).toBe(false);
+    expect(seen.some((s) => s.ev.t === 'topics')).toBe(true);
+  });
 });
 
 describe('WebRoom: held edits', () => {

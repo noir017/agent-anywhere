@@ -51,13 +51,38 @@ body{background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,-apple-system,
 #login input{width:100%;padding:9px 11px;background:var(--field);color:var(--fg);border:1px solid var(--line);border-radius:4px;font:inherit}
 #login button{margin-top:10px;width:100%}
 #err{color:#c06a6a;min-height:1.6em;margin:8px 0 0;font-size:13px}
-#app{display:flex;flex-direction:column;height:100%;max-width:820px;width:100%;margin:0 auto}
-#topics{display:flex;gap:10px;align-items:center;padding:8px 16px;border-bottom:1px solid var(--line);overflow-x:auto;white-space:nowrap;font-size:13px}
-#topics button{background:none;border:0;padding:2px 0;color:var(--dim);font:inherit;cursor:pointer;flex:0 0 auto;max-width:22ch;overflow:hidden;text-overflow:ellipsis}
-#topics button:hover{color:var(--fg)}
-#topics button.on{color:var(--fg)}
-#topics button.add{color:var(--dim);padding:2px 6px}
-#log{flex:1;overflow-y:auto;padding:20px 16px 8px}
+
+#app{display:flex;flex-direction:row;height:100%;width:100%;margin:0;overflow:hidden}
+
+#sidebar{width:240px;flex:0 0 240px;background:#171717;border-right:1px solid var(--line);display:flex;flex-direction:column;height:100%;transition:margin-left .18s ease;z-index:10}
+#sidebar.collapsed{margin-left:-240px}
+#sidebar-header{display:flex;align-items:center;gap:6px;padding:10px 12px;border-bottom:1px solid var(--line);min-height:42px}
+.sidebar-title{flex:1;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--dim)}
+.btn-icon{background:none;border:0;padding:4px 7px;color:var(--dim);font:inherit;font-size:13px;cursor:pointer;border-radius:4px;line-height:1}
+.btn-icon:hover{color:var(--fg);background:var(--field)}
+#sidebar-header .add{font-size:15px;font-weight:600}
+
+#topics{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:3px;padding:8px}
+#topics button.topic-item{display:flex;align-items:center;gap:8px;width:100%;padding:7px 9px;border:1px solid transparent;border-radius:5px;background:none;text-align:left;font:inherit;font-size:13px;cursor:pointer;transition:background .15s}
+#topics button.topic-item:hover{background:#222}
+#topics button.topic-item.on{background:#252525;border-color:var(--line)}
+.topic-dot{width:7px;height:7px;border-radius:50%;flex:0 0 7px;background:#444}
+.topic-dot.running{background:#38bdf8;box-shadow:0 0 6px rgba(56,189,248,.8);animation:pulse 1.5s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.topic-title{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#topics button.topic-item.running .topic-title{color:var(--fg)}
+#topics button.topic-item.on.running .topic-title{color:#fff}
+#topics button.topic-item.idle .topic-title{color:var(--dim)}
+#topics button.topic-item.on.idle .topic-title{color:#a0a0a0}
+.topic-badge{background:#2563eb;color:#fff;border-radius:9px;padding:1px 6px;font-size:11px;font-weight:600;line-height:1.3;margin-left:4px;flex-shrink:0}
+
+#chat{flex:1;display:flex;flex-direction:column;height:100%;min-width:0;position:relative}
+#chat-header{display:flex;align-items:center;gap:10px;padding:9px 16px;border-bottom:1px solid var(--line);min-height:42px;font-size:13px}
+.chat-title{font-weight:600;color:var(--fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:50ch}
+.chat-status{font-size:11.5px;color:var(--dim);text-transform:uppercase;letter-spacing:.04em}
+.chat-status.running{color:#38bdf8}
+
+#log{flex:1;overflow-y:auto;padding:20px 16px 8px;max-width:860px;width:100%;margin:0 auto}
 .m{margin:0 0 18px;max-width:100%;overflow-wrap:anywhere}
 .m.own{border-left:2px solid var(--line);padding-left:10px;color:#bdbdbd}
 .b>:first-child{margin-top:0}
@@ -80,8 +105,8 @@ body{background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,-apple-system,
 button{background:var(--field);color:var(--fg);border:1px solid var(--line);border-radius:4px;padding:6px 11px;font:inherit;font-size:13px;cursor:pointer}
 button:hover{border-color:#3a3a3a}
 button:disabled{opacity:.5;cursor:default}
-#typing{color:var(--dim);font-size:13px;padding:0 16px 6px}
-#bar{border-top:1px solid var(--line);padding:10px 16px 14px}
+#typing{color:var(--dim);font-size:13px;padding:0 16px 6px;max-width:860px;width:100%;margin:0 auto}
+#bar{border-top:1px solid var(--line);padding:10px 16px 14px;max-width:860px;width:100%;margin:0 auto}
 #hints{margin-bottom:8px;display:flex;flex-wrap:wrap;gap:6px}
 #hints button{font-size:12px}
 #chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
@@ -90,7 +115,10 @@ button:disabled{opacity:.5;cursor:default}
 #row{display:flex;gap:8px;align-items:flex-end}
 #input{flex:1;resize:none;max-height:40vh;padding:8px 10px;background:var(--field);color:var(--fg);border:1px solid var(--line);border-radius:4px;font:inherit}
 #input:focus,#login input:focus{outline:none;border-color:#3d3d3d}
-#note{color:var(--dim);font-size:12px;padding:0 16px 8px}
+#note{color:var(--dim);font-size:12px;padding:0 16px 8px;max-width:860px;width:100%;margin:0 auto}
+@media(max-width:640px){
+  #sidebar{position:absolute;box-shadow:3px 0 12px rgba(0,0,0,.6)}
+}
 `;
 
 const SCRIPT = `
@@ -98,10 +126,41 @@ const SCRIPT = `
   var $ = function(id){ return document.getElementById(id); };
   var log=$('log'), app=$('app'), gate=$('login'), err=$('err'), input=$('input'),
       chips=$('chips'), hints=$('hints'), typing=$('typing'), note=$('note'), picker=$('picker'),
-      bar=$('topics');
+      bar=$('topics'), sidebar=$('sidebar'), collapseBtn=$('collapse-sidebar'),
+      expandBtn=$('expand-sidebar'), newTopicBtn=$('new-topic'),
+      chatTitle=$('topic-title'), chatStatus=$('topic-status');
   var data={}, els={}, files=[], commands=[], stream=null, done=false;
   var topic = new URLSearchParams(location.search).get('t') || '';
   var topics = [];
+  var readCounts = {};
+  try { readCounts = JSON.parse(localStorage.getItem('aa_reads') || '{}'); } catch(x){}
+
+  function saveReads(){
+    try { localStorage.setItem('aa_reads', JSON.stringify(readCounts)); } catch(x){}
+  }
+
+  var sidebarOpen = localStorage.getItem('aa_sb_open');
+  if(sidebarOpen === null){ sidebarOpen = window.innerWidth > 640 ? '1' : '0'; }
+  function applySidebar(){
+    if(sidebarOpen === '0'){
+      sidebar.className = 'collapsed';
+      expandBtn.hidden = false;
+    } else {
+      sidebar.className = '';
+      expandBtn.hidden = true;
+    }
+  }
+  collapseBtn.addEventListener('click', function(){
+    sidebarOpen = '0';
+    try { localStorage.setItem('aa_sb_open', '0'); } catch(x){}
+    applySidebar();
+  });
+  expandBtn.addEventListener('click', function(){
+    sidebarOpen = '1';
+    try { localStorage.setItem('aa_sb_open', '1'); } catch(x){}
+    applySidebar();
+  });
+  applySidebar();
 
   function text(s){ var d=document.createElement('div'); d.textContent=s==null?'':String(s); return d.innerHTML; }
   function wait(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
@@ -159,13 +218,40 @@ const SCRIPT = `
 
   function paintTopics(){
     var h='';
+    var cur=null;
     for(var i=0;i<topics.length;i++){
       var t=topics[i];
-      h += '<button type="button" class="'+(t.id===topic?'on':'')+'" data-topic="'+text(t.id)+'">'
-         + text(t.title || 'Untitled') + '</button>';
+      var isCur=(t.id===topic);
+      if(isCur) cur=t;
+      var isRunning=Boolean(t.running);
+      var count=t.msgCount||0;
+      if(isCur){
+        readCounts[t.id]=count;
+        saveReads();
+      }
+      if(readCounts[t.id]===undefined){
+        readCounts[t.id]=count;
+        saveReads();
+      }
+      var unread=isCur?0:Math.max(0, count - readCounts[t.id]);
+      var cls='topic-item '+(isCur?'on ':'')+(isRunning?'running':'idle');
+      var dotCls='topic-dot'+(isRunning?' running':'');
+      var badge=unread>0?'<span class="topic-badge">'+(unread>99?'99+':unread)+'</span>':'';
+      h += '<button type="button" class="'+cls+'" data-topic="'+text(t.id)+'">'
+         + '<span class="'+dotCls+'"></span>'
+         + '<span class="topic-title">'+text(t.title || 'Untitled')+'</span>'
+         + badge
+         + '</button>';
     }
-    h += '<button type="button" class="add" data-new="1" title="New topic">+</button>';
     bar.innerHTML=h;
+    if(cur){
+      chatTitle.textContent=cur.title || 'Untitled';
+      chatStatus.textContent=cur.running ? 'running' : '';
+      chatStatus.className='chat-status'+(cur.running ? ' running' : '');
+    } else {
+      chatTitle.textContent='';
+      chatStatus.textContent='';
+    }
   }
 
   function handle(ev){
@@ -174,11 +260,25 @@ const SCRIPT = `
       history.replaceState(null,'','?t='+encodeURIComponent(topic));
       log.innerHTML=''; data={}; els={};
       for(var i=0;i<ev.messages.length;i++){ data[ev.messages[i].id]=ev.messages[i]; paint(ev.messages[i].id); }
+      readCounts[topic] = ev.messages.length;
+      saveReads();
       commands = ev.commands || [];
-      topics = ev.topics || []; paintTopics();
+      topics = ev.topics || [];
+      paintTopics();
       note.textContent=''; toBottom();
     }
-    else if(ev.t==='msg'){ upsert(ev.msg); }
+    else if(ev.t==='msg'){
+      upsert(ev.msg);
+      readCounts[topic] = (readCounts[topic] || 0) + 1;
+      saveReads();
+      for(var i=0;i<topics.length;i++){
+        if(topics[i].id===topic){
+          topics[i].msgCount = (topics[i].msgCount || 0) + 1;
+          break;
+        }
+      }
+      paintTopics();
+    }
     else if(ev.t==='del'){ drop(ev.id); }
     else if(ev.t==='react'){
       var m=data[ev.id]; if(!m) return;
@@ -186,7 +286,16 @@ const SCRIPT = `
       m.reactions = ev.on ? kept.concat([ev.emoji]) : kept;
       paint(ev.id);
     }
-    else if(ev.t==='typing'){ typing.hidden = !ev.on; }
+    else if(ev.t==='typing'){
+      typing.hidden = !ev.on;
+      for(var i=0;i<topics.length;i++){
+        if(topics[i].id===topic){
+          topics[i].running = ev.on;
+          break;
+        }
+      }
+      paintTopics();
+    }
     else if(ev.t==='commands'){ commands = ev.commands || []; }
     else if(ev.t==='topics'){ topics = ev.topics || []; paintTopics(); }
     else if(ev.t==='bye'){ done=true; if(stream) stream.close(); note.textContent='Disconnected. Reload when it is back.'; }
@@ -212,19 +321,43 @@ const SCRIPT = `
   }
 
   bar.addEventListener('click', function(e){
-    var b = e.target.closest ? e.target.closest('button') : null;
+    var b = e.target.closest ? e.target.closest('button[data-topic]') : null;
     if(!b) return;
-    if(b.getAttribute('data-new')){
-      post('api/topics',{},1).then(function(r){ return r.ok ? r.json() : null; }).then(function(d){
-        if(!d || !d.topic) return;
-        topic = d.topic.id; connect();
-      });
-      return;
-    }
     var id = b.getAttribute('data-topic');
     if(!id || id===topic) return;
-    topic = id; connect();
+    topic = id;
+    for(var i=0;i<topics.length;i++){
+      if(topics[i].id===id){
+        readCounts[id]=topics[i].msgCount || 0;
+        saveReads();
+        break;
+      }
+    }
+    paintTopics();
+    connect();
+    if(window.innerWidth <= 640){
+      sidebarOpen = '0';
+      try { localStorage.setItem('aa_sb_open', '0'); } catch(x){}
+      applySidebar();
+    }
   });
+
+  function createTopic(){
+    post('api/topics',{},1).then(function(r){ return r.ok ? r.json() : null; }).then(function(d){
+      if(!d || !d.topic) return;
+      topic = d.topic.id;
+      readCounts[topic] = 0;
+      saveReads();
+      connect();
+      if(window.innerWidth <= 640){
+        sidebarOpen = '0';
+        try { localStorage.setItem('aa_sb_open', '0'); } catch(x){}
+        applySidebar();
+      }
+    });
+  }
+
+  newTopicBtn.addEventListener('click', createTopic);
 
   $('gate').addEventListener('submit', function(e){
     e.preventDefault();
@@ -327,22 +460,36 @@ const PAGE = `<!doctype html>
 <p id="err"></p>
 </div></form>
 <main id="app" hidden>
-  <div id="topics"></div>
-  <div id="log"></div>
-  <div id="typing" hidden>...</div>
-  <div id="note"></div>
-  <div id="bar">
-    <div id="hints" hidden></div>
-    <div id="chips"></div>
-    <form id="composer">
-      <div id="row">
-        <textarea id="input" rows="1" placeholder="Message" autocomplete="off"></textarea>
-        <input id="picker" type="file" multiple hidden>
-        <button type="button" id="attach" title="Attach a file">+</button>
-        <button type="submit">Send</button>
-      </div>
-    </form>
-  </div>
+  <aside id="sidebar">
+    <div id="sidebar-header">
+      <span class="sidebar-title">Topics</span>
+      <button type="button" class="btn-icon add" id="new-topic" data-new="1" title="New topic">+</button>
+      <button type="button" class="btn-icon" id="collapse-sidebar" title="Collapse sidebar">◀</button>
+    </div>
+    <div id="topics"></div>
+  </aside>
+  <section id="chat">
+    <div id="chat-header">
+      <button type="button" class="btn-icon" id="expand-sidebar" title="Show topics" hidden>☰</button>
+      <span id="topic-title" class="chat-title"></span>
+      <span id="topic-status" class="chat-status"></span>
+    </div>
+    <div id="log"></div>
+    <div id="typing" hidden>...</div>
+    <div id="note"></div>
+    <div id="bar">
+      <div id="hints" hidden></div>
+      <div id="chips"></div>
+      <form id="composer">
+        <div id="row">
+          <textarea id="input" rows="1" placeholder="Message" autocomplete="off"></textarea>
+          <input id="picker" type="file" multiple hidden>
+          <button type="button" id="attach" title="Attach a file">+</button>
+          <button type="submit">Send</button>
+        </div>
+      </form>
+    </div>
+  </section>
 </main>
 <script>${SCRIPT}</script>
 </body>

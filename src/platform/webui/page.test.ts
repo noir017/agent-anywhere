@@ -49,12 +49,18 @@ describe('webui page', () => {
     expect(scriptOf(evil)).not.toContain('alert(1)');
   });
 
-  it('has a topic switcher, and nothing else new to look at', () => {
-    // The one visual element this feature adds. It exists because parallel topics are useless
-    // if you cannot see or reach them; everything else about the page is unchanged.
+  it('has a collapsible topic sidebar with running indicators and unread badges', () => {
     expect(html).toContain('id="topics"');
+    expect(html).toContain('id="sidebar"');
+    expect(html).toContain('#sidebar.collapsed');
+    expect(html).toContain('id="collapse-sidebar"');
+    expect(html).toContain('id="expand-sidebar"');
     expect(html).toContain('data-topic=');
     expect(html).toContain('data-new=');
+    expect(html).toContain('topic-badge');
+    expect(html).toContain('topic-dot');
+    expect(html).toContain('.topic-item.idle');
+    expect(html).toContain('.topic-item.running');
   });
 
   it('sends a nonce, without which its own retry would double-post', () => {

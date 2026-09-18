@@ -126,6 +126,7 @@ interface Room {
   timer: NodeJS.Timeout | null;
   /** When the current hold must end regardless of further edits; 0 when nothing is held. */
   holdUntil: number;
+  msgCount: number;
 }
 
 export class WebRoom {
@@ -160,8 +161,19 @@ export class WebRoom {
     return true;
   }
 
+  topicList(): Topic[] {
+    return this.topics.list().map((t) => {
+      const room = this.rooms.get(t.id);
+      return {
+        ...t,
+        running: Boolean(room?.typing),
+        msgCount: room?.msgCount ?? 0,
+      };
+    });
+  }
+
   private announceTopics(): void {
-    const topics = this.topics.list();
+    const topics = this.topicList();
     // The one event that crosses rooms: the switcher has to stay current without every client
     // subscribing to topics nobody is reading.
     for (const client of this.clients) this.deliver(client, { t: 'topics', topics });
@@ -223,7 +235,7 @@ export class WebRoom {
       topic: topicId,
       messages: [...room.stored.values()].map((s) => s.msg),
       commands: this.commands,
-      topics: this.topics.list(),
+      topics: this.topicList(),
     };
   }
 
@@ -340,6 +352,7 @@ export class WebRoom {
       if (oldest !== undefined) room.stored.delete(oldest);
     }
     room.stored.set(msg.id, { msg, text });
+    room.msgCount += 1;
     this.emit(topicId, { t: 'msg', msg });
     this.topics.touch(topicId, msg.at);
     this.announceTopics();
@@ -388,6 +401,7 @@ export class WebRoom {
     room.typing = on;
     this.flush(room, topicId);
     this.emit(topicId, { t: 'typing', on });
+    this.announceTopics();
   }
 
   /** The registered slash vocabulary, for the page's autocomplete. Not per topic. */
@@ -520,7 +534,7 @@ export class WebRoom {
   private roomOf(topicId: string): Room {
     let room = this.rooms.get(topicId);
     if (!room) {
-      room = { stored: new Map(), typing: false, seq: 0, backlog: [], queue: [], timer: null, holdUntil: 0 };
+      room = { stored: new Map(), typing: false, seq: 0, backlog: [], queue: [], timer: null, holdUntil: 0, msgCount: 0 };
       this.rooms.set(topicId, room);
     }
     return room;

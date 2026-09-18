@@ -5,6 +5,14 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **The web UI switches to a collapsible left sidebar, distinguishes running from finished topics, and badges unread messages.**
+  - Topic navigation moves from the top header bar to a dedicated left sidebar (`#sidebar`) displayed as a vertical list. The sidebar can be collapsed to maximize chat space using `◀` and re-opened via `☰` from the chat header, remembering the user's preference in `localStorage`.
+  - Active turns are visually distinct from finished sessions: topics running an agent turn show a bright pulsing status indicator and highlighted title, while finished/idle topics show greyed-out titles and muted status dots.
+  - Topic entries in the sidebar badge unread message counts in real-time. Background topics increment unread counts as messages arrive and clear as soon as the user selects the topic.
+
+
 ## [1.13.0] - 2026-09-18
 
 ### Added

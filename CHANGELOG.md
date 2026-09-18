@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.14.0] - 2026-09-18
+
 ### Changed
 
 - **The web UI switches to a collapsible left sidebar, distinguishes running from finished topics, and badges unread messages.**

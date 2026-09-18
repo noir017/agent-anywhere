@@ -21,27 +21,30 @@
  * in `room.ts` and `server.ts`, `measureRendered` and the typed `MessageNotEditableError`
  * below.
  */
+import path from 'node:path';
+
+import { configDir } from '../../config/load.js';
 import type { ConversationAddress } from '../../core/conversation.js';
 import type { MessageRef, SlashCommandSpec } from '../../types.js';
 import type { PlatformAdapter } from '../adapter.js';
 import { renderWebMarkdown } from '../web-markdown.js';
 import { WebAuth } from './auth.js';
-import { CHANNEL, WebRoom, type WebuiInstance } from './room.js';
+import { CHANNEL, TopicStore, WebRoom, type WebuiInstance } from './room.js';
 import { createWebServer, type WebServer } from './server.js';
 
-export { WebRoom, type WebuiInstance } from './room.js';
+export { WebRoom, TopicStore, type Topic, type WebuiInstance } from './room.js';
 
 /**
  * What this platform can do, declared honestly.
  *
  * Almost everything is true, which is unusual in this directory and is simply what a browser
  * is: it can redraw a message, show a button, strike one out, and stop a typing indicator on
- * command instead of waiting for it to expire. The three falses are the interesting ones.
+ * command instead of waiting for it to expire.
  */
 const CAPABILITIES: PlatformAdapter['capabilities'] = {
   editMessage: true,
   /**
-   * Declared for the record; nothing in the daemon reads it. `addReaction` / `startTyping`
+   * Declared for the record; nothing in the daemon reads either. `addReaction` / `startTyping`
    * are called unconditionally and swallowed on failure, so the obligation these two flags
    * describe is really "these methods must be safe to call", which they are.
    */
@@ -49,17 +52,18 @@ const CAPABILITIES: PlatformAdapter['capabilities'] = {
   typing: true,
   reply: true,
   /**
-   * No threads. The page is one conversation, and inventing a lane inside it to satisfy a
-   * capability would change how `conversationKey`, `formatAddress` and `chat.channels`
-   * entries all spell this conversation, in exchange for nothing the page would show.
+   * Topics. Each is a lane on the one channel, so each is its own conversation with its own
+   * agent session — the Telegram-forum shape, in a browser. `createThread` opens one, which
+   * also means the agent can open one for itself.
    */
-  thread: false,
+  thread: true,
   /**
-   * Which makes renaming moot: `retitleLane` refuses any address with no lane, so declaring
-   * this true would only trade one accurate refusal for a less accurate one — and, until the
-   * check was moved, would have spent a title-summarising model call per conversation first.
+   * And they can be named, which is the other half of that shape: the harness summarises what
+   * a topic turned out to be about and the switcher shows it. This works only because a topic
+   * IS a lane — `retitleLane` refuses any address without one, so the channel-per-topic
+   * alternative would have left this permanently inert.
    */
-  renameThread: false,
+  renameThread: true,
   buttons: true,
   editButtons: true,
   /**
@@ -73,18 +77,16 @@ const CAPABILITIES: PlatformAdapter['capabilities'] = {
    * Received, not registered in the platform's own UI — the same shape as Telegram, where a
    * slash command arrives as an ordinary message. `registerCommands` here only hands the page
    * the vocabulary for its autocomplete; invoking one sends plain text, which `route()`
-   * intercepts exactly as it does anywhere else. So there is no interaction to close out,
-   * hence no ack.
+   * intercepts exactly as it does anywhere else. So there is no interaction to close out.
    */
   slashCommands: true,
   slashNeedsAck: false,
   canRegisterSlashAtRuntime: true,
   /**
    * Not a platform limit — a browser has none. It is a ceiling on how large one message may
-   * grow before the writer seals it and starts another, and it exists because every streaming
-   * edit re-sends the whole rendered body: without a bound, one runaway reply becomes an
-   * unbounded DOM node redrawn several times a second. 20k characters is far past any real
-   * answer, so in practice nothing is ever split.
+   * grow before the writer seals it and starts another, and it exists because a streaming edit
+   * re-renders the whole body: without a bound, one runaway reply becomes an unbounded DOM
+   * node. 20k characters is far past any real answer, so nothing is ever split in practice.
    */
   maxMessageLength: 20_000,
   // maxEditsPerMessage is deliberately absent: nothing here refuses an edit after N of them.
@@ -93,13 +95,18 @@ const CAPABILITIES: PlatformAdapter['capabilities'] = {
 /**
  * Build the adapter the daemon drives.
  *
- * `start()` binds the port — not the factory. `createPlatformAdapters` runs in
+ * `start()` binds the port — not this function. `createPlatformAdapters` runs in
  * `commands/start.ts` well before `Daemon.run()` registers the inbound handlers, so a server
  * listening from the factory would accept a message in that window and drop it into a null
  * handler with nothing logged.
  */
 export function createWebuiAdapter(instance: WebuiInstance): PlatformAdapter {
-  const room = new WebRoom(instance);
+  // Per instance rather than one shared file: two web UIs on two ports are two deployments,
+  // and merging their topic lists would put one's rooms in the other's switcher.
+  const topics = new TopicStore(path.join(configDir(), `webui-topics-${instance.id}.json`));
+  // The page is never without a room to be in, including on a brand-new install.
+  topics.current();
+  const room = new WebRoom(instance, topics);
   const server = createWebServer(room, new WebAuth({ token: instance.token }), instance);
   return { ...describe(instance), ...outbound(room, instance), ...lifecycle(room, server) };
 }
@@ -128,79 +135,101 @@ type Outbound = Pick<
 >;
 
 function outbound(room: WebRoom, instance: WebuiInstance): Outbound {
-  /** Every outbound call names an address; only one exists here, and silence would be wrong. */
-  const here = (address: ConversationAddress, op: string): void => {
-    if (address.channel === CHANNEL && address.thread === undefined) return;
-    throw new Error(
-      `[webui] ${op}: this instance serves one conversation (${CHANNEL}), not ${address.channel}${address.thread ? `/${address.thread}` : ''}`
-    );
+  /**
+   * The topic an address names.
+   *
+   * Every outbound call has to say which room it is for, and the two ways of getting that
+   * wrong both deserve an error rather than a guess: a channel that is not this instance's
+   * (a `--channel` override on a reverse command) and a topic that no longer exists. Posting
+   * either into "the only room there is" would be the wrong kind of helpful — there is now
+   * more than one.
+   */
+  const topicOf = (address: ConversationAddress, op: string): string => {
+    const where = `${address.channel}${address.thread ? `/${address.thread}` : ''}`;
+    if (address.channel !== CHANNEL || !address.thread) {
+      throw new Error(`[webui] ${op}: "${instance.id}" addresses topics as ${CHANNEL}/<topic id>, not ${where}`);
+    }
+    if (!room.topics.has(address.thread)) {
+      throw new Error(`[webui] ${op}: no such topic ${where}`);
+    }
+    return address.thread;
   };
-  const ref = (id: string): MessageRef => ({ address: { channel: CHANNEL }, messageId: id });
+  const ref = (topic: string, id: string): MessageRef => ({
+    address: { channel: CHANNEL, thread: topic },
+    messageId: id,
+  });
 
   return {
     async sendMessage(address, text) {
-      here(address, 'sendMessage');
-      return ref(room.post({ own: false, html: renderWebMarkdown(text) }, text).id);
+      const topic = topicOf(address, 'sendMessage');
+      return ref(topic, room.post(topic, { own: false, html: renderWebMarkdown(text) }, text).id);
     },
     async editMessage(r, text) {
-      room.revise(r.messageId, text);
+      room.revise(topicOf(r.address, 'editMessage'), r.messageId, text);
     },
     async deleteMessage(r) {
-      room.remove(r.messageId);
+      room.remove(topicOf(r.address, 'deleteMessage'), r.messageId);
     },
     async sendFile(address, file) {
-      here(address, 'sendFile');
+      const topic = topicOf(address, 'sendFile');
       const name = file.name ?? file.path.split('/').pop() ?? 'file';
       const url = room.publish(file.path, name);
       const caption = file.caption ?? '';
-      return ref(room.post({ own: false, html: renderWebMarkdown(caption), file: { name, url } }, caption).id);
+      return ref(topic, room.post(topic, { own: false, html: renderWebMarkdown(caption), file: { name, url } }, caption).id);
     },
     async replyMessage(r, text) {
       // A quote of the message being answered, which is all "native reply" can mean on a page
-      // that has no threads: the reader sees what it is about without scrolling.
-      const quote = room.htmlOf(r.messageId);
-      return ref(room.post({ own: false, html: renderWebMarkdown(text), quote: { html: quote } }, text).id);
+      // whose topics are flat: the reader sees what it is about without scrolling.
+      const topic = topicOf(r.address, 'replyMessage');
+      const quote = room.htmlOf(topic, r.messageId);
+      return ref(topic, room.post(topic, { own: false, html: renderWebMarkdown(text), quote: { html: quote } }, text).id);
     },
     async sendButtons(address, text, buttons) {
-      here(address, 'sendButtons');
-      return ref(room.post({ own: false, html: renderWebMarkdown(text), buttons }, text).id);
+      const topic = topicOf(address, 'sendButtons');
+      return ref(topic, room.post(topic, { own: false, html: renderWebMarkdown(text), buttons }, text).id);
     },
     async editButtons(r, text, buttons) {
-      room.revise(r.messageId, text, buttons);
+      room.revise(topicOf(r.address, 'editButtons'), r.messageId, text, buttons);
     },
     async addReaction(r, emoji) {
-      room.react(r.messageId, emoji, true);
+      room.react(topicOf(r.address, 'addReaction'), r.messageId, emoji, true);
     },
     async removeReaction(r, emoji) {
-      room.react(r.messageId, emoji, false);
+      room.react(topicOf(r.address, 'removeReaction'), r.messageId, emoji, false);
     },
     async startTyping(address) {
-      here(address, 'startTyping');
-      room.setTyping(true);
+      room.setTyping(topicOf(address, 'startTyping'), true);
     },
-    async stopTyping() {
-      room.setTyping(false);
+    async stopTyping(address) {
+      room.setTyping(topicOf(address, 'stopTyping'), false);
     },
-    async createThread() {
-      // Capability-gated by the daemon before it ever gets here; throwing rather than
-      // returning a made-up address is the second line of defence satori-core has too.
-      throw new Error(`[webui] "${instance.id}" has no threads: it serves one conversation`);
+    /**
+     * Open a topic.
+     *
+     * Reached from the reverse command, so an agent can file a side errand into a room of its
+     * own rather than into the middle of the conversation that asked for it. The daemon's own
+     * `autoThread: 'perTurn'` never gets here — that path requires `kind: 'group'` and this
+     * platform reports `'direct'`.
+     */
+    async createThread(_r, name) {
+      const topic = room.createTopic(name);
+      return { address: { channel: CHANNEL, thread: topic.id } };
     },
-    async renameThread() {
-      throw new Error(`[webui] "${instance.id}" has no lane to rename`);
+    /** Name a topic. The string is `formatLaneTitle`'s `[agent] subject`. */
+    async renameThread(address, name) {
+      room.renameTopic(topicOf(address, 'renameThread'), name);
     },
     /**
      * Identity, and it has to be: `maxMessageLength` counts the raw markdown the writer is
      * chunking, not the html this adapter renders it into. Measuring the html would make a
-     * fenced code block read three to five times its real size and chop replies at a third of
-     * the stated limit for no reason.
+     * fenced code block read three to five times its real size and chop replies at a fraction
+     * of the stated limit for no reason.
      */
     measureRendered(text) {
       return text.length;
     },
     async fetchHistory(address, opts) {
-      here(address, 'fetchHistory');
-      return room.history(opts);
+      return room.history(topicOf(address, 'fetchHistory'), opts);
     },
   };
 }
@@ -225,6 +254,11 @@ function lifecycle(
       room.setCommands(cmds);
     },
     start: () => server.start(),
-    stop: () => server.stop(),
+    stop: async () => {
+      // Send whatever is being held before the sockets go, so a turn that ended just as the
+      // daemon was asked to stop is not left with its last edit in a queue nobody will run.
+      room.dispose();
+      await server.stop();
+    },
   };
 }

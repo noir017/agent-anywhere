@@ -44,7 +44,8 @@ naming it, and they are all of them:
 | File | Role |
 |---|---|
 | `index.ts` | The `PlatformAdapter`: capability declaration + the outbound methods |
-| `room.ts` | The conversation — message ring, subscribers, both directions of traffic. No HTTP. |
+| `room.ts` | The conversations — per-topic message rings, subscribers, the hold queue, both directions of traffic. No HTTP. |
+| `topics.ts` | The topic list and its file. Shaped like `daemon/workdir-usage.ts`. |
 | `server.ts` | `node:http`: routes, auth gate, SSE, upload, download, shutdown |
 | `auth.ts` | Shared-secret login, session cookies, brute-force throttle |
 | `protocol.ts` | `.strict()` zod schemas for every inbound body; the outbound event union |
@@ -54,19 +55,45 @@ naming it, and they are all of them:
 `room.ts` is deliberately free of HTTP so the adapter's behaviour is testable without opening
 a port — which is what `room.test.ts` and `index.test.ts` do.
 
-## One conversation
+## Topics
 
-The page is a single room: `{ channel: 'main', kind: 'direct', user: 'owner' }`. No sidebar,
-no room list, no threads. A second conversation is a second `platforms:` entry on a second
-port.
+A topic is a LANE on the one channel: `{ channel: 'main', thread: '<topic id>' }`. Each is its
+own conversation, with its own agent session and its own harness-generated name — the shape a
+Telegram forum topic or a Feishu 话题群 has, in a browser.
 
-That is why `thread` and `renameThread` are declared false. `renameThread` in particular
-*could* have been true — but `retitleLane` refuses any address with no lane, so it would have
-traded one accurate refusal ("this platform cannot") for a less accurate one ("there is no
-name to change") and bought nothing. `/title` says the first.
+**A lane rather than a channel of its own, and that is not arbitrary.** Both would give
+separate conversations: `conversationKey` under the default `per_thread` scope is
+`platform#channel#thread`, so either varying part separates them. The difference is naming.
+`retitleLane` refuses any address with no lane, so `capabilities.renameThread` is only ever
+true for a lane — a channel-per-topic design would have left the automatic naming permanently
+inert, and that naming is half of what makes topics worth having.
 
-`kind: 'direct'` matters: the inbound gate answers a DM with `respondInDirect` and never asks
-for a mention, which is the right behaviour for a page with one person on it.
+**`kind` stays `'direct'` even though a lane is set, and this one is a trap worth knowing
+about.** `shouldRespond` (`core/inbound-gate.ts`) answers a DM at step 3 and only reaches its
+mention requirement at step 6. A `kind: 'thread'` message that is not a DM, has no active
+session yet, and carries no @ falls through to that step — and `chat.requireMention` defaults
+to true, so **the first message in every new topic would be silently dropped**. `'direct'`
+short-circuits before that while `conversationKey` still separates by lane and `retitleLane`
+still works. A DM that has lanes is a shape the gateway already knows: a Telegram DM topic.
+
+**Ids are hex and may not contain `/`.** A topic id travels as the lane half of `main/<id>`,
+which `parseAddress` splits on `/` and refuses to see twice — so an id with one in it would
+break `--channel` and the `chat.channels` allowlist far from here. `protocol.ts` rejects the
+wrong shape at the request boundary.
+
+**Message ids are global and never reused**, not per topic. The outbound pacer coalesces edits
+into `edit:<channel>:<messageId>` and every topic shares the one channel, so an id restarting
+per topic would let one topic's edits supersede another's. For the same reason all topics share
+one rate-limit budget — exactly as Telegram forum topics share their chat's.
+
+**The topic list is persisted; the transcripts are not.** Losing the list is not "the page looks
+empty": `conversations.json` still holds the agent binding and session id under
+`<instance>#main#<topic id>`, so every context would still be running and no longer reachable.
+See `topics.ts` for why its `title` duplicates one the daemon also stores.
+
+**`access.allowFrom` identity is `<instance id>:owner`**, the same for every topic. An existing
+config that already lists other identities will silently ignore every message typed into this
+page until that entry is added — `doctor` checks for exactly this.
 
 **`access.allowFrom` identity is `<instance id>:owner`.** An existing config that already
 lists other identities will silently ignore every message typed into this page until that
@@ -79,13 +106,51 @@ entry is added — `doctor` checks for exactly this.
 | `editMessage` | ✓ | Redrawing a message is what a DOM does |
 | `reaction` / `typing` | ✓ | Nothing in the daemon reads either flag; the real obligation is that the methods are safe to call |
 | `reply` | ✓ | Rendered as a quote above the body |
-| `thread` / `renameThread` | – | See above |
+| `thread` / `renameThread` | ✓ | Topics, and topics that name themselves. The second is only possible because the first is a lane |
 | `buttons` / `editButtons` | ✓ | Both, or `/model`, `/cd` and `/setting` silently degrade to plain text |
 | `menuPageSize` | 12 | The same number every other platform declares. A browser could carry more; that is not a reason to make it the odd one out, and `menu-page-size.test.ts` holds that invariant for the profiles it can see |
 | `slashCommands` | ✓ | *Received*, as ordinary text, exactly like Telegram — `registerCommands` only feeds the page's autocomplete |
 | `slashNeedsAck` | – | There is no interaction to close out |
 | `maxMessageLength` | 20000 | Not a platform limit. A ceiling so one runaway reply does not become an unbounded DOM node redrawn several times a second |
 | `maxEditsPerMessage` | unset | Nothing here ever refuses an edit |
+
+## Built for a bad connection
+
+Three things here exist because this is expected to be read over a weak link, and each would be
+simpler without that constraint. Together they took a 30-second streamed answer from 13 updates
+and ~2.6 KB to 3 updates and ~600 bytes.
+
+**Edits are held, not broadcast.** Every streaming flush re-renders the whole message, so
+announcing each one sends the same growing body over and over. An edit is queued and emitted
+once the message stops changing, or after a cap so a long reply still shows progress.
+`SETTLE_MS` cannot be read on its own: it is 1500ms because `EXPERIENCE.stream.flushIntervalMs`
+is 1200ms, and anything below that expires between every pair of edits — announcing each one
+separately, adding a fixed delay to all of them, and saving nothing. If that 1200 moves, this
+has to move with it.
+
+The ordering rule that makes holding safe: **any non-edit event flushes the queue first.** A
+tool bubble is a new message (flush), its progress is an edit (held), and the next segment's
+text is another new message (flush) — so the bubble's final state always arrives above the text
+that followed it. Getting that backwards is the scrambled transcript
+`daemon/render-order.test.ts` exists for, one layer up.
+
+**A dropped stream resumes.** Every event carries a sequence number written as the SSE `id:`
+field, and each topic keeps a backlog of the last 300. `EventSource` sends back the last id it
+saw, and the room replays only what that client missed. Before this, every network blip cost a
+full re-send of the conversation. A `Last-Event-ID` the backlog no longer reaches falls back to
+a full sync rather than handing over a transcript with a hole in it, and the cross-topic
+`topics` event deliberately carries no id so it cannot move a resume point.
+
+**Everything is compressed**, the event stream included — which is the part with a trap in it.
+A gzip stream buffers until told otherwise, so each event is followed by an explicit
+`Z_SYNC_FLUSH`. Without it the page receives nothing until the connection closes, which is
+indistinguishable from a hung daemon. `server.test.ts` pins it, and the test hangs rather than
+failing an assertion if the flush goes away — which is the honest reproduction.
+
+**Sends are idempotent.** A POST can be accepted and still time out on a bad link, so the page
+retries — which is only safe because each send carries a nonce the server remembers. The
+daemon's own inbound dedup cannot help here: it keys on a message id, and a retry mints a fresh
+one.
 
 ## Transport: SSE, not WebSocket
 
@@ -146,6 +211,8 @@ shared secret is what stands in its place.
   `closeIdleConnections` / `close` / `closeAllConnections`, behind a timeout. Get this wrong
   and Ctrl-C hangs the daemon forever, because the signal handler's `process.exit` lives in
   that promise's `finally`.
+- **A reverse proxy must not buffer**, and must not strip `Content-Encoding` without
+  re-adding it. `proxy_buffering off;` in nginx.
 - **`page.ts` is invisible to the toolchain.** Not typechecked, not linted, not unit-tested —
   to TypeScript it is a string. So the script is kept stupid, uses string concatenation
   rather than template literals (a literal `` ` `` or `${` would be eaten by the surrounding

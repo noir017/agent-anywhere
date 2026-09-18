@@ -18,6 +18,7 @@ import { z } from 'zod';
 
 import type { ButtonSpec } from '../adapter.js';
 import type { SlashCommandSpec } from '../../types.js';
+import type { Topic } from './topics.js';
 
 /**
  * Hard ceiling on one request body.
@@ -46,15 +47,37 @@ const UploadSchema = z
 
 export const LoginRequestSchema = z.object({ token: z.string().min(1).max(4096) }).strict();
 
+/**
+ * Which topic a request is about.
+ *
+ * Shaped, not free text: the id travels on as the lane half of the address `main/<id>`, which
+ * `core/conversation.ts` splits on `/` and refuses to see twice. Rejecting the wrong shape here
+ * keeps a malformed lane from ever reaching an address.
+ */
+const TopicId = z.string().regex(/^[0-9a-f]{8}$/, 'not a topic id');
+
 export const SendRequestSchema = z
   .object({
+    topic: TopicId,
     text: z.string().max(MAX_TEXT_CHARS),
     files: z.array(UploadSchema).max(10).optional(),
+    /**
+     * Client-generated, so a retry is safe.
+     *
+     * The point of the whole weak-network pass: a POST can time out after the server has
+     * already accepted it, and a client that retries without this would send the message
+     * twice. The daemon's own inbound dedup cannot help — it keys on the message id, and a
+     * retry mints a fresh one.
+     */
+    nonce: z.string().min(1).max(64).optional(),
   })
   .strict();
 
+export const CreateTopicRequestSchema = z.object({ title: z.string().max(200).optional() }).strict();
+
 export const ClickRequestSchema = z
   .object({
+    topic: TopicId,
     messageId: z.string().min(1).max(256),
     buttonId: z.string().min(1).max(512),
   })
@@ -63,6 +86,7 @@ export const ClickRequestSchema = z
 export type LoginRequest = z.infer<typeof LoginRequestSchema>;
 export type SendRequest = z.infer<typeof SendRequestSchema>;
 export type ClickRequest = z.infer<typeof ClickRequestSchema>;
+export type CreateTopicRequest = z.infer<typeof CreateTopicRequestSchema>;
 
 /**
  * Validate one inbound body against a schema.
@@ -92,13 +116,28 @@ export function parseBody<T>(
  * mid-turn produces exactly that. With upsert semantics there is no such case to get wrong.
  */
 export type WebEvent =
-  /** Full replay of the conversation, sent first on every (re)connect. */
-  | { t: 'sync'; messages: WebMessage[]; commands: SlashCommandSpec[] }
+  /**
+   * Full replay of one topic, sent when a client connects without a resumable position.
+   *
+   * No longer sent on EVERY connect: a stream that reconnects with a `Last-Event-ID` the
+   * backlog still covers is caught up with the events it missed instead. Re-sending the whole
+   * conversation after every network blip was the single most expensive thing this protocol
+   * did on a weak link.
+   */
+  | { t: 'sync'; topic: string; messages: WebMessage[]; commands: SlashCommandSpec[]; topics: Topic[] }
   | { t: 'msg'; msg: WebMessage }
   | { t: 'del'; id: string }
   | { t: 'react'; id: string; emoji: string; on: boolean }
   | { t: 'typing'; on: boolean }
   | { t: 'commands'; commands: SlashCommandSpec[] }
+  /**
+   * The topic list changed — one was created, renamed, or spoken in.
+   *
+   * Broadcast to every client regardless of which topic it is watching, because the switcher
+   * has to stay current without subscribing to rooms nobody is reading. It is the only event
+   * that crosses topics.
+   */
+  | { t: 'topics'; topics: Topic[] }
   /**
    * The daemon is going away; stop reconnecting.
    *

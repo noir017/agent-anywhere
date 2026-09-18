@@ -5,6 +5,73 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **The web UI has topics, and they work the way a Telegram forum topic does.** A row of names
+  across the top switches between parallel conversations; each has its own agent session and its
+  own context, and each names itself from what it turned out to be about. `+` opens one, the agent
+  can open one for itself with `agent-anywhere create-thread`, and write into one with
+  `--channel main/<topic id>`.
+
+  A topic is a LANE on the one channel rather than a channel of its own, and the difference is the
+  naming: `retitleLane` refuses any address with no lane, so `capabilities.renameThread` can only
+  ever be true for a lane. A channel-per-topic design would have given the same conversation
+  separation and left the automatic naming permanently inert.
+
+  The `kind` stays `direct` even though a lane is set, which looks wrong and is not. `shouldRespond`
+  answers a DM at step 3 and only reaches its mention requirement at step 6; a `kind: 'thread'`
+  message that is not a DM, has no active session yet and carries no @ falls through to that step —
+  and `chat.requireMention` defaults to true, so the FIRST message in every new topic would have
+  been dropped without a word. A DM that has lanes is a shape the gateway already knows: a Telegram
+  DM topic is exactly this.
+
+  The topic list is persisted next to the daemon's own state, and that is not cosmetic: losing it
+  would leave every one of those conversations still bound and still resumable in
+  `conversations.json` under `<instance>#main#<topic id>`, and unreachable because nothing knew the
+  ids any more.
+
+  **Upgrading resets the web UI's existing conversation, once.** Its key was `<instance>#main#`
+  with no lane; a topic makes it `<instance>#main#<id>`, so the old one is no longer looked up. It
+  is one platform, one version old, and a migration shim for a shape published a day earlier costs
+  more than starting the conversation again.
+
+- **The web UI is usable on a weak, high-latency link.** Three changes, and together they took a
+  thirty-second streamed answer from 13 updates and ~2.6 KB to 3 updates and ~600 bytes:
+
+  Replies are announced when they settle rather than on every flush. Each streaming flush
+  re-renders the whole message, so announcing all of them sent the same growing body over and over.
+  The settle window is 1500ms *because* `EXPERIENCE.stream.flushIntervalMs` is 1200ms — anything
+  below that expires between every pair of edits, announcing each one separately and saving
+  nothing. Any non-edit event flushes what is held first, so a tool bubble's final state still
+  arrives above the text that followed it.
+
+  A dropped stream resumes. Every event now carries a sequence number as the SSE `id:` field and
+  each topic keeps a backlog, so `EventSource`'s own reconnect is answered with the handful of
+  events that were missed instead of the entire conversation — which is what every network blip
+  used to cost.
+
+  Everything on the wire is compressed, the event stream included. That one has a trap in it: a
+  gzip stream buffers until told otherwise, so each event is followed by an explicit
+  `Z_SYNC_FLUSH`; without it the page receives nothing until the connection closes, which reads
+  exactly like a hung daemon. The test that pins it hangs rather than failing an assertion if the
+  flush goes away.
+
+  Sends carry a nonce, so the page can retry one that timed out without risking a double post. The
+  daemon's own inbound dedup cannot cover this — it keys on a message id, and a retry mints a fresh
+  one.
+
+### Fixed
+
+- **`agent-anywhere create-thread` tells you the thread it just made.** It never has, on any
+  platform: the daemon returned the adapter's `{address}` verbatim while the CLI reads
+  `data.threadId`, so the command printed an empty id and the help line under it read "send into
+  this thread by passing `--channel`" with nothing after it. The daemon now answers in the shape
+  the protocol declares, formatting the address the same way `--channel` parses it back — a bare
+  channel where a thread is a channel of its own, `<channel>/<lane>` where it is a lane — so the
+  help line is true wherever it is printed. Found while making that command do something real on
+  the web UI, where it opens a topic.
+
+
 ## [1.12.0] - 2026-09-18
 
 ### Added

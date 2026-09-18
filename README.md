@@ -177,7 +177,7 @@ appended after the defaults, and agy's flag parsing is last-wins).
 | Lifecycle reactions | ✓ | ✓ | ✓ | ✓ | ✓ | – | – | – | ✓ |
 | Typing indicator | ✓ | ✓ | – | – | – | ✓ | – | – | ✓ |
 | Native reply | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | – | – | ✓ |
-| Threads / auto-thread | ✓ | ✓ | ✓ | ✓ | – | – | – | – | – |
+| Threads / auto-thread | ✓ | ✓ | ✓ | ✓ | – | – | – | – | ✓ |
 | Buttons (`ask`) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | – | – | ✓ |
 | Slash commands | ✓ | ✓ | ✓ | – | – | – | – | – | ✓ |
 
@@ -208,8 +208,18 @@ Open `http://<host>:8787`, enter the token, and you have the same conversation
 every other platform gets: streaming replies, tool bubbles, the `/model`, `/cd`
 and `/setting` button menus, `ask` questions, file upload and download.
 
-It is **one conversation** — no sidebar, no room list, no threads. `/new` starts
-over; a second conversation is a second instance on a second port.
+**Topics.** A row of names across the top switches between parallel conversations,
+the same way a Telegram forum topic or a Feishu 话题 does: each has its own agent
+session and its own context, and each gets named automatically from what it turned
+out to be about. `+` opens one; the agent can open one itself with
+`agent-anywhere create-thread`, and write into one with `--channel main/<topic id>`.
+
+**Built for a bad connection.** Replies are sent when they settle rather than on
+every keystroke of the stream, everything on the wire is compressed, and a dropped
+connection resumes from where it left off instead of re-downloading the
+conversation. In a 30-second streamed answer that is 13 updates collapsed to 3, at
+about a quarter of the bytes. Sends carry a nonce, so the page retries safely on a
+link that drops them.
 
 > [!WARNING]
 > The default binds every interface and speaks plain HTTP, so the token is the

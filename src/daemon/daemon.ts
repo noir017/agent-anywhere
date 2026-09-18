@@ -721,7 +721,18 @@ export class Daemon {
         if (!platform.capabilities.thread) {
           throw new Error('unsupported operation: this platform does not support creating threads');
         }
-        return platform.createThread({ address, messageId: action.messageId }, action.name);
+        // Answer in the shape the protocol declares (`CreateThreadResult`) rather than handing
+        // the adapter's `{address}` straight back: the CLI reads `data.threadId` and prints
+        // "send into this thread by passing --channel <threadId>", so returning the raw address
+        // made that line read `--channel <threadId>` with an empty id — on every platform, ever
+        // since the command existed. `formatAddress` produces exactly what `--channel` parses
+        // back (`<channel>` where a thread is a channel of its own, `<channel>/<lane>` where it
+        // is a lane), so the help line is now true wherever it is printed.
+        return {
+          threadId: formatAddress(
+            (await platform.createThread({ address, messageId: action.messageId }, action.name)).address
+          ),
+        };
       case 'ask':
         // Capability gate: throw (not return { chosen: null }) when buttons are unsupported. ask means
         // "let the user choose"; silently returning null would mask the problem, while throwing gives

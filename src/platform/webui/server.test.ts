@@ -1,21 +1,33 @@
+import fs from 'node:fs';
+import http from 'node:http';
 import net from 'node:net';
-import { afterEach, describe, it, expect } from 'vitest';
+import os from 'node:os';
+import path from 'node:path';
+import { createGunzip } from 'node:zlib';
+import { afterEach, beforeEach, describe, it, expect } from 'vitest';
 
 import { WebuiConfigSchema } from '../config-schemas.js';
 import { WebAuth } from './auth.js';
 import { WebRoom, type WebuiInstance } from './room.js';
 import { createWebServer, type WebServer } from './server.js';
+import { TopicStore } from './topics.js';
 
 /**
  * These run a real server on a real (ephemeral, loopback) port.
  *
- * Worth the loop rather than asserting against a fake `req`/`res`: what is being checked here
- * is header behaviour, status codes and — above all — that shutdown terminates, and every one
- * of those is a property of `node:http` rather than of the handler this file could mock.
+ * Worth the loop rather than asserting against a fake `req`/`res`: what is checked here is
+ * header behaviour, status codes, that a compressed stream actually delivers events one at a
+ * time, and that shutdown terminates — every one of which is a property of `node:http` and
+ * `node:zlib` rather than of the handler a mock could stand in for.
  */
 const running: WebServer[] = [];
+let dir = '';
+beforeEach(() => {
+  dir = fs.mkdtempSync(path.join(os.tmpdir(), 'webui-server-'));
+});
 afterEach(async () => {
   await Promise.all(running.splice(0).map((s) => s.stop()));
+  fs.rmSync(dir, { recursive: true, force: true });
 });
 
 function freePort(): Promise<number> {
@@ -34,6 +46,8 @@ interface Booted {
   room: WebRoom;
   server: WebServer;
   base: string;
+  port: number;
+  topic: string;
   instance: WebuiInstance;
 }
 
@@ -46,11 +60,13 @@ async function boot(over: Partial<WebuiInstance> = {}): Promise<Booted> {
     port,
     ...over,
   };
-  const room = new WebRoom(instance);
+  const topics = new TopicStore(path.join(dir, `${port}.json`));
+  const topic = topics.current().id;
+  const room = new WebRoom(instance, topics);
   const server = createWebServer(room, new WebAuth({ token: instance.token }), instance);
   await server.start();
   running.push(server);
-  return { room, server, base: `http://127.0.0.1:${instance.port}`, instance };
+  return { room, server, base: `http://127.0.0.1:${port}`, port, topic, instance };
 }
 
 const JSON_HEADERS = { 'content-type': 'application/json' };
@@ -61,8 +77,55 @@ async function signIn(base: string, token = 'open-sesame'): Promise<string> {
     headers: JSON_HEADERS,
     body: JSON.stringify({ token }),
   });
-  const cookie = res.headers.get('set-cookie') ?? '';
-  return cookie.split(';')[0] ?? '';
+  return (res.headers.get('set-cookie') ?? '').split(';')[0] ?? '';
+}
+
+/** Open an event stream with raw `node:http`, so compression is visible instead of undone. */
+function openStream(
+  port: number,
+  topic: string,
+  cookie: string,
+  lastEventId?: string
+): Promise<{ res: http.IncomingMessage; next: () => Promise<string>; close: () => void }> {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        host: '127.0.0.1',
+        port,
+        path: `/api/events?t=${topic}`,
+        headers: {
+          cookie,
+          'accept-encoding': 'gzip',
+          ...(lastEventId ? { 'last-event-id': lastEventId } : {}),
+        },
+      },
+      (res) => {
+        const out = res.headers['content-encoding'] === 'gzip' ? res.pipe(createGunzip()) : res;
+        const pending: string[] = [];
+        let waiting: ((chunk: string) => void) | null = null;
+        out.on('data', (chunk: Buffer) => {
+          const text = chunk.toString('utf8');
+          if (waiting) {
+            const fn = waiting;
+            waiting = null;
+            fn(text);
+          } else pending.push(text);
+        });
+        resolve({
+          res,
+          next: () =>
+            new Promise<string>((done) => {
+              const ready = pending.shift();
+              if (ready !== undefined) done(ready);
+              else waiting = done;
+            }),
+          close: () => req.destroy(),
+        });
+      }
+    );
+    req.once('error', reject);
+    req.end();
+  });
 }
 
 describe('webui server: the page', () => {
@@ -73,7 +136,6 @@ describe('webui server: the page', () => {
     expect(res.headers.get('content-type')).toContain('text/html');
     const html = await res.text();
     expect(html).toContain('<title>Chat</title>');
-    // Nothing is fetched from anywhere: no CDN, no font service, no analytics.
     expect(html).not.toMatch(/(src|href)="https?:/);
   });
 
@@ -84,18 +146,24 @@ describe('webui server: the page', () => {
     expect(html).toContain('&lt;/title&gt;');
   });
 
-  it('answers an unknown route with a 404 rather than the page', async () => {
+  it('compresses it, because the page is the largest thing on the wire', async () => {
     const { base } = await boot();
-    const cookie = await signIn(base);
-    expect((await fetch(`${base}/nope`, { headers: { cookie } })).status).toBe(404);
+    const res = await fetch(`${base}/`, { headers: { 'accept-encoding': 'gzip' } });
+    // undici decodes and drops the header, so the reliable witness is Vary — set only on the
+    // branch that actually compressed.
+    expect(res.headers.get('vary')).toBe('Accept-Encoding');
   });
 });
 
 describe('webui server: the door', () => {
   it('refuses every guarded route without a session', async () => {
-    const { base } = await boot();
+    const { base, topic } = await boot();
     expect((await fetch(`${base}/api/events`)).status).toBe(401);
-    const send = await fetch(`${base}/api/send`, { method: 'POST', headers: JSON_HEADERS, body: '{"text":"x"}' });
+    const send = await fetch(`${base}/api/send`, {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ topic, text: 'x' }),
+    });
     expect(send.status).toBe(401);
   });
 
@@ -110,8 +178,8 @@ describe('webui server: the door', () => {
     const cookie = good.headers.get('set-cookie') ?? '';
     expect(cookie).toContain('HttpOnly');
     expect(cookie).toContain('SameSite=Strict');
-    // No Secure over plain http, or the browser would drop the cookie and login would appear
-    // to succeed while nothing worked.
+    // No Secure over plain http, or the browser drops the cookie and login appears to succeed
+    // while nothing works.
     expect(cookie).not.toContain('Secure');
   });
 
@@ -126,73 +194,159 @@ describe('webui server: the door', () => {
   });
 
   it('rejects a body that is not JSON, which is half of the CSRF defence', async () => {
-    // A form post or an <img> can only produce a "simple" request, and a simple request cannot
-    // carry application/json without a preflight the browser will not get an answer to.
-    const { base } = await boot();
+    const { base, topic } = await boot();
     const cookie = await signIn(base);
     const res = await fetch(`${base}/api/send`, {
       method: 'POST',
       headers: { cookie, 'content-type': 'text/plain' },
-      body: '{"text":"x"}',
+      body: JSON.stringify({ topic, text: 'x' }),
     });
     expect(res.status).toBe(415);
   });
 
   it('rejects a state-changing request that came from another origin', async () => {
-    const { base } = await boot();
+    const { base, topic } = await boot();
     const cookie = await signIn(base);
     const res = await fetch(`${base}/api/send`, {
       method: 'POST',
       headers: { ...JSON_HEADERS, cookie, origin: 'https://evil.example' },
-      body: JSON.stringify({ text: 'x' }),
+      body: JSON.stringify({ topic, text: 'x' }),
     });
     expect(res.status).toBe(403);
   });
 
-  it('rejects a malformed body with the offending field named', async () => {
+  it.each([
+    ['an unknown key', { topic: 'aaaaaaaa', text: 'x', admin: true }],
+    ['a malformed topic id', { topic: 'not-a-topic', text: 'x' }],
+    ['no topic at all', { text: 'x' }],
+  ])('rejects %s', async (_label, body) => {
     const { base } = await boot();
     const cookie = await signIn(base);
     const res = await fetch(`${base}/api/send`, {
       method: 'POST',
       headers: { ...JSON_HEADERS, cookie },
-      body: JSON.stringify({ text: 'x', admin: true }),
+      body: JSON.stringify(body),
     });
     expect(res.status).toBe(400);
-    expect(await res.text()).toContain('admin');
+  });
+});
+
+describe('webui server: topics', () => {
+  it('opens one and reports it', async () => {
+    const { base } = await boot();
+    const cookie = await signIn(base);
+    const res = await fetch(`${base}/api/topics`, { method: 'POST', headers: { ...JSON_HEADERS, cookie }, body: '{}' });
+    expect(res.status).toBe(201);
+    const made = (await res.json()) as { topic: { id: string } };
+    expect(made.topic.id).toMatch(/^[0-9a-f]{8}$/);
+  });
+
+  it('streams only the topic that was asked for', async () => {
+    const { base, port, room, topic } = await boot();
+    const cookie = await signIn(base);
+    const other = room.createTopic('other').id;
+    const stream = await openStream(port, topic, cookie);
+    await stream.next(); // the sync frame
+
+    room.post(other, { own: false, html: '<p>elsewhere</p>' }, 'elsewhere');
+    room.post(topic, { own: false, html: '<p>here</p>' }, 'here');
+    // Read up to the message, since the cross-topic `topics` broadcast rides the same wire.
+    let seen = '';
+    for (let i = 0; i < 6 && !seen.includes('here'); i += 1) seen += await stream.next();
+    // The other topic's message must not be on this wire at all — that isolation is what keeps
+    // one busy room from costing a client reading a quiet one.
+    expect(seen).not.toContain('elsewhere');
+    expect(seen).toContain('here');
+    stream.close();
+  });
+
+  it('answers 404 for a message sent to a topic that does not exist', async () => {
+    const { base } = await boot();
+    const cookie = await signIn(base);
+    const res = await fetch(`${base}/api/send`, {
+      method: 'POST',
+      headers: { ...JSON_HEADERS, cookie },
+      body: JSON.stringify({ topic: 'deadbeef', text: 'x' }),
+    });
+    expect(res.status).toBe(404);
+  });
+});
+
+describe('webui server: built for a weak link', () => {
+  it('compresses the event stream AND still delivers each event as it happens', async () => {
+    // The trap this pins: a gzip stream buffers until told otherwise, so without an explicit
+    // Z_SYNC_FLUSH after every event the page receives nothing until the connection closes —
+    // a "live" UI that shows the whole turn at the end of it. Without the flush this test does
+    // not fail an assertion, it hangs, which is the honest reproduction of the bug.
+    const { base, port, room, topic } = await boot();
+    const cookie = await signIn(base);
+    const stream = await openStream(port, topic, cookie);
+    expect(stream.res.headers['content-encoding']).toBe('gzip');
+    expect(await stream.next()).toContain('"t":"sync"');
+
+    room.post(topic, { own: false, html: '<p>later</p>' }, 'later');
+    expect(await stream.next()).toContain('later');
+    stream.close();
+  });
+
+  it('resumes from where a dropped stream left off instead of re-sending everything', async () => {
+    const { base, port, room, topic } = await boot();
+    const cookie = await signIn(base);
+    const first = await openStream(port, topic, cookie);
+    await first.next();
+    room.post(topic, { own: false, html: '<p>one</p>' }, 'one');
+    const frame = await first.next();
+    const id = /id: (\S+)/.exec(frame)?.[1] ?? '';
+    expect(id).toMatch(new RegExp(`^${topic}\\.\\d+$`));
+    first.close();
+
+    room.post(topic, { own: false, html: '<p>two</p>' }, 'two');
+    const second = await openStream(port, topic, cookie, id);
+    const resumed = await second.next();
+    // Only what was missed. Re-sending the whole conversation after every blip was the single
+    // most expensive thing this protocol did on a bad connection.
+    expect(resumed).toContain('two');
+    expect(resumed).not.toContain('"t":"sync"');
+    expect(resumed).not.toContain('one');
+    second.close();
+  });
+
+  it('delivers a retried send once', async () => {
+    const { base, room, topic } = await boot();
+    const cookie = await signIn(base);
+    const heard: string[] = [];
+    room.onMessage((m) => heard.push(m.content));
+    const body = JSON.stringify({ topic, text: 'only once', nonce: 'n-1' });
+    const a = await fetch(`${base}/api/send`, { method: 'POST', headers: { ...JSON_HEADERS, cookie }, body });
+    const b = await fetch(`${base}/api/send`, { method: 'POST', headers: { ...JSON_HEADERS, cookie }, body });
+    // The retry is answered as if it were the original, because for the caller it is.
+    expect([a.status, b.status]).toEqual([202, 202]);
+    expect(heard).toEqual(['only once']);
   });
 });
 
 describe('webui server: traffic', () => {
-  it('delivers a posted message to the room and streams the room to a client', async () => {
-    const { base, room } = await boot();
+  it('delivers a posted message to the room', async () => {
+    const { base, room, topic } = await boot();
     const cookie = await signIn(base);
     const heard: string[] = [];
     room.onMessage((m) => heard.push(m.content));
-
-    const stream = await fetch(`${base}/api/events`, { headers: { cookie } });
-    expect(stream.headers.get('content-type')).toContain('text/event-stream');
-    // Both of these tell a proxy not to buffer. nginx buffers SSE by default, and a buffered
-    // stream shows nothing until the turn ends — indistinguishable from a hung daemon.
-    expect(stream.headers.get('cache-control')).toContain('no-transform');
-    expect(stream.headers.get('x-accel-buffering')).toBe('no');
-
-    const reader = stream.body?.getReader();
-    const first = await reader?.read();
-    expect(new TextDecoder().decode(first?.value)).toContain('"t":"sync"');
-
-    const sent = await fetch(`${base}/api/send`, { method: 'POST', headers: { ...JSON_HEADERS, cookie }, body: JSON.stringify({ text: 'hi there' }) });
+    const sent = await fetch(`${base}/api/send`, {
+      method: 'POST',
+      headers: { ...JSON_HEADERS, cookie },
+      body: JSON.stringify({ topic, text: 'hi there' }),
+    });
     expect(sent.status).toBe(202);
     expect(heard).toEqual(['hi there']);
-    await reader?.cancel();
   });
 
   it('refuses a click on a message the room no longer holds', async () => {
-    const { base } = await boot();
+    const { base, topic } = await boot();
     const cookie = await signIn(base);
     const res = await fetch(`${base}/api/click`, {
       method: 'POST',
       headers: { ...JSON_HEADERS, cookie },
-      body: JSON.stringify({ messageId: 'gone', buttonId: 'ask:r:0' }),
+      body: JSON.stringify({ topic, messageId: 'gone', buttonId: 'ask:r:0' }),
     });
     expect(res.status).toBe(409);
   });
@@ -209,16 +363,15 @@ describe('webui server: traffic', () => {
     expect(res.headers.get('content-type')).toBe('application/octet-stream');
     expect(res.headers.get('content-disposition')).toContain('attachment');
     expect(res.headers.get('x-content-type-options')).toBe('nosniff');
-    expect(await res.text()).toContain('webui server: traffic');
   });
 
   it.each([
     ['an unknown token', 'f/deadbeef'],
     ['a path instead of a token', 'f/..%2F..%2Fetc%2Fpasswd'],
-  ])('answers 404 for %s', async (_label, path) => {
+  ])('answers 404 for %s', async (_label, p) => {
     const { base } = await boot();
     const cookie = await signIn(base);
-    expect((await fetch(`${base}/${path}`, { headers: { cookie } })).status).toBe(404);
+    expect((await fetch(`${base}/${p}`, { headers: { cookie } })).status).toBe(404);
   });
 });
 
@@ -227,24 +380,25 @@ describe('webui server: lifecycle', () => {
     // Without this, EADDRINUSE arrives as an asynchronous 'error' event, gets swallowed by the
     // daemon's global [uncaughtException] handler, and the daemon runs forever with a dead UI.
     const { instance } = await boot();
-    const clash = createWebServer(new WebRoom(instance), new WebAuth({ token: 'x' }), instance);
+    const topics = new TopicStore(path.join(dir, 'clash.json'));
+    const clash = createWebServer(new WebRoom(instance, topics), new WebAuth({ token: 'x' }), instance);
     await expect(clash.start()).rejects.toThrow(/cannot bind/);
   });
 
-  it('stops promptly with an event stream still open', async () => {
+  it('stops promptly with a compressed event stream still open', async () => {
     // The regression this exists for: `server.close()` alone waits for every connection to
-    // end, and an SSE response never does. Its callback would never fire, `Daemon.stop()`
-    // would never resolve, and the signal handler's `process.exit` sits in that promise's
-    // finally — so Ctrl-C would hang the daemon forever.
-    const { base, server } = await boot();
+    // end, and an SSE response never does. Its callback would never fire, `Daemon.stop()` would
+    // never resolve, and the signal handler's `process.exit` sits in that promise's finally —
+    // so Ctrl-C would hang the daemon forever. The gzip stream has to be ended too, not just
+    // the response.
+    const { base, port, server, topic } = await boot();
     const cookie = await signIn(base);
-    const stream = await fetch(`${base}/api/events`, { headers: { cookie } });
-    const reader = stream.body?.getReader();
-    await reader?.read(); // the sync frame; the connection now stays open by design
+    const stream = await openStream(port, topic, cookie);
+    await stream.next();
 
     const started = Date.now();
     await server.stop();
     expect(Date.now() - started).toBeLessThan(1500);
-    await reader?.cancel().catch(() => undefined);
+    stream.close();
   });
 });

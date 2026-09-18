@@ -1,6 +1,14 @@
 import { describe, it, expect } from 'vitest';
 
-import { ClickRequestSchema, LoginRequestSchema, SendRequestSchema, parseBody } from './protocol.js';
+import {
+  ClickRequestSchema,
+  CreateTopicRequestSchema,
+  LoginRequestSchema,
+  SendRequestSchema,
+  parseBody,
+} from './protocol.js';
+
+const TOPIC = 'a1b2c3d4';
 
 /**
  * These schemas are the shape of everything that crosses into the daemon from a browser, so
@@ -10,39 +18,60 @@ import { ClickRequestSchema, LoginRequestSchema, SendRequestSchema, parseBody } 
  */
 describe('webui protocol: inbound validation', () => {
   it('accepts a plain message', () => {
-    expect(parseBody(SendRequestSchema, { text: 'hi' })).toEqual({ ok: true, value: { text: 'hi' } });
+    expect(parseBody(SendRequestSchema, { topic: TOPIC, text: 'hi' })).toEqual({
+      ok: true,
+      value: { topic: TOPIC, text: 'hi' },
+    });
   });
 
-  it('accepts a message with attachments', () => {
-    const body = { text: '', files: [{ name: 'a.txt', mime: 'text/plain', data: 'aGk=' }] };
+  it('accepts a message with attachments and a retry nonce', () => {
+    const body = {
+      topic: TOPIC,
+      text: '',
+      files: [{ name: 'a.txt', mime: 'text/plain', data: 'aGk=' }],
+      nonce: 'abc123',
+    };
     expect(parseBody(SendRequestSchema, body).ok).toBe(true);
   });
 
   it.each([
-    ['an unknown key', { text: 'hi', admin: true }],
-    ['a wrong type', { text: 42 }],
+    ['too short', 'a1b2c3d'],
+    ['too long', 'a1b2c3d4e'],
+    ['not hex', 'ZZZZZZZZ'],
+    ['containing the address separator', 'a1b2/c3d'],
+    ['uppercase', 'A1B2C3D4'],
+  ])('rejects a topic id %s', (_label, topic) => {
+    // The id travels on as the lane half of `main/<id>`, which core splits on `/` and refuses
+    // to see twice. Rejecting the wrong shape here keeps a malformed lane out of an address.
+    expect(parseBody(SendRequestSchema, { topic, text: 'x' }).ok).toBe(false);
+  });
+
+  it.each([
+    ['an unknown key', { topic: TOPIC, text: 'hi', admin: true }],
+    ['a wrong type', { topic: TOPIC, text: 42 }],
     ['a missing field', {}],
     ['a non-object', 'hi'],
     ['null', null],
-    ['too many files', { text: '', files: Array.from({ length: 11 }, () => ({ name: 'a', mime: '', data: '' })) }],
-    ['an unknown key inside a file', { text: '', files: [{ name: 'a', mime: '', data: '', path: '/etc/passwd' }] }],
-    ['a nameless file', { text: '', files: [{ name: '', mime: '', data: '' }] }],
+    ['too many files', { topic: TOPIC, text: '', files: Array.from({ length: 11 }, () => ({ name: 'a', mime: '', data: '' })) }],
+    ['an unknown key inside a file', { topic: TOPIC, text: '', files: [{ name: 'a', mime: '', data: '', path: '/etc/passwd' }] }],
+    ['a nameless file', { topic: TOPIC, text: '', files: [{ name: '', mime: '', data: '' }] }],
   ])('rejects %s', (_label, body) => {
     expect(parseBody(SendRequestSchema, body).ok).toBe(false);
   });
 
   it('names the offending path so a 400 is debuggable', () => {
-    const res = parseBody(SendRequestSchema, { text: 42 });
+    const res = parseBody(SendRequestSchema, { topic: TOPIC, text: 42 });
     expect(res.ok).toBe(false);
     if (res.ok) return;
     expect(res.error).toContain('text');
   });
 
   it.each([
-    ['both ids present', { messageId: 'm1', buttonId: 'ask:r1:0' }, true],
-    ['a missing button', { messageId: 'm1' }, false],
-    ['an empty id', { messageId: '', buttonId: 'b' }, false],
-    ['an extra key', { messageId: 'm1', buttonId: 'b', as: 'admin' }, false],
+    ['both ids present', { topic: TOPIC, messageId: 'm1', buttonId: 'ask:r1:0' }, true],
+    ['a missing button', { topic: TOPIC, messageId: 'm1' }, false],
+    ['an empty id', { topic: TOPIC, messageId: '', buttonId: 'b' }, false],
+    ['no topic', { messageId: 'm1', buttonId: 'b' }, false],
+    ['an extra key', { topic: TOPIC, messageId: 'm1', buttonId: 'b', as: 'admin' }, false],
   ])('click with %s', (_label, body, want) => {
     expect(parseBody(ClickRequestSchema, body).ok).toBe(want);
   });
@@ -54,5 +83,13 @@ describe('webui protocol: inbound validation', () => {
     ['an extra key', { token: 's', remember: true }, false],
   ])('login with %s', (_label, body, want) => {
     expect(parseBody(LoginRequestSchema, body).ok).toBe(want);
+  });
+
+  it.each([
+    ['nothing at all', {}, true],
+    ['a name', { title: 'notes' }, true],
+    ['an extra key', { title: 'x', pinned: true }, false],
+  ])('creating a topic with %s', (_label, body, want) => {
+    expect(parseBody(CreateTopicRequestSchema, body).ok).toBe(want);
   });
 });

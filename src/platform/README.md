@@ -69,8 +69,8 @@ Three rules keep this from rotting:
 | `reaction` | ✓ | ✓ | ✓ | ✓ | ✓ | – | – | – | ✓ |
 | `typing` | ✓ | ✓ | – | – | – | ✓ | – | – | ✓ |
 | `reply` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | – | – | ✓ |
-| `thread` | ✓ | ✓ | ✓ | ✓ | – | – | – | – | – |
-| `renameThread` | – | ✓ | – | – | – | – | – | – | – |
+| `thread` | ✓ | ✓ | ✓ | ✓ | – | – | – | – | ✓ |
+| `renameThread` | – | ✓ | – | – | – | – | – | – | ✓ |
 | `buttons` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | – | – | ✓ |
 | `editButtons` | ✓ | ✓ | ✓ | ✓ | – | – | – | – | ✓ |
 | `slashCommands` | ✓ | ✓ | ✓ | – | – | – | – | – | ✓ |
@@ -85,8 +85,10 @@ have buttons and no edit endpoint at all (LINE has no delete either, so not even
 delete-and-repost is available). A caller that needs to advance a posted menu — the
 paginated `/model` picker — checks this field and degrades to a text answer otherwise.
 
-The web UI column is what a browser is: almost all of it true, and the two falses are the
-page being one conversation rather than a platform full of them.
+The web UI column is what a browser is: everything true. Its topics are lanes, the same shape
+as a Telegram forum topic, which is also why it is the second platform after Telegram that can
+rename one — `retitleLane` refuses any address without a lane, so a design that gave each topic
+a channel of its own would have left `renameThread` permanently inert.
 
 **`menuPageSize` is a declaration, not a preference.** It says how many items one page of
 a button menu (`/cd`, `/model`, `/setting`) may hold here, and the limits are nowhere near

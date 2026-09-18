@@ -38,14 +38,27 @@ describe('webui page', () => {
   });
 
   it('asks for everything by a relative path, so a reverse proxy sub-path just works', () => {
-    expect(html).toContain("EventSource('api/events')");
+    expect(html).toContain("EventSource('api/events'");
     expect(html).not.toMatch(/fetch\('\//);
+    expect(html).toContain("post('api/send'");
   });
 
   it('escapes the configured title', () => {
     const evil = renderPage('</title><script>alert(1)</script>');
     expect(evil).not.toContain('<script>alert(1)</script>');
     expect(scriptOf(evil)).not.toContain('alert(1)');
+  });
+
+  it('has a topic switcher, and nothing else new to look at', () => {
+    // The one visual element this feature adds. It exists because parallel topics are useless
+    // if you cannot see or reach them; everything else about the page is unchanged.
+    expect(html).toContain('id="topics"');
+    expect(html).toContain('data-topic=');
+    expect(html).toContain('data-new=');
+  });
+
+  it('sends a nonce, without which its own retry would double-post', () => {
+    expect(html).toContain('nonce:');
   });
 
   it('makes the hidden attribute actually hide', () => {

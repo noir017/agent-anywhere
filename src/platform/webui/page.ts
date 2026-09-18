@@ -52,6 +52,11 @@ body{background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,-apple-system,
 #login button{margin-top:10px;width:100%}
 #err{color:#c06a6a;min-height:1.6em;margin:8px 0 0;font-size:13px}
 #app{display:flex;flex-direction:column;height:100%;max-width:820px;width:100%;margin:0 auto}
+#topics{display:flex;gap:10px;align-items:center;padding:8px 16px;border-bottom:1px solid var(--line);overflow-x:auto;white-space:nowrap;font-size:13px}
+#topics button{background:none;border:0;padding:2px 0;color:var(--dim);font:inherit;cursor:pointer;flex:0 0 auto;max-width:22ch;overflow:hidden;text-overflow:ellipsis}
+#topics button:hover{color:var(--fg)}
+#topics button.on{color:var(--fg)}
+#topics button.add{color:var(--dim);padding:2px 6px}
 #log{flex:1;overflow-y:auto;padding:20px 16px 8px}
 .m{margin:0 0 18px;max-width:100%;overflow-wrap:anywhere}
 .m.own{border-left:2px solid var(--line);padding-left:10px;color:#bdbdbd}
@@ -92,14 +97,29 @@ const SCRIPT = `
 (function(){
   var $ = function(id){ return document.getElementById(id); };
   var log=$('log'), app=$('app'), gate=$('login'), err=$('err'), input=$('input'),
-      chips=$('chips'), hints=$('hints'), typing=$('typing'), note=$('note'), picker=$('picker');
+      chips=$('chips'), hints=$('hints'), typing=$('typing'), note=$('note'), picker=$('picker'),
+      bar=$('topics');
   var data={}, els={}, files=[], commands=[], stream=null, done=false;
+  var topic = new URLSearchParams(location.search).get('t') || '';
+  var topics = [];
 
   function text(s){ var d=document.createElement('div'); d.textContent=s==null?'':String(s); return d.innerHTML; }
-  function post(path, body){
+  function wait(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+
+  // Retried, which is only safe because every send carries a nonce the server remembers: on a
+  // bad link a request can be accepted and still time out, and without the nonce a retry would
+  // post the same message twice.
+  function post(path, body, tries){
     return fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify(body),credentials:'same-origin'});
+      body:JSON.stringify(body),credentials:'same-origin'}).then(function(r){
+        if(!r.ok && r.status>=500 && tries>0) return wait(700).then(function(){ return post(path, body, tries-1); });
+        return r;
+      }, function(e){
+        if(tries>0) return wait(700).then(function(){ return post(path, body, tries-1); });
+        throw e;
+      });
   }
+
   function atBottom(){ return log.scrollHeight - log.scrollTop - log.clientHeight < 80; }
   function toBottom(){ log.scrollTop = log.scrollHeight; }
 
@@ -137,16 +157,28 @@ const SCRIPT = `
     delete data[id];
   }
 
-  function setCommands(list){
-    commands = list || [];
+  function paintTopics(){
+    var h='';
+    for(var i=0;i<topics.length;i++){
+      var t=topics[i];
+      h += '<button type="button" class="'+(t.id===topic?'on':'')+'" data-topic="'+text(t.id)+'">'
+         + text(t.title || 'Untitled') + '</button>';
+    }
+    h += '<button type="button" class="add" data-new="1" title="New topic">+</button>';
+    bar.innerHTML=h;
   }
 
   function handle(ev){
     if(ev.t==='sync'){
+      topic = ev.topic;
+      history.replaceState(null,'','?t='+encodeURIComponent(topic));
       log.innerHTML=''; data={}; els={};
       for(var i=0;i<ev.messages.length;i++){ data[ev.messages[i].id]=ev.messages[i]; paint(ev.messages[i].id); }
-      setCommands(ev.commands); note.textContent=''; toBottom();
-    } else if(ev.t==='msg'){ upsert(ev.msg); }
+      commands = ev.commands || [];
+      topics = ev.topics || []; paintTopics();
+      note.textContent=''; toBottom();
+    }
+    else if(ev.t==='msg'){ upsert(ev.msg); }
     else if(ev.t==='del'){ drop(ev.id); }
     else if(ev.t==='react'){
       var m=data[ev.id]; if(!m) return;
@@ -155,12 +187,16 @@ const SCRIPT = `
       paint(ev.id);
     }
     else if(ev.t==='typing'){ typing.hidden = !ev.on; }
-    else if(ev.t==='commands'){ setCommands(ev.commands); }
+    else if(ev.t==='commands'){ commands = ev.commands || []; }
+    else if(ev.t==='topics'){ topics = ev.topics || []; paintTopics(); }
     else if(ev.t==='bye'){ done=true; if(stream) stream.close(); note.textContent='Disconnected. Reload when it is back.'; }
   }
 
   function connect(){
-    stream = new EventSource('api/events');
+    if(stream) stream.close();
+    // EventSource resends the last id it saw on its own, so a blip is answered with the few
+    // events that were missed rather than the whole conversation.
+    stream = new EventSource('api/events' + (topic ? '?t='+encodeURIComponent(topic) : ''));
     stream.onmessage = function(e){ try{ handle(JSON.parse(e.data)); }catch(x){} };
     stream.onopen = function(){ gate.hidden=true; app.hidden=false; note.textContent=''; input.focus(); };
     stream.onerror = function(){
@@ -175,10 +211,25 @@ const SCRIPT = `
     };
   }
 
+  bar.addEventListener('click', function(e){
+    var b = e.target.closest ? e.target.closest('button') : null;
+    if(!b) return;
+    if(b.getAttribute('data-new')){
+      post('api/topics',{},1).then(function(r){ return r.ok ? r.json() : null; }).then(function(d){
+        if(!d || !d.topic) return;
+        topic = d.topic.id; connect();
+      });
+      return;
+    }
+    var id = b.getAttribute('data-topic');
+    if(!id || id===topic) return;
+    topic = id; connect();
+  });
+
   $('gate').addEventListener('submit', function(e){
     e.preventDefault();
     err.textContent='';
-    post('api/login',{token:$('secret').value}).then(function(r){
+    post('api/login',{token:$('secret').value},0).then(function(r){
       if(r.ok){ $('secret').value=''; connect(); return; }
       err.textContent = r.status===429 ? 'Too many attempts. Wait a minute.' : 'That is not the right token.';
     }).catch(function(){ err.textContent='Could not reach the server.'; });
@@ -188,7 +239,7 @@ const SCRIPT = `
     var b = e.target.closest ? e.target.closest('button[data-btn]') : null;
     if(!b) return;
     b.disabled = true;
-    post('api/click',{messageId:b.getAttribute('data-msg'),buttonId:b.getAttribute('data-btn')})
+    post('api/click',{topic:topic,messageId:b.getAttribute('data-msg'),buttonId:b.getAttribute('data-btn')},2)
       .catch(function(){ b.disabled=false; });
   });
 
@@ -241,11 +292,12 @@ const SCRIPT = `
   });
 
   function send(){
-    var body={text:input.value};
+    var body={topic:topic, text:input.value,
+      nonce:Math.random().toString(36).slice(2)+Date.now().toString(36)};
     if(files.length) body.files=files;
     if(!body.text.trim() && !files.length) return;
     input.value=''; files=[]; renderChips(); suggest(); grow();
-    post('api/send', body).catch(function(){ note.textContent='That message did not reach the daemon.'; });
+    post('api/send', body, 2).catch(function(){ note.textContent='That message did not reach the daemon.'; });
   }
 
   input.addEventListener('input', function(){ grow(); suggest(); });
@@ -275,6 +327,7 @@ const PAGE = `<!doctype html>
 <p id="err"></p>
 </div></form>
 <main id="app" hidden>
+  <div id="topics"></div>
   <div id="log"></div>
   <div id="typing" hidden>...</div>
   <div id="note"></div>

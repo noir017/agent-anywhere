@@ -56,7 +56,11 @@ Enforced facts, verifiable with grep:
   IM stack.
 - `platform/` imports only pure pieces of `core/` — `proxy.ts`, `conversation.ts`,
   `outbound-errors.ts` — and never `daemon/`. Profiles never see the whole `Config`, only
-  their own typed `platforms.<id>` entry.
+  their own typed `platforms.<id>` entry. One platform also imports `config/load.ts`, for
+  `configDir()` alone: `webui/` persists its topic list beside the daemon's own state files,
+  and the alternative was a second copy of that path. The arrow already allows it
+  (`platform ──► core ──► config`); it is named here because nothing else in `platform/`
+  reaches for `config/` at runtime.
 - `config/schema.ts` imports `platform/config-schemas.ts` (the per-platform credential
   schemas). That file is deliberately kept free of Satori imports so config loading
   never drags in the adapter chain.

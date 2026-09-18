@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-09-18
+
 ### Added
 
 - **A built-in web UI, so the gateway is usable with no chat platform at all.** Every way into this

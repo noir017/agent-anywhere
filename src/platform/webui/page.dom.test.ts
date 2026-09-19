@@ -66,6 +66,20 @@ interface Harness {
 
 const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
 
+/**
+ * Spin the macrotask queue until something becomes true.
+ *
+ * `FileReader` resolves over several turns in jsdom, and how many is an implementation detail —
+ * a fixed number of `tick()`s here would be a test that passes until jsdom changes its mind.
+ */
+async function until(what: string, ok: () => boolean): Promise<void> {
+  for (let i = 0; i < 50; i++) {
+    if (ok()) return;
+    await tick();
+  }
+  throw new Error(`never happened: ${what}`);
+}
+
 /** A sync in the shape `WebRoom.syncEvent` builds it. */
 function sync(topic: string, messages: Array<Record<string, unknown>>, topics: string[]): Record<string, unknown> {
   return {
@@ -210,6 +224,19 @@ describe('webui page: rendering', () => {
     expect(h.el('log').textContent).not.toContain('second');
   });
 
+  it('marks your own messages apart from the agent', async () => {
+    // The only thing that separates the two sides of the transcript is this class, and the
+    // stylesheet hangs a tinted panel off it. Painted onto the wrong side — or onto neither —
+    // a long conversation is one undifferentiated column again.
+    const h = await open();
+    await h.emit(
+      sync('a1b2c3d4', [message('m1', '<p>the answer</p>'), message('m2', '<p>the question</p>', true)], ['a1b2c3d4'])
+    );
+
+    const painted = Array.from(h.el('log').children);
+    expect(painted.map((el) => el.className)).toEqual(['m', 'm own']);
+  });
+
   it('shows the typing indicator and marks the topic running', async () => {
     const h = await open();
     await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
@@ -267,8 +294,36 @@ describe('webui page: topics', () => {
     expect(h.rows()).toBe(1);
   });
 
-  it('badges unread messages on a topic that is not the one being read', async () => {
+  it('shows which project each topic is working in', async () => {
     const h = await open({ url: 'http://localhost:8787/?t=a1b2c3d4' });
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+
+    await h.emit({
+      t: 'topics',
+      topics: [
+        { id: 'a1b2c3d4', title: 'fix the parser', lastAt: 1000, msgCount: 0, dir: { name: 'agent-anywhere', path: '/home/user/workspace/agent-anywhere' } },
+        { id: 'b2c3d4e5', title: 'bump the image', lastAt: 999, msgCount: 0, dir: { name: 'uniagent', path: '/home/user/workspace/uniagent' } },
+      ],
+    });
+
+    const dirs = Array.from(h.doc.querySelectorAll('.topic-dir'));
+    expect(dirs.map((d) => d.textContent)).toEqual(['agent-anywhere', 'uniagent']);
+    // The column is 240px wide, so the row shows the last segment and the tooltip carries the
+    // path that tells two checkouts of one project apart.
+    expect(dirs[0]!.getAttribute('title')).toBe('/home/user/workspace/agent-anywhere');
+  });
+
+  it('leaves the row alone for a daemon that offered no directory', async () => {
+    // Every `topics` event before this feature existed, and every deployment whose adapter does
+    // not implement the lookup: the second line is absent, not blank.
+    const h = await open();
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+
+    expect(h.doc.querySelector('.topic-dir')).toBeNull();
+    expect(h.doc.querySelector('.topic-title')?.textContent).toBe('Topic a1b2c3d4');
+  });
+
+  it('badges unread messages on a topic that is not the one being read', async () => {    const h = await open({ url: 'http://localhost:8787/?t=a1b2c3d4' });
     await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4', 'b2c3d4e5']));
     expect(h.doc.querySelector('.topic-badge')).toBeNull();
 
@@ -326,6 +381,90 @@ describe('webui page: sending', () => {
     await h.click('#composer button[type="submit"]');
 
     expect(h.calls.filter((c) => c.path === 'api/send')).toHaveLength(0);
+  });
+});
+
+describe('webui page: pasting', () => {
+  /**
+   * A `paste` carrying clipboard items.
+   *
+   * jsdom implements neither `ClipboardEvent` nor `DataTransfer`, so the event is an ordinary
+   * one with `clipboardData` defined onto it — which is all the handler reads, and keeps this
+   * about the handler rather than about jsdom's coverage of the clipboard API.
+   */
+  function pasteOf(h: Harness, items: Array<{ kind: string; type: string; file: File | null }>): Event {
+    const ev = new h.window.Event('paste', { bubbles: true, cancelable: true });
+    Object.defineProperty(ev, 'clipboardData', {
+      value: { items: items.map((i) => ({ kind: i.kind, type: i.type, getAsFile: () => i.file })) },
+    });
+    return ev;
+  }
+
+  const image = (h: Harness, name: string, type: string): File =>
+    new h.window.File([new Uint8Array([137, 80, 78, 71])], name, { type });
+
+  it('attaches a screenshot pasted into the composer', async () => {
+    const h = await open();
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+
+    const ev = pasteOf(h, [{ kind: 'file', type: 'image/png', file: image(h, 'image.png', 'image/png') }]);
+    h.el('input').dispatchEvent(ev);
+
+    // Swallowed, or the `<img>` the clipboard carries beside the file pastes into the textarea
+    // as markup on top of the attachment.
+    expect(ev.defaultPrevented).toBe(true);
+    await until('the chip is rendered', () => h.el('chips').textContent !== '');
+    expect(h.el('chips').textContent).toBe('pasted-1.png');
+
+    (h.el('input') as HTMLTextAreaElement).value = 'what is this';
+    await h.click('#composer button[type="submit"]');
+
+    const sent = h.calls.find((c) => c.path === 'api/send');
+    const files = sent?.body.files as Array<Record<string, string>>;
+    expect(files).toHaveLength(1);
+    expect(files[0]!.name).toBe('pasted-1.png');
+    expect(files[0]!.mime).toBe('image/png');
+    // Base64 with the `data:` prefix cut off, which is what `api/send` accepts.
+    expect(files[0]!.data).toBe('iVBORw==');
+  });
+
+  it('gives each paste a name of its own', async () => {
+    // Every engine calls a pasted screenshot image.png, so without this two of them are two
+    // indistinguishable chips and two attachments the agent cannot tell apart.
+    const h = await open();
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+
+    h.el('input').dispatchEvent(pasteOf(h, [{ kind: 'file', type: 'image/png', file: image(h, 'image.png', 'image/png') }]));
+    await until('the first chip', () => h.el('chips').children.length === 1);
+    h.el('input').dispatchEvent(pasteOf(h, [{ kind: 'file', type: 'image/jpeg', file: image(h, 'image.png', 'image/jpeg') }]));
+    await until('the second chip', () => h.el('chips').children.length === 2);
+
+    expect(Array.from(h.el('chips').children).map((c) => c.textContent)).toEqual(['pasted-1.png', 'pasted-2.jpeg']);
+  });
+
+  it('leaves an ordinary text paste alone', async () => {
+    const h = await open();
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+
+    const ev = pasteOf(h, [{ kind: 'string', type: 'text/plain', file: null }]);
+    h.el('input').dispatchEvent(ev);
+
+    // Cancelling this one would mean pasting text into the composer no longer works at all.
+    expect(ev.defaultPrevented).toBe(false);
+    await tick();
+    expect(h.el('chips').textContent).toBe('');
+  });
+
+  it('takes a paste that landed outside the composer', async () => {
+    // The textarea is not focused after clicking a topic or a button, and on a phone it is
+    // rarely focused at all — a paste that reaches nothing there looks like a broken feature.
+    const h = await open();
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+
+    h.doc.body.dispatchEvent(pasteOf(h, [{ kind: 'file', type: 'image/png', file: image(h, 'image.png', 'image/png') }]));
+
+    await until('the chip is rendered', () => h.el('chips').textContent !== '');
+    expect(h.el('chips').textContent).toBe('pasted-1.png');
   });
 });
 

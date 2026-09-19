@@ -31,6 +31,7 @@
  * what `room.test.ts` drives.
  */
 import { randomUUID } from 'node:crypto';
+import { basename } from 'node:path';
 
 import {
   addressListed,
@@ -67,6 +68,19 @@ const MAX_BACKLOG = 300;
 
 /** How many of the agent's sent files stay downloadable, across all topics. */
 const MAX_DOWNLOADS = 200;
+
+/**
+ * How long a topic's working directory is reused before it is looked up again.
+ *
+ * The lookup is not free — it crosses into the daemon, which resolves a conversation key, finds
+ * the bound agent and stats the recorded directory — and `topicList()` is rebuilt on every
+ * message posted into any topic, so a streamed answer would ask the same question a hundred
+ * times a turn. The answer only changes when someone runs `/cd`, so a few seconds of staleness
+ * costs a label that is briefly out of date on a sidebar and saves the rest.
+ *
+ * Exported only so `room.test.ts` can assert the bound by name instead of restating the number.
+ */
+export const DIR_TTL_MS = 5000;
 
 /**
  * How long a message must stop changing before its edit is announced.
@@ -139,6 +153,9 @@ export class WebRoom {
 
   private onMsg: ((m: InboundMessage) => void) | null = null;
   private onBtn: ((ev: ButtonInteraction) => void) | null = null;
+  /** Injected by the daemon; absent in a deployment (or a test) that never offered one. */
+  private workdir: ((ref: ConversationRef) => string | undefined) | null = null;
+  private readonly dirCache = new Map<string, { at: number; dir?: Topic['dir'] }>();
 
   constructor(
     private readonly instance: WebuiInstance,
@@ -168,18 +185,58 @@ export class WebRoom {
       if (room.timer) clearTimeout(room.timer);
       this.rooms.delete(id);
     }
+    this.dirCache.delete(id);
     if (!this.topics.delete(id)) return false;
     this.announceTopics();
     return true;
   }
 
+  /**
+   * Accept the daemon's way of asking where a topic's conversation is working.
+   *
+   * Pull, not push — see `PlatformAdapter.useWorkdirLookup` for why the daemon does not simply
+   * tell us. Everything cached under a previous lookup is dropped, since the new one is by
+   * definition a different daemon's answer.
+   */
+  useWorkdirLookup(lookup: (ref: ConversationRef) => string | undefined): void {
+    this.workdir = lookup;
+    this.dirCache.clear();
+  }
+
+  /**
+   * The directory label for one topic, memoised for `DIR_TTL_MS`.
+   *
+   * Swallows a failing lookup rather than letting it out: this runs inside the path that
+   * announces a topic list, which runs inside the path that posts a message, and a sidebar
+   * label is not worth losing an answer over.
+   */
+  private dirOf(topicId: string): Topic['dir'] {
+    if (!this.workdir) return undefined;
+    const now = Date.now();
+    const hit = this.dirCache.get(topicId);
+    if (hit && now - hit.at < DIR_TTL_MS) return hit.dir;
+    let full: string | undefined;
+    try {
+      full = this.workdir(this.conversation(topicId));
+    } catch (e) {
+      console.warn('[webui] could not resolve a topic working directory:', e instanceof Error ? e.message : e);
+    }
+    // basename('/') is '', and a directory with no last segment has no short name to show — the
+    // full path is then both the label and the tooltip, which is honest and still fits.
+    const dir = full ? { name: basename(full) || full, path: full } : undefined;
+    this.dirCache.set(topicId, { at: now, dir });
+    return dir;
+  }
+
   topicList(): Topic[] {
     return this.topics.list().map((t) => {
       const room = this.rooms.get(t.id);
+      const dir = this.dirOf(t.id);
       return {
         ...t,
         running: Boolean(room?.typing),
         msgCount: room?.msgCount ?? 0,
+        ...(dir ? { dir } : {}),
       };
     });
   }

@@ -443,3 +443,51 @@ describe('resolveConversationCwd (read by both runtimes at spawn)', () => {
     expect(resolveConversationCwd(def, 'k', store)).toBe(root);
   });
 });
+
+/**
+ * `workdirForRef` — the lookup handed to a platform that can SHOW where a conversation works
+ * (`PlatformAdapter.useWorkdirLookup`, implemented only by the web UI's topic list).
+ *
+ * The reason it exists rather than the platform forming a key itself: the key depends on the
+ * session scope and on the alias table, and a platform that guessed would be right about the
+ * default scope and quietly wrong about the rest.
+ */
+describe('workdirForRef (what a platform is told to display)', () => {
+  const ref = (over: Partial<Parameters<ConversationRegistry['workdirForRef']>[0]> = {}) => ({
+    platform: 'discord',
+    channel: 'c1',
+    kind: 'direct' as const,
+    user: 'u1',
+    ...over,
+  });
+
+  it('answers the agent root for a conversation that has never chosen one', () => {
+    const { reg } = rig();
+    expect(reg.workdirForRef(ref())).toBe(root);
+  });
+
+  it('follows a /cd, so the label a page shows is the directory the child will start in', () => {
+    const { reg, send } = rig();
+    return send('/cd quantlab').then(() => {
+      expect(reg.workdirForRef(ref())).toBe(QUANTLAB);
+      // The same answer the runtimes read at spawn, by construction — one resolver, not two.
+      expect(reg.workdirForRef(ref())).toBe(reg.workdirOf('discord#c1#', 'cc'));
+    });
+  });
+
+  it('separates lanes, because under the default scope they are separate conversations', async () => {
+    const { reg, send } = rig();
+    await send('/cd quantlab');
+    // Same channel, a lane of its own: it has chosen nothing and must not inherit the move.
+    expect(reg.workdirForRef(ref({ thread: 't7' }))).toBe(root);
+    expect(reg.workdirForRef(ref())).toBe(QUANTLAB);
+  });
+
+  it('answers for an address nothing has ever been said at', () => {
+    // Every topic in the switcher after a restart, and most of them at any time: the list is
+    // rendered for conversations with no in-memory state, and a blank second line for all of
+    // them would make the feature look broken rather than empty.
+    const { reg } = rig();
+    expect(reg.workdirForRef(ref({ channel: 'never-used', thread: 'nor-this' }))).toBe(root);
+  });
+});

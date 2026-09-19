@@ -1,4 +1,4 @@
-import type { ConversationAddress } from '../core/conversation.js';
+import type { ConversationAddress, ConversationRef } from '../core/conversation.js';
 import type {
   ButtonInteraction,
   CommandInteraction,
@@ -108,6 +108,26 @@ export interface PlatformAdapter {
    * operation, and no caller wants it.
    */
   renameThread(address: ConversationAddress, name: string): Promise<void>;
+
+  /**
+   * Hand the platform a way to ask which directory the conversation at one of its addresses is
+   * working in, so that it can show it.
+   *
+   * Optional, and the web UI is the only implementor. A chat app has nowhere to put this — a
+   * Telegram forum topic has one title and it is already spent on what the conversation is
+   * *about* — while the page's own switcher has room for a second line and, without this,
+   * nothing to put in it: several topics open on different projects read identically there.
+   *
+   * A lookup rather than a value pushed in, because the answer belongs to the daemon and it
+   * moves: `/cd` changes it, a rebind changes which agent's root it falls back to, and a
+   * restart leaves conversations that have a directory and no in-memory state at all. Pushing
+   * would mean finding every one of those moments and would still be blank after the restart.
+   *
+   * Best-effort decoration, and the implementation must treat it as such: it is called while
+   * rendering a list, so it may be called often, and nothing about delivering a message may
+   * depend on it.
+   */
+  useWorkdirLookup?(lookup: (ref: ConversationRef) => string | undefined): void;
 
   /** Send a message with buttons (used by clarify). */
   sendButtons(

@@ -38,7 +38,7 @@ export function renderPage(title: string): string {
 }
 
 const STYLE = `
-:root{--bg:#131313;--fg:#dcdcdc;--dim:#7d7d7d;--line:#272727;--own:#1c1c1c;--field:#1a1a1a;color-scheme:dark}
+:root{--bg:#131313;--fg:#dcdcdc;--dim:#7d7d7d;--line:#272727;--own:#1c222b;--own-edge:#3a5f86;--field:#1a1a1a;color-scheme:dark}
 *{box-sizing:border-box;scrollbar-width:thin;scrollbar-color:#333 transparent}
 ::-webkit-scrollbar{width:6px;height:6px}
 ::-webkit-scrollbar-track{background:transparent}
@@ -77,7 +77,15 @@ body{background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,-apple-system,
 .topic-dot{width:7px;height:7px;border-radius:50%;flex:0 0 7px;background:#444}
 .topic-dot.running{background:#38bdf8;box-shadow:0 0 6px rgba(56,189,248,.8);animation:pulse 1.5s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-.topic-title{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* Two lines in one row, so the second can hold the directory. min-width:0 is what lets either
+   line actually ellipsis — without it a flex item refuses to shrink below its content and a
+   long title pushes the delete button out of the column instead of being cut. */
+.topic-main{flex:1;min-width:0;display:flex;flex-direction:column}
+.topic-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* Which project this topic is in. Dimmer than an idle title on purpose: it is what you scan
+   for when several topics are open, not what you read. */
+.topic-dir{font-size:11px;line-height:1.35;color:#6b7683;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#topics .topic-item.on .topic-dir{color:#8b98a6}
 #topics .topic-item.running .topic-title{color:var(--fg)}
 #topics .topic-item.on.running .topic-title{color:#fff}
 #topics .topic-item.idle .topic-title{color:var(--dim)}
@@ -96,7 +104,17 @@ body{background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,-apple-system,
 
 #log{flex:1;overflow-y:auto;padding:20px 16px 8px;max-width:860px;width:100%;margin:0 auto}
 .m{margin:0 0 18px;max-width:100%;overflow-wrap:anywhere}
-.m.own{border-left:2px solid var(--line);padding-left:10px;color:#bdbdbd}
+/* A rule and an indent were all that separated the two sides of the conversation, and at a
+   glance down a long transcript that is not enough to find where your own question ended and
+   the answer began. Own messages get a tinted panel instead — cool where the page is neutral,
+   so it reads as "mine" without becoming a second theme. The agent's side stays flat on the
+   background: one side marked is what makes the boundary visible, and marking both would just
+   move the problem. */
+.m.own{background:var(--own);border-left:2px solid var(--own-edge);border-radius:0 6px 6px 0;padding:9px 12px;color:#cdcdcd}
+/* Inside the panel the neutral --line borders disappear into the tint, so the quote rail and
+   any code block it carries are lifted a step. */
+.m.own .q{border-left-color:#3d4a5a;color:#8b96a3}
+.m.own .b pre,.m.own .b :not(pre)>code{background:#161b22;border-color:#2b3441}
 .b>:first-child{margin-top:0}
 .b>:last-child{margin-bottom:0}
 .b p{margin:0 0 .6em}
@@ -316,9 +334,15 @@ const SCRIPT = `
       var cls='topic-item '+(isCur?'on ':'')+(isRunning?'running':'idle');
       var dotCls='topic-dot'+(isRunning?' running':'');
       var badge=unread>0?'<span class="topic-badge">'+(unread>99?'99+':unread)+'</span>':'';
+      // The full path on the title attribute rather than in the row: two checkouts of one
+      // project have the same last segment, and the column is 240px wide.
+      var dir=t.dir?'<span class="topic-dir" title="'+text(t.dir.path)+'">'+text(t.dir.name)+'</span>':'';
       h += '<div class="'+cls+'" data-topic="'+text(t.id)+'" role="button" tabindex="0">'
          + '<span class="'+dotCls+'"></span>'
+         + '<span class="topic-main">'
          + '<span class="topic-title">'+text(t.title || 'Untitled')+'</span>'
+         + dir
+         + '</span>'
          + badge
          + '<button type="button" class="btn-icon topic-del" data-del="'+text(t.id)+'" title="Delete topic">×</button>'
          + '</div>';
@@ -556,18 +580,33 @@ const SCRIPT = `
     chips.innerHTML=h;
   }
 
-  function take(list){
+  // The rename argument exists for the clipboard, which is the one source that hands over files
+  // the browser has already named badly — see the paste handler below. Everything else passes
+  // the name through, and this stays the single place a file becomes a chip.
+  function take(list, rename){
     for(var i=0;i<list.length;i++){
       (function(f){
         var r=new FileReader();
         r.onload=function(){
           var s=String(r.result), c=s.indexOf(',');
-          files.push({name:f.name, mime:f.type||'', data:c<0?'':s.slice(c+1)});
+          files.push({name:(rename ? rename(f) : f.name) || 'file', mime:f.type||'', data:c<0?'':s.slice(c+1)});
           renderChips();
         };
         r.readAsDataURL(f);
       })(list[i]);
     }
+  }
+
+  // Every engine calls a pasted screenshot 'image.png', so two of them in one message would
+  // arrive as two attachments neither the chips nor the agent can tell apart. A counter is
+  // enough: the name only has to be distinct within the message being composed.
+  var pastes = 0;
+  function pastedName(f){
+    var type = f.type || 'image/png';
+    var slash = type.indexOf('/');
+    var ext = slash > 0 ? type.slice(slash+1).split(';')[0].split('+')[0] : 'png';
+    pastes++;
+    return 'pasted-' + pastes + '.' + ext;
   }
 
   picker.addEventListener('change', function(){ take(picker.files); picker.value=''; });
@@ -576,6 +615,28 @@ const SCRIPT = `
   document.addEventListener('drop', function(e){
     e.preventDefault();
     if(e.dataTransfer && e.dataTransfer.files) take(e.dataTransfer.files);
+  });
+  // Ctrl-V of a screenshot, which is the thing most worth showing an agent and the slowest to
+  // get to it any other way. On the document rather than the textarea: the composer is not
+  // necessarily focused after clicking a topic or a button, and a paste that reaches nothing is
+  // indistinguishable from a broken feature. The login field is the only other paste target on
+  // the page and a file is not a token, so nothing is taken away from it.
+  //
+  // preventDefault only once a file has actually been picked up. A clipboard carrying an image
+  // usually carries an img tag in text/html beside it — swallowing that is the point — but a
+  // plain text paste must still land in the textarea the ordinary way.
+  document.addEventListener('paste', function(e){
+    var items = e.clipboardData && e.clipboardData.items;
+    if(!items) return;
+    var found = [];
+    for(var i=0;i<items.length;i++){
+      if(items[i].kind !== 'file') continue;
+      var f = items[i].getAsFile();
+      if(f) found.push(f);
+    }
+    if(!found.length) return;
+    e.preventDefault();
+    take(found, pastedName);
   });
 
   function suggest(){

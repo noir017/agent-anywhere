@@ -1877,6 +1877,36 @@ ${formatTokens(left)} left before compaction — ${name}`;
   }
 
   /**
+   * The directory the conversation at an ADDRESS works in — the lookup handed to any platform
+   * that can display it (`PlatformAdapter.useWorkdirLookup`).
+   *
+   * Takes the long way round through the scope and the alias table rather than letting the
+   * caller build a key, because neither is a platform's business to know: under `per_channel`
+   * every lane shares one conversation and therefore one directory, under `shared` all of them
+   * do, and an auto-threaded lane answers under the key of the conversation that opened it. A
+   * platform that formed the key itself would be right about the default scope and quietly
+   * wrong about the rest.
+   *
+   * `boundAgentFor` rather than `agentIdOf` for the reason a `/cd` typed as the opening message
+   * uses it: after a restart a topic has a persisted binding and no state, and falling through
+   * to `routing.default` would report the wrong agent's root for every topic on the list.
+   */
+  workdirForRef(ref: ConversationRef): string | undefined {
+    const scope = resolveScope(this.config, {
+      platform: ref.platform,
+      channel: ref.channel,
+      ...(ref.thread != null ? { thread: ref.thread } : {}),
+      ...(ref.space != null ? { space: ref.space } : {}),
+      user: ref.user,
+      kind: ref.kind,
+      isBot: false,
+    });
+    const raw = conversationKey(scope, ref);
+    const id = this.threadAliases.get(raw) ?? raw;
+    return this.workdirOf(id, this.boundAgentFor(id, this.config.routing.default));
+  }
+
+  /**
    * The `/cd` option list for this agent: what is on disk, in the order this machine actually uses.
    *
    * The one place scanning and ranking are combined, so the menu and the typed text list cannot

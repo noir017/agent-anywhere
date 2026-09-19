@@ -5,6 +5,16 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **The web UI takes an image straight off the clipboard.** Ctrl-V (⌘-V) of a screenshot attaches it to the message being composed, which is the fastest way there is to show an agent what you are looking at — the alternative was saving the screenshot to a file first so the picker had something to point at. Every engine names a pasted screenshot `image.png`, so each paste is renamed `pasted-1.png`, `pasted-2.jpeg` as it is taken: two identical names would otherwise reach the agent as two attachments it cannot tell apart. The listener is on the document rather than on the textarea, because the composer is not focused after clicking a topic or a button and a paste that reaches nothing looks like a broken feature. A paste carrying no file is left alone, so pasting text into the composer still works the ordinary way.
+
+- **Each topic in the web UI's sidebar says which directory it is working in.** A row carried only a title, so several topics open on different projects were told apart by remembering which was which. The row now has a second line with the project directory's name, and the full path on its tooltip — two checkouts of one project share a last segment. Deliberately not a copy kept beside the title: the daemon owns the answer and `/cd` moves it, so the adapter is handed a *lookup* (`PlatformAdapter.useWorkdirLookup`, optional and implemented only here — a chat platform has nowhere to put this) and asks per render, memoised for a few seconds because the list is rebuilt on every message. A directory changed with `/cd` is on the sidebar within seconds, and a topic that has never run still shows the root its agent would start in.
+
+### Changed
+
+- **Your own messages in the web UI now sit on a tinted panel instead of behind a hairline rule.** A 2px border and a 10px indent were all that separated the two sides of the conversation, and scanning back through a long transcript for where your own question ended and the answer began was harder than it should be. Own messages get a cool-tinted background; the agent's side stays flat on the page background. Only one side is marked deliberately — marking both would move the problem rather than solve it — and the quote rail and code blocks inside the panel are lifted a step so they do not disappear into the tint.
+
 ## [1.16.0] - 2026-09-19
 
 ### Changed

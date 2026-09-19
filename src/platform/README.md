@@ -90,6 +90,15 @@ as a Telegram forum topic, which is also why it is the second platform after Tel
 rename one — `retitleLane` refuses any address without a lane, so a design that gave each topic
 a channel of its own would have left `renameThread` permanently inert.
 
+**One adapter method is not in the matrix, because it is not a capability.**
+`useWorkdirLookup` hands an adapter a way to *ask* the daemon which directory the conversation
+at one of its addresses works in, and only the web UI implements it: a chat platform has
+nowhere to put the answer, while the page's topic switcher has a second line per row and,
+without this, nothing to put in it. Optional rather than flagged — an adapter that does not
+implement it is simply never asked, the same shape `fetchAttachment` uses. Pull rather than
+push because the answer moves (`/cd`, a rebind) and because a restart leaves conversations that
+have a directory and no in-memory state at all; see the doc comment on the method for the rest.
+
 **`menuPageSize` is a declaration, not a preference.** It says how many items one page of
 a button menu (`/cd`, `/model`, `/setting`) may hold here, and the limits are nowhere near
 each other: Discord allows 25 components per message, Telegram's inline keyboard is

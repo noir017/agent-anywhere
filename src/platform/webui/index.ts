@@ -237,10 +237,19 @@ function outbound(room: WebRoom, instance: WebuiInstance): Outbound {
 function lifecycle(
   room: WebRoom,
   server: WebServer
-): Pick<PlatformAdapter, 'onMessage' | 'onButton' | 'onCommand' | 'registerCommands' | 'start' | 'stop'> {
+): Pick<
+  PlatformAdapter,
+  'onMessage' | 'onButton' | 'onCommand' | 'useWorkdirLookup' | 'registerCommands' | 'start' | 'stop'
+> {
   return {
     onMessage: (handler) => room.onMessage(handler),
     onButton: (handler) => room.onButton(handler),
+    /**
+     * The one platform that implements this, because it is the one with somewhere to put the
+     * answer: the topic switcher's rows have a second line, and without this several topics
+     * open on different projects are indistinguishable there.
+     */
+    useWorkdirLookup: (lookup) => room.useWorkdirLookup(lookup),
     /**
      * Accepted and never called.
      *

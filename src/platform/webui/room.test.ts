@@ -5,7 +5,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import { MessageNotEditableError } from '../../core/outbound-errors.js';
 import { WebuiConfigSchema } from '../config-schemas.js';
-import { CHANNEL, OWNER, WebRoom, type WebuiInstance } from './room.js';
+import { CHANNEL, DIR_TTL_MS, OWNER, WebRoom, type WebuiInstance } from './room.js';
 import { TopicStore } from './topics.js';
 import type { InboundMessage } from '../../types.js';
 import type { WebEvent } from './protocol.js';
@@ -446,5 +446,77 @@ describe('WebRoom: outbound basics', () => {
     expect(url).toMatch(/^f\/[0-9a-f]{32}$/);
     expect(url).not.toContain('tmp');
     expect(room.resolveDownload(url.slice(2))).toEqual({ path: '/tmp/report.pdf', name: 'report.pdf' });
+  });
+});
+
+describe('WebRoom: which directory a topic is working in', () => {
+  it('lists nothing at all when the daemon never offered a lookup', () => {
+    // Every deployment that is not the daemon — the tests above, a future embedder — must keep
+    // working, so the field is absent rather than empty.
+    const { room, topic } = attached();
+    expect(room.topicList().find((t) => t.id === topic)?.dir).toBeUndefined();
+  });
+
+  it('labels each topic with the last segment, keeping the full path for the tooltip', () => {
+    const { room, topic } = attached();
+    room.useWorkdirLookup((ref) => (ref.thread === topic ? '/home/user/workspace/agent-anywhere' : undefined));
+
+    expect(room.topicList().find((t) => t.id === topic)?.dir).toEqual({
+      name: 'agent-anywhere',
+      path: '/home/user/workspace/agent-anywhere',
+    });
+  });
+
+  it('asks the daemon at the address of the topic, not of the channel', () => {
+    // The lookup crosses back into the conversation store, which separates lanes — handing it
+    // the channel would give every topic the directory of whichever one happened to be first.
+    const { room, topic } = attached();
+    const asked: Array<string | undefined> = [];
+    room.useWorkdirLookup((ref) => {
+      asked.push(ref.thread);
+      return '/srv/project';
+    });
+
+    room.topicList();
+
+    expect(asked).toEqual([topic]);
+  });
+
+  it('does not ask again for every message of a streamed turn', () => {
+    // topicList() is rebuilt on every post, and the lookup stats the filesystem on the other
+    // side. Without the memo a long answer asks the same question once per segment.
+    vi.useFakeTimers();
+    const { room, topic } = attached();
+    let answer = '/srv/project';
+    let asked = 0;
+    room.useWorkdirLookup(() => {
+      asked += 1;
+      return answer;
+    });
+
+    for (let i = 0; i < 20; i++) room.post(topic, { own: false, html: '' }, `m${i}`);
+    expect(asked).toBe(1);
+
+    // Which is what the staleness costs: a `/cd` is not on the sidebar yet.
+    answer = '/srv/elsewhere';
+    expect(room.topicList().find((t) => t.id === topic)?.dir?.name).toBe('project');
+
+    // And what bounds it: the label cannot be wrong for longer than the TTL.
+    vi.advanceTimersByTime(DIR_TTL_MS + 1);
+    expect(room.topicList().find((t) => t.id === topic)?.dir?.name).toBe('elsewhere');
+    expect(asked).toBe(2);
+  });
+
+  it('posts the message even when the lookup throws', () => {
+    // It runs inside announceTopics, which runs inside post. A sidebar label is not worth
+    // losing an answer over.
+    const { room, topic, seen } = attached();
+    room.useWorkdirLookup(() => {
+      throw new Error('the store is gone');
+    });
+
+    expect(() => room.post(topic, { own: false, html: '<p>hi</p>' }, 'hi')).not.toThrow();
+    expect(kinds(seen)).toContain('msg');
+    expect(room.topicList().find((t) => t.id === topic)?.dir).toBeUndefined();
   });
 });

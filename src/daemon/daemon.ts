@@ -587,6 +587,11 @@ export class Daemon {
       adapter.onButton((ev) => this.onButton(ev));
       // Native slash commands: not interpreted; synthesized into a `/<name> <input>` message for the agent.
       adapter.onCommand((ev) => this.onCommand(ev));
+      // A platform that can show where a conversation is working gets a way to ask (the web
+      // UI's topic list). Here rather than at construction because the registry that answers it
+      // does not exist when the adapters are built, and best-effort because it is decoration:
+      // an adapter that does not implement it simply shows nothing.
+      adapter.useWorkdirLookup?.((ref) => this.registry.workdirForRef(ref));
       await adapter.start();
       console.log(`[daemon] platform instance "${id}" (${adapter.platformType}) started`);
     }

@@ -91,6 +91,15 @@ empty": `conversations.json` still holds the agent binding and session id under
 `<instance>#main#<topic id>`, so every context would still be running and no longer reachable.
 See `topics.ts` for why its `title` duplicates one the daemon also stores.
 
+**Each row also says which directory that topic works in**, which is the one thing a title does
+not tell you when several topics are open on different projects. It is not stored beside the
+title, though, and that asymmetry is deliberate: the title is *this module's* (a topic has one
+before a turn has ever run), while the directory is the daemon's and moves under `/cd`, so a
+copy here would be a second answer that outlives the real one. The daemon hands the adapter a
+lookup instead (`PlatformAdapter.useWorkdirLookup`), and `topicList()` asks it — memoised for
+`DIR_TTL_MS`, because the list is rebuilt on every posted message and the lookup stats the
+filesystem on the other side. A deployment that never offers one shows no second line at all.
+
 **`access.allowFrom` identity is `<instance id>:owner`**, the same for every topic. An existing
 config that already lists other identities will silently ignore every message typed into this
 page until that entry is added — `doctor` checks for exactly this.

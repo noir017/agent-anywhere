@@ -80,6 +80,22 @@ describe('webui page', () => {
     expect(html).toMatch(/--bg:#1[0-9a-f]{5}/);
   });
 
+  it('gives your own messages a tinted panel the agent does not get', () => {
+    // Asserted as text: jsdom resolves no custom property, so the CSSOM would report an empty
+    // background for a rule that is perfectly correct in a browser.
+    expect(html).toMatch(/--own:#[0-9a-f]{6}/);
+    expect(html).toContain('.m.own{background:var(--own)');
+    // One side marked is what makes the boundary findable; marking both moves the problem.
+    expect(html).not.toContain('.m:not(.own){background:');
+  });
+
+  it('takes a file off the clipboard and names it before it can collide', () => {
+    expect(html).toContain("addEventListener('paste'");
+    expect(html).toContain('getAsFile()');
+    // Every engine calls a pasted screenshot image.png.
+    expect(html).toContain("'pasted-'");
+  });
+
   it('styles scrollbars to blend with the dark background', () => {
     expect(html).toContain('color-scheme:dark');
     expect(html).toContain('scrollbar-color:');

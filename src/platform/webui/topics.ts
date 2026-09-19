@@ -36,6 +36,15 @@ export interface Topic {
   running?: boolean;
   /** Monotonic count of messages posted into this topic. */
   msgCount?: number;
+  /**
+   * Where this topic's conversation is working, when the daemon gave the adapter a way to ask
+   * (`PlatformAdapter.useWorkdirLookup`). Both halves are sent because they answer different
+   * questions: `name` is the project you recognise at a glance in a 240px column, and `path` is
+   * the one that tells two checkouts of the same name apart, so the page hangs it off the title
+   * attribute. Derived on every render like `running` and `msgCount` — never persisted, because
+   * the daemon's answer is the only true one and a stale copy of it would outlive a `/cd`.
+   */
+  dir?: { name: string; path: string };
 }
 
 /**

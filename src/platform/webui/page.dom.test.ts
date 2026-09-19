@@ -390,40 +390,58 @@ describe('webui page: a screen held upright', () => {
 });
 
 describe('webui page: the narrow-screen stylesheet', () => {
-  // jsdom does not evaluate @media, so these read the rules rather than the computed style.
-  const rules = (): Record<string, string> => {
-    const dom = new JSDOM(renderPage('Chat'));
-    const sheet = dom.window.document.styleSheets[0]!;
-    const out: Record<string, string> = {};
-    for (const rule of sheet.cssRules as unknown as Iterable<CSSRule>) {
-      const media = rule as CSSMediaRule;
-      if (media.media?.mediaText !== '(max-width:640px)') continue;
-      for (const inner of media.cssRules as unknown as Iterable<CSSRule>) {
-        out[(inner as CSSStyleRule).selectorText] = (inner as CSSStyleRule).style.cssText;
-      }
+  /**
+   * The text of the one `@media(max-width:640px)` block, sliced out of the served CSS.
+   *
+   * Read as text rather than through `document.styleSheets`, for two reasons. jsdom does not
+   * evaluate `@media` at all, so the CSSOM could never answer "does this rule apply" anyway —
+   * and its CSS parser silently DROPS declarations it cannot parse while normalizing selectors
+   * as it likes. Under jsdom 27 that made `#bar`'s `calc(… + env(safe-area-inset-bottom))`
+   * vanish and `html,body` come back under a different key, failing assertions about rules that
+   * were perfectly correct. Slicing keeps this about the stylesheet the daemon serves rather
+   * than about one parser's coverage of modern CSS.
+   */
+  const narrowBlock = (): string => {
+    const html = renderPage('Chat');
+    const at = html.indexOf('@media(max-width:640px){');
+    if (at < 0) throw new Error('there is no narrow-screen block in the stylesheet');
+    let depth = 0;
+    for (let i = html.indexOf('{', at); i < html.length; i++) {
+      if (html[i] === '{') depth++;
+      else if (html[i] === '}' && --depth === 0) return html.slice(at, i + 1);
     }
-    return out;
+    throw new Error('the narrow-screen block is never closed');
   };
 
   it('turns the sidebar into a drawer that clears the screen when shut', () => {
-    const r = rules();
-    expect(r['#sidebar']).toContain('position: fixed');
-    // -240px would leave a strip of the wider drawer on screen.
-    expect(r['#sidebar.collapsed']).toContain('margin-left: -100%');
-    expect(r['#backdrop']).toContain('display: block');
+    const css = narrowBlock();
+    expect(css).toContain('#sidebar{position:fixed');
+    // -240px would leave a strip of the wider drawer still on screen.
+    expect(css).toContain('#sidebar.collapsed{margin-left:-100%}');
+    expect(css).toContain('#backdrop{display:block}');
   });
 
   it('measures height in dvh, which is the viewport the URL bar has left', () => {
-    const r = rules();
-    expect(r['html,body']).toContain('dvh');
-    expect(r['#input']).toContain('dvh');
+    const css = narrowBlock();
+    expect(css).toContain('html,body{height:100vh;height:100dvh}');
+    expect(css).toContain('#input{max-height:30dvh}');
   });
 
   it('keeps fields at 16px so Safari does not zoom in and stay there', () => {
-    expect(rules()['#input,#secret']).toContain('font-size: 16px');
+    expect(narrowBlock()).toContain('#input,#secret{font-size:16px}');
   });
 
   it('pads the send row past the home indicator', () => {
-    expect(rules()['#bar']).toContain('env(safe-area-inset-bottom');
+    expect(narrowBlock()).toContain('env(safe-area-inset-bottom');
+  });
+
+  it('scopes all of that to the narrow screen and nothing else', () => {
+    // The point of slicing the block rather than searching the document: these rules must be
+    // INSIDE it. A drawer and 16px fields applied unconditionally would wreck the desktop
+    // layout, and an assertion against the whole stylesheet would not notice.
+    const css = narrowBlock();
+    expect(css.startsWith('@media(max-width:640px){')).toBe(true);
+    expect(css.endsWith('}')).toBe(true);
+    expect(css.slice('@media'.length)).not.toContain('@media');
   });
 });

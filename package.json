@@ -3,7 +3,8 @@
   "version": "1.15.1",
   "license": "MIT",
   "comments": {
-    "pinnedDeps": "@satorijs/adapter-slack and @satorijs/core are pinned to exact versions: the Slack profile relies on their undocumented internal behavior (see the header comment in src/platform/profiles/slack.ts). Before upgrading either, you must manually regress Slack button/slash reception—no CI covers this path."
+    "pinnedDeps": "@satorijs/adapter-slack and @satorijs/core are pinned to exact versions: the Slack profile relies on their undocumented internal behavior (see the header comment in src/platform/profiles/slack.ts). Before upgrading either, you must manually regress Slack button/slash reception—no CI covers this path.",
+    "jsdom": "Held at ^27 by CI's Node version, not by taste. jsdom 28+ nests an undici that calls webidl.util.markAsUncloneable, which Node 20 does not have, so npm ci installs happily and then every test in page.dom.test.ts dies at import. jsdom's own engines field says so, but nothing enforces it. Raising this pin means raising node-version in ci.yml and the >=20 engines below together."
   },
   "description": "A gateway CLI that connects Claude Code to IM platforms: Koishi for inbound/outbound + claude agent sdk for processing, with streaming replies aligned to the hermes experience",
   "type": "module",
@@ -51,11 +52,11 @@
     "zod": "^3.23.0"
   },
   "devDependencies": {
-    "@types/jsdom": "^30.0.0",
+    "@types/jsdom": "^27.0.0",
     "@types/node": "^22.0.0",
     "@vitest/coverage-v8": "^2.1.9",
     "eslint": "^9.39.4",
-    "jsdom": "^30.1.0",
+    "jsdom": "^27.4.0",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",
     "typescript-eslint": "^8.62.0",

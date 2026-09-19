@@ -262,13 +262,18 @@ Three things about it that are not obvious:
 
 - **The stubs are installed in `beforeParse`**, before the inline script runs. Evaluating the
   script a second time to hand it a global would register every listener twice.
-- **jsdom does not evaluate `@media` at all**, so `getComputedStyle` always reports the desktop
-  cascade. The narrow-screen rules are asserted by walking `document.styleSheets`; the script's
-  own `narrow()` branches respond to `innerWidth` and are driven normally.
-- **Its CSSOM keeps only the last of two declarations of one property**, so the deliberate
-  `height:100vh; height:100dvh` fallback pair reads as collapsed there while being correct in a
-  browser. Do not rewrite the stylesheet to satisfy that.
+- **Do not assert CSS through the CSSOM.** jsdom does not evaluate `@media` at all, so
+  `getComputedStyle` only ever reports the desktop cascade — and its CSS parser silently drops
+  declarations it cannot parse (jsdom 27 discards `calc(… + env(safe-area-inset-bottom))`
+  outright) while normalizing selector text, so assertions fail on rules that are perfectly
+  correct. The narrow-screen rules are asserted by slicing the `@media` block out of the served
+  CSS as text, which also proves they are *inside* it rather than leaking onto the desktop
+  layout. The script's own `narrow()` branches do respond to `innerWidth` and are driven
+  normally.
+- **`jsdom` is pinned to `^27`**, because CI runs Node 20 and jsdom 28+ nests an undici that
+  needs a newer one. Read the note in `package.json`'s `comments.pinnedDeps` before bumping it.
 
 The suite is mutation-checked: restoring the sync-guard bug fails eight tests, removing the
-backdrop element fails the whole file, and dropping either the 16px field rule or the
-narrow-screen focus guard fails exactly the test that names it.
+backdrop element fails the whole file, and dropping the 16px field rule, the safe-area padding,
+the collapsed-drawer offset or the narrow-screen focus guard each fails exactly the test that
+names it — including when a rule is *moved out* of the `@media` block rather than deleted.

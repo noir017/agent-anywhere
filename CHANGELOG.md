@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.17.0] - 2026-09-19
+
 ### Added
 
 - **The web UI takes an image straight off the clipboard.** Ctrl-V (⌘-V) of a screenshot attaches it to the message being composed, which is the fastest way there is to show an agent what you are looking at — the alternative was saving the screenshot to a file first so the picker had something to point at. Every engine names a pasted screenshot `image.png`, so each paste is renamed `pasted-1.png`, `pasted-2.jpeg` as it is taken: two identical names would otherwise reach the agent as two attachments it cannot tell apart. The listener is on the document rather than on the textarea, because the composer is not focused after clicking a topic or a button and a paste that reaches nothing looks like a broken feature. A paste carrying no file is left alone, so pasting text into the composer still works the ordinary way.

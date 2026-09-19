@@ -396,8 +396,22 @@ describe('WebRoom: outbound basics', () => {
     const msg = room.post(topic, { own: false, html: '', buttons: [{ id: 'ask:r:0', label: 'Yes' }] }, '');
     seen.length = 0;
     room.revise(topic, msg.id, 'answered', []);
-    vi.advanceTimersByTime(1_600);
     expect((last(seen) as { msg: { buttons: unknown[] } }).msg.buttons).toEqual([]);
+  });
+
+  it('an edit carrying buttons goes out at once, unlike a text-only one', () => {
+    // The page disables a button as it is clicked and re-enables it only when the message
+    // repaints. Holding that repaint for the settle window leaves the control the user just
+    // pressed dead in their hand — on a multi-select, for the whole 1.5s between two ticks.
+    vi.useFakeTimers();
+    const { room, topic, seen } = attached();
+    const msg = room.post(topic, { own: false, html: '', buttons: [{ id: 'ask:r:0', label: '☐ EU' }] }, '');
+    seen.length = 0;
+    room.revise(topic, msg.id, 'pick some', [{ id: 'ask:r:0', label: '☑ EU' }]);
+    expect(seen).toHaveLength(1);
+    expect((last(seen) as { msg: { buttons: Array<{ label: string }> } }).msg.buttons).toEqual([
+      { id: 'ask:r:0', label: '☑ EU' },
+    ]);
   });
 
   it('carries reactions on the message as well as announcing them, so a reload keeps them', () => {

@@ -143,6 +143,12 @@ text is another new message (flush) — so the bubble's final state always arriv
 that followed it. Getting that backwards is the scrambled transcript
 `daemon/render-order.test.ts` exists for, one layer up.
 
+The one edit that is **not** held is an edit carrying buttons, and the reason is interaction
+rather than ordering: the page disables a button the instant it is clicked and re-enables it only
+when the message repaints. Holding that repaint for the settle window leaves the control the user
+just pressed dead in their hand — on a multi-select question, where ticking and unticking land on
+the same button, for a second and a half between every tap.
+
 **A dropped stream resumes.** Every event carries a sequence number written as the SSE `id:`
 field, and each topic keeps a backlog of the last 300. `EventSource` sends back the last id it
 saw, and the room replays only what that client missed. Before this, every network blip cost a

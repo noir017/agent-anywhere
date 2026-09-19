@@ -5,6 +5,12 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **A question the agent asked with "select all that apply" could only be answered with one option.** The wire shape for a multi-select question was parsed correctly — `type: 'array'`, options under `items.anyOf` — and then collected with the ordinary one-tap question and sent back as a single-element array, so the model asked for several answers and was told one. The round is now a stateful bubble: every option carries its own checkbox, a tap toggles it and repaints the row, and a Done button sitting one index past the options resolves with everything ticked, in the order the agent listed them rather than the order they were tapped. Done with nothing ticked says so and leaves the question up — there is no answer to give, and doing nothing at all reads as the bot ignoring the tap. Because all of that rests on repainting buttons that are already posted, it happens only where the platform can replace them (Discord, Telegram, Slack, Lark, the web UI); on LINE and QQ the round stays one tap and the message says why, pointing at typing, which genuinely carries several answers since a typed reply travels under the question's own free-text field and the harness prefers it over the enum.
+
+- **In the web UI, a button stayed greyed out for a second and a half after every click.** The page disables a button the moment it is pressed and re-enables it only when the message repaints, and message edits are deliberately held so a streaming reply is not re-broadcast on every flush. Those two are fine apart and wrong together: an edit carrying buttons is never streaming progress but always the acknowledgement of a tap — a menu page turn, a question being retired, a multi-select tick — so it is now sent at once. On a multi-select, where ticking and unticking land on the same button, holding it was not a delay but a broken control.
+
 ## [1.17.1] - 2026-09-19
 
 ### Fixed

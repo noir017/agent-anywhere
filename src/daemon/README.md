@@ -639,6 +639,16 @@ takes a string), and any question whose form declared no free-text field (sendin
 enum value would hand the agent something it never offered). Both keep the old meaning, which is
 also the way out of a question you cannot answer.
 
+**A question that takes more than one answer** (`multiSelect`, `type: 'array'` on the wire) is a
+stateful bubble rather than a one-tap one: each option carries a checkbox in its own label, a tap
+toggles it and repaints the row, and a Done button one index past the options — which is what lets
+`onAskClick` tell "finish" from "toggle option n" without a second id grammar — resolves the round
+with everything ticked, in the agent's own option order. Done with nothing ticked says so and stays
+up, because there is no answer to give and a silent no-op reads as the bot ignoring the tap. All of
+that rests on repainting the posted buttons, so it happens only where `capabilities.editButtons` is
+true; elsewhere the round degrades to one tap and the body says so, pointing at typing — which
+genuinely works, since a typed answer travels under the free-text field the harness prefers anyway.
+
 Questions are retired — buttons cleared, outcome written onto the bubble — on every exit: a tap, a
 typed answer, a timeout, `/stop`, `/new`, and any interruption of the turn (`abortTurn`, the one
 choke point both cancellations pass through). Leaving one behind is not cosmetic: its buttons stay

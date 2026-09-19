@@ -376,6 +376,23 @@ describe('webui page: sending', () => {
     expect(h.doc.querySelector<HTMLButtonElement>('button[data-btn="b:yes"]')?.disabled).toBe(true);
   });
 
+  it('a repaint hands the button back, which is what makes a multi-select tickable twice', async () => {
+    // The click handler disables and never re-enables; the repaint that follows the tap is what
+    // does. A multi-select round rests entirely on this — tick, untick, tick again all land on the
+    // same button — so it is pinned here rather than left as a property of innerHTML.
+    const h = await open();
+    const ticked = { ...message('m1', '<p>pick some</p>'), buttons: [{ id: 'ask:r:0', label: '☐ EU' }] };
+    await h.emit(sync('a1b2c3d4', [ticked], ['a1b2c3d4']));
+
+    await h.click('button[data-btn="ask:r:0"]');
+    expect(h.doc.querySelector<HTMLButtonElement>('button[data-btn="ask:r:0"]')?.disabled).toBe(true);
+
+    await h.emit({ t: 'msg', msg: { ...ticked, buttons: [{ id: 'ask:r:0', label: '☑ EU' }] } });
+    const button = h.doc.querySelector<HTMLButtonElement>('button[data-btn="ask:r:0"]');
+    expect(button?.disabled).toBe(false);
+    expect(button?.textContent).toBe('☑ EU');
+  });
+
   it('sends with a nonce and clears the composer', async () => {
     const h = await open();
     await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));

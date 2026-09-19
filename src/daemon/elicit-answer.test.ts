@@ -63,7 +63,7 @@ const TWO_QUESTIONS: AgentElicitation = {
   ],
 };
 
-function rig() {
+function rig(caps: { editButtons?: boolean } = {}) {
   const prompts: string[] = [];
   const sent: string[] = [];
   const edits: Array<{ messageId: string; text: string }> = [];
@@ -104,8 +104,8 @@ function rig() {
     platform: 'tg',
     platformType: 'telegram',
     capabilities: {
-      thread: true, editMessage: true, editButtons: true, buttons: true, reaction: true,
-      reply: true, slashCommands: true, typing: true, maxMessageLength: 4096,
+      thread: true, editMessage: true, editButtons: caps.editButtons ?? true, buttons: true,
+      reaction: true, reply: true, slashCommands: true, typing: true, maxMessageLength: 4096,
     },
     sendMessage: async (address: { channel: string }, text: string) => {
       sent.push(text);
@@ -164,6 +164,9 @@ function rig() {
   };
   /** The id of the nth posted question's first button (`ask:<reqId>:0`). */
   const firstButtonOf = (round: number): string => buttonSends[round]!.buttons[0]!.id;
+  /** The id of one of the nth posted question's buttons, by position (Done is one past the options). */
+  const buttonOf = (round: number, index: number): string =>
+    buttonSends[round]!.buttons[index]!.id;
   const ask = (form: AgentElicitation): void => void (pendingForm = form);
   /** Keep the next question's send in flight until the returned function is called. */
   const holdNextButtonSend = (): (() => Promise<void>) => {
@@ -176,7 +179,7 @@ function rig() {
   };
 
   return {
-    ask, send, click, firstButtonOf, holdNextButtonSend,
+    ask, send, click, firstButtonOf, buttonOf, holdNextButtonSend,
     prompts, sent, edits, buttonEdits, buttonSends, answers, aborts: () => aborts,
   };
 }
@@ -335,5 +338,97 @@ describe('calling a question off', () => {
 
     expect(r.answers).toEqual([{ action: 'cancel' }]);
     expect(r.buttonEdits.at(-1)!.text).toContain('(context cleared)');
+  });
+});
+
+/**
+ * A question the agent asked with `multiSelect: true` — `type: 'array'` on the wire, and an answer
+ * the harness comma-joins (claude-agent-acp's applyAskElicitationResponse). It used to be collected
+ * with the ordinary one-tap question and sent back as a single-element array, so "pick every one
+ * that applies" could only ever be answered with one.
+ */
+const MULTI_FORM: AgentElicitation = {
+  message: '哪些区域要部署？',
+  questions: [
+    {
+      key: 'question_0',
+      prompt: '哪些区域要部署？',
+      options: [
+        { label: 'EU', value: 'eu', description: '离你的用户最近。' },
+        { label: 'US', value: 'us' },
+        { label: 'APAC', value: 'ap' },
+      ],
+      customKey: 'question_0_custom',
+      multi: true,
+    },
+  ],
+};
+
+describe('a question that takes more than one answer', () => {
+  it('taps toggle and Done answers with every option that was ticked', async () => {
+    const r = rig();
+    r.ask(MULTI_FORM);
+    await r.send('帮我上线');
+
+    // Posted with a checkbox per option and a Done button one index past them.
+    expect(r.buttonSends[0]!.buttons.map((b) => b.label)).toEqual(['☐ EU', '☐ US', '☐ APAC', '✅ Done']);
+    expect(r.buttonSends[0]!.text).toContain('Tap to select as many as apply');
+
+    await r.click(r.buttonOf(0, 2)); // APAC on
+    await r.click(r.buttonOf(0, 0)); // EU on
+    await r.click(r.buttonOf(0, 2)); // APAC off again — a tap is a toggle, not a commit
+    expect(r.buttonEdits.at(-1)!.buttons.map((b) => b.label)).toEqual([
+      '☑ EU', '☐ US', '☐ APAC', '✅ Done (1)',
+    ]);
+    expect(r.answers).toHaveLength(0); // still open: only Done answers
+
+    await r.click(r.buttonOf(0, 1)); // US on
+    await r.click(r.buttonOf(0, 3)); // Done
+
+    // An array under the question's own key, carrying the options' `value`s in the order the agent
+    // listed them — not the order they happened to be tapped in.
+    expect(r.answers).toEqual([{ action: 'accept', content: { question_0: ['eu', 'us'] } }]);
+    expect(r.buttonEdits.at(-1)).toEqual({
+      text: '哪些区域要部署？\n\n**EU** — 离你的用户最近。\n\n→ Selected: EU, US',
+      buttons: [],
+    });
+  });
+
+  it('Done with nothing ticked says so instead of answering, or doing nothing at all', async () => {
+    const r = rig();
+    r.ask(MULTI_FORM);
+    await r.send('帮我上线');
+    await r.click(r.buttonOf(0, 3));
+
+    expect(r.answers).toHaveLength(0); // an empty array is not an answer the agent asked for
+    expect(r.buttonEdits.at(-1)!.text).toContain('Nothing selected yet');
+    expect(r.buttonEdits.at(-1)!.buttons).toHaveLength(4); // and the question is still up
+  });
+
+  it('a typed answer still wins, and still travels under the free-text field', async () => {
+    const r = rig();
+    r.ask(MULTI_FORM);
+    await r.send('帮我上线');
+    await r.click(r.buttonOf(0, 0)); // a tick the words then override
+    await r.send('EU 和 US，另外加 sa-east-1');
+
+    expect(r.answers).toEqual([
+      { action: 'accept', content: { question_0_custom: 'EU 和 US，另外加 sa-east-1' } },
+    ]);
+  });
+
+  it('where the buttons cannot be repainted, the round degrades to one tap and says so', async () => {
+    // LINE and QQ: buttons yes, editButtons no. The tick lives in the button label, so a
+    // multi-select there would be one the user can never see move.
+    const r = rig({ editButtons: false });
+    r.ask(MULTI_FORM);
+    await r.send('帮我上线');
+
+    expect(r.buttonSends[0]!.buttons.map((b) => b.label)).toEqual(['EU', 'US', 'APAC']);
+    expect(r.buttonSends[0]!.text).toContain('takes more than one answer');
+    await r.click(r.buttonOf(0, 0));
+
+    // Still an array, because the field is still `type: 'array'` — just one entry in it.
+    expect(r.answers).toEqual([{ action: 'accept', content: { question_0: ['eu'] } }]);
   });
 });

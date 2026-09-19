@@ -161,9 +161,13 @@ export interface ElicitQuestion {
    */
   customKey?: string;
   /**
-   * Whether the wire field takes an array (ACP multi-select). Buttons are one tap, so the daemon
-   * still collects exactly one option and returns it wrapped — the alternative (a stateful
-   * multi-select UI on eight IM platforms) buys little over the model re-asking.
+   * Whether the wire field takes an array (ACP multi-select), i.e. the agent asked "pick every one
+   * that applies" and expects however many the user ticks.
+   *
+   * The daemon honours it by making the question's buttons stateful: a tap toggles a tick and a
+   * Done button ends the round. That needs the posted buttons to be redrawable, so it happens only
+   * where `capabilities.editButtons` is true — elsewhere the round degrades to one tap (and says
+   * so), because a tick the platform can never repaint is worse than no tick at all.
    */
   multi: boolean;
 }

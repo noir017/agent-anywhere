@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { composeElicitPrompt, parseAskButtonId } from './daemon.js';
+import { buildAskButtons, composeElicitPrompt, parseAskButtonId } from './daemon.js';
 import type { ElicitQuestion } from '../types.js';
 
 describe('parseAskButtonId', () => {
@@ -71,4 +71,37 @@ describe('composeElicitPrompt (what the user reads above the buttons)', () => {
     );
     expect(text).toBe('这个项目用哪个数据库？\n\n**B** — only B explains itself');
   });
+
+  it('a note about the question sits below the rationales', () => {
+    // The one note that exists today says this platform cannot collect the several answers the
+    // question asked for — which the user has to read BEFORE tapping, and which stays true of the
+    // question after it is answered (unlike the "tap Done" affordance, which lives with the buttons).
+    const text = composeElicitPrompt(q([{ label: 'A', value: 'a' }]), 0, 1, '_one tap only here_');
+    expect(text).toBe('这个项目用哪个数据库？\n\n_one tap only here_');
+  });
 });
+
+describe('buildAskButtons (what a question is drawn with)', () => {
+  it('single-select: one button per option, no checkbox and no Done', () => {
+    expect(buildAskButtons('r1', ['A', 'B'])).toEqual([
+      { id: 'ask:r1:0', label: 'A' },
+      { id: 'ask:r1:1', label: 'B' },
+    ]);
+  });
+
+  it('multi-select: a checkbox per option plus Done one index past them', () => {
+    // Done sits at labels.length on purpose: that is what lets the click handler tell "finish" from
+    // "toggle option n" without inventing a second id grammar the platforms would have to carry.
+    expect(buildAskButtons('r1', ['A', 'B'], new Set([1]))).toEqual([
+      { id: 'ask:r1:0', label: '☐ A' },
+      { id: 'ask:r1:1', label: '☑ B' },
+      { id: 'ask:r1:2', label: '✅ Done (1)', style: 'primary' },
+    ]);
+  });
+
+  it('nothing ticked yet: empty boxes and a bare Done', () => {
+    const buttons = buildAskButtons('r1', ['A'], new Set());
+    expect(buttons.map((b) => b.label)).toEqual(['☐ A', '✅ Done']);
+  });
+});
+

@@ -428,7 +428,17 @@ export class WebRoom {
     return msg;
   }
 
-  /** Replace a message's body and buttons in place. Held, not announced — see `enqueue`. */
+  /**
+   * Replace a message's body and buttons in place.
+   *
+   * A text-only edit is HELD (see `enqueue`) — that is streaming progress, and coalescing it is
+   * the whole point of the queue. An edit that carries BUTTONS is sent at once instead, because
+   * every one of them is the acknowledgement of a tap: a menu page turn, a question being retired,
+   * a multi-select tick. The page disables a button the moment it is clicked and re-enables it
+   * only when the message repaints, so holding that repaint for the settle window leaves the
+   * control the user just pressed greyed out and unpressable for a second and a half — which on a
+   * multi-select (tap, untap, tap again) is not a delay but a broken control.
+   */
   revise(topicId: string, id: string, text: string, buttons?: ButtonSpec[]): void {
     const room = this.roomOf(topicId);
     const rec = this.mustFind(room, id, 'edit');
@@ -436,6 +446,7 @@ export class WebRoom {
     rec.msg = { ...rec.msg, html: renderWebMarkdown(text), ...(buttons ? { buttons } : {}) };
     room.stored.set(id, rec);
     this.enqueue(room, topicId, id);
+    if (buttons) this.flush(room, topicId);
   }
 
   /** Remove a message. Removing one that is already gone is success, not an error. */

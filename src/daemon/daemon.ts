@@ -44,7 +44,7 @@ import {
   type SettingOption,
   type SettingRow,
 } from '../core/settings.js';
-import type { PlatformAdapter } from '../platform/adapter.js';
+import type { ButtonSpec, PlatformAdapter } from '../platform/adapter.js';
 import { OutboundPacer } from '../core/outbound-pacer.js';
 import { splitIntoChunks } from '../core/stream-buffer.js';
 import { formatEmptyCatalog, formatSkillCatalog } from '../core/skills-catalog.js';
@@ -240,26 +240,105 @@ export function buildRegisteredSpecs(cfg: Pick<Config, 'agents'>): SlashCommandS
  *
  * Options with no rationale contribute no line at all, rather than a label followed by an empty
  * dash — a form where none of them has one then renders as a bare question, which is right.
+ *
+ * `note` is for something about the QUESTION that outlives the answer (today: that this platform
+ * cannot collect the several answers it asked for). The live "tap Done when you're finished"
+ * affordance is deliberately NOT here — it belongs to the buttons and has to disappear with them,
+ * so askButtons appends it and retireAsk drops it.
  */
-export function composeElicitPrompt(q: ElicitQuestion, index: number, total: number): string {
+export function composeElicitPrompt(
+  q: ElicitQuestion,
+  index: number,
+  total: number,
+  note?: string
+): string {
   const heading = total > 1 ? `(${index + 1}/${total}) ${q.prompt}` : q.prompt;
   const detail = q.options
     .filter((o) => o.description)
     .map((o) => `**${o.label}** — ${o.description}`)
     .join('\n');
-  return detail ? `${heading}\n\n${detail}` : heading;
+  const body = detail ? `${heading}\n\n${detail}` : heading;
+  return note ? `${body}\n\n${note}` : body;
 }
+
+/**
+ * Affordance line under a live multi-select question.
+ *
+ * Buttons do not say how many of them you may press, and every other question in this system is
+ * answered by the first tap — so without this the ticks read as a bug ("I pressed it and nothing
+ * happened") rather than as a selection.
+ */
+const MULTI_HINT = '_Tap to select as many as apply, then tap Done._';
+
+/** Shown when Done is pressed with nothing ticked: a silent no-op reads as the bot ignoring you. */
+const MULTI_EMPTY_NOTE = '_Nothing selected yet — tick at least one option, or type your own answer._';
+
+/**
+ * What a multi-select question says where its buttons cannot be redrawn in place (LINE, QQ).
+ *
+ * The tick lives in the button label, so a platform without editButtons could offer a multi-select
+ * that never visibly changes. It gets the ordinary one-tap question instead, plus this — because
+ * typing genuinely does work here: a typed answer travels under the question's own free-text field
+ * and the harness prefers it over the enum, so several answers in one sentence arrive intact.
+ */
+const MULTI_DEGRADED_NOTE =
+  '_This question takes more than one answer, which this platform cannot offer as buttons — tap the most important one, or type them all as a reply._';
+
+/**
+ * Whether a question that wants several answers can actually collect them here.
+ *
+ * One predicate, two readers (the note above and the buttons themselves), because a round that
+ * degrades silently is exactly the failure this is meant to avoid.
+ */
+function canMultiSelect(platform: PlatformAdapter, q: ElicitQuestion): boolean {
+  return q.multi && platform.capabilities.editButtons;
+}
+
+/**
+ * The buttons of one posted question (pure, testable).
+ *
+ * Single-select (`selected` absent): one button per option, and the first tap is the answer.
+ *
+ * Multi-select: the same buttons, each prefixed with its own checkbox, plus a Done button sitting
+ * at index `labels.length` — one past the options, which is what lets the click handler tell "end
+ * the round" from "toggle option n" without a second id grammar. The tick has to live in the
+ * LABEL because no platform here exposes a pressed/selected style the daemon can drive, and the
+ * only way to repaint a posted button at all is to replace the whole row (editButtons).
+ */
+export function buildAskButtons(
+  reqId: string,
+  labels: string[],
+  selected?: ReadonlySet<number>
+): ButtonSpec[] {
+  const buttons: ButtonSpec[] = labels.map((label, i) => ({
+    // custom_id: `ask:` prefix + index (≤100 chars; must not start with `input`).
+    id: `${ASK_PREFIX}${reqId}:${i}`,
+    label: selected ? `${selected.has(i) ? '☑' : '☐'} ${label}` : label,
+  }));
+  if (selected) {
+    buttons.push({
+      id: `${ASK_PREFIX}${reqId}:${labels.length}`,
+      label: selected.size > 0 ? `✅ Done (${selected.size})` : '✅ Done',
+      style: 'primary',
+    });
+  }
+  return buttons;
+}
+
 
 /**
  * What a pending question resolved to.
  *
- * Two shapes, because the answer travels back differently: a tapped option carries the label the
- * button was drawn with (mapped to the option's own `value` before it reaches the agent), while a
- * typed answer is whatever the user wrote and goes back through the question's free-text field.
+ * Two shapes, because the answer travels back differently: tapped options carry the labels the
+ * buttons were drawn with (mapped to the options' own `value`s before they reach the agent), while
+ * a typed answer is whatever the user wrote and goes back through the question's free-text field.
  * Collapsing them into a bare string is what would let a typed answer be mistaken for an option
  * the agent listed.
+ *
+ * `labels` is a list rather than one string because a multi-select round resolves with everything
+ * that was ticked; a single-select round always carries exactly one, and neither is ever empty.
  */
-export type AskOutcome = { kind: 'option'; label: string } | { kind: 'text'; text: string };
+export type AskOutcome = { kind: 'option'; labels: string[] } | { kind: 'text'; text: string };
 
 /**
  * What happened to a conversation while the next round of its form was still being posted.
@@ -302,6 +381,13 @@ interface PendingAsk {
    * since there is no conversation to attribute one to.
    */
   conversationId?: ConversationId;
+  /**
+   * Ticked option indices — present only on a multi-select round, absent on every other question.
+   *
+   * Its presence is also what makes a tap toggle instead of answer, so the two kinds of question
+   * cannot be confused at click time. Mutated in place as taps arrive; read once, on Done.
+   */
+  selected?: Set<number>;
 }
 
 /**
@@ -789,7 +875,10 @@ export class Daemon {
     // The reverse `ask` speaks in labels, and a typed answer is simply the label the user wrote —
     // the CLI's contract is "what the human answered", not "which of your options they picked", and
     // the prompt came from the agent itself rather than from a schema it has to validate against.
-    return { chosen: chosen === null ? null : chosen.kind === 'option' ? chosen.label : chosen.text };
+    // The join is a formality: `ask` never requests a multi-select, so there is always one label.
+    return {
+      chosen: chosen === null ? null : chosen.kind === 'option' ? chosen.labels.join(', ') : chosen.text,
+    };
   }
 
   /**
@@ -801,6 +890,10 @@ export class Daemon {
    * copies would inevitably drift on the details that took a bug each to get right (keeping the
    * posted message's own ref for the ack edit, stripping the buttons on resolve, re-checking the
    * clicker against the allowlist).
+   *
+   * `opts.multi` turns the bubble into a stateful one — ticks in the labels, Done to finish. It is
+   * the caller's job to have checked `canMultiSelect` first: this redraws through `editButtons`,
+   * and on a platform that cannot do that the user would tap at ticks that never move.
    */
   private askButtons(
     platform: PlatformAdapter,
@@ -809,15 +902,16 @@ export class Daemon {
     labels: string[],
     timeoutMs: number,
     conversationId?: ConversationId,
-    acceptsText = true
+    opts: { acceptsText?: boolean; multi?: boolean } = {}
   ): Promise<AskOutcome | null> {
     const reqId = randomUUID().slice(0, 8);
-    // custom_id: `ask:` prefix + index (≤100 chars; must not start with `input`).
-    const buttons = labels.map((label, i) => ({
-      id: `${ASK_PREFIX}${reqId}:${i}`,
-      label,
-    }));
-    return platform.sendButtons(address, prompt, buttons).then(
+    const acceptsText = opts.acceptsText ?? true;
+    const selected = opts.multi ? new Set<number>() : undefined;
+    const buttons = buildAskButtons(reqId, labels, selected);
+    // The Done affordance is appended here rather than baked into `prompt`, because `prompt` is
+    // what retireAsk reprints under the answer — and "tap Done when you're finished" under a
+    // question that is already answered is stale instruction, not a record of what happened.
+    return platform.sendButtons(address, selected ? `${prompt}\n\n${MULTI_HINT}` : prompt, buttons).then(
       (ref) =>
         new Promise<AskOutcome | null>((resolve) => {
           const timer = setTimeout(() => {
@@ -850,6 +944,7 @@ export class Daemon {
             adapter: platform,
             acceptsText,
             conversationId,
+            ...(selected ? { selected } : {}),
           });
           if (conversationId !== undefined) this.settleFromGap(reqId, conversationId, acceptsText);
         })
@@ -1038,14 +1133,20 @@ export class Daemon {
   ): Promise<ElicitAnswer> {
     const content: Record<string, string | string[]> = {};
     for (const [i, q] of request.questions.entries()) {
+      const multi = canMultiSelect(platform, q);
       const answer = await this.askButtons(
         platform,
         address,
-        composeElicitPrompt(q, i, request.questions.length),
+        composeElicitPrompt(
+          q,
+          i,
+          request.questions.length,
+          q.multi && !multi ? MULTI_DEGRADED_NOTE : undefined
+        ),
         q.options.map((o) => o.label),
         DEFAULT_ASK_TIMEOUT_MS,
         conversationId,
-        q.customKey !== undefined
+        { acceptsText: q.customKey !== undefined, multi }
       );
       if (answer === null) {
         console.log(`[elicit] ${conversationId}: question ${i + 1} went unanswered; cancelling`);
@@ -1058,11 +1159,16 @@ export class Daemon {
         content[q.customKey!] = answer.text;
         continue;
       }
-      // Send back the option's `value`, not the label the button carried: ACP separates display
+      // Send back the options' `value`s, not the labels the buttons carried: ACP separates display
       // text from the answer, and an MCP server that made them differ must get what it offered.
-      const picked = q.options.find((o) => o.label === answer.label);
-      if (!picked) return { action: 'cancel' }; // unreachable: labels come from these very options
-      content[q.key] = q.multi ? [picked.value] : picked.value;
+      const picked = answer.labels.map((l) => q.options.find((o) => o.label === l)?.value);
+      // Unreachable: labels come from these very options. Cancelling rather than filtering the
+      // misses out, because a multi-select answer with a hole in it is not the answer that was given.
+      if (picked.some((v) => v === undefined)) return { action: 'cancel' };
+      const values = picked as string[];
+      // An array field takes an array even when one option was ticked — the schema says `type:
+      // 'array'`, and the harness joins whatever it gets (applyAskElicitationResponse).
+      content[q.key] = q.multi ? values : values[0]!;
     }
     return { action: 'accept', content };
   }
@@ -1095,9 +1201,63 @@ export class Daemon {
     if (!parsed) return;
     const pending = this.pendingAsks.get(parsed.reqId);
     if (!pending) return;
-    if (parsed.index >= pending.labels.length) return;
-    const label = pending.labels[parsed.index]!; // bounds-checked above (index < labels.length)
-    this.settleAsk(parsed.reqId, { kind: 'option', label }, `→ Selected: ${label}`);
+    this.onAskClick(parsed.reqId, parsed.index, pending);
+  }
+
+  /**
+   * A tap on a question's own buttons — the answer, or one tick of a multi-select round.
+   *
+   * The index decides which, and `pending.selected` decides how to read it: on a single-select
+   * question the first tap IS the answer, while on a multi-select one every option toggles and
+   * only the Done button (the one index past the options) resolves. Out-of-range indices are
+   * ignored rather than clamped — they can only come from a button this question never drew.
+   */
+  private onAskClick(reqId: string, index: number, pending: PendingAsk): void {
+    const { labels, selected } = pending;
+    if (!selected) {
+      if (index >= labels.length) return;
+      const label = labels[index]!; // bounds-checked above (index < labels.length)
+      this.settleAsk(reqId, { kind: 'option', labels: [label] }, `→ Selected: ${label}`);
+      return;
+    }
+    if (index > labels.length) return;
+    if (index < labels.length) {
+      if (selected.has(index)) selected.delete(index);
+      else selected.add(index);
+      this.redrawAsk(reqId, pending);
+      return;
+    }
+    if (selected.size === 0) {
+      // Done with nothing ticked has no answer to give, and doing nothing at all would read as the
+      // bot ignoring the tap — so say what is missing and leave the question up.
+      this.redrawAsk(reqId, pending, MULTI_EMPTY_NOTE);
+      return;
+    }
+    // Tick ORDER is not the answer's order: the options' own order is what the agent listed and
+    // what its rationales read in, so a user who tapped bottom-up gets the same answer as one who
+    // tapped top-down.
+    const chosen = [...selected].sort((a, b) => a - b).map((i) => labels[i]!);
+    this.settleAsk(reqId, { kind: 'option', labels: chosen }, `→ Selected: ${chosen.join(', ')}`);
+  }
+
+  /**
+   * Repaint a live multi-select question after a tick moved (best-effort, like every other
+   * cosmetic edit here).
+   *
+   * A failed repaint leaves the ticks stale on screen but costs no answer: the selection itself
+   * lives in `pending.selected`, which the click handler owns, so Done still resolves with what was
+   * actually tapped.
+   */
+  private redrawAsk(reqId: string, pending: PendingAsk, note?: string): void {
+    const body = `${pending.prompt}\n\n${MULTI_HINT}${note ? `\n${note}` : ''}`;
+    void pending.adapter
+      .editButtons(pending.ref, body, buildAskButtons(reqId, pending.labels, pending.selected))
+      .catch((err) =>
+        console.warn(
+          `[ask] ${pending.conversationId ?? reqId}: failed to repaint the selection:`,
+          err instanceof Error ? err.message : err
+        )
+      );
   }
 
   /**

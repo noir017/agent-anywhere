@@ -5,6 +5,23 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Topics in the web UI can be deleted directly from the sidebar.**
+  - An inline delete button (`×`) appears on hover next to each topic in the sidebar. Clicking it prompts for confirmation, then removes the topic from persistent storage, cleans up the room's in-memory state, and broadcasts the updated topic list to all connected clients.
+  - Deleting the currently active topic automatically navigates to the next available topic in the list, or mints a new one if none remain, ensuring the client is never stranded in an invalid room.
+  - The HTTP server guards topic deletion with session authentication and CSRF origin verification, supporting both `POST /api/topics/delete` and `DELETE /api/topics`.
+
+### Changed
+
+- **Web UI scrollbars match the dark theme.**
+  - Custom scrollbar styles (`scrollbar-color`, `scrollbar-width: thin`, and `::-webkit-scrollbar` with subtle dark thumb and transparent track) eliminate the jarring contrast between default bright system scrollbars and the pitch-black background across all browsers.
+  - `color-scheme: dark` is declared on `:root` to ensure native system controls and browser-level overlays default to dark mode.
+
+- **Topic switching is instant via client-side LRU message caching.**
+  - Switching topics previously incurred a noticeable delay while the client tore down its event stream, initiated a new HTTP connection, and waited for the server's compressed `sync` event.
+  - The browser now maintains a bounded LRU cache (capped at 10 recent topics and 40 messages each, synchronized to `sessionStorage`) of recent message history. When switching to a cached topic, its messages and status render in 0ms, followed by an immediate background stream reconnect that seamlessly reconciles any newer messages from the server.
+
 ## [1.14.0] - 2026-09-18
 
 ### Changed

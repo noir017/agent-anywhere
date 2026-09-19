@@ -3,6 +3,7 @@ import { describe, it, expect } from 'vitest';
 import {
   ClickRequestSchema,
   CreateTopicRequestSchema,
+  DeleteTopicRequestSchema,
   LoginRequestSchema,
   SendRequestSchema,
   parseBody,
@@ -91,5 +92,14 @@ describe('webui protocol: inbound validation', () => {
     ['an extra key', { title: 'x', pinned: true }, false],
   ])('creating a topic with %s', (_label, body, want) => {
     expect(parseBody(CreateTopicRequestSchema, body).ok).toBe(want);
+  });
+
+  it.each([
+    ['a valid topic id', { topic: TOPIC }, true],
+    ['a malformed topic id', { topic: 'not-hex' }, false],
+    ['missing topic', {}, false],
+    ['an extra key', { topic: TOPIC, force: true }, false],
+  ])('deleting a topic with %s', (_label, body, want) => {
+    expect(parseBody(DeleteTopicRequestSchema, body).ok).toBe(want);
   });
 });

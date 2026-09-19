@@ -270,6 +270,40 @@ describe('webui server: topics', () => {
     });
     expect(res.status).toBe(404);
   });
+
+  it('deletes an existing topic and rejects unknown ones', async () => {
+    const { base, room } = await boot();
+    const cookie = await signIn(base);
+    const created = room.createTopic('deleteme').id;
+
+    // POST /api/topics/delete
+    const res = await fetch(`${base}/api/topics/delete`, {
+      method: 'POST',
+      headers: { ...JSON_HEADERS, cookie },
+      body: JSON.stringify({ topic: created }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
+    expect(room.topics.has(created)).toBe(false);
+
+    // Deleting again answers 404
+    const res404 = await fetch(`${base}/api/topics/delete`, {
+      method: 'POST',
+      headers: { ...JSON_HEADERS, cookie },
+      body: JSON.stringify({ topic: created }),
+    });
+    expect(res404.status).toBe(404);
+
+    // Also supports DELETE /api/topics
+    const another = room.createTopic('another').id;
+    const resDel = await fetch(`${base}/api/topics`, {
+      method: 'DELETE',
+      headers: { ...JSON_HEADERS, cookie },
+      body: JSON.stringify({ topic: another }),
+    });
+    expect(resDel.status).toBe(200);
+    expect(room.topics.has(another)).toBe(false);
+  });
 });
 
 describe('webui server: built for a weak link', () => {

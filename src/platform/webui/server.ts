@@ -44,6 +44,7 @@ import { renderPage } from './page.js';
 import {
   ClickRequestSchema,
   CreateTopicRequestSchema,
+  DeleteTopicRequestSchema,
   LoginRequestSchema,
   MAX_BODY_BYTES,
   SendRequestSchema,
@@ -222,6 +223,8 @@ const GUARDED: Route[] = [
   { method: 'POST', path: '/api/send', run: submit },
   { method: 'POST', path: '/api/click', run: click },
   { method: 'POST', path: '/api/topics', run: createTopic },
+  { method: 'POST', path: '/api/topics/delete', run: deleteTopic },
+  { method: 'DELETE', path: '/api/topics', run: deleteTopic },
   { method: 'POST', path: '/api/logout', run: logout },
   { method: 'GET', path: '/f/', prefix: true, run: ({ req, res, rest }, ctx) => download(req, res, ctx.room, rest) },
 ];
@@ -254,7 +257,7 @@ async function route(req: IncomingMessage, res: ServerResponse, ctx: Ctx): Promi
   // One gate for everything else, rather than a check inside each handler, so a route added
   // later is protected by default instead of by remembering.
   if (!ctx.auth.check(req.headers.cookie)) return send(req, res, 401, { error: 'not signed in' });
-  if (method === 'POST' && !sameOrigin(req)) return send(req, res, 403, { error: 'cross-origin request refused' });
+  if ((method === 'POST' || method === 'DELETE') && !sameOrigin(req)) return send(req, res, 403, { error: 'cross-origin request refused' });
 
   const guarded = match(GUARDED, method, url.pathname);
   if (guarded) return guarded.route.run({ req, res, url, rest: guarded.rest }, ctx);
@@ -384,6 +387,15 @@ async function createTopic({ req, res }: Req, ctx: Ctx): Promise<void> {
     // orphan a live agent session. Say so instead of failing anonymously.
     send(req, res, 409, { error: e instanceof Error ? e.message : 'could not create a topic' });
   }
+}
+
+async function deleteTopic({ req, res }: Req, ctx: Ctx): Promise<void> {
+  const parsed = await readBody(req, res, DeleteTopicRequestSchema);
+  if (!parsed) return;
+  if (!ctx.room.deleteTopic(parsed.topic)) {
+    return send(req, res, 404, { error: 'no such topic' });
+  }
+  send(req, res, 200, { ok: true });
 }
 
 async function download(req: IncomingMessage, res: ServerResponse, room: WebRoom, token: string): Promise<void> {

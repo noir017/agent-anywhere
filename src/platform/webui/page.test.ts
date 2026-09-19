@@ -79,4 +79,25 @@ describe('webui page', () => {
     expect(html).not.toContain('prefers-color-scheme');
     expect(html).toMatch(/--bg:#1[0-9a-f]{5}/);
   });
+
+  it('styles scrollbars to blend with the dark background', () => {
+    expect(html).toContain('color-scheme:dark');
+    expect(html).toContain('scrollbar-color:');
+    expect(html).toContain('scrollbar-width:thin');
+    expect(html).toContain('::-webkit-scrollbar');
+    expect(html).toContain('::-webkit-scrollbar-thumb');
+  });
+
+  it('allows deleting topics with an inline delete button and confirmation', () => {
+    expect(html).toContain('topic-del');
+    expect(html).toContain('data-del=');
+    expect(html).toContain('api/topics/delete');
+  });
+
+  it('caches topic messages in browser storage for instant switching', () => {
+    expect(html).toContain('aa_cache');
+    expect(html).toContain('sessionStorage');
+    expect(html).toContain('MAX_CACHE_TOPICS');
+    expect(html).toContain('MAX_CACHE_MSGS');
+  });
 });

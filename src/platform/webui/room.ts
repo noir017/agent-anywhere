@@ -161,6 +161,18 @@ export class WebRoom {
     return true;
   }
 
+  /** Delete a topic, disposing its room state and announcing the new list. */
+  deleteTopic(id: string): boolean {
+    const room = this.rooms.get(id);
+    if (room) {
+      if (room.timer) clearTimeout(room.timer);
+      this.rooms.delete(id);
+    }
+    if (!this.topics.delete(id)) return false;
+    this.announceTopics();
+    return true;
+  }
+
   topicList(): Topic[] {
     return this.topics.list().map((t) => {
       const room = this.rooms.get(t.id);

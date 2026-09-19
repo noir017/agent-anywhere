@@ -74,6 +74,7 @@ export const SendRequestSchema = z
   .strict();
 
 export const CreateTopicRequestSchema = z.object({ title: z.string().max(200).optional() }).strict();
+export const DeleteTopicRequestSchema = z.object({ topic: TopicId }).strict();
 
 export const ClickRequestSchema = z
   .object({
@@ -87,6 +88,7 @@ export type LoginRequest = z.infer<typeof LoginRequestSchema>;
 export type SendRequest = z.infer<typeof SendRequestSchema>;
 export type ClickRequest = z.infer<typeof ClickRequestSchema>;
 export type CreateTopicRequest = z.infer<typeof CreateTopicRequestSchema>;
+export type DeleteTopicRequest = z.infer<typeof DeleteTopicRequestSchema>;
 
 /**
  * Validate one inbound body against a schema.

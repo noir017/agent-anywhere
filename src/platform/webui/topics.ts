@@ -107,6 +107,15 @@ export class TopicStore {
     return true;
   }
 
+  /** Delete a topic from the store and persist the list. */
+  delete(id: string): boolean {
+    const topic = this.topics.get(id);
+    if (!topic) return false;
+    this.topics.delete(id);
+    this.flush();
+    return true;
+  }
+
   /**
    * Give an unnamed topic a placeholder from the first thing said in it.
    *

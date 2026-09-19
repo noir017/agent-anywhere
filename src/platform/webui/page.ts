@@ -38,8 +38,13 @@ export function renderPage(title: string): string {
 }
 
 const STYLE = `
-:root{--bg:#131313;--fg:#dcdcdc;--dim:#7d7d7d;--line:#272727;--own:#1c1c1c;--field:#1a1a1a}
-*{box-sizing:border-box}
+:root{--bg:#131313;--fg:#dcdcdc;--dim:#7d7d7d;--line:#272727;--own:#1c1c1c;--field:#1a1a1a;color-scheme:dark}
+*{box-sizing:border-box;scrollbar-width:thin;scrollbar-color:#333 transparent}
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:#303030;border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:#484848}
+::-webkit-scrollbar-corner{background:transparent}
 /* An id rule with display: wins over the browser's own [hidden]{display:none}, so #app and
    #hints would both ignore the attribute and show anyway — the chat pane before login, the
    command list with nothing in it. This is the standard fix and it has to stay. */
@@ -63,18 +68,22 @@ body{background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,-apple-system,
 #sidebar-header .add{font-size:15px;font-weight:600}
 
 #topics{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:3px;padding:8px}
-#topics button.topic-item{display:flex;align-items:center;gap:8px;width:100%;padding:7px 9px;border:1px solid transparent;border-radius:5px;background:none;text-align:left;font:inherit;font-size:13px;cursor:pointer;transition:background .15s}
-#topics button.topic-item:hover{background:#222}
-#topics button.topic-item.on{background:#252525;border-color:var(--line)}
+#topics .topic-item{display:flex;align-items:center;gap:8px;width:100%;padding:7px 9px;border:1px solid transparent;border-radius:5px;background:none;text-align:left;font:inherit;font-size:13px;cursor:pointer;transition:background .15s;position:relative}
+#topics .topic-item:hover{background:#222}
+#topics .topic-item.on{background:#252525;border-color:var(--line)}
 .topic-dot{width:7px;height:7px;border-radius:50%;flex:0 0 7px;background:#444}
 .topic-dot.running{background:#38bdf8;box-shadow:0 0 6px rgba(56,189,248,.8);animation:pulse 1.5s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
 .topic-title{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-#topics button.topic-item.running .topic-title{color:var(--fg)}
-#topics button.topic-item.on.running .topic-title{color:#fff}
-#topics button.topic-item.idle .topic-title{color:var(--dim)}
-#topics button.topic-item.on.idle .topic-title{color:#a0a0a0}
+#topics .topic-item.running .topic-title{color:var(--fg)}
+#topics .topic-item.on.running .topic-title{color:#fff}
+#topics .topic-item.idle .topic-title{color:var(--dim)}
+#topics .topic-item.on.idle .topic-title{color:#a0a0a0}
 .topic-badge{background:#2563eb;color:#fff;border-radius:9px;padding:1px 6px;font-size:11px;font-weight:600;line-height:1.3;margin-left:4px;flex-shrink:0}
+.topic-del{opacity:0;background:none;border:0;color:var(--dim);font:inherit;font-size:16px;line-height:1;padding:2px 5px;cursor:pointer;border-radius:3px;margin-left:auto;flex-shrink:0;transition:opacity .15s,color .15s,background .15s}
+#topics .topic-item:hover .topic-del,#topics .topic-item:focus-within .topic-del{opacity:1}
+.topic-del:hover{color:#f87171;background:rgba(248,113,113,.15)}
+@media(hover:none){.topic-del{opacity:.7}}
 
 #chat{flex:1;display:flex;flex-direction:column;height:100%;min-width:0;position:relative}
 #chat-header{display:flex;align-items:center;gap:10px;padding:9px 16px;border-bottom:1px solid var(--line);min-height:42px;font-size:13px}
@@ -137,6 +146,45 @@ const SCRIPT = `
 
   function saveReads(){
     try { localStorage.setItem('aa_reads', JSON.stringify(readCounts)); } catch(x){}
+  }
+
+  var MAX_CACHE_TOPICS = 10;
+  var MAX_CACHE_MSGS = 40;
+  var topicCache = {};
+  var cacheOrder = [];
+  try {
+    var saved = JSON.parse(sessionStorage.getItem('aa_cache') || '{}');
+    if(saved && typeof saved === 'object'){
+      topicCache = saved.data || {};
+      cacheOrder = saved.order || [];
+    }
+  } catch(x){}
+
+  function saveCache(){
+    try {
+      sessionStorage.setItem('aa_cache', JSON.stringify({ data: topicCache, order: cacheOrder }));
+    } catch(x){}
+  }
+
+  function setCachedMsgs(tId, msgs){
+    if(!tId || !msgs) return;
+    var slice = msgs.length > MAX_CACHE_MSGS ? msgs.slice(-MAX_CACHE_MSGS) : msgs.slice();
+    topicCache[tId] = slice;
+    var idx = cacheOrder.indexOf(tId);
+    if(idx >= 0) cacheOrder.splice(idx, 1);
+    cacheOrder.push(tId);
+    while(cacheOrder.length > MAX_CACHE_TOPICS){
+      var evict = cacheOrder.shift();
+      delete topicCache[evict];
+    }
+    saveCache();
+  }
+
+  function dropCachedTopic(tId){
+    delete topicCache[tId];
+    var idx = cacheOrder.indexOf(tId);
+    if(idx >= 0) cacheOrder.splice(idx, 1);
+    saveCache();
   }
 
   var sidebarOpen = localStorage.getItem('aa_sb_open');
@@ -237,11 +285,12 @@ const SCRIPT = `
       var cls='topic-item '+(isCur?'on ':'')+(isRunning?'running':'idle');
       var dotCls='topic-dot'+(isRunning?' running':'');
       var badge=unread>0?'<span class="topic-badge">'+(unread>99?'99+':unread)+'</span>':'';
-      h += '<button type="button" class="'+cls+'" data-topic="'+text(t.id)+'">'
+      h += '<div class="'+cls+'" data-topic="'+text(t.id)+'" role="button" tabindex="0">'
          + '<span class="'+dotCls+'"></span>'
          + '<span class="topic-title">'+text(t.title || 'Untitled')+'</span>'
          + badge
-         + '</button>';
+         + '<button type="button" class="btn-icon topic-del" data-del="'+text(t.id)+'" title="Delete topic">×</button>'
+         + '</div>';
     }
     bar.innerHTML=h;
     if(cur){
@@ -254,12 +303,65 @@ const SCRIPT = `
     }
   }
 
+  function switchTopic(id){
+    if(!id || id===topic) return;
+    topic = id;
+    history.replaceState(null,'','?t='+encodeURIComponent(topic));
+    for(var i=0;i<topics.length;i++){
+      if(topics[i].id===id){
+        readCounts[id]=topics[i].msgCount || 0;
+        saveReads();
+        break;
+      }
+    }
+    paintTopics();
+    log.innerHTML='';
+    data={};
+    els={};
+    var cached = topicCache[id];
+    if(cached && cached.length){
+      for(var j=0;j<cached.length;j++){
+        data[cached[j].id] = cached[j];
+        paint(cached[j].id);
+      }
+      toBottom();
+    }
+    connect();
+  }
+
+  function deleteTopic(delId){
+    var target = null;
+    for(var i=0;i<topics.length;i++){
+      if(topics[i].id===delId){ target=topics[i]; break; }
+    }
+    var title = (target && target.title) ? target.title : 'Untitled';
+    if(!confirm('Delete topic "' + title + '"?')) return;
+    post('api/topics/delete',{topic:delId},1).then(function(r){
+      return r.ok ? r.json() : null;
+    }).then(function(d){
+      if(!d) return;
+      dropCachedTopic(delId);
+      delete readCounts[delId];
+      saveReads();
+      if(topic === delId){
+        var remaining = topics.filter(function(t){ return t.id !== delId; });
+        if(remaining.length > 0){
+          switchTopic(remaining[0].id);
+        } else {
+          createTopic();
+        }
+      }
+    });
+  }
+
   function handle(ev){
     if(ev.t==='sync'){
+      if(ev.topic !== topic) return;
       topic = ev.topic;
       history.replaceState(null,'','?t='+encodeURIComponent(topic));
       log.innerHTML=''; data={}; els={};
       for(var i=0;i<ev.messages.length;i++){ data[ev.messages[i].id]=ev.messages[i]; paint(ev.messages[i].id); }
+      setCachedMsgs(topic, ev.messages);
       readCounts[topic] = ev.messages.length;
       saveReads();
       commands = ev.commands || [];
@@ -269,6 +371,11 @@ const SCRIPT = `
     }
     else if(ev.t==='msg'){
       upsert(ev.msg);
+      if(topicCache[topic]){
+        topicCache[topic].push(ev.msg);
+        if(topicCache[topic].length > MAX_CACHE_MSGS) topicCache[topic].shift();
+        saveCache();
+      }
       readCounts[topic] = (readCounts[topic] || 0) + 1;
       saveReads();
       for(var i=0;i<topics.length;i++){
@@ -279,12 +386,27 @@ const SCRIPT = `
       }
       paintTopics();
     }
-    else if(ev.t==='del'){ drop(ev.id); }
+    else if(ev.t==='del'){
+      drop(ev.id);
+      if(topicCache[topic]){
+        topicCache[topic] = topicCache[topic].filter(function(m){ return m.id !== ev.id; });
+        saveCache();
+      }
+    }
     else if(ev.t==='react'){
       var m=data[ev.id]; if(!m) return;
       var kept=(m.reactions||[]).filter(function(e){ return e!==ev.emoji; });
       m.reactions = ev.on ? kept.concat([ev.emoji]) : kept;
       paint(ev.id);
+      if(topicCache[topic]){
+        for(var k=0;k<topicCache[topic].length;k++){
+          if(topicCache[topic][k].id === ev.id){
+            topicCache[topic][k].reactions = m.reactions;
+            saveCache();
+            break;
+          }
+        }
+      }
     }
     else if(ev.t==='typing'){
       typing.hidden = !ev.on;
@@ -297,7 +419,17 @@ const SCRIPT = `
       paintTopics();
     }
     else if(ev.t==='commands'){ commands = ev.commands || []; }
-    else if(ev.t==='topics'){ topics = ev.topics || []; paintTopics(); }
+    else if(ev.t==='topics'){
+      topics = ev.topics || [];
+      paintTopics();
+      if(topic && !topics.some(function(t){ return t.id===topic; })){
+        if(topics.length > 0){
+          switchTopic(topics[0].id);
+        } else {
+          createTopic();
+        }
+      }
+    }
     else if(ev.t==='bye'){ done=true; if(stream) stream.close(); note.textContent='Disconnected. Reload when it is back.'; }
   }
 
@@ -321,20 +453,18 @@ const SCRIPT = `
   }
 
   bar.addEventListener('click', function(e){
-    var b = e.target.closest ? e.target.closest('button[data-topic]') : null;
+    var del = e.target.closest ? e.target.closest('[data-del]') : null;
+    if(del){
+      e.stopPropagation();
+      var delId = del.getAttribute('data-del');
+      if(delId) deleteTopic(delId);
+      return;
+    }
+    var b = e.target.closest ? e.target.closest('[data-topic]') : null;
     if(!b) return;
     var id = b.getAttribute('data-topic');
     if(!id || id===topic) return;
-    topic = id;
-    for(var i=0;i<topics.length;i++){
-      if(topics[i].id===id){
-        readCounts[id]=topics[i].msgCount || 0;
-        saveReads();
-        break;
-      }
-    }
-    paintTopics();
-    connect();
+    switchTopic(id);
     if(window.innerWidth <= 640){
       sidebarOpen = '0';
       try { localStorage.setItem('aa_sb_open', '0'); } catch(x){}
@@ -342,13 +472,22 @@ const SCRIPT = `
     }
   });
 
+  bar.addEventListener('keydown', function(e){
+    if(e.key==='Enter' || e.key===' '){
+      if(e.target.closest && e.target.closest('[data-del]')) return;
+      var b = e.target.closest ? e.target.closest('[data-topic]') : null;
+      if(!b) return;
+      e.preventDefault();
+      var id = b.getAttribute('data-topic');
+      if(!id || id===topic) return;
+      switchTopic(id);
+    }
+  });
+
   function createTopic(){
     post('api/topics',{},1).then(function(r){ return r.ok ? r.json() : null; }).then(function(d){
       if(!d || !d.topic) return;
-      topic = d.topic.id;
-      readCounts[topic] = 0;
-      saveReads();
-      connect();
+      switchTopic(d.topic.id);
       if(window.innerWidth <= 640){
         sidebarOpen = '0';
         try { localStorage.setItem('aa_sb_open', '0'); } catch(x){}
@@ -438,6 +577,14 @@ const SCRIPT = `
     if(e.key==='Enter' && !e.shiftKey && !e.isComposing){ e.preventDefault(); send(); }
   });
   $('composer').addEventListener('submit', function(e){ e.preventDefault(); send(); });
+  if(topic && topicCache[topic]){
+    var initialCached = topicCache[topic];
+    for(var j=0;j<initialCached.length;j++){
+      data[initialCached[j].id] = initialCached[j];
+      paint(initialCached[j].id);
+    }
+    toBottom();
+  }
 
   connect();
 })();

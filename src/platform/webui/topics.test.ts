@@ -78,6 +78,22 @@ describe('TopicStore', () => {
     expect(store.rename('nope', 'x')).toBe(false);
   });
 
+  it('deletes a topic and persists the removal across restarts', () => {
+    const store = new TopicStore(file);
+    const a = store.create('first');
+    const b = store.create('second');
+    expect(store.has(a.id)).toBe(true);
+    expect(store.delete(a.id)).toBe(true);
+    expect(store.has(a.id)).toBe(false);
+    expect(store.delete(a.id)).toBe(false);
+    expect(store.delete('nonexistent')).toBe(false);
+
+    // Reopened store no longer has the deleted topic
+    const reopened = new TopicStore(file);
+    expect(reopened.has(a.id)).toBe(false);
+    expect(reopened.has(b.id)).toBe(true);
+  });
+
   it('refuses past its cap instead of evicting, because evicting orphans a live session', () => {
     const store = new TopicStore(file);
     for (let i = 0; i < 64; i += 1) store.create();

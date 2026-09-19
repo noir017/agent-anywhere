@@ -142,6 +142,21 @@ describe('WebRoom: topics are separate conversations', () => {
     expect(room.topicList().find((t) => t.id === topic)?.running).toBe(false);
     expect(seen.some((s) => s.ev.t === 'topics')).toBe(true);
   });
+
+  it('deletes a topic, cleans up room state, and announces the updated list', () => {
+    const { room, seen } = attached();
+    const second = room.createTopic('second');
+    room.post(second.id, { own: false, html: '<p>msg</p>' }, 'msg');
+    seen.length = 0;
+
+    expect(room.deleteTopic(second.id)).toBe(true);
+    expect(room.topicList().some((t) => t.id === second.id)).toBe(false);
+    expect(last(seen)).toMatchObject({ t: 'topics' });
+    expect((last(seen) as { topics: Array<{ id: string }> }).topics.some((t) => t.id === second.id)).toBe(false);
+
+    // Deleting again returns false
+    expect(room.deleteTopic(second.id)).toBe(false);
+  });
 });
 
 describe('WebRoom: held edits', () => {

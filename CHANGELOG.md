@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.18.1] - 2026-09-19
+
 ### Fixed
 
 - **Entering a topic in the web UI went blank, then snapped the whole conversation into place.** Two things were wrong and they compounded. Nothing was shown while the first sync was in flight, so the panel was simply empty for however long the network took; and when the sync landed it emptied `#log` and rebuilt every message from scratch — which destroyed the scroll container along with its position, so even a topic already painted from the local cache flashed through blank on its way to looking identical. The transcript is now reconciled by id: a message that did not change is left alone (the paint writes nothing when the markup it builds matches what is already there), one that moved is moved rather than re-created, and only what the server no longer has is removed. In the gap before the first sync the panel holds message-shaped placeholders instead of nothing, so the real conversation replaces something of the same shape rather than appearing out of an empty box. New messages fade in over 180ms; both the fade and the placeholders' breathing are dropped under `prefers-reduced-motion`.

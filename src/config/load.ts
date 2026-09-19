@@ -128,14 +128,26 @@ export function saveConfig(cfg: UserConfig): void {
  * Persist a set of section updates while PRESERVING the rest of the file — comments,
  * key order, and hand-edited sections outside the patched paths survive. This is the
  * yaml-package Document API doing properly what hermes-desktop attempted with regex
- * patches. Used by setup: it only claims the sections the wizard actually asked about.
+ * patches. Used by setup: it only claims the sections the wizard actually asked about,
+ * and by the `/setting` chat command, which writes one scalar at a time.
+ *
+ * A patch whose `value` is `undefined` DELETES that key rather than writing it. That
+ * distinction is load-bearing for optional fields: `agents[].model` is
+ * `z.string().optional()`, and serializing "no model" as `null` would make the very next
+ * `loadConfig` fail validation — i.e. a write that bricks the file it was clearing.
+ * Deleting a path that does not exist is a no-op.
+ *
+ * A path segment may be a number, addressing one entry of a sequence (`['agents', 1, 'model']`).
+ * The INDEX must be resolved against this file, not against a runtime array — see
+ * daemon/settings-store.ts for why.
  */
-export function saveConfigPatch(patch: Array<{ path: string[]; value: unknown }>): void {
+export function saveConfigPatch(patch: Array<{ path: Array<string | number>; value: unknown }>): void {
   const p = configPath();
   // parseDocument('') yields an empty document; setIn creates block-style collections as needed.
   const doc = parseDocument(fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : '');
   for (const { path: at, value } of patch) {
-    doc.setIn(at, doc.createNode(value));
+    if (value === undefined) doc.deleteIn(at);
+    else doc.setIn(at, doc.createNode(value));
   }
   writeConfigFile(doc.toString());
 }

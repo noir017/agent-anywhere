@@ -6,16 +6,34 @@ import {
   type GateContext,
 } from './inbound-gate.js';
 
-/** Minimal InboundMessage; overrides set gating-relevant fields. */
-function makeMsg(overrides: Partial<InboundMessage> = {}): InboundMessage {
+/**
+ * Minimal InboundMessage; overrides set gating-relevant fields.
+ *
+ * The conversation-shaped fields (channel / lane / kind) are accepted in their old flat spelling
+ * so each case still reads as one line about the thing under test. `isDirect`/`isThread` map onto
+ * the single `kind` witness that replaced them.
+ */
+type MsgOverrides = Partial<Omit<InboundMessage, 'conversation'>> & {
+  channelId?: string;
+  thread?: string;
+  isDirect?: boolean;
+  isThread?: boolean;
+};
+
+function makeMsg(overrides: MsgOverrides = {}): InboundMessage {
+  const { channelId = 'C1', thread, isDirect, isThread, ...rest } = overrides;
   return {
-    platform: 'discord',
-    channelId: 'C1',
-    userId: 'U1',
+    conversation: {
+      platform: 'discord',
+      channel: channelId,
+      ...(thread != null ? { thread } : {}),
+      kind: isDirect ? 'direct' : isThread ? 'thread' : 'group',
+      user: 'U1',
+    },
     messageId: 'M1',
     content: 'hello',
     timestamp: 0,
-    ...overrides,
+    ...rest,
   };
 }
 
@@ -173,5 +191,108 @@ describe('shouldRespond · default allow', () => {
       makeCtx()
     );
     expect(d).toEqual({ respond: true, reason: 'default' });
+  });
+});
+
+/**
+ * Empty messages.
+ *
+ * Telegram delivers a native slash command as TWO inbounds: an empty text message plus the command
+ * event. The empty one carries no command text, so it routed to the DEFAULT agent and started a
+ * second turn beside the real one — a `/oc hi` was answered by oc AND cc. Attachment-only messages
+ * (an image with no caption) are real input and must still pass.
+ */
+describe('shouldRespond · empty message', () => {
+  it('rejects a message with no text and no attachments', () => {
+    const d = shouldRespond(makeMsg({ content: '' }), makeCfg(), makeCtx());
+    expect(d).toEqual({ respond: false, reason: 'empty' });
+  });
+
+  it('rejects whitespace-only text', () => {
+    expect(shouldRespond(makeMsg({ content: '   \n\t ' }), makeCfg(), makeCtx()).respond).toBe(false);
+  });
+
+  it('accepts an attachment-only message (image with no caption)', () => {
+    const msg = makeMsg({
+      content: '',
+      isDirect: true,
+      attachments: [{ type: 'image', url: 'https://example.com/a.png' }],
+    });
+    expect(shouldRespond(msg, makeCfg(), makeCtx()).respond).toBe(true);
+  });
+
+  it('rejects empty even in a DM, where everything else is allowed', () => {
+    // The empty phantom message arrives in the same DM as the real command, so the DM branch must
+    // not rescue it.
+    const d = shouldRespond(makeMsg({ content: '', isDirect: true }), makeCfg(), makeCtx());
+    expect(d).toEqual({ respond: false, reason: 'empty' });
+  });
+
+  it('rejects empty even in a free-response channel', () => {
+    const d = shouldRespond(
+      makeMsg({ content: '' }),
+      makeCfg({ freeResponseChannels: ['C1'] }),
+      makeCtx()
+    );
+    expect(d.respond).toBe(false);
+  });
+
+  it('rejects empty even when mentioned in a guild', () => {
+    const d = shouldRespond(makeMsg({ content: '', mentionedSelf: true }), makeCfg(), makeCtx());
+    expect(d.respond).toBe(false);
+  });
+
+  it('still reports ignored-channel for an empty message in a blocked channel', () => {
+    // Ordering detail: 'empty' short-circuits first, so a blocked channel with an empty message
+    // reports 'empty'. Either reason is a rejection; this pins the actual behavior.
+    const d = shouldRespond(makeMsg({ content: '' }), makeCfg({ ignoredChannels: ['C1'] }), makeCtx());
+    expect(d.respond).toBe(false);
+    expect(d.reason).toBe('empty');
+  });
+
+  it('non-empty text is unaffected', () => {
+    expect(shouldRespond(makeMsg({ isDirect: true }), makeCfg(), makeCtx()).respond).toBe(true);
+  });
+});
+
+/**
+ * Topic-mode groups (Feishu 话题模式群): every message carries a lane, and the lane id is minted
+ * per root message — so the only entry an operator can write is the chat id. Both lists have to
+ * honour it, or the config silently does nothing at all.
+ */
+describe('shouldRespond · a chat-level entry covers the chat\'s topics', () => {
+  it('freeResponseChannels naming the chat exempts a message in one of its topics', () => {
+    const d = shouldRespond(
+      makeMsg({ channelId: 'oc_chat', thread: 'omt_1', isThread: true }),
+      makeCfg({ freeResponseChannels: ['oc_chat'] }),
+      makeCtx()
+    );
+    expect(d).toEqual({ respond: true, reason: 'free-response' });
+  });
+
+  it('ignoredChannels naming the chat blocks a message in one of its topics', () => {
+    const d = shouldRespond(
+      makeMsg({ channelId: 'oc_chat', thread: 'omt_1', isThread: true, mentionedSelf: true }),
+      makeCfg({ ignoredChannels: ['oc_chat'] }),
+      makeCtx()
+    );
+    expect(d).toEqual({ respond: false, reason: 'ignored-channel' });
+  });
+
+  it('a topic-level entry still targets only that topic', () => {
+    const cfg = makeCfg({ freeResponseChannels: ['oc_chat/omt_1'] });
+    const inTopic = shouldRespond(
+      makeMsg({ channelId: 'oc_chat', thread: 'omt_1', isThread: true }),
+      cfg,
+      makeCtx()
+    );
+    const inSibling = shouldRespond(
+      makeMsg({ channelId: 'oc_chat', thread: 'omt_2', isThread: true }),
+      cfg,
+      makeCtx()
+    );
+    expect(inTopic.reason).toBe('free-response');
+    // Not exempted: no mention, no active session in this topic.
+    expect(inSibling).toEqual({ respond: false, reason: 'no-mention' });
   });
 });

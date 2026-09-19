@@ -16,14 +16,20 @@ import { createQQProfile } from './profiles/qq.js';
 import { createLineProfile } from './profiles/line.js';
 import { createWecomProfile } from './profiles/wecom.js';
 import { createDingtalkProfile } from './profiles/dingtalk.js';
+import { createWebuiAdapter } from './webui/index.js';
 
 /**
- * Platform type → profile factory. Adding a platform = one line here + a schema in
- * config-schemas.ts. Each factory returns a profile typed to its own config; the map
+ * Platform type → profile factory. Adding a Satori platform = one line here + a schema in
+ * config-schemas.ts.
+ *
+ * `webui` is excluded because it has no profile: it is not a Satori adapter at all (see
+ * webui/index.ts for why) and is dispatched separately below. The `Exclude` rather than a
+ * loosened type is what keeps this map exhaustive — the next Satori platform still fails to
+ * compile until it is listed here. Each factory returns a profile typed to its own config; the map
  * widens to PlatformProfile (method-bivariance) — safe because dispatch below always
  * hands a profile the instance whose `type` selected it.
  */
-const PROFILES: Record<PlatformType, () => PlatformProfile> = {
+const PROFILES: Record<Exclude<PlatformType, 'webui'>, () => PlatformProfile> = {
   discord: createDiscordProfile,
   telegram: createTelegramProfile,
   slack: createSlackProfile,
@@ -40,6 +46,10 @@ const PROFILES: Record<PlatformType, () => PlatformProfile> = {
  * discriminated union guarantees `type` is implemented, so no unknown-type branch remains.
  */
 export async function createPlatformAdapter(instance: PlatformInstance): Promise<PlatformAdapter> {
+  // The one platform that is not a chat app. It implements PlatformAdapter directly rather
+  // than going through the profile seam, for the reasons in webui/index.ts — the daemon only
+  // ever sees PlatformAdapter, so nothing downstream can tell the difference.
+  if (instance.type === 'webui') return createWebuiAdapter(instance);
   return createSatoriAdapter(PROFILES[instance.type](), instance);
 }
 

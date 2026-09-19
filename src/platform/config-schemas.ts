@@ -24,13 +24,21 @@ import { z } from 'zod';
  */
 export const ChatGateSchema = z
   .object({
-    /** Listen-channel allowlist; empty = all channels. */
+    /**
+     * Listen-channel allowlist; empty = all channels.
+     *
+     * All three channel lists here take the textual address form (`core/conversation.ts`):
+     * `<chat>` names a chat AND every topic/thread inside it, `<chat>/<thread>` names one lane.
+     * Matched by `addressSelects`, whose doc block records why a bare chat entry has to include
+     * its lanes — a Feishu topic-mode group mints a topic id per message, so exact matching made
+     * all three lists unusable there.
+     */
     channels: z.array(z.string()).default([]),
     /** Whether group/guild channels require an @mention to respond. */
     requireMention: z.boolean().default(true),
-    /** Channels that respond without a mention. */
+    /** Channels that respond without a mention (same address form as `channels`). */
     freeResponseChannels: z.array(z.string()).default([]),
-    /** Channels that are fully ignored. */
+    /** Channels that are fully ignored (same address form as `channels`). */
     ignoredChannels: z.array(z.string()).default([]),
     /** Responding to other bots: none / mentions (only when @-ed) / all. */
     allowBots: z.enum(['none', 'mentions', 'all']).default('none'),
@@ -55,6 +63,20 @@ const common = {
   threadAutoArchiveMinutes: z
     .union([z.literal(60), z.literal(1440), z.literal(4320), z.literal(10080)])
     .default(1440),
+  /**
+   * Rename a conversation's thread to the title the agent generates for it.
+   *
+   * On by default, because a topic named after what is being discussed is the point of having
+   * topics, and the alternative — every lane keeping the placeholder it was created with — is what
+   * this setting exists to end. Gated at runtime by `capabilities.renameThread`, so it is inert on
+   * platforms that cannot do it.
+   *
+   * Turn it off when the lane names are yours to curate: with it on, a new title from the harness
+   * WILL overwrite a name you set by hand (the Bot API cannot report a topic's current name, so
+   * "was this renamed by a human" is not a question that can be answered — only "is it what we
+   * last set"). That is the deliberate trade for keeping the name current.
+   */
+  autoRenameThread: z.boolean().default(true),
 };
 
 export const DiscordConfigSchema = z.object({
@@ -162,6 +184,42 @@ export const DingtalkConfigSchema = z.object({
   ...common,
 });
 
+/**
+ * The built-in web UI: a browser chat page this daemon serves itself.
+ *
+ * The only platform here with no account, no bot token and no upstream service — which is
+ * the point of it. It is also the only one that opens a port for HUMANS rather than for a
+ * platform's webhook, so two of its fields are security decisions rather than connection
+ * details, and both are documented where the operator will read them.
+ */
+export const WebuiConfigSchema = z.object({
+  type: z.literal('webui'),
+  /**
+   * Shared secret for the login page. Required, and required for a reason: behind this page
+   * is an agent the daemon grants full tool access, and `host` below defaults to every
+   * interface. Use `${VAR}` and keep it out of the file.
+   */
+  token: z.string().min(1).describe('Shared login secret for the web UI'),
+  /**
+   * Interface to bind.
+   *
+   * `0.0.0.0` by default, because a gateway whose whole purpose is reaching your agent from
+   * elsewhere is not useful bound to loopback. That default is safe only because `token` is
+   * mandatory; there is no TLS here, so put a reverse proxy in front before this crosses
+   * anything you do not control. Set `127.0.0.1` to reach it over an SSH tunnel instead.
+   */
+  host: z.string().default('0.0.0.0'),
+  port: z.number().int().min(1).max(65535).default(8787),
+  /**
+   * The page's `<title>`, and the only text on it that is not conversation.
+   *
+   * Configurable because a deliberately unremarkable title is the difference between a tab
+   * someone glances past and one they ask about. The default says nothing.
+   */
+  title: z.string().default('Chat'),
+  ...common,
+});
+
 /** All platform entry schemas, keyed by type. setup's schema-driven prompts iterate this. */
 export const PLATFORM_SCHEMAS = {
   discord: DiscordConfigSchema,
@@ -172,6 +230,7 @@ export const PLATFORM_SCHEMAS = {
   line: LineConfigSchema,
   wecom: WecomConfigSchema,
   dingtalk: DingtalkConfigSchema,
+  webui: WebuiConfigSchema,
 } as const;
 
 /** One entry of the `platforms:` map (discriminated on `type`). */
@@ -184,6 +243,7 @@ export const PlatformConfigSchema = z.discriminatedUnion('type', [
   LineConfigSchema,
   WecomConfigSchema,
   DingtalkConfigSchema,
+  WebuiConfigSchema,
 ]);
 export type PlatformConfig = z.infer<typeof PlatformConfigSchema>;
 export type PlatformType = PlatformConfig['type'];
@@ -202,3 +262,4 @@ export type QQPlatformConfig = z.infer<typeof QQConfigSchema>;
 export type LinePlatformConfig = z.infer<typeof LineConfigSchema>;
 export type WecomPlatformConfig = z.infer<typeof WecomConfigSchema>;
 export type DingtalkPlatformConfig = z.infer<typeof DingtalkConfigSchema>;
+export type WebuiPlatformConfig = z.infer<typeof WebuiConfigSchema>;

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
+import { createRequire } from 'node:module';
 import { encode } from '@toon-format/toon';
 import { runSetup } from './commands/setup.js';
 import { runDoctor } from './commands/doctor.js';
@@ -10,11 +11,26 @@ import { REVERSE_COMMANDS, CHANNEL_OPTION } from './ipc/commands.js';
 // lazy-loaded to keep --help / setup / doctor / reverse commands lightweight to start.
 const runStart = () => import('./commands/start.js').then((m) => m.runStart());
 
+/**
+ * The real installed version, read from package.json at runtime.
+ *
+ * This used to be a string literal, and it stopped being true four minor releases ago: a 0.11.0
+ * install answered `--version` with `0.2.0`. That is worse than having no flag — it is the first
+ * thing you check when a deployment misbehaves, and it sent an investigation of a live daemon after
+ * a phantom stale install. The uniagent image even documents the workaround (assert on the
+ * installed package.json instead, since --version "will always pass").
+ *
+ * `createRequire` rather than a JSON import: `../package.json` sits outside rootDir, so importing
+ * it would drag the file into the emitted layout and shift dist/cli.js down a directory. This path
+ * is correct in both shapes — dist/cli.js and src/cli.ts are each one level below the package root.
+ */
+const version = (createRequire(import.meta.url)('../package.json') as { version: string }).version;
+
 const program = new Command();
 program
   .name('agent-anywhere')
   .description('Gateway that connects IM platforms to coding agents: messaging via Koishi, handled over ACP')
-  .version('0.2.0')
+  .version(version)
   // Global: pick a specific config file (e.g. one per platform). Default is ~/.config/agent-anywhere/config.yaml.
   // We stash it on process.env so it's inherited by the spawned agent — its reverse commands then resolve
   // the same config/socket. Only one daemon runs at a time, so the socket sits next to the chosen file.

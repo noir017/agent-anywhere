@@ -6,6 +6,19 @@ import { loadConfig, resolveSocketPath, configPath, readRawConfigIfExists, saveC
 import { ConfigSchema, accessUnrestricted, platformInstances, type Config } from '../config/schema.js';
 import { isLegacyConfig, migrateLegacyConfig } from '../config/migrate.js';
 import { resolveClaudeAdapterEntry, resolveCodexAdapterEntry } from '../daemon/agent-acp.js';
+import { AGY_COMMAND } from '../daemon/agent-agy.js';
+import { agentHome } from '../daemon/skills-scan.js';
+import { OWNER } from '../platform/webui/room.js';
+
+/** Whether a host:port can be bound right now. Binds and releases; never leaves it held. */
+async function portFree(host: string, port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.once('error', () => resolve(false));
+    probe.once('listening', () => probe.close(() => resolve(true)));
+    probe.listen(port, host);
+  });
+}
 
 /**
  * Locate an executable: if it contains a path separator, check the file directly;
@@ -33,7 +46,7 @@ function locateCommand(cmd: string): string | null {
   return null;
 }
 
-/** Agent definition -> its harness's main executable name (doctor only checks reachability, same convention as agent-acp's resolveHarness). claude/codex are handled separately (local dependencies, not PATH). */
+/** Agent definition -> its harness's main executable name (doctor only checks reachability, same convention as agent-acp's resolveHarness / agent-agy's AGY_COMMAND). claude/codex are handled separately (local dependencies, not PATH). */
 function harnessCommand(def: import('../config/schema.js').AgentDef): string {
   switch (def.harness) {
     case 'claude':
@@ -44,6 +57,10 @@ function harnessCommand(def: import('../config/schema.js').AgentDef): string {
       return 'codex-acp';
     case 'opencode':
       return 'opencode';
+    case 'dsh':
+      return 'dsh';
+    case 'agy':
+      return AGY_COMMAND;
     case 'custom':
       return def.command ?? '(custom harness: no command configured)';
   }
@@ -62,9 +79,12 @@ function adapterResolves(resolve: () => string): boolean {
 /**
  * Auth-method note. harness=claude (claude-agent-acp) by default reuses this machine's
  * `claude /login` subscription session; if ANTHROPIC_API_KEY is set (via env or
- * environment) it uses an API key. Other harnesses aren't noted (own mechanisms).
+ * environment) it uses an API key. harness=agy reuses the Google sign-in `agy` cached in the OS
+ * keyring — headless runs never prompt, so a never-signed-in agy fails at the first turn, and
+ * saying so here is the only warning the operator gets. Other harnesses aren't noted (own mechanisms).
  */
 function authNote(def: import('../config/schema.js').AgentDef): string {
+  if (def.harness === 'agy') return ' [agy Google sign-in from the OS keyring; run `agy` once interactively if never signed in]';
   if (def.harness !== 'claude') return '';
   const hasKey = Boolean(def.env?.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY);
   return hasKey ? ' [API key]' : ' [claude /login subscription session]';
@@ -222,7 +242,12 @@ export async function runDoctor(opts: { migrateConfig?: boolean } = {}): Promise
         let anyFail = false;
         let anyWarn = false;
         for (const [id, p] of Object.entries(cfg.platforms)) {
-          if (p.type === 'discord') {
+          if (p.type === 'webui') {
+            // Its credential is a secret the operator chose for a server this process runs;
+            // there is nothing upstream to ask. The port and the allowlist are what can be
+            // wrong here, and both are checked below.
+            lines.push(`${id} (webui): the login token is local — nothing to validate online`);
+          } else if (p.type === 'discord') {
             discordResult = await checkDiscordToken(p.token);
             if (!discordResult.ok) anyFail = true;
             else if (discordResult.level === 'warn') anyWarn = true;
@@ -282,6 +307,46 @@ export async function runDoctor(opts: { migrateConfig?: boolean } = {}): Promise
       },
     },
     {
+      // The web UI's two ways of being configured-but-dead: a port something else already
+      // holds, and an allowlist that does not name it. Both fail silently at runtime — the
+      // first as a startup error long after the other platforms are live, the second as a
+      // page that accepts your messages and never answers one.
+      name: 'Web UI',
+      run: async () => {
+        if (!cfg) return { ok: false, detail: 'config unavailable, cannot check the web UI' };
+        const uis = Object.entries(cfg.platforms).filter(([, p]) => p.type === 'webui');
+        if (uis.length === 0) return { ok: true, detail: 'no webui instance configured; skipped' };
+        const lines: string[] = [];
+        let warn = false;
+        for (const [id, p] of uis) {
+          if (p.type !== 'webui') continue;
+          const free = await portFree(p.host, p.port);
+          if (!free) {
+            warn = true;
+            lines.push(
+              `${id}: ${p.host}:${p.port} is already in use — that is this web UI if the daemon is running, and a conflict if it is not`
+            );
+          } else {
+            lines.push(`${id}: ${p.host}:${p.port} is free`);
+          }
+          const identity = `${id}:${OWNER}`;
+          if (cfg.access.allowFrom.length > 0 && !cfg.access.allowFrom.includes(identity)) {
+            warn = true;
+            lines.push(
+              `${id}: access.allowFrom does not list "${identity}", so every message typed into this page will be ignored`
+            );
+          }
+          if (p.host !== '127.0.0.1' && p.host !== 'localhost' && p.host !== '::1') {
+            warn = true;
+            lines.push(
+              `${id}: bound to ${p.host} over plain HTTP — the login token is the only thing between the network and an agent with full tool access; put TLS in front of it`
+            );
+          }
+        }
+        return { ok: true, ...(warn ? { level: 'warn' as const } : {}), detail: lines.join('; ') };
+      },
+    },
+    {
       name: 'ACP SDK installed',
       run: async () => {
         const sdkName = '@agentclientprotocol/sdk';
@@ -325,6 +390,45 @@ export async function runDoctor(opts: { migrateConfig?: boolean } = {}): Promise
         // A fully missing command means the agent subprocess can't launch at start -> escalate to ❌ (so the exit code reflects it), not warn.
         return anyMissing
           ? { ok: false, detail: `some harness commands are not on PATH: ${lines.join('; ')}` }
+          : { ok: true, detail: lines.join('; ') };
+      },
+    },
+    {
+      /**
+       * Only meaningful for agy, and skipped entirely without one. It answers the one question an
+       * operator cannot answer by looking: the footer's context numbers arrive through agy's
+       * `statusLine` setting (see daemon/agy-statusline.ts), so a setting that points elsewhere is
+       * the whole explanation for "why does /context say nothing on agy" — and pointing elsewhere
+       * is a supported choice, hence a warning rather than a failure.
+       */
+      name: 'agy status line wired for context usage',
+      run: async () => {
+        if (!cfg) return { ok: false, detail: 'config unavailable, cannot check agents' };
+        const agyAgents = cfg.agents.filter((a) => a.harness === 'agy');
+        if (agyAgents.length === 0) return { ok: true, detail: 'no agy agent configured' };
+        if (process.env.AGENT_ANYWHERE_NO_AGY_STATUSLINE) {
+          return { ok: true, level: 'warn', detail: 'AGENT_ANYWHERE_NO_AGY_STATUSLINE is set — agy will report no context usage' };
+        }
+        const lines: string[] = [];
+        let anyUnwired = false;
+        for (const home of new Set(agyAgents.map((a) => agentHome(a)))) {
+          const file = path.join(home, '.gemini', 'antigravity-cli', 'settings.json');
+          let command: string | undefined;
+          try {
+            const parsed: unknown = JSON.parse(fs.readFileSync(file, 'utf8'));
+            command = (parsed as { statusLine?: { command?: string } })?.statusLine?.command;
+          } catch {
+            command = undefined;
+          }
+          if (command?.includes('agy-statusline')) {
+            lines.push(`${file} → agent-anywhere shim ✓`);
+          } else {
+            anyUnwired = true;
+            lines.push(`${file} → ${command ?? 'no statusLine'} (the daemon rewires this on start)`);
+          }
+        }
+        return anyUnwired
+          ? { ok: true, level: 'warn', detail: lines.join('; ') }
           : { ok: true, detail: lines.join('; ') };
       },
     },

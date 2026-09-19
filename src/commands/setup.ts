@@ -23,6 +23,8 @@ const PLATFORM_NOTES: Partial<Record<PlatformType, string>> = {
   qq: 'Note: edit the yaml to set sandbox/intents/protocol if needed.',
   line: 'Note: edit the yaml to set host/port if needed.',
   dingtalk: 'Note: defaults to ws (Stream mode, no public URL). Edit the yaml for protocol=http (webhook at <public host>/dingtalk) with host/port.',
+  webui:
+    'Note: the page is served at http://<host>:8787 — edit the yaml for host/port/title. It binds every interface and speaks plain HTTP, so the token you just set is the only thing protecting it; put TLS in front of it before exposing it beyond a network you trust, or set host: 127.0.0.1 and reach it over an SSH tunnel. Its identity for access.allowFrom is "<this instance id>:owner", and the "channels to listen on" question below is answered by "main" or left empty.',
 };
 
 /**
@@ -87,6 +89,7 @@ export async function runSetup(): Promise<void> {
     line: 'LINE',
     wecom: 'WeCom (WeChat Work)',
     dingtalk: 'DingTalk (钉钉)',
+    webui: 'Web UI (a browser page this daemon serves)',
   };
   const platformType = (await select({
     message: 'IM platform:',
@@ -119,11 +122,12 @@ export async function runSetup(): Promise<void> {
   });
 
   const harness = await select({
-    message: 'Agent harness (the ACP-speaking agent):',
+    message: 'Agent harness (the coding agent to drive):',
     choices: [
       { name: 'Claude (via claude-agent-acp)', value: 'claude' },
       { name: 'Gemini CLI (native ACP)', value: 'gemini' },
       { name: 'Codex', value: 'codex' },
+      { name: 'Antigravity CLI (agy)', value: 'agy' },
       { name: 'Custom (provide your own command)', value: 'custom' },
     ],
     default: 'claude',

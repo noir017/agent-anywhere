@@ -1,4 +1,5 @@
 import type { InboundMessage, MessageRef } from '../types.js';
+import { addressOf } from './conversation.js';
 
 /**
  * Inbound merger (one instance per session).
@@ -9,6 +10,8 @@ import type { InboundMessage, MessageRef } from '../types.js';
  *   latest batch, never drops), starting as a fresh batch after the turn ends.
  * - On interrupt, the remaining input is merged into the next batch (the
  *   continuation/skip-aborted-tool logic lives in the agent layer).
+ * - `interrupt()` is the explicit half of that: a user who typed `/stop` gets the
+ *   turn cancelled and the backlog dropped, whatever interruptOnNewMessage says.
  * - Lifecycle reactions: received 👀 / done ✅ / error ❌.
  */
 
@@ -19,6 +22,12 @@ export interface InboundMergerOptions {
   /** Whether a new message during a running turn interrupts it (default false: wait for natural end). */
   interruptOnNewMessage: boolean;
   reactions: { received: string; done: string; error: string };
+  /**
+   * Whether to mark the user's message with the lifecycle reactions at all (display.reactions.enabled).
+   * false = never call addReaction, so the user's own messages stay unmarked. Independent of the emoji
+   * above, which stay frozen in EXPERIENCE.
+   */
+  reactionsEnabled?: boolean;
 }
 
 export interface MergerDeps {
@@ -27,7 +36,7 @@ export interface MergerDeps {
   /**
    * Hand the merged batch to the agent; resolve = turn ended. `signal` aborts when a newer message
    * interrupts this turn (interruptOnNewMessage) — the runner reads it to finalize the partial reply
-   * cleanly (drop the streaming cursor, no footer) instead of decorating it as a completed turn.
+   * cleanly (no footer) instead of decorating it as a completed turn.
    */
   runTurn(batch: InboundMessage[], signal?: AbortSignal): Promise<void>;
   addReaction(ref: MessageRef, emoji: string): Promise<void>;
@@ -58,12 +67,46 @@ export class InboundMerger {
     return this.phase === 'idle';
   }
 
+  /**
+   * Explicit user interrupt (`/stop`): stop whatever this conversation is doing, and report what
+   * that was so the caller can say something true rather than a generic ack.
+   *
+   * Deliberately does NOT consult `opts.interruptOnNewMessage`. That switch governs the IMPLICIT
+   * path — a newly arrived message cutting the running turn short — and a user who typed "stop" is
+   * not asking for that policy's opinion.
+   *
+   * The queued backlog is DROPPED rather than run next. Those messages were written for the turn
+   * being stopped, and "stop, then immediately start the thing I queued behind it" is not what stop
+   * means. Anything still wanted can be sent again.
+   */
+  interrupt(): 'running' | 'collecting' | 'idle' {
+    if (this.phase === 'running') {
+      this.interrupted = true; // dispatch then skips ✅: the turn did not finish, it was stopped
+      this.queued = [];
+      // Both halves, same as the implicit path: trip the turn's signal (the runner finalizes the
+      // partial reply cleanly — no footer) *and* cancel the agent itself.
+      this.activeAbort?.abort();
+      this.deps.abortTurn?.();
+      return 'running';
+    }
+    if (this.phase === 'collecting') {
+      // Still inside the merge window: nothing has reached the agent, so cancelling the timer and
+      // dropping the buffer is the entire job — there is no turn to abort.
+      this.collectTimer?.();
+      this.collectTimer = null;
+      this.buffer = [];
+      this.toIdle();
+      return 'collecting';
+    }
+    return 'idle';
+  }
+
   /** Entry: called once per inbound message. */
   async ingest(msg: InboundMessage): Promise<void> {
     // The "received" reaction is best-effort and must never gate the pipeline:
     // awaiting it would let a flaky platform REST / broken pool stall dispatch.
     void this.safeReaction(
-      { channelId: msg.channelId, messageId: msg.messageId },
+      { address: addressOf(msg.conversation), messageId: msg.messageId },
       this.opts.reactions.received
     );
 
@@ -114,13 +157,13 @@ export class InboundMerger {
       // Skip ✅ for an interrupted turn: the continuing batch will mark its own latest message.
       if (!this.interrupted) {
         await this.safeReaction(
-          { channelId: last.channelId, messageId: last.messageId },
+          { address: addressOf(last.conversation), messageId: last.messageId },
           this.opts.reactions.done
         );
       }
     } catch {
       await this.safeReaction(
-        { channelId: last.channelId, messageId: last.messageId },
+        { address: addressOf(last.conversation), messageId: last.messageId },
         this.opts.reactions.error
       );
     } finally {
@@ -149,8 +192,13 @@ export class InboundMerger {
     this.deps.onIdle?.();
   }
 
-  /** Lifecycle reactions are best-effort markers; failures are swallowed, never escaping dispatch. */
+  /**
+   * Lifecycle reactions are best-effort markers; failures are swallowed, never escaping dispatch.
+   * The single choke point for all three (received/done/error), so the display.reactions.enabled
+   * gate lives here rather than at each call site.
+   */
   private async safeReaction(ref: MessageRef, emoji: string): Promise<void> {
+    if (this.opts.reactionsEnabled === false) return;
     try {
       await this.deps.addReaction(ref, emoji);
     } catch {

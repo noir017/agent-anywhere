@@ -30,16 +30,20 @@ export const SessionScope = z.enum(['per_thread', 'per_channel', 'per_user', 'sh
 export type SessionScope = z.infer<typeof SessionScope>;
 
 /**
- * A single agent definition. harness is a preset (claude/gemini/codex/opencode); with custom,
+ * A single agent definition. harness is a preset (claude/gemini/codex/opencode/dsh/agy); with custom,
  * command points at any ACP-speaking executable. harness-specific switches (e.g.
  * claude's --setting-sources) go through args, not the generic schema.
+ *
+ * All presets except `agy` speak ACP (see daemon/agent-acp.ts). `agy` (Google Antigravity CLI) has
+ * no ACP mode at all and is driven over its own stream-json protocol by daemon/agent-agy.ts; the
+ * factory picks the runtime from this field.
  */
 export const AgentDefSchema = z
   .object({
     /** Unique id referenced by routing. */
     id: z.string().min(1),
     /** Preset; command is required when custom. */
-    harness: z.enum(['claude', 'gemini', 'codex', 'opencode', 'custom']),
+    harness: z.enum(['claude', 'gemini', 'codex', 'opencode', 'dsh', 'agy', 'custom']),
     /** Executable to launch the ACP agent when harness=custom; empty for presets (resolveHarness provides a default). */
     command: z.string().optional(),
     /** Extra args appended to the harness command (harness-specific switches go here). */
@@ -48,6 +52,16 @@ export const AgentDefSchema = z
     cwd: z.string().optional(),
     /** Model (best-effort via newSession; whether it takes effect depends on the harness). */
     model: z.string().optional(),
+    /**
+     * Override the context-window size the footer reports (tokens), replacing whatever the harness
+     * sends over ACP `usage_update`. Set this when the harness UNDER-reports the window: claude-agent-acp
+     * carries a hardcoded model table, and a model absent from it (e.g. `claude-opus-5`) falls back to a
+     * 200k default even though the gateway serves 1M — so the same agent shows 200k or 1M depending only
+     * on which model the session landed on. A local fact (the gateway's real limit), so it lives in local
+     * config rather than being probed: set `contextWindow: 1000000` and the footer reads `/ 1M` regardless.
+     * Unset = trust the harness's number.
+     */
+    contextWindow: z.number().int().positive().optional(),
     /**
      * NOTE: there is no per-call permission policy here. As the ACP client, the daemon
      * auto-approves every tool request (session/request_permission) — agents run with full
@@ -97,7 +111,7 @@ export type RouteRule = z.infer<typeof RouteRuleSchema>;
  * here; it is a code change by design, not an operator knob.
  */
 const ExperienceSchema = z.object({
-  /** Session guardrails. Sessions live for the daemon's lifetime — no automatic reclamation (see SessionRegistry). */
+  /** Turn-level session guardrails. The idle-reclaim window is a deployment choice, so it lives in the user surface instead. */
   session: z
     .object({
       /** (reserved) per-thread concurrent session cap; one-session-per-scope-key model, not enforced yet. */
@@ -106,34 +120,90 @@ const ExperienceSchema = z.object({
        * Per-turn silence watchdog (ms): abort a turn if the agent emits no update for this long.
        * Bounds *silence*, not total turn length (timer resets on every agent update). On trip the
        * subprocess is force-disposed and the turn fails with ❌. Default 10 min; 0 disables.
+       *
+       * A turn with a tool call still open gets more than this — see TOOL_SILENCE_FACTOR in
+       * agent-acp.ts. It has to: a tool is silent for exactly as long as it runs, and Claude
+       * Code's Bash tool allows up to 600000ms, i.e. precisely this default, so a tool call at
+       * the harness's own limit was certain to trip a watchdog meant for hangs.
        */
       turnTimeoutMs: z.number().int().nonnegative().default(600_000),
     })
     .default({}),
 
-  /** Outbound streaming buffer params. */
+  /**
+   * Outbound reply delivery — the TUNING half, frozen. Whether streaming happens at all is
+   * `stream.enabled` on the user schema below (the same split `session` uses: the decision is the
+   * operator's, the guardrails are not).
+   *
+   * There is no "delivery mode" enum: whether a reply streams follows from `enabled` AND what the
+   * platform can do, not from a preference three values wide. The `mode: auto|edit|chunk` field
+   * that used to sit here was read by nothing.
+   */
   stream: z
     .object({
-      /** Streaming delivery mode: auto (edit/chunk by platform capability) / edit (in-place) / chunk (sequential parts). */
-      mode: z.enum(['auto', 'edit', 'chunk']).default('auto'),
-      /** Char trigger threshold: edit immediately after this many new chars accumulate. */
+      /** Streaming only: flush after this many new chars accumulate. */
       charThreshold: z.number().int().positive().default(200),
-      /** Time trigger interval (ms): flush once this long has passed since the last edit (~1/sec IM limit → 1200ms). */
+      /** Streaming only: flush once this long has passed since the last write (~1/sec IM limit → 1200ms). */
       flushIntervalMs: z.number().int().positive().default(1200),
-      /** Rate-limit backoff cap. */
+      /** Streaming only: cap for the exponential backoff after a transient edit failure. */
       maxBackoffMs: z.number().int().positive().default(10_000),
-      /** Fall back to whole-message send after this many consecutive edit failures. */
-      maxFailuresBeforeFallback: z.number().int().positive().default(3),
+      /**
+       * Override the platform's per-message edit budget (`PlatformCapabilities.maxEditsPerMessage`),
+       * which bounds both streaming edits and tool-bubble refreshes. Set it only to work around a
+       * platform changing its cap on you: too high and the tail of a streamed reply is refused until
+       * the writer notices, too low and replies fragment into more messages than necessary.
+       * Absent = trust the profile's declared value.
+       */
+      maxEditsPerMessage: z.number().int().positive().optional(),
       /** If the model replies with only this token, send no message. */
       silentToken: z.string().default('[SILENT]'),
-      /** Streaming-message footer (hermes "model/context/cwd" tagline). Off by default. */
-      footer: z
-        .object({
-          enabled: z.boolean().default(false),
-          /** Fields and order: model / contextPct / cwd. contextPct excluded by default (SDK lacks a reliable limit). */
-          fields: z.array(z.enum(['model', 'contextPct', 'cwd'])).default(['model', 'cwd']),
-        })
-        .default({}),
+    })
+    .default({}),
+
+  /**
+   * The per-chat write budget every outbound path shares (core/outbound-pacer.ts).
+   *
+   * One budget, not one per writer: the platform counts the reply, the tool bubbles, the
+   * reactions, the menus and the agent's own reverse commands as a single stream per chat. Four
+   * writers each politely throttling themselves still add up to a flood — which is what produced
+   * 78 Telegram 429s, with `retry after` reaching 229 seconds, in one daemon run.
+   *
+   * Frozen: these are guardrails, not deployment decisions. The defaults track what the platforms
+   * actually enforce (Telegram: ~1 message/sec per chat, ~30/sec overall).
+   */
+  outbound: z
+    .object({
+      /** Sustained writes per second, per chat. */
+      ratePerSec: z.number().positive().default(1),
+      /**
+       * Writes allowed back-to-back on a chat that has been idle.
+       *
+       * Sized so a whole ORDINARY turn — header bubble, a tool bubble and its refreshes, the reply,
+       * the ✅ — goes out with no delay at all, and only sustained traffic is paced. Too small and
+       * pacing becomes a latency tax on every turn that uses a tool; too large and a flood gets a
+       * long head start before the rate limit bites. The failure this exists to prevent was
+       * hundreds of writes, not a dozen.
+       */
+      burst: z.number().int().positive().default(12),
+      /** Ceiling across all chats of one platform instance. */
+      globalRatePerSec: z.number().positive().default(25),
+      globalBurst: z.number().int().positive().default(30),
+      /**
+       * How long a tool-progress write may sit queued before it stops being worth sending. Past
+       * this it is dropped and the renderer's next paint carries the current state instead — a
+       * bubble showing where the agent was eight seconds ago is worse than one that skips ahead.
+       */
+      progressMaxWaitMs: z.number().int().nonnegative().default(8_000),
+      /**
+       * How long a finishing turn waits for its tool bubbles to land. Past this the turn stops
+       * WAITING; it does not cancel — a queued write still goes out, just after the ✅. Without a
+       * bound, a chat the platform paused for 229 s would hold the turn open for the same 229 s.
+       */
+      finalizeWaitMs: z.number().int().nonnegative().default(15_000),
+      /** Ceiling on a platform-stated wait, so one absurd value cannot silence a chat for the process. */
+      maxRetryAfterMs: z.number().int().positive().default(300_000),
+      /** How long `stop()` spends delivering the queue before abandoning it. */
+      drainMs: z.number().int().nonnegative().default(5_000),
     })
     .default({}),
 
@@ -155,6 +225,14 @@ const ExperienceSchema = z.object({
         WebFetch: '🌐',
         WebSearch: '🔎',
       }),
+      /**
+       * First delay before repainting a bubble whose write failed for a reason that stated no wait
+       * of its own; doubles up to maxRetryMs. A stated wait (Telegram's `retry after`) is used
+       * verbatim instead — see ToolRenderer.armRetry.
+       */
+      retryIntervalMs: z.number().int().positive().default(1_200),
+      /** Ceiling on that exponential retry backoff. */
+      maxRetryMs: z.number().int().positive().default(30_000),
     })
     .default({}),
 
@@ -255,13 +333,53 @@ export const ConfigSchema = z
     }),
 
     /**
-     * Session scope. Sessions live for the daemon's lifetime (no automatic reclamation);
-     * guardrail params (turnTimeoutMs/…) stay frozen in EXPERIENCE.
+     * Conversation scope and idle reclaim. Turn-level guardrails (turnTimeoutMs/…) stay frozen in
+     * EXPERIENCE; these two are here because the right answer depends on the deployment.
      */
     session: z
       .object({
-        /** Session ownership scope (global default, overridable by route.use.scope). */
-        scope: SessionScope.default('per_channel'),
+        /**
+         * What counts as one conversation (global default, overridable by route.use.scope).
+         *
+         * Defaults to per_thread: a Telegram topic / Slack thread / Discord thread is its own
+         * conversation, and the channel root is another. That matches what a topic is FOR — people
+         * open one per task — and it is the only scope under which two topics of one chat don't
+         * share an agent's context. Use per_channel to fold every lane of a channel together.
+         */
+        scope: SessionScope.default('per_thread'),
+        /**
+         * Stop a conversation's resident agent child after this long with nothing happening in it.
+         * 0 disables reclaim entirely (every child stays up until `/new` or shutdown).
+         *
+         * This is a knob because `scope: per_thread` makes it one: every topic anyone has ever
+         * messaged holds its own harness process (a Claude Code child is hundreds of MB), and how
+         * many of those a machine can carry is a property of the machine, not of this project.
+         *
+         * ── What it measures, and why it is safe ────────────────────────────────────────────────
+         * The clock counts SILENCE AFTER the last turn ended, not turn length — a task that runs for
+         * hours (subagents included) is never a candidate, because its conversation is not idle
+         * while it runs. Turn length is bounded separately by EXPERIENCE.session.turnTimeoutMs.
+         *
+         * One gap, and it is not closable from here: work Claude Code put in the BACKGROUND
+         * (`run_in_background`) outlives its turn, so its conversation genuinely does look idle
+         * while the script runs. The harness knows (the SDK sends `background_tasks_changed`), but
+         * claude-agent-acp does not forward that over ACP, so the gateway cannot see it. Output
+         * from such a job touches the conversation as it arrives (see TurnRunner.followUpSink),
+         * which keeps a chatty job warm; a job that stays silent longer than this deadline will
+         * have its child — and with it the job, a descendant process — stopped. Raise the deadline
+         * if that is the workload.
+         *
+         * Reclaim stops the process, not the conversation: the binding, the reverse-command token
+         * and every agent's own session id in conversations.json are all kept, so the next message
+         * respawns the child and resumes through the harness's own reload (ACP `session/load`, agy
+         * `--conversation`). That is the same path a daemon restart already takes for every
+         * conversation at once; this applies it one at a time. A session that cannot state it is
+         * resumable is never reclaimed (see AgentSession.reclaimState).
+         *
+         * The only cost the user can perceive is that the first message after a reclaim waits a few
+         * seconds for the respawn.
+         */
+        idleTimeoutMs: z.number().int().nonnegative().default(3_600_000),
       })
       .default({}),
 
@@ -276,6 +394,130 @@ export const ConfigSchema = z
          * fill this. loadConfig warns (does not block) when it is empty.
          */
         allowFrom: z.array(z.string()).default([]),
+      })
+      .default({}),
+
+    /**
+     * Reply delivery. Alongside `display`, the part of outbound rendering an operator legitimately
+     * decides; the throttling and chunking guardrails stay in the frozen EXPERIENCE block.
+     */
+    stream: z
+      .object({
+        /**
+         * Stream the reply by editing one message in place as text arrives.
+         *
+         * OFF by default, which delivers each completed text segment as a whole message instead.
+         * The live effect reads better while it works, but every flush spends an edit and platforms
+         * cap them per message (Feishu: 20, after which that message is refused permanently) — so
+         * the long, considered reply is the one that runs out of edits mid-delivery. Sent-once text
+         * has no such ceiling; the only limit left is message length, which splits cleanly. A turn
+         * is not silent either way: a finished segment is sent at every tool boundary.
+         *
+         * Ignored on platforms that cannot edit messages (QQ/LINE/WeCom/DingTalk) — they deliver
+         * whole segments regardless.
+         */
+        enabled: z.boolean().default(false),
+      })
+      .default({}),
+
+    /**
+     * Reply decoration. The one part of the streaming experience an operator legitimately
+     * decides — everything else about outbound rendering (throttling, chunking, tool bubbles)
+     * stays in the frozen EXPERIENCE block, but whether replies are annotated with which agent
+     * and model answered is a deployment-visible preference, not a tuning knob. Both off by
+     * default, so behavior is unchanged unless asked for.
+     */
+    display: z
+      .object({
+        /**
+         * Standalone "which agent is answering" bubble, e.g. `🤖 cc · opus[1m]`, sent once per
+         * session the moment an accepted message arrives — before the agent starts, so it doubles
+         * as an immediate receipt while the subprocess spawns. /clear and /new re-arm it.
+         *
+         * Its model is the CONFIGURED value (agent.model, or a /model override): at receipt time
+         * no agent session exists yet, so the live model the footer reports isn't knowable.
+         * Header = what was asked for, footer = what actually ran.
+         */
+        header: z
+          .object({
+            enabled: z.boolean().default(false),
+          })
+          .default({}),
+        /**
+         * Trailing runtime tagline on the final message of each turn, e.g.
+         * `cc · 18k / 1M (2%) · claude-opus-4-5`.
+         */
+        footer: z
+          .object({
+            enabled: z.boolean().default(false),
+            /**
+             * Fields and order. `agent` = the agent id that answered (`cc`/`oc`), `model` = short
+             * model name, `context` = `18k / 1M (2%)`, `contextPct` = just the percentage,
+             * `cwd` = working dir.
+             *
+             * The context fields need the harness to report ACP `usage_update` (claude and
+             * opencode both do — opencode only for a model whose context window it knows, so a
+             * custom-provider model needs a `limit.context` in opencode.json); one that doesn't
+             * renders no context segment rather than a guessed number.
+             */
+            fields: z
+              .array(z.enum(['agent', 'model', 'context', 'contextPct', 'cwd']))
+              .default(['agent', 'context', 'model']),
+          })
+          .default({}),
+        /**
+         * Lifecycle reactions on the USER's inbound message: 👀 while the turn runs, then ✅ or ❌
+         * (per-platform mapped — Telegram's allow-set turns these into 👌/👎). Default true, i.e.
+         * the long-standing behavior.
+         *
+         * Worth turning off in a one-operator DM deployment: reactions exist to signal "seen" in a
+         * busy channel, but in a private chat the reply itself already proves it, so all they do is
+         * decorate every message the operator sends. Suppressing them costs no information — a
+         * failed turn still reports itself in-channel via the ❌ error notice.
+         *
+         * Only the on/off switch is here; the emoji themselves stay in the frozen EXPERIENCE block
+         * (`inbound.reactions`), which is why this toggle can't live next to them — anything nested
+         * under a key EXPERIENCE owns is overwritten at load (see withExperienceDefaults).
+         */
+        reactions: z
+          .object({
+            enabled: z.boolean().default(true),
+          })
+          .default({}),
+      })
+      .default({}),
+
+    /**
+     * How a conversation's chat lane (a Telegram forum topic, a Discord thread) gets its name.
+     *
+     * A conversation is named ONCE, from its opening message, after its first successful turn, and
+     * then left alone until `/title` or `/new`. Whether it happens at all is per-platform
+     * (`autoRenameThread`); this block is only about where the name comes from.
+     *
+     * Without `llm` the name is the opening message cut to 40 characters — a substring, not a
+     * summary, and it shows. Point `llm` at any OpenAI-compatible `/chat/completions` endpoint to
+     * get a real one; a flash-tier model is the right size for the job and costs ~60 tokens per
+     * conversation. A failed call falls back to the substring, so naming never depends on it.
+     */
+    title: z
+      .object({
+        llm: z
+          .object({
+            /** Base URL up to and including the version segment, e.g. `http://newapi:3000/v1`. */
+            baseUrl: z.string().min(1),
+            apiKey: z.string().min(1),
+            model: z.string().min(1),
+            /**
+             * Deadline for the naming call.
+             *
+             * Generous on purpose. Nothing waits on it — the reply has already been delivered —
+             * so the only thing a tight deadline buys is a conversation stuck with the fallback
+             * name for good. A flash-tier model answers in 1-4s; the outliers are the upstream
+             * having a moment, and those are exactly the ones worth waiting out.
+             */
+            timeoutMs: z.number().int().positive().default(45_000),
+          })
+          .optional(),
       })
       .default({}),
   })
@@ -325,15 +567,34 @@ export const ConfigSchema = z
         });
       }
     }
+    // Two instances cannot share a port, and the failure without this is ugly: whichever binds
+    // second throws EADDRINUSE at STARTUP, after the first is already live, so the daemon comes
+    // up half-working. It is not a hypothetical pairing either — line, wecom and dingtalk all
+    // default to 127.0.0.1:8080, so two webhook platforms enabled together collide out of the box.
+    const bound = new Map<string, string>();
+    for (const [id, p] of Object.entries(cfg.platforms)) {
+      if (!('port' in p) || p.port === undefined) continue;
+      const where = `${'host' in p ? p.host : ''}:${p.port}`;
+      const taken = bound.get(where);
+      if (taken !== undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['platforms', id, 'port'],
+          message: `platform instances "${taken}" and "${id}" both bind ${where}; give one of them a different port`,
+        });
+      }
+      bound.set(where, id);
+    }
   });
 
 /** The slim, file-backed config (what setup writes and saveConfig serializes). */
 export type UserConfig = z.infer<typeof ConfigSchema>;
 
 /** Full runtime config: user fields + the frozen experience defaults. */
-export type Config = Omit<UserConfig, 'session'> &
-  Omit<Experience, 'session'> & {
+export type Config = Omit<UserConfig, 'session' | 'stream'> &
+  Omit<Experience, 'session' | 'stream'> & {
     session: Experience['session'] & UserConfig['session'];
+    stream: Experience['stream'] & UserConfig['stream'];
   };
 
 /** Merge the frozen experience defaults onto a parsed user config to get the runtime Config. */
@@ -343,6 +604,10 @@ export function withExperienceDefaults(u: UserConfig): Config {
     ...EXPERIENCE,
     // scope comes from the user; guardrails from experience.
     session: { ...EXPERIENCE.session, ...u.session },
+    // Same split for delivery: `enabled` is the operator's call, the throttling knobs are not.
+    // Without this the spread above would drop the user's value on the floor — a written
+    // stream.enabled would work until the next restart and then silently revert.
+    stream: { ...EXPERIENCE.stream, ...u.stream },
   };
 }
 
@@ -359,6 +624,19 @@ export function parseConfig(raw: unknown): Config {
 /** Get an agent definition by id; undefined if not found. */
 export function findAgent(cfg: Config, id: string): AgentDef | undefined {
   return cfg.agents.find((a) => a.id === id);
+}
+
+/**
+ * Human-readable name for an agent: its harness (`opencode`, `claude`, …) rather than the config id.
+ *
+ * The id is an operator's shorthand — `oc`, `cc`, whatever is quick to type after a slash — and
+ * means nothing to a reader of the conversation. The harness is the thing that actually answered,
+ * spelled the way its project spells it. For `harness: custom` the harness name says nothing
+ * either, so the id is the best available label.
+ */
+export function agentDisplayName(def: AgentDef | undefined, fallbackId: string): string {
+  if (!def || def.harness === 'custom') return fallbackId;
+  return def.harness;
 }
 
 /**

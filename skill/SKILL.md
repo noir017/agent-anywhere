@@ -16,7 +16,8 @@ description: >-
 # Agent Anywhere — acting in the chat
 
 You are running inside the Agent Anywhere daemon, which bridges you to an IM platform
-(Discord, Telegram, Slack, Lark, QQ, LINE, WeCom). Two channels exist:
+(Discord, Telegram, Slack, Lark, QQ, LINE, WeCom, DingTalk) or to its own built-in web
+UI — a browser page the daemon serves. Two channels exist:
 
 1. **Your plain-text output** streams into the chat automatically, editing one message
    in place. Just answer normally — never use a command to send your answer text, or
@@ -95,6 +96,16 @@ commands.
 
 ### Asking the user (blocking)
 
+**First check whether you already have your own question tool** (Claude Code's
+`AskUserQuestion`, or any harness tool that presents choices). If you do, use it — the
+daemon renders it as the same buttons, and it needs no shell-out. The gateway advertises
+ACP's `elicitation.form` capability precisely so that tool is enabled here; on
+claude-agent-acp it would otherwise be disabled.
+
+The command below is for harnesses that have no such tool. Verified 2026-09-11: `opencode`
+1.18.27 and `dsh` 0.1.2-rc.1 send no elicitations at all, so on those this is the only way
+to get buttons.
+
 ```bash
 agent-anywhere ask "Deploy to production?" -o "Deploy" -o "Dry run" -o "Cancel" [--timeout 120000]
 ```
@@ -103,11 +114,14 @@ Sends a message with buttons and **blocks** until the user clicks or the timeout
 (default 120 s) expires. stdout is the chosen label verbatim — branch on it directly:
 
 - stdout `Deploy` → the user picked "Deploy".
+- Any other non-empty stdout → the user typed their own answer instead of tapping, which is
+  what they do when none of your options fit. Read it as the answer; it is not a malformed
+  option.
 - Empty stdout → timeout / no selection. Pick a sensible default yourself and say so;
   don't re-ask in a loop.
 
-Prefer `ask` over ending your turn with an open question whenever the choice is a
-small closed set: the user taps a button and your logic continues in the same turn.
+Either way, prefer asking over ending your turn with an open question whenever the choice
+is a small closed set: the user taps a button and your logic continues in the same turn.
 
 ## Output & errors
 
@@ -136,8 +150,8 @@ agent-anywhere doctor
 ```
 
 `doctor` is a read-only self-check: config validity, platform credentials, daemon
-socket liveness, and agent harness reachability (`claude` / `gemini` / `codex`
-binaries, auth mode). Run it first and report what it finds — it is always safe.
+socket liveness, and agent harness reachability (`claude` / `gemini` / `codex` /
+`agy` binaries, auth mode). Run it first and report what it finds — it is always safe.
 
 - **Config file**: `~/.config/agent-anywhere/config.yaml` by default; if
   `AGENT_ANYWHERE_CONFIG_FILE` is set in your environment, that file is the active

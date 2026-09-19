@@ -49,9 +49,10 @@ describe('parseSlackInteractiveFrame', () => {
     });
     expect(parseSlackInteractiveFrame(raw)).toEqual([
       {
-        platform: 'slack',
-        channelId: 'C456',
-        userId: 'U123',
+        // Slack sends no thread_ts with an interactive frame, so the click is honestly reported
+        // as belonging to the channel rather than guessed into a thread.
+        conversation: { channel: 'C456', kind: 'group' },
+        user: 'U123',
         messageId: '1700000000.000100',
         buttonId: 'ask:r:0',
       },
@@ -79,7 +80,7 @@ describe('parseSlackInteractiveFrame', () => {
       payload: { type: 'block_actions', actions: [{ action_id: 'x' }] },
     });
     expect(parseSlackInteractiveFrame(raw)).toEqual([
-      { platform: 'slack', channelId: '', userId: '', messageId: '', buttonId: 'x' },
+      { conversation: { channel: '', kind: 'group' }, user: '', messageId: '', buttonId: 'x' },
     ]);
   });
 

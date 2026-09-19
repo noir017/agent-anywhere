@@ -1,0 +1,292 @@
+import { describe, expect, it } from 'vitest';
+import { ConversationRegistry } from './conversation.js';
+import { parseConfig, type Config } from '../config/schema.js';
+import type { PlatformAdapter } from '../platform/adapter.js';
+import type { AgentFactory, AgentSession, AgentUsage, ModelSelector } from './agent.js';
+import type { InboundMessage } from '../types.js';
+
+/**
+ * `/context` and `/model` on a harness with no native spelling for them.
+ *
+ * Both existed in the generic vocabulary only to be REFUSED on opencode, because the translation
+ * layer's single mechanism is text: it rewrites `/x` and hands it to the agent as a prompt, so a
+ * capability the harness exposes over the protocol instead of as a slash command reads as "not
+ * supported". Probed live against opencode 1.18.18, both are there — a `usage_update {used, size}`
+ * on every turn, and a `model` select with its full model list — so the gateway answers them.
+ *
+ * "Every turn" holds only for a model whose window opencode knows; a custom-provider model with no
+ * `limit.context` reports none, ever. That empty case has its own answer, and its own test below.
+ *
+ * The negatives matter as much as the answers: neither may reach the agent as a prompt.
+ */
+
+const parsed = parseConfig({
+  platforms: { discord: { type: 'discord', token: 't' } },
+  agents: [
+    { id: 'cc', harness: 'claude' },
+    { id: 'oc', harness: 'opencode' },
+  ],
+  routing: {
+    default: 'oc',
+    pipeline: [
+      { when: { command: 'oc' }, use: { agent: 'oc' } },
+      { when: { command: 'cc' }, use: { agent: 'cc' } },
+    ],
+  },
+});
+// Shrink the merge window so a routed message dispatches promptly. Applied post-parse: `inbound`
+// is part of the frozen EXPERIENCE block and would be discarded from the input.
+const cfg: Config = { ...parsed, inbound: { ...parsed.inbound, mergeWindowMs: 1, maxMergeWindowMs: 1 } };
+
+const clock = {
+  now: () => Date.now(),
+  schedule: (fn: () => void, ms: number) => {
+    const t = setTimeout(fn, ms);
+    return () => clearTimeout(t);
+  },
+};
+const drain = (): Promise<void> => new Promise((r) => setTimeout(r, 20));
+
+const SELECTOR: ModelSelector = {
+  current: 'opencode/big-pickle',
+  options: [
+    { value: 'opencode/big-pickle', name: 'OpenCode Zen/Big Pickle' },
+    { value: 'opencode/claude-sonnet-5', name: 'OpenCode Zen/Claude Sonnet 5' },
+    { value: 'opencode/claude-opus-4-8', name: 'OpenCode Zen/Claude Opus 4.8' },
+    { value: 'opencode/glm-5', name: 'OpenCode Zen/GLM-5' },
+  ],
+};
+
+/**
+ * @param opts.selector       models the session reports straight away
+ * @param opts.lazySelector   models that only exist once the session has been STARTED — the real
+ *                            ACP shape, where the list arrives in the session/new response. This is
+ *                            what `/model` before a conversation's first turn actually hits.
+ * @param opts.startError     make ensureSession reject, standing in for a missing binary or an
+ *                            un-logged-in harness
+ */
+function rig(
+  opts: {
+    selector?: ModelSelector;
+    usage?: AgentUsage;
+    lazySelector?: ModelSelector;
+    startError?: string;
+  } = {}
+) {
+  const prompts: string[] = [];
+  const sent: string[] = [];
+  const setModelCalls: string[] = [];
+  const starts: string[] = [];
+  const sessions = new Map<string, AgentSession>();
+
+  const factory: AgentFactory = {
+    getOrCreate(conversationId) {
+      let s = sessions.get(conversationId);
+      if (!s) {
+        let started = false;
+        s = {
+          conversationId,
+          runTurn: async (input, handlers) => {
+            prompts.push(input.prompt);
+            if (opts.usage) handlers.onUsage?.(opts.usage);
+          },
+          abort: () => {},
+          dispose: () => {},
+          modelSelector: () => (started ? (opts.lazySelector ?? opts.selector) : opts.selector),
+          setModel: async (value: string) => {
+            setModelCalls.push(value);
+            return value;
+          },
+          ...(opts.lazySelector || opts.startError
+            ? {
+                ensureSession: async (token: string) => {
+                  starts.push(token);
+                  if (opts.startError) throw new Error(opts.startError);
+                  started = true;
+                },
+              }
+            : {}),
+        } as AgentSession;
+        sessions.set(conversationId, s);
+      }
+      return s;
+    },
+    peek: (id) => sessions.get(id),
+    dispose: (id) => void sessions.delete(id),
+  };
+
+  const platform = {
+    capabilities: { thread: false, editMessage: true },
+    sendMessage: async (address: { channel: string }, text: string) => {
+      sent.push(text);
+      return { address, messageId: 'm1' };
+    },
+    editMessage: async () => {},
+    addReaction: async () => {},
+    startTyping: async () => {},
+    stopTyping: async () => {},
+    measureRendered: (t: string) => t.length,
+  } as unknown as PlatformAdapter;
+
+  const reg = new ConversationRegistry(cfg, new Map([['discord', platform]]), factory, clock);
+  let n = 0;
+  const send = async (content: string): Promise<void> => {
+    reg.route({
+      conversation: { platform: 'discord', channel: 'c1', kind: 'direct', user: 'u1' },
+      messageId: `m${++n}`,
+      content,
+      timestamp: 0,
+    } as InboundMessage);
+    await drain();
+  };
+  /** Text the gateway sent that is not the header bubble. */
+  const replies = (): string[] => sent.filter((t) => !t.startsWith('🤖'));
+  return { send, prompts, replies, setModelCalls, starts };
+}
+
+describe('/context answered by the gateway', () => {
+  it('reports the numbers the agent last sent, without running a turn', async () => {
+    const { send, prompts, replies } = rig({ usage: { used: 13942, size: 200_000 } });
+    await send('hello'); // one real turn, which is what reports usage
+    expect(prompts).toEqual(['hello']);
+
+    await send('/context');
+    expect(prompts).toEqual(['hello']); // no second turn: this is a question about the session
+    expect(replies().at(-1)).toContain('14k / 200k (7%)');
+  });
+
+  it('says the numbers have not arrived yet rather than inventing a window', async () => {
+    const { send, replies } = rig(); // agent never reports usage
+    await send('/context');
+    expect(replies().at(-1)).toContain('No context numbers yet');
+  });
+
+  // The same empty state, one turn later, means the opposite thing. opencode emits usage_update only
+  // for a model whose window it knows, so on a custom-provider model with no `limit.context` the
+  // numbers never arrive — and "send a message, then /context" sent the user in a circle.
+  it('stops promising numbers once a turn has finished without reporting any', async () => {
+    const { send, replies } = rig(); // agent never reports usage
+    await send('hello');
+    await send('/context');
+    const answer = replies().at(-1)!;
+    expect(answer).toContain('not reported');
+    expect(answer).not.toContain('No context numbers yet');
+    expect(answer).toContain('opencode.json'); // the default agent here is opencode: name the fix
+  });
+
+  it('forgets the snapshot on /new, which is what just invalidated it', async () => {
+    const { send, replies } = rig({ usage: { used: 13942, size: 200_000 } });
+    await send('hello');
+    await send('/context');
+    expect(replies().at(-1)).toContain('14k / 200k (7%)');
+
+    await send('/new');
+    await send('/context');
+    // Not the pre-reset number, and not "not reported" either: nothing has run since the reset.
+    expect(replies().at(-1)).toContain('No context numbers yet');
+  });
+
+  it('forgets the snapshot on a rebind, so one agent never wears another\'s numbers', async () => {
+    const { send, replies } = rig({ usage: { used: 13942, size: 200_000 } });
+    await send('/cc hello'); // claude answers and reports usage
+    await send('/oc'); // bare agent command: rebinds to opencode without running a turn
+    await send('/context');
+    expect(replies().at(-1)).toContain('No context numbers yet');
+  });
+});
+
+describe('/model answered by the gateway', () => {
+  it('shows the live model and how to change it', async () => {
+    const { send, prompts, replies } = rig({ selector: SELECTOR });
+    await send('/model');
+    expect(prompts).toEqual([]);
+    expect(replies().at(-1)).toContain('opencode/big-pickle');
+    expect(replies().at(-1)).toContain('4 available');
+  });
+
+  it('switches on a substring that picks exactly one model', async () => {
+    const { send, replies, setModelCalls } = rig({ selector: SELECTOR });
+    await send('/model glm');
+    expect(setModelCalls).toEqual(['opencode/glm-5']);
+    expect(replies().at(-1)).toContain('opencode/glm-5');
+  });
+
+  it('lists the candidates instead of guessing when a query is ambiguous', async () => {
+    const { send, replies, setModelCalls } = rig({ selector: SELECTOR });
+    await send('/model claude');
+    expect(setModelCalls).toEqual([]); // picking one silently would change who answers
+    const msg = replies().at(-1)!;
+    expect(msg).toContain('matches 2 models');
+    expect(msg).toContain('opencode/claude-sonnet-5');
+    expect(msg).toContain('opencode/claude-opus-4-8');
+  });
+
+  it('takes an exact id even when it is a substring of another', async () => {
+    const selector: ModelSelector = {
+      current: 'a',
+      options: [
+        { value: 'opencode/glm-5', name: 'GLM-5' },
+        { value: 'opencode/glm-5.1', name: 'GLM-5.1' },
+      ],
+    };
+    const { send, setModelCalls } = rig({ selector });
+    await send('/model opencode/glm-5');
+    expect(setModelCalls).toEqual(['opencode/glm-5']);
+  });
+
+  it('says nothing matched rather than failing silently', async () => {
+    const { send, replies, setModelCalls } = rig({ selector: SELECTOR });
+    await send('/model gpt-9');
+    expect(setModelCalls).toEqual([]);
+    expect(replies().at(-1)).toContain('No model matches');
+  });
+
+  it('says the agent has no model selector when it offers none and cannot be warmed', async () => {
+    const { send, replies } = rig(); // no selector, and the fake session has no ensureSession
+    await send('/model');
+    expect(replies().at(-1)).toContain('offers no model selector');
+    // The old answer told the user to send a message first, which is no longer true: the gateway
+    // starts the session itself now, so reaching this text means the harness really has no picker.
+    expect(replies().at(-1)).not.toContain('Send a message');
+  });
+
+  // The bug this fixes: under ACP the model list arrives in the session/new response, so a
+  // conversation that has not run a turn had nothing to show — and the natural order of operations
+  // is to pick a directory, pick a model, and only then say anything. `/cd` made it worse by
+  // disposing the session, so even an established conversation lost its list.
+  it('starts the session to answer /model before the conversation has run a turn', async () => {
+    const { send, prompts, replies, starts } = rig({ lazySelector: SELECTOR });
+    await send('/model');
+    expect(starts).toHaveLength(1); // the session was brought up on purpose
+    expect(prompts).toEqual([]); // …but no turn ran and no context was spent
+    expect(replies().at(-1)).toContain('4 available');
+    expect(replies().at(-1)).toContain('opencode/big-pickle');
+  });
+
+  it('switches by substring on a conversation that has not run a turn', async () => {
+    const { send, setModelCalls, prompts } = rig({ lazySelector: SELECTOR });
+    await send('/model glm');
+    expect(setModelCalls).toEqual(['opencode/glm-5']);
+    expect(prompts).toEqual([]);
+  });
+
+  it('reuses one warm session rather than starting it again per /model', async () => {
+    const { send, starts } = rig({ lazySelector: SELECTOR });
+    await send('/model');
+    await send('/model');
+    expect(starts).toHaveLength(1);
+  });
+
+  // The old code answered "send a message, then /model" to a missing binary too, which sent the
+  // user to do the one thing guaranteed to fail in exactly the same way.
+  it('reports why the agent could not start instead of blaming the user for not messaging', async () => {
+    const { send, replies } = rig({
+      lazySelector: SELECTOR,
+      startError: 'agent "oc" must be logged in before use',
+    });
+    await send('/model');
+    const answer = replies().at(-1)!;
+    expect(answer).toContain('must be logged in');
+    expect(answer).not.toContain('Send a message');
+  });
+});

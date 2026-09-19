@@ -1,0 +1,922 @@
+import { promisify } from 'node:util';
+import { execFile as execFileCb, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import type { AgentDef, Config } from '../config/schema.js';
+import { findAgent } from '../config/schema.js';
+import type { AgentFactory, AgentSession, AgentStreamHandlers, ModelSelector, ReclaimState, RunTurnInput } from './agent.js';
+import type { ConversationStore } from './conversation-store.js';
+import {
+  buildAgentEnv,
+  buildInputPreview,
+  buildReverseHint,
+  killChildProcess,
+  resolveConversationCwd,
+  truncateToolName,
+} from './agent-common.js';
+import { ensureAgyStatusLine, readAgyUsage } from './agy-statusline.js';
+import { agentHome } from './skills-scan.js';
+
+const execFile = promisify(execFileCb);
+
+/**
+ * AgentFactory implementation for `agy` — the Google Antigravity CLI (which replaced Gemini CLI).
+ *
+ * WHY THIS IS NOT IN agent-acp.ts: agy does not speak ACP. Unlike claude/gemini/codex/opencode, it
+ * has no ACP mode at all; it exposes its own bidirectional NDJSON "stream-json" protocol (documented
+ * at antigravity.google/docs/cli/headless). A community ACP adapter (agy-acp) exists, but it drives
+ * agy through a PTY and reads its internal SQLite/protobuf records, and it deadlocks permanently on
+ * the turn following any tool call — fatal for a chat gateway, where the bot would go silent forever
+ * after its first real task. So this file speaks agy's own protocol directly, using only the
+ * officially documented headless interface, and implements the same AgentFactory/AgentSession
+ * contract as the ACP runtime. Everything above it (TurnRunner / SessionRegistry / StreamBuffer /
+ * ToolRenderer) is reused unchanged.
+ *
+ * Protocol mapping (verified empirically against agy 1.1.22):
+ *   one resident child             ↔ an AgentSession (context retained across turns)
+ *   {"event":"user","message":…}   ↔ runTurn (one line written to stdin per turn)
+ *   step_update.text_delta         ↔ onText (deltas, not cumulative)
+ *   step_type:"tool" ACTIVE        ↔ onToolStart
+ *   step_type:"tool" DONE          ↔ onToolFinish
+ *   text↔tool boundary             ↔ onSegmentBreak
+ *   event:"result"                 ↔ turn end (status SUCCESS, else an error for the upper layer)
+ *   init.conversation_id           ↔ SessionStore entry, replayed via --conversation after a restart
+ *   init.model                     ↔ onModel (stored at spawn, replayed at the start of every turn)
+ *   SIGINT                         ↔ abort (agy has no in-band cancel message)
+ *
+ * agy pushes no command list over the wire, so onAvailableCommands is never called and no native
+ * slash commands are registered for this harness. Its own commands are reachable all the same:
+ * `agy -p /help` lists them, and runAgyCliCommand answers each with a one-shot process (see
+ * buildAgyArgs for why they must never enter the resident session). Skills, unlike those, ARE
+ * expanded by the session itself and need nothing from this file — only the flag that used to
+ * suppress them being gone.
+ *
+ * Models: agy has no in-process switch — the model is fixed by `--model=` at spawn. However,
+ * available models can be queried via `agy models`, and switching models is performed via a
+ * kill-and-respawn strategy: setModel() sets the per-session preference and triggers teardown(),
+ * and the next turn respawns with the new `--model=` while resuming conversation history via
+ * `--conversation=<id>`. `modelSelector()` returns the available models list, and `setModel()`
+ * returns the newly applied model name.
+ */
+
+// ───────────────────────── launch command ─────────────────────────
+
+/**
+ * Build the agy launch args.
+ *
+ * Each preset flag below is a workaround for behavior measured against the real CLI:
+ *
+ * - `--input-format/--output-format stream-json`: the bidirectional resident mode. Requires both.
+ * - `--print-timeout`: default is 5m and it KILLS the turn (`status:ERROR, error:"timeout waiting
+ *   for response"`), which a long agent task would trip constantly. Set effectively-never here; the
+ *   daemon already has its own silence watchdog (`session.turnTimeoutMs`) that bounds hung turns.
+ * - `--dangerously-skip-permissions`: matches the daemon's existing stance for every harness — it is
+ *   a headless client and auto-approves tool requests; access control is `access.allowFrom` (who may
+ *   trigger an agent at all), not per-call prompts. Without it, tools that need approval are
+ *   soft-denied silently, so the agent would appear to work while doing nothing.
+ * - `--add-dir <cwd>`: agy only treats configured `trustedWorkspaces` as writable; in an untrusted
+ *   cwd it silently redirects file writes to its own scratch dir instead of the project. This trusts
+ *   exactly the agent's own cwd.
+ * - `-p=`: print (headless) mode. The `=` is REQUIRED: agy uses Go flag parsing, so a bare `-p`
+ *   swallows the next argument as its prompt value and then errors out.
+ *
+ * NOT passed, though it used to be: `--disable-slash-commands`. The constraint it was added for is
+ * real but much narrower than the flag. Re-probed on agy 1.2.0 (2026-09-17), sending each of these
+ * into one resident stream-json session:
+ *
+ *   `/aa-probe` (a skill under `<home>/.agents/skills`)   → expanded, answered, session alive
+ *   `/aa-proj`  (a skill under `<cwd>/.agents/skills`)    → expanded, answered, session alive
+ *   `/totally-not-a-real-command-xyz hello`               → reached the model as plain text, alive
+ *   `/model`                                              → `status:ERROR` AND process exit code 2
+ *
+ * So only the commands agy's own CLI answers are fatal, and its error names the way out: "run it as
+ * its own --print /model invocation". Those names are listed by `agy -p /help` and enumerated in
+ * core/command-translate.ts, which keeps them out of the session and answers them with one-shot
+ * processes instead — leaving the flag off, which is what brings agy's skills back.
+ *
+ * `def.args` is appended AFTER the presets so a user can override any of them — Go's flag parsing is
+ * last-wins (verified), e.g. `args: ["--disable-slash-commands"]` gives up skill expansion in
+ * exchange for a session that survives a `/model` typed by someone bypassing the gateway's menu.
+ * `-p=` stays last so it can't consume a user argument.
+ */
+export function buildAgyArgs(
+  def: AgentDef,
+  cwd: string,
+  conversationId?: string,
+  modelOverride?: string
+): string[] {
+  const model = modelOverride ?? def.model;
+  return [
+    '--input-format=stream-json',
+    '--output-format=stream-json',
+    '--print-timeout=8760h',
+    '--dangerously-skip-permissions',
+    `--add-dir=${cwd}`,
+    ...(model ? [`--model=${model}`] : []),
+    // Resume the conversation this session owned before the daemon restarted. A stale/unknown id is
+    // non-fatal (agy warns on stderr and starts a fresh conversation), so no existence check is needed.
+    ...(conversationId ? [`--conversation=${conversationId}`] : []),
+    ...def.args,
+    '-p=',
+  ];
+}
+
+/** The executable name; `agy install` puts it on PATH. Exported so doctor reports the same thing. */
+export const AGY_COMMAND = 'agy';
+
+/**
+ * Parse `agy models` TSV output into ModelSelector options (`{ value, name }`).
+ * Lines are formatted as `<modelId>\t<displayName>` (e.g. `gemini-3.8-flash-high\tGemini 3.8 Flash (High)`).
+ * Lines without tabs fall back to using the model ID as the display name.
+ */
+export function parseAgyModelsOutput(stdout: string): Array<{ value: string; name: string }> {
+  return stdout
+    .trim()
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const tabIdx = line.indexOf('\t');
+      if (tabIdx >= 0) {
+        const value = line.slice(0, tabIdx).trim();
+        const name = line.slice(tabIdx + 1).trim();
+        return { value, name: name || value };
+      }
+      return { value: line, name: line };
+    })
+    .filter((o) => o.value.length > 0);
+}
+
+export type AgyModelFetcher = () => Promise<Array<{ value: string; name: string }>>;
+
+export async function defaultFetchAgyModels(): Promise<Array<{ value: string; name: string }>> {
+  try {
+    const { stdout } = await execFile(AGY_COMMAND, ['models']);
+    return parseAgyModelsOutput(stdout);
+  } catch (e) {
+    console.debug('[agy] fetch models failed:', e instanceof Error ? e.message : e);
+    return [];
+  }
+}
+
+// ───────────────────────── one-shot CLI commands ─────────────────────────
+
+/**
+ * How long a one-shot `agy -p /<command>` may take before it is given up on.
+ *
+ * Generous because the floor is a cold CLI start (~5s observed for `agy models`), and the ceiling
+ * only has to be short enough that a user does not think the gateway ignored them.
+ */
+const CLI_COMMAND_TIMEOUT_MS = 60_000;
+
+/** Longest CLI answer forwarded whole. `/changelog` is the one that needs this; the rest are short. */
+const CLI_OUTPUT_MAX_CHARS = 2_500;
+
+/**
+ * Run one of agy's own slash commands as its own process and return what it printed.
+ *
+ * This is the path agy itself points at when such a command reaches a stream-json session ("run it
+ * as its own --print /model invocation"), and it is cheap in the way that matters: the CLI answers
+ * these from local state, so no model is invoked, no tokens are spent, and the conversation's
+ * resident child is never touched.
+ *
+ * Probed on agy 1.2.0 (2026-09-17) against all eleven commands `agy -p /help` lists: every one
+ * exits 0 without a terminal, and none blocks waiting for input — including the four that render as
+ * interactive panels in the TUI (`/config`, `/effort`, `/hooks`, `/permissions`), which print their
+ * current state instead. `/agents`, `/hooks` and `/permissions` print NOTHING when there is nothing
+ * configured, which is why an empty answer is reported rather than passed on as an empty message.
+ *
+ * `cwd` is the conversation's directory because some answers are workspace-scoped (`/agents` reads
+ * the workspace's custom agents). Failure is returned, never thrown: this runs inside a chat
+ * command, where the reason belongs in the reply.
+ */
+export async function runAgyCliCommand(
+  name: string,
+  cwd: string,
+  env?: NodeJS.ProcessEnv
+): Promise<{ ok: true; output: string } | { ok: false; error: string }> {
+  try {
+    const { stdout } = await execFile(AGY_COMMAND, [`-p=/${name}`], {
+      cwd,
+      env,
+      timeout: CLI_COMMAND_TIMEOUT_MS,
+      // agy prints the whole changelog for `/changelog`; the default 1MB buffer is ample, but say so.
+      maxBuffer: 1024 * 1024,
+    });
+    return { ok: true, output: stdout.trim() };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/**
+ * Render what a one-shot CLI command printed, as a chat message.
+ *
+ * Everything but `/usage` prints either a short TSV table (`/model`, `/credits`, `/effort`,
+ * `/config`) or markdown (`/changelog`), so the honest rendering is the text itself in a fenced
+ * block — inventing structure per command would be guessing at output this gateway does not own.
+ *
+ * Truncation is announced and points at the host, because the commands whose answers overflow are
+ * exactly the ones a reader might need in full.
+ */
+export function formatAgyCliOutput(name: string, output: string): string {
+  if (!output) {
+    return `\`/${name}\` — agy answered with nothing. That is its answer when there is none configured.`;
+  }
+  if (name === 'usage') {
+    const quota = formatAgyQuota(output);
+    if (quota) return quota;
+  }
+  let body = output;
+  let note = '';
+  if (body.length > CLI_OUTPUT_MAX_CHARS) {
+    body = body.slice(0, CLI_OUTPUT_MAX_CHARS);
+    note = `\n\nTruncated at ${CLI_OUTPUT_MAX_CHARS} characters — run \`agy -p=/${name}\` on the host for all of it.`;
+    console.log(`[agy] truncated the /${name} answer from ${output.length} to ${CLI_OUTPUT_MAX_CHARS} chars`);
+  }
+  return `\`\`\`\n${body}\n\`\`\`${note}`;
+}
+
+/**
+ * `/usage` specifically: four tab-separated columns (pool, metric, remaining %, ISO reset), e.g.
+ *
+ *   Gemini Models\tWeekly Limit Remaining\t100%\t2026-09-24T06:12:21Z
+ *
+ * Worth a renderer of its own because a percentage and a timestamp are what the question was, and
+ * the raw row buries both: the bar makes "how much is left" readable at a glance, and the reset is
+ * rewritten as a duration because "in 6d" is actionable where a UTC timestamp is arithmetic.
+ *
+ * Returns undefined when the shape is not the expected four columns, so the caller falls back to
+ * printing the output verbatim rather than dropping an answer it failed to parse.
+ */
+export function formatAgyQuota(output: string, now: number = Date.now()): string | undefined {
+  const rows = output
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => line.split('\t').map((c) => c.trim()));
+  if (rows.length === 0 || rows.some((r) => r.length !== 4)) return undefined;
+
+  const lines = rows.map((r) => {
+    const [pool, metric, remaining, resetAt] = r as [string, string, string, string];
+    const pct = Number.parseFloat(remaining);
+    const bar = Number.isNaN(pct) ? '' : ` ${quotaBar(pct)}`;
+    return `**${pool}** — ${metric}: ${remaining}${bar}${formatResetIn(resetAt, now)}`;
+  });
+  return `Quota:\n${lines.join('\n')}`;
+}
+
+/** An 8-cell bar for a remaining-percentage, matching the footer's plain-text idiom. */
+function quotaBar(percent: number, width = 8): string {
+  const clamped = Math.max(0, Math.min(100, percent));
+  const filled = Math.round((clamped / 100) * width);
+  return `[${'█'.repeat(filled)}${'░'.repeat(width - filled)}]`;
+}
+
+/** ` (resets in 6d 4h)` for a parseable ISO timestamp in the future, and nothing otherwise. */
+function formatResetIn(iso: string, now: number): string {
+  const at = Date.parse(iso);
+  if (Number.isNaN(at)) return '';
+  const secs = Math.round((at - now) / 1000);
+  if (secs <= 0) return ' (resets now)';
+  const d = Math.floor(secs / 86400);
+  const h = Math.floor((secs % 86400) / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const span = d > 0 ? `${d}d ${h}h` : h > 0 ? `${h}h ${m}m` : `${m}m`;
+  return ` (resets in ${span})`;
+}
+
+// ───────────────────────────────── factory / session ─────────────────────────────────
+
+export function createAgyAgentFactory(
+  cfg: Config,
+  socketPath: string,
+  store?: ConversationStore,
+  modelFetcher: AgyModelFetcher = defaultFetchAgyModels
+): AgentFactory {
+  const sessions = new Map<string, AgentSession>();
+  let cachedModels: Array<{ value: string; name: string }> | undefined;
+  let fetchPromise: Promise<Array<{ value: string; name: string }>> | undefined;
+
+  function ensureModels(): void {
+    if (cachedModels !== undefined || fetchPromise !== undefined) return;
+    fetchPromise = modelFetcher()
+      .then((models) => {
+        cachedModels = models;
+        fetchPromise = undefined;
+        return models;
+      })
+      .catch((e) => {
+        console.debug('[agy] failed to fetch models:', e instanceof Error ? e.message : e);
+        fetchPromise = undefined;
+        return [];
+      });
+  }
+
+  /**
+   * Start the prefetch if needed and wait for whichever attempt is in flight.
+   *
+   * Read `fetchPromise` AFTER ensureModels so a caller arriving before the first prefetch settles
+   * joins it rather than returning immediately on a still-empty cache. Never rejects — ensureModels
+   * already turns a failed `agy models` into an empty list, and a caller's job is then to report
+   * "no models offered", not to fail.
+   */
+  async function awaitModels(): Promise<void> {
+    ensureModels();
+    await fetchPromise;
+  }
+
+  // Eager pre-fetch so the model list is ready when /model is invoked.
+  ensureModels();
+
+  // Point agy's status line at this daemon's shim, once per distinct home among the agy agents —
+  // it is the only channel through which agy reports context usage (see agy-statusline.ts).
+  for (const home of new Set(cfg.agents.filter((a) => a.harness === 'agy').map((a) => agentHome(a)))) {
+    ensureAgyStatusLine(home);
+  }
+
+  return {
+    getOrCreate(sessionId: string, agentId: string): AgentSession {
+      let s = sessions.get(sessionId);
+      if (!s) {
+        const def = findAgent(cfg, agentId);
+        if (!def) throw new Error(`unknown agent id: ${agentId} (check the routing and agents config)`);
+        s = createAgySession(
+          def,
+          socketPath,
+          sessionId,
+          store,
+          () => {
+            ensureModels();
+            return cachedModels;
+          },
+          awaitModels
+        );
+        sessions.set(sessionId, s);
+      }
+      return s;
+    },
+    peek(sessionId: string): AgentSession | undefined {
+      return sessions.get(sessionId);
+    },
+    dispose(sessionId: string): void {
+      const s = sessions.get(sessionId);
+      if (!s) return;
+      s.dispose();
+      sessions.delete(sessionId);
+    },
+  };
+}
+
+/** Max wait for the child's `init` event after spawn; on timeout treat the spawn as failed (ENOENT etc.). */
+const START_TIMEOUT_MS = 30_000;
+
+function createAgySession(
+  def: AgentDef,
+  socketPath: string,
+  /** The conversation this agent instance serves (store key half; the other half is def.id). */
+  conversationId: string,
+  store?: ConversationStore,
+  getModels?: () => Array<{ value: string; name: string }> | undefined,
+  /**
+   * Await the factory's model prefetch. Distinct from getModels because `/model` needs a list
+   * BEFORE the prefetch settles, and the prefetch is fire-and-forget at factory construction —
+   * a `/model` in the first moments after a daemon start would otherwise read `undefined` and be
+   * told the harness has no model selector, which is simply untrue.
+   */
+  awaitModels?: () => Promise<void>
+): AgentSession {
+  /**
+   * The directory this session's child runs in — and, through `--add-dir`, the one it is allowed to
+   * write to. Resolved per SPAWN rather than once per session so a `/cd` that disposed the child
+   * takes effect on the next turn (see resolveConversationCwd); `let`, and reassigned in
+   * ensureStarted, for exactly that reason.
+   */
+  let cwd = resolveConversationCwd(def, conversationId, store);
+
+  /** Lazily-started child; established on the first turn, killed on dispose. */
+  let proc: ChildProcessWithoutNullStreams | undefined;
+  /** Set once the child's `init` event arrived — the sole readiness signal (mirrors ACP's `active`). */
+  let ready = false;
+  /**
+   * agy's conversation id for this session, as last seen on the wire. Only used to avoid redundant
+   * store writes; the value that actually gets replayed is read back from the store at spawn
+   * (so a /new that clears the store is honored even if this child already knew an id).
+   */
+  let lastSeenConversationId: string | undefined;
+  /**
+   * The model agy named for this child (`init.model`), in agy's own spelling.
+   *
+   * Held on the session instead of being pushed straight to the handlers, for two reasons: `init`
+   * arrives inside ensureStarted, before the turn's sink exists, and the footer reads the model off
+   * a PER-TURN record (TurnRunner's TurnRef) — so a single emit at spawn would name the model on
+   * the first turn's footer and on no other. Stored here, replayed at the top of every turn.
+   */
+  let lastSeenModel: string | undefined;
+  /**
+   * Per-conversation model preference set via setModel() (/model command or menu).
+   * Kept in the session closure across child respawns (same pattern as ACP runtime's modelPreference).
+   */
+  let modelPreference: string | undefined;
+  /** Whether the reverse-command hint was injected (once per child, like the ACP runtime). */
+  let hintInjected = false;
+  /** Intentional-abort flag: set by abort()/dispose() so a killed turn resolves silently. */
+  let aborting = false;
+
+  /** The in-flight turn's sink for parsed events; undefined between turns. */
+  let currentTurn: TurnSink | undefined;
+
+  /** Resolvers waiting for the child's `init` event (only ever 0 or 1, but kept as a list for clarity). */
+  const initWaiters: Array<{ res: () => void; rej: (e: Error) => void }> = [];
+
+  function resetHandles(): void {
+    proc = undefined;
+    ready = false;
+    lastSeenModel = undefined;
+  }
+
+  /**
+   * Detach the current child from this session and settle any in-flight turn.
+   *
+   * Shared by dispose() and abort() because both need the same three things in the same order:
+   * stop attributing this child's output to the session, unblock the waiting turn (a killed agy
+   * ends its stream without a normal `result`, so nothing else would settle it), and terminate the
+   * process. Detaching synchronously — rather than waiting for the async 'exit' — is what keeps a
+   * dying agy's trailing `result` ("stream input cancelled") from failing the NEXT turn.
+   *
+   * `reason` settles the pending turn; runTurn swallows it because `aborting` is set by both callers.
+   */
+  function teardown(reason: string): void {
+    aborting = true;
+    const child = proc;
+    const pending = currentTurn;
+    resetHandles();
+    currentTurn = undefined;
+    hintInjected = false; // a fresh child won't know the reverse-CLI usage
+    if (child) interruptChild(child);
+    pending?.fail(new Error(reason));
+  }
+
+  /** Spawn the child and wait for its `init` event (which agy emits before reading any stdin). */
+  async function ensureStarted(sessionToken: string): Promise<void> {
+    if (ready) return;
+
+    // Re-read the conversation's directory: a `/cd` since the last child disposed it, and this is
+    // the only point at which the new one can be honored (agy takes its cwd at spawn).
+    cwd = resolveConversationCwd(def, conversationId, store);
+
+    // Replay this session's prior conversation so a daemon restart keeps the context (the ACP
+    // runtime's session/load equivalent). agy owns the history on its own disk; we only remember which.
+    // Keyed by (conversation, agent) so agy resumes ITS conversation here, not one belonging to
+    // another agent that also answered in this topic.
+    const child = spawn(
+      AGY_COMMAND,
+      buildAgyArgs(def, cwd, store?.agentSession(conversationId, def.id), modelPreference),
+      {
+        cwd,
+        env: buildAgentEnv(def, sessionToken, socketPath),
+      }
+    );
+    // Record immediately so the 'exit' callback and start-failure rollback can match by reference.
+    proc = child;
+    // agy sends diagnostics (auth notices, permission notes, conversation warnings) to stderr.
+    child.stderr.on('data', (d: Buffer) => process.stderr.write(d));
+    child.on('error', (e) => console.error(`[agy] child process error (${def.id}):`, e.message));
+    child.stdout.setEncoding('utf8');
+    // The line buffer is per-child, and every frame is tagged with the child that produced it: after
+    // an abort (SIGINT) the dying process still emits a trailing `result` (status ERROR, "stream
+    // input cancelled"), which must never be attributed to the next turn's child.
+    let buf = '';
+    child.stdout.on('data', (chunk: string) => {
+      buf = consumeNdJsonLines(buf + chunk, (line) => handleLine(line, child));
+    });
+    child.on('exit', (code, signal) => onChildExit(child, code, signal));
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        new Promise<void>((res, rej) => {
+          initWaiters.push({ res, rej });
+        }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(startupTimeoutMessage(def.id))), START_TIMEOUT_MS);
+        }),
+      ]);
+    } catch (err) {
+      // Clear the child + handles so the next turn can retry, and surface a readable reason.
+      teardown('agent startup failed');
+      aborting = false; // a start failure is a real error, not an intentional abort
+      throw err;
+    } finally {
+      if (timer) clearTimeout(timer);
+      initWaiters.length = 0;
+    }
+  }
+
+  /**
+   * On child crash/kill: clear handles so the next turn rebuilds a fresh child (self-healing), and
+   * fail any in-flight turn — the stream ended without a `result`, so nothing else would settle it.
+   * Guarded by reference so a stale 'exit' can't clobber a post-dispose replacement child.
+   */
+  function onChildExit(child: ChildProcessWithoutNullStreams, code: number | null, signal: string | null): void {
+    if (proc !== child) return;
+    console.debug(`[agy] child process exited (${def.id}): code=${code} signal=${signal}; will respawn on the next turn`);
+    const pending = currentTurn;
+    currentTurn = undefined;
+    resetHandles();
+    // A fresh child means a fresh conversation, so the hint must be re-injected.
+    hintInjected = false;
+    pending?.fail(
+      new Error(`agy exited unexpectedly (code=${code} signal=${signal}) — see the log above for its stderr output`)
+    );
+  }
+
+  /**
+   * Route one parsed NDJSON frame: `init` completes startup, everything else feeds the active turn.
+   *
+   * `from` is the child that emitted the line. Frames from a superseded child are dropped: a killed
+   * agy still flushes a trailing `result` before exiting, and feeding that to whatever turn is
+   * current would fail an unrelated turn (or, after an abort, the very next one).
+   */
+  function handleLine(line: string, from: ChildProcessWithoutNullStreams): void {
+    if (proc !== from) {
+      console.debug('[agy] dropping a frame from a superseded child:', line.slice(0, 120));
+      return;
+    }
+
+    let msg: AgyEvent;
+    try {
+      msg = JSON.parse(line) as AgyEvent;
+    } catch {
+      // Not our protocol (a stray banner/log line on stdout). Ignore rather than fail the turn.
+      console.debug('[agy] ignoring non-JSON stdout line:', line.slice(0, 200));
+      return;
+    }
+
+    if (msg.event === 'init') {
+      rememberConversation(msg.init?.conversation_id ?? msg.conversation_id);
+      // Kept even when `--model=` asked for it: agy answers with its own resolved id, and with
+      // nothing configured this is the only place its default model is ever named.
+      if (msg.init?.model) lastSeenModel = msg.init.model;
+      ready = true;
+      for (const w of initWaiters) w.res();
+      initWaiters.length = 0;
+      return;
+    }
+
+    // agy repeats conversation_id on later events; adopt it from there. That fallback stopped
+    // being a fallback: on 1.1.22 the id came with `init`, and on 1.2.0 `init` carries none at all
+    // and the first one to name it is the turn's own `step_update`. Both shapes work because this
+    // reads whichever arrives — worth knowing before "simplifying" either branch away, since a
+    // session with no recorded id resumes blank after a restart and reports no context usage.
+    rememberConversation(msg.step_update?.conversation_id ?? msg.result?.conversation_id ?? msg.conversation_id);
+
+    if (!currentTurn) {
+      // Never silently: the ACP runtime forwards out-of-turn output to the conversation as a
+      // follow-up message (see FollowUpSink), and agy has no such path yet because it has never
+      // been seen to emit anything after `result`. If this line ever shows up in the logs, that
+      // assumption is wrong and agy needs the same wiring.
+      console.debug(`[agy] dropping a "${msg.event}" event that arrived outside a turn`);
+      return;
+    }
+    currentTurn.feed(msg);
+  }
+
+  /** Persist the conversation id for post-restart `--conversation` resume (write-through on change). */
+  function rememberConversation(id?: string): void {
+    if (!id || id === lastSeenConversationId) return;
+    lastSeenConversationId = id;
+    store?.setAgentSession(conversationId, def.id, id);
+  }
+
+  return {
+    conversationId,
+
+    async runTurn(input: RunTurnInput, handlers: AgentStreamHandlers): Promise<void> {
+      aborting = false;
+      if (input.model && input.model !== (modelPreference ?? def.model)) {
+        modelPreference = input.model;
+        if (proc) teardown('model changed');
+      }
+      await ensureStarted(input.sessionToken);
+      // Nothing renders from this; it only records which model to name in this turn's footer.
+      if (lastSeenModel) handlers.onModel?.(lastSeenModel);
+
+      // Reverse-command hint: injected once per child, prepended to the first turn's text. Unlike the
+      // ACP runtime there is no slash-command carve-out — slash expansion is disabled for this
+      // harness, so a leading `/…` is just text and a preceding hint block can't break anything.
+      const hint = hintInjected ? '' : buildReverseHint(def.harness);
+      hintInjected = true;
+      const content = hint ? `${hint}\n${input.prompt}` : input.prompt;
+
+      const state: AgyTurnState = {
+        handlers,
+        lastSegment: 'none',
+        toolLedger: new Map(),
+        toolIndexSeq: 0,
+      };
+
+      // Install the sink BEFORE writing the prompt, so no event can arrive unclaimed.
+      const done = new Promise<void>((resolve, reject) => {
+        currentTurn = makeTurnSink(state, {
+          done: () => {
+            currentTurn = undefined;
+            resolve();
+          },
+          failed: (err) => {
+            currentTurn = undefined;
+            reject(err);
+          },
+        });
+      });
+
+      // One NDJSON line = one turn. Only `text` content blocks are permitted by the protocol; any
+      // other shape terminates agy's session, so the merged prompt is always sent as a plain string.
+      proc!.stdin.write(JSON.stringify({ event: 'user', message: { content } }) + '\n');
+
+      try {
+        await done;
+      } catch (err) {
+        if (aborting) return; // intentional abort/dispose is not an error
+        throw err;
+      } finally {
+        // Context numbers, read at the end of the turn they describe. agy publishes them only
+        // through its status line (see agy-statusline.ts), so they arrive out of band and the turn
+        // has to go and fetch them — in `finally`, because a turn that failed still consumed the
+        // window, and the footer of the message reporting the failure should say so.
+        const usage = readAgyUsage(lastSeenConversationId);
+        if (usage) handlers.onUsage?.(usage);
+      }
+    },
+
+    abort(): void {
+      // agy has no in-band cancel message, so interrupt the process itself (verified: SIGINT ends
+      // the run). The next turn respawns and resumes the same conversation via --conversation, so
+      // context survives an interrupt.
+      teardown('turn aborted');
+    },
+
+    async ensureSession(): Promise<void> {
+      // No child needed: agy's model list comes from a separate `agy models` call, not from the
+      // session. So "make a selector available" means "wait for the prefetch", and deliberately
+      // NOT "spawn a child" — starting one here would cost a process and teach nothing.
+      await awaitModels?.();
+    },
+
+    modelSelector(): ModelSelector | undefined {
+      const options = getModels?.();
+      if (!options || options.length === 0) return undefined;
+      return {
+        current: lastSeenModel ?? modelPreference ?? def.model,
+        options,
+      };
+    },
+
+    async setModel(value: string): Promise<string> {
+      modelPreference = value;
+      // Kill the current child. The next runTurn -> ensureStarted spawns a new one with
+      // --model=<value> --conversation=<id>. Context survives via --conversation.
+      teardown('model switch');
+      return value;
+    },
+
+    reclaimState(): ReclaimState {
+      // `ready` (the child's `init` arrived) is this runtime's readiness signal, so it is also the
+      // honest test for "there is a live child worth reclaiming".
+      if (!proc || !ready) return 'no-child';
+      // agy replays a conversation with `--conversation=<id>` (buildAgyArgs), and the id is written
+      // to the store as soon as `init` names it — so a child that is ready has, in practice, already
+      // recorded one. Asked rather than assumed: without an id, a respawn would start agy blank.
+      return store?.agentSession(conversationId, def.id) ? 'resumable' : 'unresumable';
+    },
+
+    dispose(): void {
+      teardown('agent session disposed');
+    },
+  };
+}
+
+// ───────────────────────── event → handlers translation (core) ─────────────────────────
+
+/** Readable startup-failure hint (the two realistic causes: not on PATH, or never signed in). */
+function startupTimeoutMessage(agentId: string): string {
+  return `agent "${agentId}" startup timed out (${START_TIMEOUT_MS}ms). Make sure \`${AGY_COMMAND}\` is executable on PATH (run \`agy install\`) and logged in (run \`agy\` once interactively to sign in).`;
+}
+
+/**
+ * Interrupt a detached child: SIGINT (agy's own cancel path), backed by the shared SIGTERM→SIGKILL
+ * escalation so a wedged process that ignores SIGINT can't linger — once detached, nothing else
+ * tracks its pid.
+ */
+function interruptChild(child: ChildProcessWithoutNullStreams): void {
+  try {
+    child.kill('SIGINT');
+  } catch (e) {
+    console.debug('[agy] SIGINT on abort failed:', e instanceof Error ? e.message : e);
+  }
+  killChildProcess(child);
+}
+
+/**
+ * Emit every complete newline-terminated frame in `buf` and return the trailing partial line.
+ * A stdout chunk can split mid-frame (and can carry several frames), so the remainder must be
+ * carried over to the next chunk rather than parsed as-is.
+ */
+export function consumeNdJsonLines(buf: string, onLine: (line: string) => void): string {
+  let rest = buf;
+  let nl: number;
+  while ((nl = rest.indexOf('\n')) >= 0) {
+    const line = rest.slice(0, nl).trim();
+    rest = rest.slice(nl + 1);
+    if (line) onLine(line);
+  }
+  return rest;
+}
+
+/**
+ * Build the per-turn event sink: translate each frame, and settle the turn on `result` (or on a
+ * translation error / child death). Kept separate from runTurn so the promise wiring stays readable
+ * and the ledger flush lives next to the code that decides a turn is over.
+ */
+function makeTurnSink(
+  state: AgyTurnState,
+  settle: { done: () => void; failed: (err: Error) => void }
+): TurnSink {
+  return {
+    feed: (msg) => {
+      try {
+        if (translateAgyEvent(msg, state)) {
+          flushPendingTools(state);
+          settle.done();
+        }
+      } catch (err) {
+        settle.failed(err instanceof Error ? err : new Error(String(err)));
+      }
+    },
+    fail: settle.failed,
+  };
+}
+
+/** One frame of agy's stream-json output (only the fields this runtime reads). */
+export interface AgyEvent {
+  event?: string;
+  conversation_id?: string;
+  init?: { conversation_id?: string; cwd?: string; model?: string; permission_mode?: string };
+  step_update?: {
+    conversation_id?: string;
+    step_index?: number;
+    /** 'ACTIVE' while running, 'DONE' when that step finished. */
+    state?: string;
+    /** 'user_input' | 'agent_response' | 'tool' | 'checkpoint' | … */
+    step_type?: string;
+    tool_name?: string;
+    /** Incremental text (NOT cumulative). */
+    text_delta?: string;
+    duration_seconds?: number;
+    tool_info?: {
+      name?: string;
+      parameters?: unknown;
+      output?: unknown;
+      error?: { type?: string; message?: string };
+    };
+  };
+  result?: {
+    conversation_id?: string;
+    /** SUCCESS | ERROR | CANCELED | INTERRUPTED | INVALID | WAITING | RUNNING */
+    status?: string;
+    response?: string;
+    error?: string;
+  };
+}
+
+export interface AgyTurnState {
+  handlers: AgentStreamHandlers;
+  /** 'none' start / 'text' streaming body / 'tool' just had a tool. Drives onSegmentBreak. */
+  lastSegment: 'none' | 'text' | 'tool';
+  /** step_index → evolving tool state (ACTIVE then DONE arrive as separate frames). */
+  toolLedger: Map<number, AgyToolRec>;
+  toolIndexSeq: number;
+}
+
+interface AgyToolRec {
+  /** Bubble index handed to the renderer (its own sequence, independent of agy's step_index). */
+  index: number;
+  name: string;
+  started: boolean;
+  finished: boolean;
+}
+
+/**
+ * Translate one agy event into handler calls.
+ * Returns true when the event ends the turn (`result`), so the caller can resolve runTurn.
+ * Throws when the turn failed, so the upper layer renders ❌ with a readable reason.
+ */
+export function translateAgyEvent(msg: AgyEvent, st: AgyTurnState): boolean {
+  if (msg.event === 'result') {
+    const status = msg.result?.status ?? 'SUCCESS';
+    // CANCELED/INTERRUPTED are our own doing (abort); the session layer treats them as non-errors and
+    // runTurn's `aborting` check swallows them, so surfacing them as errors here is still correct.
+    if (status !== 'SUCCESS') {
+      throw new Error(`agy turn ended with status ${status}${msg.result?.error ? `: ${msg.result.error}` : ''}`);
+    }
+    return true;
+  }
+
+  if (msg.event !== 'step_update' || !msg.step_update) return false;
+  const s = msg.step_update;
+
+  if (s.step_type === 'tool') {
+    ingestToolStep(s, st);
+  } else if (s.step_type === 'agent_response' && s.text_delta) {
+    // Agent text: text_delta is incremental, so push it straight through.
+    // Only agent_response carries display text; user_input/checkpoint frames are bookkeeping.
+    if (st.lastSegment === 'tool') st.handlers.onSegmentBreak(); // tool → text boundary
+    st.lastSegment = 'text';
+    st.handlers.onText(s.text_delta);
+  }
+  return false;
+}
+
+/** Tool step: the first frame (ACTIVE) opens the bubble, DONE closes it. `tool_info.error` marks failure. */
+function ingestToolStep(s: NonNullable<AgyEvent['step_update']>, st: AgyTurnState): void {
+  const key = s.step_index ?? -1;
+  const label = toolLabel(s.tool_info?.name ?? s.tool_name);
+  let rec = st.toolLedger.get(key);
+  if (!rec) {
+    rec = { index: st.toolIndexSeq++, name: label, started: false, finished: false };
+    st.toolLedger.set(key, rec);
+  }
+  // A later frame may carry a better name than the first (agy sends tool_info on both).
+  if (label !== 'Tool') rec.name = label;
+
+  if (!rec.started) {
+    rec.started = true;
+    if (st.lastSegment === 'text') st.handlers.onSegmentBreak(); // text → tool boundary
+    st.handlers.onToolStart({
+      name: rec.name,
+      inputPreview: buildInputPreview(s.tool_info?.parameters),
+      input: s.tool_info?.parameters,
+      index: rec.index,
+    });
+    st.lastSegment = 'tool';
+  }
+
+  if (s.state === 'DONE' && !rec.finished) {
+    rec.finished = true;
+    st.handlers.onToolFinish({
+      name: rec.name,
+      index: rec.index,
+      ok: !s.tool_info?.error,
+      // agy reports the step's own duration; prefer it over wall-clock so the bubble matches the CLI.
+      durationMs: Math.round((s.duration_seconds ?? 0) * 1000),
+    });
+  }
+}
+
+/** Turn end: close any tool bubble left open (agy omits DONE if the turn was cut short). */
+function flushPendingTools(st: AgyTurnState): void {
+  for (const rec of st.toolLedger.values()) {
+    if (rec.started && !rec.finished) {
+      rec.finished = true;
+      st.handlers.onToolFinish({ name: rec.name, index: rec.index, ok: true, durationMs: 0 });
+    }
+  }
+  st.toolLedger.clear();
+}
+
+/**
+ * agy tool name → short display name, aligned with the default `tools.emojiMap` keys (see
+ * config/schema.ts) so each bubble picks up the same emoji as the equivalent Claude/Codex tool.
+ * Unmapped tools fall back to their own (truncated) name rather than a generic label, since agy
+ * ships many specialized tools (browser_*, subagents) that are clearer named than lumped together.
+ */
+export function toolLabel(name?: string): string {
+  if (!name) return 'Tool';
+  const byName: Record<string, string> = {
+    run_command: 'Bash',
+    command_status: 'Bash',
+    send_command_input: 'Bash',
+    view_file: 'Read',
+    read_resource: 'Read',
+    notebook_edit: 'Edit',
+    replace_file_content: 'Edit',
+    multi_replace_file_content: 'Edit',
+    sed_file: 'Edit',
+    write_to_file: 'Write',
+    grep_search: 'Grep',
+    find_by_name: 'Glob',
+    list_dir: 'Glob',
+    read_url_content: 'WebFetch',
+    open_browser_url: 'WebFetch',
+    search_web: 'WebSearch',
+    invoke_subagent: 'Task',
+    browser_subagent: 'Task',
+    define_subagent: 'Task',
+    manage_task: 'Task',
+  };
+  return byName[name] ?? truncateToolName(name);
+}
+
+/** Sink for the in-flight turn: parsed events in, settle the runTurn promise out. */
+interface TurnSink {
+  feed(msg: AgyEvent): void;
+  fail(err: Error): void;
+}

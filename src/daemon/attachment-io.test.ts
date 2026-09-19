@@ -3,7 +3,14 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // Mock DNS resolution so the domain-path SSRF tests are deterministic and offline.
 vi.mock('node:dns/promises', () => ({ lookup: vi.fn() }));
 import { lookup } from 'node:dns/promises';
-import { isPrivateAddress, sanitizeFilename, assertSafeAttachmentUrl } from './attachment-io.js';
+import {
+  isPrivateAddress,
+  sanitizeFilename,
+  assertSafeAttachmentUrl,
+  createAttachmentIngestDeps,
+  decodeDataUrl,
+} from './attachment-io.js';
+import type { Config } from '../config/schema.js';
 
 const mockLookup = vi.mocked(lookup);
 
@@ -122,5 +129,138 @@ describe('assertSafeAttachmentUrl', () => {
 
   it('rejects a malformed URL', async () => {
     await expect(assertSafeAttachmentUrl('not a url')).rejects.toThrow(/invalid attachment URL/i);
+  });
+});
+
+/**
+ * The platform fetch override (`fetchAttachment`).
+ *
+ * The generic downloader speaks http(s) only — by design, since it re-validates every hop of a
+ * user-controlled URL — and Lark's media elements are `internal:lark/…` addresses only the bot
+ * can resolve. So the platform gets first refusal on each URL, and what it hands back still has
+ * to obey the one guard that is about bytes rather than about hosts: the size cap.
+ */
+describe('createAttachmentIngestDeps · platform fetch first', () => {
+  const config = {
+    attachments: { maxDownloadBytes: 100, cacheDir: '/tmp/agent-anywhere-test' },
+  } as unknown as Config;
+  const LARK_URL = 'internal:lark/cli_x/im/v1/messages/om_1/resources/img_v2_a?type=image';
+
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn());
+  });
+
+  it('uses the platform fetch for a URL it claims, and never touches HTTP', async () => {
+    const bytes = new Uint8Array([1, 2, 3]);
+    const deps = createAttachmentIngestDeps(config, async () => ({
+      bytes,
+      mime: 'image/png',
+      name: 'img_v2_a.png',
+    }));
+    await expect(deps.download(LARK_URL)).resolves.toEqual({
+      bytes,
+      contentType: 'image/png',
+      name: 'img_v2_a.png',
+    });
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+
+    // Also covers the branches where mime and name are absent
+    const depsNoMeta = createAttachmentIngestDeps(config, async () => ({ bytes }));
+    await expect(depsNoMeta.download(LARK_URL)).resolves.toEqual({ bytes });
+  });
+
+  it('falls through to HTTP when the platform declines the URL', async () => {
+    mockLookup.mockResolvedValue([{ address: '8.8.8.8', family: 4 }] as never);
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(new Uint8Array([9]), { status: 200, headers: { 'content-type': 'image/gif' } })
+    );
+    const declined = vi.fn(async () => undefined);
+    const deps = createAttachmentIngestDeps(config, declined);
+    const got = await deps.download('https://cdn.example.com/a.gif');
+    expect(declined).toHaveBeenCalledWith('https://cdn.example.com/a.gif');
+    expect(got.contentType).toBe('image/gif');
+  });
+
+  it('enforces maxDownloadBytes on what the platform returns', async () => {
+    // This route reports no content-length to pre-check, so the cap can only be applied after the
+    // bytes are in hand — but it must still be applied.
+    const deps = createAttachmentIngestDeps(config, async () => ({
+      bytes: new Uint8Array(101),
+    }));
+    await expect(deps.download(LARK_URL)).rejects.toThrow(/exceeds maxDownloadBytes/);
+  });
+
+  it('a platform fetch that fails is not retried over HTTP (nothing there can serve it)', async () => {
+    const deps = createAttachmentIngestDeps(config, async () => {
+      throw new Error('[lark] resource gone');
+    });
+    await expect(deps.download(LARK_URL)).rejects.toThrow('[lark] resource gone');
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+
+  it('with no platform fetch at all, an internal: URL is still refused by scheme', async () => {
+    const deps = createAttachmentIngestDeps(config);
+    await expect(deps.download(LARK_URL)).rejects.toThrow(/non-http\(s\)/);
+  });
+});
+
+/**
+ * `data:` URLs, which is the shape EVERY inbound Telegram photo arrives in: adapter-telegram
+ * downloads the file with the bot token and inlines it as base64 rather than handing over a URL.
+ * Before this was handled, such an attachment was refused by the SSRF scheme check — a guard that
+ * has nothing to guard here, since there is no host to resolve and no request to make.
+ */
+describe('decodeDataUrl', () => {
+  it('decodes base64 payloads with their content type', () => {
+    const got = decodeDataUrl('data:image/jpeg;base64,/9j/4AAB');
+    expect(got?.contentType).toBe('image/jpeg');
+    expect(Array.from(got!.bytes)).toEqual([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x01]);
+  });
+
+  it('decodes percent-encoded payloads', () => {
+    const got = decodeDataUrl('data:text/plain,hello%20world');
+    expect(new TextDecoder().decode(got!.bytes)).toBe('hello world');
+  });
+
+  it('survives extra media parameters before the base64 marker', () => {
+    const got = decodeDataUrl('data:image/png;charset=utf-8;base64,iVBORw==');
+    expect(got?.contentType).toBe('image/png');
+  });
+
+  it('is not fooled by other schemes', () => {
+    expect(decodeDataUrl('https://cdn.example.com/a.png')).toBeUndefined();
+    expect(decodeDataUrl('internal:lark/cli_x/resources/img')).toBeUndefined();
+    // No comma: not a data URL, and must not be treated as an empty one.
+    expect(decodeDataUrl('data:image/png;base64')).toBeUndefined();
+  });
+});
+
+describe('createAttachmentIngestDeps · inline data URLs', () => {
+  const config = {
+    attachments: { maxDownloadBytes: 100, cacheDir: '/tmp/agent-anywhere-test' },
+  } as unknown as Config;
+
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn());
+  });
+
+  it('returns the inline bytes without any network request', async () => {
+    const deps = createAttachmentIngestDeps(config);
+    const got = await deps.download('data:image/jpeg;base64,/9j/4AAB');
+    expect(got.contentType).toBe('image/jpeg');
+    expect(got.bytes.length).toBe(6);
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+
+  it('still enforces maxDownloadBytes on inline bytes', async () => {
+    // The one limit that does apply to a payload already in hand.
+    const oversized = `data:application/octet-stream;base64,${Buffer.alloc(101).toString('base64')}`;
+    const deps = createAttachmentIngestDeps(config);
+    await expect(deps.download(oversized)).rejects.toThrow(/exceeds maxDownloadBytes/);
+  });
+
+  it('is preferred over the platform fetch, which does not claim these', async () => {
+    const deps = createAttachmentIngestDeps(config, async () => undefined);
+    await expect(deps.download('data:text/plain,hi')).resolves.toMatchObject({ contentType: 'text/plain' });
   });
 });

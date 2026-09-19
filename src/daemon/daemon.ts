@@ -1,20 +1,88 @@
 import { randomUUID } from 'node:crypto';
 import type { Config } from '../config/schema.js';
+import { agentDisplayName, findAgent } from '../config/schema.js';
+import {
+  agentCommandSpecs,
+  agentForCommand,
+  DAEMON_COMMANDS,
+  genericCommandSpecs,
+  genericNativeNames,
+  harnessCommandName,
+} from '../core/command-translate.js';
+import { parseButtonId } from '../core/button-id.js';
+import {
+  buildModelMenu,
+  modelChoiceText,
+  modelIndexOf,
+  modelMenuExpiredText,
+  modelMenuSupersededText,
+  modelPageOf,
+  parseModelButtonId,
+  type ModelButtonClick,
+  type ModelOption,
+} from '../core/model-menu.js';
+import {
+  buildWorkdirMenu,
+  parseWorkdirButtonId,
+  workdirChoiceText,
+  workdirIndexOf,
+  workdirMenuExpiredText,
+  workdirMenuSupersededText,
+  workdirPageOf,
+  type WorkdirButtonClick,
+  type WorkdirOption,
+} from '../core/workdir-menu.js';
+import {
+  buildSettingValueMenu,
+  buildSettingsMenu,
+  parseSettingButtonId,
+  settingAckText,
+  settingValuePage,
+  settingsMenuExpiredText,
+  settingsMenuSupersededText,
+  type SettingButtonClick,
+  type SettingOption,
+  type SettingRow,
+} from '../core/settings.js';
 import type { PlatformAdapter } from '../platform/adapter.js';
+import { OutboundPacer } from '../core/outbound-pacer.js';
+import { splitIntoChunks } from '../core/stream-buffer.js';
+import { formatEmptyCatalog, formatSkillCatalog } from '../core/skills-catalog.js';
+import { resolveConversationCwd } from './agent-common.js';
+import {
+  agentHome,
+  opencodeSkillDirs,
+  scanSkillDirs,
+  skillDirsFor,
+} from './skills-scan.js';
+import { withOutboundPacing } from './paced-adapter.js';
 import type {
   AgentCommand,
+  AgentElicitation,
   ButtonInteraction,
   CommandInteraction,
+  ConversationId,
+  ElicitAnswer,
+  ElicitQuestion,
   InboundMessage,
   MessageRef,
-  SessionId,
+  ModelSelector,
   SlashCommandSpec,
 } from '../types.js';
+import {
+  addressOf,
+  formatAddress,
+  type ConversationAddress,
+  type ConversationRef,
+} from '../core/conversation.js';
 import type { AgentFactory } from './agent.js';
-import { SessionRegistry } from './session.js';
-import type { SessionStore } from './session-store.js';
+import { ConversationRegistry } from './conversation.js';
+import type { ConversationStore } from './conversation-store.js';
+import type { WorkdirUsageStore } from './workdir-usage.js';
+import { resolvePageSize } from '../core/paging.js';
 import { IpcServer } from '../ipc/server.js';
 import type { IpcAction } from '../ipc/protocol.js';
+import { DEFAULT_ASK_TIMEOUT_MS as PROTOCOL_DEFAULT_ASK_TIMEOUT_MS } from '../ipc/protocol.js';
 
 /** Valid slash name: lowercase/digit/_/-, 1-32 chars (Discord constraint). Non-matching names are skipped on registration. */
 const SLASH_NAME_RE = /^[a-z0-9_-]{1,32}$/;
@@ -23,43 +91,10 @@ const SLASH_NAME_RE = /^[a-z0-9_-]{1,32}$/;
 const SLASH_DESC_MAX = 100;
 
 /**
- * Built-in slash command names per harness, used for registration priority: when the platform
- * caps command count (capabilities.maxSlashCommands), built-ins win seats over numerous skills.
- *
- * Split by harness because the only available signal is the command name — adapters report
- * commands without a "built-in vs skill/MCP" marker. Names outside this list lose priority only
- * (still selectable / text-invokable); correctness is unaffected. gemini/codex lists are best-effort.
+ * Daemon-level slash commands are defined in core/command-translate.ts (DAEMON_COMMANDS), so
+ * registration and `/help` read the same list. All are intercepted in ConversationRegistry.route
+ * (see CONTEXT_CLEAR_RE / HELP_RE there) and never reach an agent.
  */
-const BUILTIN_COMMANDS_BY_HARNESS: Record<string, string[]> = {
-  claude: [
-    'add-dir', 'agents', 'bug', 'compact', 'config', 'context', 'doctor', 'export',
-    'feedback', 'help', 'hooks', 'ide', 'init', 'install-github-app', 'mcp', 'memory',
-    'model', 'output-style', 'permissions', 'pr-comments', 'privacy-settings', 'resume',
-    'review', 'status', 'statusline', 'terminal-setup', 'upgrade', 'usage', 'vim',
-  ],
-  // Gemini CLI common built-ins (best-effort; defer to actual --help).
-  gemini: [
-    'about', 'auth', 'bug', 'chat', 'clear', 'compress', 'docs', 'editor', 'help',
-    'mcp', 'memory', 'privacy', 'restore', 'stats', 'theme', 'tools',
-  ],
-  // Codex built-in list not yet stable; left empty (no impact on correctness, just no priority).
-  codex: [],
-};
-
-/** Union of all harness built-ins (for priority decisions). */
-const BUILTIN_COMMANDS = new Set<string>(Object.values(BUILTIN_COMMANDS_BY_HARNESS).flat());
-
-/**
- * Daemon-level slash commands, registered ahead of agent-discovered ones. Both are intercepted in
- * SessionRegistry.route (see CONTEXT_CLEAR_RE) and never reach the agent.
- */
-const DAEMON_COMMANDS: SlashCommandSpec[] = [
-  { name: 'new', description: 'Start a fresh conversation (clears context)' },
-  { name: 'clear', description: 'Alias of /new: start a fresh conversation' },
-];
-
-/** Command-registration debounce: merge bursts of per-session/per-turn reports into one platform call. */
-const REGISTER_DEBOUNCE_MS = 800;
 
 /**
  * Inbound dedup TTL: on "slash-is-a-normal-message" platforms (e.g. Telegram), one `/cmd` fires
@@ -69,11 +104,58 @@ const REGISTER_DEBOUNCE_MS = 800;
  */
 const DEDUP_TTL_MS = 15_000;
 
-/** Default timeout for an unclicked ask/clarify button (fallback when action.timeoutMs is absent). */
-const DEFAULT_ASK_TIMEOUT_MS = 120_000;
+/**
+ * Default timeout for an unclicked ask/clarify button (fallback when action.timeoutMs is absent).
+ *
+ * Ten minutes, not the two it used to be, because the person being asked is on a phone rather than
+ * at the terminal the agent is running in. Two minutes is well inside the time it takes to read a
+ * notification, switch apps and think — and the failure was silent (`ask` prints an empty line on
+ * timeout, exactly as it does when nothing was chosen), so a question the user answered three
+ * minutes later looked to the agent like a broken command. Observed doing precisely that.
+ *
+ * The ceiling still exists because an unanswered question must not pin an agent turn forever; an
+ * agent that knows its question is urgent can shorten it with `--timeout`.
+ *
+ * The value itself lives in ipc/protocol.ts: the CLI sizes its socket deadline from the same number
+ * and the two must not drift apart.
+ */
+const DEFAULT_ASK_TIMEOUT_MS = PROTOCOL_DEFAULT_ASK_TIMEOUT_MS;
+
+/**
+ * Max buttons in a harness-command menu. Discord allows 25 components per message (5 rows × 5);
+ * commands beyond this are listed as text instead of dropped. The `claude` harness reports ~39,
+ * so this cap is reached in practice, not hypothetically.
+ */
+const PICKER_BUTTON_MAX = 25;
 
 /** ask button custom_id prefix. Format `ask:<reqId>:<index>` (must not start with `input`). */
 const ASK_PREFIX = 'ask:';
+
+/**
+ * Longest typed answer echoed back onto the question message; longer ones are elided there.
+ *
+ * The echo is a receipt ("this is what I recorded for that question"), not a transcript — the
+ * user's own message is still in the chat right above it. A pasted stack trace answered into a
+ * question would otherwise be repeated in full inside the bubble.
+ */
+const ASK_ECHO_MAX = 300;
+
+/** Harness-picker button custom_id prefix. Format `cmd:<reqId>:<index>`. */
+const PICK_PREFIX = 'cmd:';
+
+/**
+ * Parse a `<prefix><reqId>:<index>` button custom_id (pure, testable). Returns null when the
+ * prefix does not match or the shape is invalid. Shared by the ask and picker buttons so both
+ * accept exactly the same id grammar — which now lives in core/button-id.ts, because the model
+ * menu builds its ids there and this file only parses them.
+ */
+function parsePrefixedButtonId(
+  buttonId: string,
+  prefix: string
+): { reqId: string; index: number } | null {
+  const parsed = parseButtonId(buttonId, prefix);
+  return parsed && { reqId: parsed.reqId, index: parsed.n };
+}
 
 /**
  * Parse an ask button custom_id (pure, testable). Recognizes only `ask:<reqId>:<index>`;
@@ -82,15 +164,16 @@ const ASK_PREFIX = 'ask:';
 export function parseAskButtonId(
   buttonId: string
 ): { reqId: string; index: number } | null {
-  if (!buttonId.startsWith(ASK_PREFIX)) return null;
-  const rest = buttonId.slice(ASK_PREFIX.length);
-  const sep = rest.lastIndexOf(':');
-  if (sep <= 0) return null;
-  const reqId = rest.slice(0, sep);
-  const indexStr = rest.slice(sep + 1);
-  // Accept only a non-negative integer string (reject empty/non-digit; Number('') would be 0).
-  if (!reqId || !/^\d+$/.test(indexStr)) return null;
-  return { reqId, index: Number(indexStr) };
+  return parsePrefixedButtonId(buttonId, ASK_PREFIX);
+}
+
+/**
+ * Parse a harness-picker button custom_id (pure, testable). Recognizes only `cmd:<reqId>:<index>`.
+ */
+export function parsePickButtonId(
+  buttonId: string
+): { reqId: string; index: number } | null {
+  return parsePrefixedButtonId(buttonId, PICK_PREFIX);
 }
 
 /**
@@ -110,40 +193,87 @@ export function agentCommandToSpec(cmd: AgentCommand): SlashCommandSpec | null {
 }
 
 /**
- * Aggregate per-session command lists into a name-deduped registration set (pure, testable).
- * Native platform slash is global/workspace-scoped, so take the union; first name wins.
- * Invalid names are dropped and returned for logging (not silently swallowed).
+ * The complete set of slash commands this deployment registers (pure, testable).
+ *
+ * ONE menu, shared by every agent. It is derived from config alone and computed once at startup;
+ * what agents report over ACP does not feed it (that goes to `agentCommands`, which serves only the
+ * harness pickers — see onAgentCommands). So a harness's command list can arrive as often as it
+ * likes without the menu moving.
+ *
+ * A menu entry the bound harness has no equivalent for is answered with an explicit "not supported"
+ * and no turn — see translateCommand in core/command-translate.ts. That refusal is what lets one
+ * menu cover agents with different vocabularies.
+ *
+ * Why not the union of what agents report: native slash is global (Telegram setMyCommands is
+ * per-bot, Discord per-application) while agents are per-session, so a union menu could say neither
+ * who owned an entry nor where to send it — an agent-specific command invoked from it fell through
+ * to `routing.default`, running opencode's `customize-opencode` on the claude agent. It also had no
+ * stable content, since whichever harness last built a session overwrote it.
+ *
+ * Three layers, in registration order:
+ *  - daemon commands (/new, /clear, /help) — intercepted before any agent
+ *  - the generic vocabulary — translated per harness at invocation (core/command-translate.ts)
+ *  - one agent command per configured harness (/cc, /oc, /agy) — switches the conversation, and
+ *    bare is the escape hatch to that agent's own commands, which are not registered globally
  */
-export function buildUnionSpecs(perSession: Iterable<AgentCommand[]>): {
-  specs: SlashCommandSpec[];
-  dropped: string[];
-} {
-  const byName = new Map<string, SlashCommandSpec>();
-  const dropped: string[] = [];
-  for (const cmds of perSession) {
-    for (const c of cmds) {
-      const spec = agentCommandToSpec(c);
-      if (!spec) {
-        dropped.push(c.name);
-        continue;
-      }
-      if (!byName.has(spec.name)) byName.set(spec.name, spec);
-    }
-  }
-  // Built-ins first (so they survive cap truncation over numerous skills), then alphabetical.
-  // Stable ordering also makes the registration signature comparable (avoids dup registrations).
-  const specs = [...byName.values()].sort((a, b) => {
-    const ab = BUILTIN_COMMANDS.has(a.name) ? 0 : 1;
-    const bb = BUILTIN_COMMANDS.has(b.name) ? 0 : 1;
-    if (ab !== bb) return ab - bb; // built-in (0) before non-built-in (1)
-    return a.name.localeCompare(b.name);
-  });
-  return { specs, dropped };
+export function buildRegisteredSpecs(cfg: Pick<Config, 'agents'>): SlashCommandSpec[] {
+  const specs = [...DAEMON_COMMANDS, ...genericCommandSpecs(), ...agentCommandSpecs(cfg)];
+  // Dedup defensively: a harness named like a generic command (or a future daemon command) must not
+  // register twice — Telegram rejects the whole setMyCommands batch on a duplicate name.
+  const seen = new Set<string>();
+  return specs.filter((s) => (seen.has(s.name) ? false : (seen.add(s.name), true)));
 }
 
-/** A pending ask request (IPC response blocked, awaiting a button click or timeout). */
+/**
+ * The message body posted above one elicitation round's buttons (pure, testable).
+ *
+ * Two things a button row cannot carry, so they go here:
+ *  - the option rationales, which are often the most useful part of the question ("you already
+ *    run pgvector here, so reusing it costs nothing") and are why asking with buttons beats
+ *    asking in prose;
+ *  - a position marker, so a multi-question form reads as 2-of-3 rather than as three unrelated
+ *    questions arriving in a row.
+ *
+ * Options with no rationale contribute no line at all, rather than a label followed by an empty
+ * dash — a form where none of them has one then renders as a bare question, which is right.
+ */
+export function composeElicitPrompt(q: ElicitQuestion, index: number, total: number): string {
+  const heading = total > 1 ? `(${index + 1}/${total}) ${q.prompt}` : q.prompt;
+  const detail = q.options
+    .filter((o) => o.description)
+    .map((o) => `**${o.label}** — ${o.description}`)
+    .join('\n');
+  return detail ? `${heading}\n\n${detail}` : heading;
+}
+
+/**
+ * What a pending question resolved to.
+ *
+ * Two shapes, because the answer travels back differently: a tapped option carries the label the
+ * button was drawn with (mapped to the option's own `value` before it reaches the agent), while a
+ * typed answer is whatever the user wrote and goes back through the question's free-text field.
+ * Collapsing them into a bare string is what would let a typed answer be mistaken for an option
+ * the agent listed.
+ */
+export type AskOutcome = { kind: 'option'; label: string } | { kind: 'text'; text: string };
+
+/**
+ * What happened to a conversation while the next round of its form was still being posted.
+ *
+ * See Daemon.elicitGaps for why this window exists and what is held in it.
+ */
+interface ElicitGap {
+  /** Whether every question in this form declared a free-text field (so a typed answer has a home). */
+  acceptsText: boolean;
+  /** An answer typed in the gap, handed to the next question the instant it registers. */
+  parked?: string;
+  /** Why the form was called off in the gap; shown on the next question, which is retired at birth. */
+  cancelled?: string;
+}
+
+/** A pending ask request (IPC response blocked, awaiting a button click, a typed reply, or timeout). */
 interface PendingAsk {
-  resolve: (label: string | null) => void;
+  resolve: (outcome: AskOutcome | null) => void;
   timer: NodeJS.Timeout;
   ref: MessageRef;
   labels: string[];
@@ -151,24 +281,195 @@ interface PendingAsk {
   /** Adapter the ask was sent on (button edits on click/timeout must go back to the same instance). */
   adapter: PlatformAdapter;
   /**
-   * Session that issued this ask (eviction-guard anchor). May be undefined when the sessionId
-   * can't be resolved (token expired / test stub): the guard then doesn't apply to this ask,
-   * matching legacy behavior when no hook is injected — never locks a session on resolve failure.
+   * Whether a message typed into the chat can answer this question instead of a tap.
+   *
+   * False only for an elicitation whose form declared no free-text field (see
+   * ElicitQuestion.customKey): there is nowhere to put the words, so a typed message keeps its old
+   * meaning — it interrupts the turn — rather than being swallowed by a question that cannot
+   * carry it.
    */
-  sessionId?: SessionId;
+  acceptsText: boolean;
+  /**
+   * Session that issued this ask (eviction-guard anchor, and what a typed reply is matched
+   * against). May be undefined when the sessionId can't be resolved (token expired / test stub):
+   * the guard then doesn't apply to this ask, matching legacy behavior when no hook is injected —
+   * never locks a session on resolve failure. Such an ask is also unreachable by typed reply,
+   * since there is no conversation to attribute one to.
+   */
+  conversationId?: ConversationId;
+}
+
+/**
+ * A posted harness-command menu, awaiting a click.
+ *
+ * `names` holds the real command names because the button id cannot: Telegram caps callback_data
+ * at 64 bytes and encodeCallbackData degrades to a lossy hash above it, so a name encoded into the
+ * id would not survive the round trip. The id carries only an index into this list.
+ *
+ * `conversation` is the conversation the menu was opened for. The click is delivered straight back
+ * to it — re-routing a bare `/init` would resolve against the pipeline instead of the conversation's
+ * bound agent, landing on whichever agent config prefers rather than the one that offered the menu.
+ */
+interface PendingPick {
+  conversationId: ConversationId;
+  /** Native command names, positionally matching the button indices. */
+  names: string[];
+  /** Where the menu was posted (origin of the click's synthesized message). */
+  conversation: ConversationRef;
+  /**
+   * The menu message itself, captured from the send.
+   *
+   * The click ack edits THIS, never the click event's messageId: a platform is free to report
+   * something other than the message on a click (Telegram reports the callback_query id), and the
+   * ask path has always used its own captured ref for the same reason.
+   */
+  ref?: MessageRef;
+}
+
+/**
+ * A posted model menu, awaiting clicks — plural, unlike every other menu here.
+ *
+ * `options` is a FROZEN snapshot taken when the menu was opened, and a pick id carries an index
+ * into it. Re-snapshotting on a page turn would let an index printed on an earlier page point at a
+ * different model in a rebuilt list, and re-validating the value could not catch it because the
+ * wrong value would still be a valid one. So: freeze here, and re-check the resolved VALUE against
+ * the live selector at click time (ConversationRegistry.applyModelChoice does).
+ *
+ * There is no page cursor. The page a button targets is absolute and lives in its id, so a failed
+ * edit cannot leave the daemon's idea of the current page disagreeing with what is on screen.
+ */
+interface PendingModelMenu {
+  conversationId: ConversationId;
+  /** The agent that offered this list; a rebind since then invalidates the menu. */
+  agentId: string;
+  /** Where the menu was posted (the ack and any error go back here). */
+  conversation: ConversationRef;
+  /** The option list as it stood when the menu opened. Indices in button ids point into THIS. */
+  options: ModelOption[];
+  /** The model marked ● when the menu was drawn. Display only; never used to decide a switch. */
+  current?: string;
+  /**
+   * Items per page, resolved from the posting platform's capabilities when the menu opened.
+   *
+   * Frozen alongside the options, and for the same reason: a click arrives later, and re-deriving
+   * the size then would compute page boundaries the message on screen was never drawn with — so
+   * `Next ▶` would skip or repeat entries. It also means a config reload cannot resize a menu that
+   * is already up.
+   */
+  pageSize: number;
+  /** The menu message itself, captured from the send — page turns and the ack both edit it. */
+  ref?: MessageRef;
+}
+
+/**
+ * A posted settings menu, awaiting clicks.
+ *
+ * Two levels in one message: `rows` is the list, `open` is the setting whose values are on screen
+ * right now (absent = the list is). Both lists are FROZEN snapshots that button indices point into,
+ * for the reason PendingModelMenu records — an index printed on one screen must not resolve against
+ * a rebuilt list. Identity comes from the snapshot; the VALUE shown is re-read from the live config
+ * every time the menu is redrawn, so a change made from the other surface is never stale here.
+ *
+ * Not one-shot, and not retired after a successful write: changing two settings in a row is the
+ * normal case, so a pick returns to the list with the new value visible on it. Bounded, like the
+ * model menus, by "at most one per conversation" rather than by a TTL — expiry should be caused by
+ * something the user did.
+ */
+interface PendingSettingsMenu {
+  conversationId: ConversationId;
+  /** Where the menu was posted (the ack and any error go back here). */
+  conversation: ConversationRef;
+  /** The settings list as it stood when the menu opened; a `stg:` index points into THIS. */
+  rows: SettingRow[];
+  /** The open setting, with the frozen option list its `stv:` indices point into. */
+  open?: { row: SettingRow; options: SettingOption[]; hint?: string };
+  /** Items per page on the value level; frozen for the reason PendingModelMenu.pageSize records. */
+  pageSize: number;
+  /** The menu message itself, captured from the send — every level change edits it. */
+  ref?: MessageRef;
+}
+
+/**
+ * A posted directory menu, awaiting clicks.
+ *
+ * Shaped like PendingModelMenu and for the same reasons — a frozen option snapshot that pick
+ * indices point into, no page cursor (the target page lives in the button id), and the resolved
+ * value re-checked at click time rather than the index trusted.
+ *
+ * It differs in what a click COSTS, which is why the two are not one type: applying a model is a
+ * live call on the running session, while applying a directory ends that session. So this menu is
+ * retired on any successful pick — including `unchanged`, where nothing happened and the menu has
+ * simply been answered — rather than left up for a second choice.
+ */
+interface PendingWorkdirMenu {
+  conversationId: ConversationId;
+  /** The agent whose root was scanned; a rebind since then invalidates the list (see applyWorkdirChoice). */
+  agentId: string;
+  /** Where the menu was posted (the ack and any error go back here). */
+  conversation: ConversationRef;
+  /** The directory list as it stood when the menu opened. Indices in button ids point into THIS. */
+  options: WorkdirOption[];
+  /** The directory marked ● when the menu was drawn. Display only. */
+  current: string;
+  /** Items per page; frozen for the reason PendingModelMenu.pageSize records. */
+  pageSize: number;
+  /** The menu message itself, captured from the send — page turns and the ack both edit it. */
+  ref?: MessageRef;
 }
 
 /** Main daemon: wires platform, session registry, and IPC server together. `agent-anywhere start` constructs and run()s it. */
 export class Daemon {
-  private registry: SessionRegistry;
+  private registry: ConversationRegistry;
   private ipc: IpcServer;
-  /** Pending ask requests: reqId → wait handle. Resolved and deleted on click or timeout. */
+  /** Pending ask requests: reqId → wait handle. Resolved and deleted on click, typed reply or timeout. */
   private pendingAsks = new Map<string, PendingAsk>();
-  /** Latest reported available commands per session (source for dynamic slash registration; unioned). */
-  private sessionCommands = new Map<SessionId, AgentCommand[]>();
-  /** Per-instance signature of registered commands; skip if unchanged to avoid redundant API calls. */
-  private registeredSigs = new Map<string, string>();
-  private registerTimer: NodeJS.Timeout | null = null;
+  /**
+   * Conversations inside a multi-round elicitation, and the answer that landed in the gap.
+   *
+   * The gap is real: between two rounds the previous question has already resolved and the next one
+   * is still being posted, so for one network round trip the conversation has nothing pending. A
+   * message arriving exactly then would fall through to the merger and interrupt the very turn the
+   * form belongs to — the bug this whole path exists to fix, reappearing in a window of a few
+   * hundred milliseconds. So it is parked here and handed to the next round the moment it registers.
+   *
+   * `acceptsText` is decided for the WHOLE form (every question declaring a free-text field) rather
+   * than per round, because in the gap the next question is not yet known — parking on a form whose
+   * next question cannot carry words would consume a message with nowhere to put it. `cancelled`
+   * holds a `/stop` that landed in the same window, for the same reason in reverse: there was no
+   * question on screen to call off yet.
+   */
+  private elicitGaps = new Map<ConversationId, ElicitGap>();
+  /**
+   * Latest command list reported per AGENT (not per session): the set is a property of the harness
+   * and its config, so every session of one agent reports the same list. Feeds the harness pickers;
+   * no longer drives registration, which is now fixed at startup (see buildRegisteredSpecs).
+   */
+  private agentCommands = new Map<string, AgentCommand[]>();
+  /** Pending harness-picker menus: reqId → the session and command names it was built for. */
+  private pendingPicks = new Map<string, PendingPick>();
+  /**
+   * Live model menus: reqId → the conversation and option snapshot it was built for.
+   *
+   * Held to the invariant "at most one per conversation": opening a menu retires whichever one that
+   * conversation already had. That is what bounds this map — by live conversations, which
+   * access.allowFrom already bounds — with no TTL and no LRU. Both were considered and rejected:
+   * a TTL expires a menu that is still on screen because a clock ran out while the user read it,
+   * and an LRU lets one user's traffic kill another's open menu. Expiry should be caused by
+   * something the user did.
+   *
+   * Unlike pendingPicks these are NOT one-shot — paging is the point. A successful pick deletes the
+   * entry; a failed one keeps it, so a retry is one tap rather than retyping /model.
+   */
+  private pendingModelMenus = new Map<string, PendingModelMenu>();
+  /** Live settings menus: reqId → the conversation, row snapshot and open level it was built for. */
+  private pendingSettingsMenus = new Map<string, PendingSettingsMenu>();
+  /**
+   * Live directory menus: reqId → the conversation and directory snapshot it was built for.
+   *
+   * Same "at most one per conversation" bound as the model menus, and the same reasoning about why
+   * that is the right bound rather than a TTL or an LRU (see pendingModelMenus).
+   */
+  private pendingWorkdirMenus = new Map<string, PendingWorkdirMenu>();
   /** Instances whose "slash must be registered out-of-band" skip notice was printed (log once each). */
   private skipRuntimeRegisterLogged = new Set<string>();
   /** Inbound dedup: `platform:channelId:messageId` → timestamp (see DEDUP_TTL_MS). */
@@ -185,16 +486,31 @@ export class Daemon {
    * first await, and handleAsk reads this value before its first await (sendButtons) — so within one
    * dispatch it can't be clobbered by another connection (Node single-threaded, no interleaving).
    */
-  private lastResolvedSessionId: SessionId | undefined;
+  private lastResolvedConversationId: ConversationId | undefined;
+
+  /**
+   * Platform adapters keyed by instance id (one daemon drives all configured instances), each
+   * wrapped in the shared outbound pacer.
+   *
+   * Wrapped HERE, once, rather than at the call sites: `ConversationRegistry`, `TurnRunner` and
+   * `handleReverse` all read this map, so one wrap puts the reply, the tool bubbles, the reactions,
+   * the menus and the agent's own reverse commands on the single per-chat budget the platform
+   * actually enforces. Adapters given to the constructor are not mutated; this is a new map.
+   */
+  private readonly platforms: Map<string, PlatformAdapter>;
+
+  /** The budget itself. Held so `stop()` can drain what is still queued. */
+  private readonly pacer: OutboundPacer;
 
   constructor(
     private readonly config: Config,
-    /** Platform adapters keyed by instance id (one daemon drives all configured instances). */
-    private readonly platforms: Map<string, PlatformAdapter>,
+    platforms: Map<string, PlatformAdapter>,
     agents: AgentFactory,
     socketPath: string,
-    /** Persistent sessionKey → ACP sessionId map (context survives daemon restarts; /new clears). */
-    store?: SessionStore
+    /** Persistent conversation state (agent binding + each agent's own session id). */
+    private readonly store?: ConversationStore,
+    /** `/cd` usage history, used to order the directory menu. Absent = alphabetical. */
+    workdirUsage?: WorkdirUsageStore
   ) {
     // Real runtime clock; core classes never read the system clock directly (for testability).
     const clock = {
@@ -205,19 +521,55 @@ export class Daemon {
       },
     };
 
-    this.registry = new SessionRegistry(config, platforms, agents, clock, {
-      // A session's agent reported available commands → record and debounce re-registration of the union.
-      onAvailableCommands: (sessionId, cmds) => this.onAgentCommands(sessionId, cmds),
-    }, store);
-    this.ipc = new IpcServer(socketPath, {
-      // resolveChannel is also the sole capture point for the session owning this reverse command:
-      // IPC only forwards channelId to handle, not sessionId. So reverse-lookup the sessionId by token
-      // and stash it for the synchronously-following handleReverse (see lastResolvedSessionId).
-      resolveChannel: (token, override) => {
-        this.lastResolvedSessionId = this.registry.sessionForToken(token);
-        return this.registry.resolveChannel(token, override);
+    this.pacer = new OutboundPacer(config.outbound, clock);
+    this.platforms = new Map(
+      [...platforms].map(([id, adapter]) => [id, withOutboundPacing(adapter, this.pacer)])
+    );
+
+    this.registry = new ConversationRegistry(config, this.platforms, agents, clock, {
+      // A conversation's agent reported its command list → record it under that AGENT (feeds pickers).
+      onAvailableCommands: (_id, agentId, cmds) => this.onAgentCommands(agentId, cmds),
+      // A harness picker (/claude, /opencode) was invoked in a conversation of that harness.
+      onPickerRequest: (id, agentId, msg) => this.onPickerRequest(id, agentId, msg),
+      onSkillsRequest: (id, agentId, msg) => this.onSkillsRequest(id, agentId, msg),
+      // The agent stopped mid-turn to ask the user something (ACP elicitation) → buttons.
+      onElicitRequest: (id, platform, address, request) =>
+        this.onElicitRequest(id, platform, address, request),
+      // Idle reclaim asks before stopping a child: a pending `ask` is the daemon holding work for a
+      // conversation from OUTSIDE any turn, so the merger looks idle while a CLI process sits
+      // blocked on a button nobody has pressed yet. (This is the guard PendingAsk.conversationId is
+      // recorded for.)
+      hasPendingWork: (id) => {
+        for (const pending of this.pendingAsks.values()) {
+          if (pending.conversationId === id) return true;
+        }
+        return false;
       },
-      handle: (action, channelId) => this.handleReverse(action, channelId),
+      // A message typed while a question is on screen answers the question instead of starting a
+      // turn (which would have interrupted the one the question belongs to).
+      answerPendingAsk: (id, text) => this.answerPendingAskWithText(id, text),
+      // `/stop` and `/new` abandon whatever is still being asked here, so nothing is left pinned,
+      // clickable, or able to swallow the next message.
+      cancelPendingAsks: (id, reason) => this.cancelPendingAsks(id, reason),
+      // A bare `/model` on a platform that can carry (and later edit) buttons.
+      onModelMenuRequest: (id, agentId, msg, selector) =>
+        this.onModelMenuRequest(id, agentId, msg, selector),
+      // A `/setting` on a platform that can carry (and later edit) buttons.
+      onSettingMenuRequest: (id, msg, menu) => this.onSettingMenuRequest(id, msg, menu),
+      // A directory menu is wanted: `/cd`, a bare agent command in a conversation with no history,
+      // or a `/new` that just cleared one.
+      onWorkdirMenuRequest: (id, agentId, msg, menu) =>
+        this.onWorkdirMenuRequest(id, agentId, msg, menu),
+    }, store, workdirUsage);
+    this.ipc = new IpcServer(socketPath, {
+      // resolveAddress is also the sole capture point for the conversation owning this reverse
+      // command: IPC only forwards the address to handle. So reverse-lookup by token and stash it
+      // for the synchronously-following handleReverse (see lastResolvedConversationId).
+      resolveAddress: (token, override) => {
+        this.lastResolvedConversationId = this.registry.conversationForToken(token);
+        return this.registry.resolveAddress(token, override);
+      },
+      handle: (action, address) => this.handleReverse(action, address),
     });
   }
 
@@ -233,7 +585,9 @@ export class Daemon {
       await adapter.start();
       console.log(`[daemon] platform instance "${id}" (${adapter.platformType}) started`);
     }
-    // No static slash registration: commands are registered dynamically from agent available_commands_update.
+    // The registered set is fixed and derived from config (see buildRegisteredSpecs), so it is
+    // registered once here rather than re-derived whenever an agent reports its commands.
+    await this.registerCommands();
     await this.ipc.start();
     // Graceful stop on SIGINT (Ctrl-C) / SIGTERM (kill / container stop); otherwise resident ACP
     // child processes are orphaned and the socket file lingers. Removed again in stop().
@@ -266,15 +620,26 @@ export class Daemon {
     this.signalCleanup?.();
     this.signalCleanup = null;
     await this.ipc.stop();
+    // Deliver what the pacer is still holding BEFORE the adapters go down: a queued write is
+    // somebody's reply, and a lane that was paced or paused at the wrong moment must not lose it
+    // just because the process is leaving. Bounded by outbound.drainMs so a chat the platform has
+    // silenced for minutes cannot hold the shutdown for the same minutes.
+    const drained = await this.pacer
+      .drain(this.config.outbound.drainMs)
+      .catch(() => ({ delivered: 0, abandoned: 0 }));
+    if (drained.delivered > 0 || drained.abandoned > 0) {
+      console.log(
+        `[daemon] outbound drain: ${drained.delivered} delivered, ${drained.abandoned} abandoned`
+      );
+    }
     for (const [id, adapter] of this.platforms) {
       await adapter.stop().catch((e) =>
         console.error(`[daemon] failed to stop platform instance "${id}":`, e instanceof Error ? e.message : e)
       );
     }
-    if (this.registerTimer) {
-      clearTimeout(this.registerTimer);
-      this.registerTimer = null;
-    }
+    this.pendingPicks.clear();
+    this.pendingModelMenus.clear();
+    this.pendingSettingsMenus.clear();
     // Clear pending asks after ipc/platform are down: no new clicks or asks can arrive now. Clear each
     // timer and resolve null ("no selection") so any caller still blocked on ask IPC gets a result
     // rather than hanging forever. Best-effort: never throw.
@@ -291,63 +656,62 @@ export class Daemon {
   }
 
   /**
-   * Adapter for the session owning the current reverse command. Reads the scratch
-   * lastResolvedSessionId (see its doc: valid because this runs synchronously after
-   * resolveChannel within one dispatch) and resolves session → platform instance →
-   * adapter. Cross-channel override sends go to the SAME instance as the session —
-   * a channelId alone can't identify a platform.
+   * Adapter for the conversation owning the current reverse command. Reads the scratch
+   * lastResolvedConversationId (see its doc: valid because this runs synchronously after
+   * resolveAddress within one dispatch) and resolves conversation → platform instance →
+   * adapter. Cross-channel override sends go to the SAME instance as the conversation —
+   * an address alone can't identify a platform.
    */
   private reverseAdapter(): PlatformAdapter {
-    const sid = this.lastResolvedSessionId;
-    const pid = sid ? this.registry.platformForSession(sid) : undefined;
+    const id = this.lastResolvedConversationId;
+    const pid = id ? this.registry.platformFor(id) : undefined;
     const adapter = pid ? this.platforms.get(pid) : undefined;
     if (!adapter) {
-      throw new Error('cannot resolve the platform instance for this reverse command (session expired?)');
+      throw new Error('cannot resolve the platform instance for this reverse command (conversation expired?)');
     }
     return adapter;
   }
 
-  /** Execute one reverse command (channelId already resolved by IPC). */
-  private async handleReverse(action: IpcAction, channelId: string): Promise<unknown> {
-    // Resolve BEFORE any await: the sessionId scratch slot is only synchronously valid.
+  /** Execute one reverse command (address already resolved and validated by IPC). */
+  private async handleReverse(action: IpcAction, address: ConversationAddress): Promise<unknown> {
+    // Resolve BEFORE any await: the conversation scratch slot is only synchronously valid.
     const platform = this.reverseAdapter();
+    // A reverse command means the agent is still working for this conversation — even between turns,
+    // which is the case idle reclaim would otherwise get wrong: a turn that ended after starting a
+    // background job leaves that job reporting through this socket, into a conversation that from
+    // the registry's side looks like nobody has said anything in an hour.
+    if (this.lastResolvedConversationId) this.registry.touch(this.lastResolvedConversationId);
     switch (action.kind) {
       case 'send-message':
-        return platform.sendMessage(channelId, action.text);
+        return platform.sendMessage(address, action.text);
       case 'reply':
         // Capability gate: platforms without native reply degrade to a plain send (closest semantics,
         // message still reaches the channel, no low-level error).
         if (!platform.capabilities.reply) {
-          return platform.sendMessage(channelId, action.text);
+          return platform.sendMessage(address, action.text);
         }
         // True reply: native platform reply (Discord message_reference).
-        return platform.replyMessage(
-          { channelId, messageId: action.messageId },
-          action.text
-        );
+        return platform.replyMessage({ address, messageId: action.messageId }, action.text);
       case 'edit-message':
         // Capability gate: editing can't be degraded to a fresh send (different message, wrong
         // semantics), so throw a clear error instead of silently doing the wrong thing.
         if (!platform.capabilities.editMessage) {
           throw new Error('unsupported operation: this platform does not support editing messages');
         }
-        return platform.editMessage({ channelId, messageId: action.messageId }, action.text);
+        return platform.editMessage({ address, messageId: action.messageId }, action.text);
       case 'send-file':
-        return platform.sendFile(channelId, {
+        return platform.sendFile(address, {
           path: action.path,
           name: action.name,
           caption: action.caption,
         });
       case 'react':
-        return platform.addReaction(
-          { channelId, messageId: action.messageId },
-          action.emoji
-        );
+        return platform.addReaction({ address, messageId: action.messageId }, action.emoji);
       case 'delete':
-        return platform.deleteMessage({ channelId, messageId: action.messageId });
+        return platform.deleteMessage({ address, messageId: action.messageId });
       case 'fetch-messages':
         return {
-          messages: await platform.fetchHistory(channelId, {
+          messages: await platform.fetchHistory(address, {
             limit: action.limit,
             before: action.before,
           }),
@@ -357,10 +721,18 @@ export class Daemon {
         if (!platform.capabilities.thread) {
           throw new Error('unsupported operation: this platform does not support creating threads');
         }
-        return platform.createThread(
-          { channelId, messageId: action.messageId },
-          action.name
-        );
+        // Answer in the shape the protocol declares (`CreateThreadResult`) rather than handing
+        // the adapter's `{address}` straight back: the CLI reads `data.threadId` and prints
+        // "send into this thread by passing --channel <threadId>", so returning the raw address
+        // made that line read `--channel <threadId>` with an empty id — on every platform, ever
+        // since the command existed. `formatAddress` produces exactly what `--channel` parses
+        // back (`<channel>` where a thread is a channel of its own, `<channel>/<lane>` where it
+        // is a lane), so the help line is now true wherever it is printed.
+        return {
+          threadId: formatAddress(
+            (await platform.createThread({ address, messageId: action.messageId }, action.name)).address
+          ),
+        };
       case 'ask':
         // Capability gate: throw (not return { chosen: null }) when buttons are unsupported. ask means
         // "let the user choose"; silently returning null would mask the problem, while throwing gives
@@ -368,7 +740,7 @@ export class Daemon {
         if (!platform.capabilities.buttons) {
           throw new Error('unsupported operation: this platform does not support interactive buttons (ask)');
         }
-        return this.handleAsk(platform, action, channelId);
+        return this.handleAsk(platform, action, address);
       default: {
         // Exhaustiveness guard: a new IpcAction variant missed here fails to compile.
         const _exhaustive: never = action;
@@ -384,62 +756,316 @@ export class Daemon {
   private async handleAsk(
     platform: PlatformAdapter,
     action: Extract<IpcAction, { kind: 'ask' }>,
-    channelId: string
+    address: ConversationAddress
   ): Promise<{ chosen: string | null }> {
     const labels = action.options;
-    // Anchor session: read the stash before any await (later awaits yield, allowing a subsequent
-    // dispatch to overwrite the value).
-    const sessionId = this.lastResolvedSessionId;
+    // Anchor the conversation: read the stash before any await (later awaits yield, allowing a
+    // subsequent dispatch to overwrite the value).
+    const conversationId = this.lastResolvedConversationId;
     // Empty-options fast path: protocol options has no min(1), so an empty array would post a
     // "no buttons" message and idle until timeoutMs. With nothing to pick, return "no selection" now.
     if (labels.length === 0) {
       return { chosen: null };
     }
+    const chosen = await this.askButtons(
+      platform,
+      address,
+      action.prompt,
+      labels,
+      action.timeoutMs ?? DEFAULT_ASK_TIMEOUT_MS,
+      conversationId
+    );
+    // The reverse `ask` speaks in labels, and a typed answer is simply the label the user wrote —
+    // the CLI's contract is "what the human answered", not "which of your options they picked", and
+    // the prompt came from the agent itself rather than from a schema it has to validate against.
+    return { chosen: chosen === null ? null : chosen.kind === 'option' ? chosen.label : chosen.text };
+  }
+
+  /**
+   * Post one question as buttons and resolve with what the user answered (null on timeout).
+   *
+   * Shared by the two ways a question reaches the user: the `ask` reverse command, and the agent's
+   * own ACP elicitation. One implementation because the mechanics are identical down to the
+   * eviction guard — the difference is only who asked and how the answer travels back — and two
+   * copies would inevitably drift on the details that took a bug each to get right (keeping the
+   * posted message's own ref for the ack edit, stripping the buttons on resolve, re-checking the
+   * clicker against the allowlist).
+   */
+  private askButtons(
+    platform: PlatformAdapter,
+    address: ConversationAddress,
+    prompt: string,
+    labels: string[],
+    timeoutMs: number,
+    conversationId?: ConversationId,
+    acceptsText = true
+  ): Promise<AskOutcome | null> {
     const reqId = randomUUID().slice(0, 8);
     // custom_id: `ask:` prefix + index (≤100 chars; must not start with `input`).
     const buttons = labels.map((label, i) => ({
       id: `${ASK_PREFIX}${reqId}:${i}`,
       label,
     }));
-    const ref = await platform.sendButtons(channelId, action.prompt, buttons);
-
-    const timeoutMs = action.timeoutMs ?? DEFAULT_ASK_TIMEOUT_MS;
-    return new Promise<{ chosen: string | null }>((resolve) => {
-      const timer = setTimeout(() => {
-        this.pendingAsks.delete(reqId);
-        // best-effort: strip buttons and mark timed out (editMessage with text only drops components).
-        void platform
-          .editMessage(ref, `${action.prompt}\n\n(timed out)`)
-          .catch(() => undefined);
-        resolve({ chosen: null });
-      }, timeoutMs);
-      this.pendingAsks.set(reqId, {
-        resolve: (label) => resolve({ chosen: label }),
-        timer,
-        ref,
-        labels,
-        prompt: action.prompt,
-        adapter: platform,
-        sessionId,
-      });
-    });
+    return platform.sendButtons(address, prompt, buttons).then(
+      (ref) =>
+        new Promise<AskOutcome | null>((resolve) => {
+          const timer = setTimeout(() => this.settleAsk(reqId, null, '(timed out)'), timeoutMs);
+          this.pendingAsks.set(reqId, {
+            resolve,
+            timer,
+            ref,
+            labels,
+            prompt,
+            adapter: platform,
+            acceptsText,
+            conversationId,
+          });
+          if (conversationId !== undefined) this.settleFromGap(reqId, conversationId, acceptsText);
+        })
+    );
   }
 
-  /** Button click: resolve the matching pending ask; otherwise ignore (reserved for future interactions). */
+  /**
+   * Settle one pending question: unblock whoever is waiting on it and take it off the screen.
+   *
+   * Every exit goes through here — tapped, typed, timed out, called off — because each of its three
+   * steps has been forgotten on this path at least once: a timer left running fires against a
+   * request that is gone, an unresolved promise parks an agent turn forever, and an un-retired
+   * bubble keeps live buttons under an answered question. Returns false when the question was
+   * already settled, which is the normal race (a tap landing just after a timeout).
+   */
+  private settleAsk(reqId: string, outcome: AskOutcome | null, shown: string): boolean {
+    const pending = this.pendingAsks.get(reqId);
+    if (!pending) return false;
+    clearTimeout(pending.timer);
+    this.pendingAsks.delete(reqId);
+    pending.resolve(outcome);
+    this.retireAsk(pending, shown);
+    return true;
+  }
+
+  /**
+   * Replay onto a just-posted question whatever happened to its conversation while it was in flight
+   * (see elicitGaps): an answer typed in the gap, or a cancellation that arrived when there was
+   * nothing on screen to cancel. Both address a question that did not exist yet, so they wait on the
+   * gap and are applied here, the instant one does.
+   */
+  private settleFromGap(reqId: string, conversationId: ConversationId, acceptsText: boolean): void {
+    const gap = this.elicitGaps.get(conversationId);
+    if (!gap) return;
+    if (gap.cancelled !== undefined) {
+      this.settleAsk(reqId, null, `(${gap.cancelled})`);
+      return;
+    }
+    if (acceptsText && gap.parked !== undefined) {
+      const parked = gap.parked;
+      gap.parked = undefined;
+      this.answerPendingAskWithText(conversationId, parked);
+    }
+  }
+
+  /**
+   * Take a question off the screen: strip its buttons and record what became of it, best-effort.
+   *
+   * `editButtons` with an EMPTY array rather than a text-only `editMessage`, for the reason spelled
+   * out on editModelMenu: only Discord and Telegram drop components when a message is edited to
+   * plain text — on Slack and Lark the buttons of an already-answered question stayed live, and a
+   * second tap on them hits a `pendingAsks` entry that is gone (silently doing nothing, which reads
+   * as the bot ignoring you). Platforms without editButtons degrade to the text-only edit, which is
+   * the best they can do.
+   */
+  private retireAsk(pending: PendingAsk, outcome: string): void {
+    const text = `${pending.prompt}\n\n${outcome}`;
+    const edit = pending.adapter.capabilities.editButtons
+      ? pending.adapter.editButtons(pending.ref, text, [])
+      : pending.adapter.editMessage(pending.ref, text);
+    void edit.catch(() => undefined);
+  }
+
+  /**
+   * A message typed into a conversation that has a question on screen: record it as the answer.
+   *
+   * Returns true when it was consumed, in which case no turn runs — which is the whole point. A
+   * typed reply used to reach the merger, and the merger's job is to interrupt the running turn:
+   * the agent was killed mid-question, so on a multi-question form every question after the one
+   * being answered was lost. Answering here instead keeps the form going: the elicitation loop
+   * resolves this round and posts the next one.
+   *
+   * The NEWEST matching question wins. Rounds are asked one at a time, so the newest is the one on
+   * screen; the only way to have two is a reverse `ask` from a background process arriving while an
+   * elicitation is up, and there the later bubble is still the one the user is looking at.
+   */
+  private answerPendingAskWithText(conversationId: ConversationId, text: string): boolean {
+    let match: string | undefined;
+    for (const [reqId, pending] of this.pendingAsks) {
+      if (pending.conversationId === conversationId && pending.acceptsText) match = reqId;
+    }
+    if (match === undefined) {
+      // Nothing on screen — but a form may be mid-flight, with its next question still being
+      // posted. Park the answer for it rather than letting the message interrupt the form (see
+      // elicitGaps). A second message in the same gap is not parked: one parked answer belongs to
+      // one question, and guessing which of two it was is worse than the old behavior.
+      const gap = this.elicitGaps.get(conversationId);
+      if (!gap?.acceptsText || gap.parked !== undefined || gap.cancelled !== undefined) return false;
+      gap.parked = text;
+      console.log(`[ask] ${conversationId}: answer parked for the question being posted`);
+      return true;
+    }
+    const echo = text.length > ASK_ECHO_MAX ? `${text.slice(0, ASK_ECHO_MAX)}…` : text;
+    this.settleAsk(match, { kind: 'text', text }, `→ Answered: ${echo}`);
+    console.log(`[ask] ${conversationId}: question answered by a typed reply`);
+    return true;
+  }
+
+  /**
+   * Abandon every question this conversation has on screen (`/stop`, `/new`), and report how many.
+   *
+   * Without this a stopped turn leaves its question behind: the buttons stay live, `hasPendingWork`
+   * keeps the agent pinned for the rest of the ten-minute timeout, and — since a typed reply now
+   * answers the newest pending question — the user's NEXT message would be swallowed as an answer
+   * to a question whose turn no longer exists. Resolving null is the same thing a timeout does, so
+   * the caller blocked on it (an elicitation, or an `ask` over IPC) unblocks normally.
+   *
+   * A form mid-round has nothing on screen to cancel, so the cancellation is recorded on the gap and
+   * applied to the question the moment it appears — otherwise `/stop` timed exactly between two
+   * rounds left the next one posted and clickable for the rest of its timeout.
+   */
+  private cancelPendingAsks(conversationId: ConversationId, reason: string): number {
+    const gap = this.elicitGaps.get(conversationId);
+    if (gap && gap.cancelled === undefined) {
+      // First reason wins: `/stop` cancels, and the turn abort it triggers cancels again a moment
+      // later. What the user did is the useful half of that pair, and it is the one that arrives
+      // first.
+      gap.cancelled = reason;
+      gap.parked = undefined; // an answer to a form nobody is waiting on any more
+    }
+    let cancelled = 0;
+    for (const [reqId, pending] of [...this.pendingAsks]) {
+      if (pending.conversationId !== conversationId) continue;
+      if (this.settleAsk(reqId, null, `(${reason})`)) cancelled++;
+    }
+    if (cancelled > 0) console.log(`[ask] ${conversationId}: ${cancelled} question(s) called off (${reason})`);
+    return cancelled;
+  }
+
+  /**
+   * The agent stopped mid-turn to ask the user something (ACP elicitation) — put each question to
+   * them as buttons, in order, and hand back what they picked.
+   *
+   * ── Why this exists at all ────────────────────────────────────────────────────────────────────
+   * Because the alternative is the model guessing. The `claude` harness keeps its AskUserQuestion
+   * tool disabled unless the client advertises `elicitation.form` (see agent-acp's initialize), so
+   * before this hook a model that needed a decision either picked for you or asked in prose and
+   * ended its turn. Now it asks, and waits.
+   *
+   * Rounds are sequential and abandoned on the first unanswered one: a form is a set of questions
+   * the agent needs ALL of, so carrying on to ask question three after question two timed out
+   * would collect an answer it cannot use, having already made the user tap twice for nothing.
+   *
+   * A round can be answered by typing instead of tapping — which is the only usable answer when
+   * none of the options fit, and the reason the question carries an "Other" field at all. The typed
+   * words go back under that field (ElicitQuestion.customKey), where the harness gives them
+   * precedence over the enum; crucially, the turn is NOT interrupted, so the remaining questions
+   * are still asked. Before this, typing at question 2 of 3 killed the turn and lost question 3.
+   *
+   * Option rationales go in the message body rather than on the buttons. They are frequently the
+   * most useful part of the question ("you already run pgvector here, so reusing it costs
+   * nothing") and a button label cannot hold a sentence on any of the eight platforms.
+   */
+  private async onElicitRequest(
+    conversationId: ConversationId,
+    platform: PlatformAdapter,
+    address: ConversationAddress,
+    request: AgentElicitation
+  ): Promise<ElicitAnswer> {
+    // Open the between-rounds window for this form (see elicitGaps), and close it whatever happens:
+    // a leaked entry would park a later message against a form that is long over.
+    const gap: ElicitGap = {
+      acceptsText: request.questions.every((q) => q.customKey !== undefined),
+    };
+    this.elicitGaps.set(conversationId, gap);
+    try {
+      return await this.askRounds(conversationId, platform, address, request);
+    } finally {
+      this.elicitGaps.delete(conversationId);
+      // Only reachable when the round that would have taken it never got posted (the send failed,
+      // so askButtons rejected). Said out loud rather than dropped in silence — it is the user's
+      // sentence that is going nowhere.
+      if (gap.parked !== undefined) {
+        console.warn(`[ask] ${conversationId}: a parked answer was never delivered: ${gap.parked}`);
+      }
+    }
+  }
+
+  /** The rounds themselves; split out of onElicitRequest so the gap window has a `finally` to close in. */
+  private async askRounds(
+    conversationId: ConversationId,
+    platform: PlatformAdapter,
+    address: ConversationAddress,
+    request: AgentElicitation
+  ): Promise<ElicitAnswer> {
+    const content: Record<string, string | string[]> = {};
+    for (const [i, q] of request.questions.entries()) {
+      const answer = await this.askButtons(
+        platform,
+        address,
+        composeElicitPrompt(q, i, request.questions.length),
+        q.options.map((o) => o.label),
+        DEFAULT_ASK_TIMEOUT_MS,
+        conversationId,
+        q.customKey !== undefined
+      );
+      if (answer === null) {
+        console.log(`[elicit] ${conversationId}: question ${i + 1} went unanswered; cancelling`);
+        return { action: 'cancel' };
+      }
+      if (answer.kind === 'text') {
+        // Only reachable when the question declared a free-text field (askButtons was told so
+        // above), so the key is present; the enum field is left unset on purpose, since sending
+        // both would make the harness pick between two answers for one question.
+        content[q.customKey!] = answer.text;
+        continue;
+      }
+      // Send back the option's `value`, not the label the button carried: ACP separates display
+      // text from the answer, and an MCP server that made them differ must get what it offered.
+      const picked = q.options.find((o) => o.label === answer.label);
+      if (!picked) return { action: 'cancel' }; // unreachable: labels come from these very options
+      content[q.key] = q.multi ? [picked.value] : picked.value;
+    }
+    return { action: 'accept', content };
+  }
+
+  /** Button click: resolve the matching model menu, directory menu, settings menu, pending ask, or picker; otherwise ignore. */
   private onButton(ev: ButtonInteraction): void {
+    // Prefixes are pairwise non-prefixing (`mdl:`/`mpg:`/`wdr:`/`wdp:`/`stg:`/`stv:`/`stp:`/`stb:`/
+    // `cmd:`/`ask:`), so this order is for readability, not correctness.
+    const model = parseModelButtonId(ev.buttonId);
+    if (model) {
+      this.onModelClick(ev, model);
+      return;
+    }
+    const workdir = parseWorkdirButtonId(ev.buttonId);
+    if (workdir) {
+      this.onWorkdirClick(ev, workdir);
+      return;
+    }
+    const setting = parseSettingButtonId(ev.buttonId);
+    if (setting) {
+      this.onSettingClick(ev, setting);
+      return;
+    }
+    const pick = parsePickButtonId(ev.buttonId);
+    if (pick) {
+      this.onPickClick(ev, pick);
+      return;
+    }
     const parsed = parseAskButtonId(ev.buttonId);
     if (!parsed) return;
     const pending = this.pendingAsks.get(parsed.reqId);
     if (!pending) return;
     if (parsed.index >= pending.labels.length) return;
-    clearTimeout(pending.timer);
-    this.pendingAsks.delete(parsed.reqId);
     const label = pending.labels[parsed.index]!; // bounds-checked above (index < labels.length)
-    pending.resolve(label);
-    // best-effort: strip buttons and mark the chosen option (via the adapter the ask was sent on).
-    void pending.adapter
-      .editMessage(pending.ref, `${pending.prompt}\n\n→ Selected: ${label}`)
-      .catch(() => undefined);
+    this.settleAsk(parsed.reqId, { kind: 'option', label }, `→ Selected: ${label}`);
   }
 
   /**
@@ -457,7 +1083,7 @@ export class Daemon {
       for (const [k, t] of this.recentRouted) {
         if (now - t > DEDUP_TTL_MS) this.recentRouted.delete(k);
       }
-      const key = `${msg.platform}:${msg.channelId}:${msg.messageId}`;
+      const key = `${msg.conversation.platform}:${formatAddress(addressOf(msg.conversation))}:${msg.messageId}`;
       if (this.recentRouted.has(key)) return; // same source message already routed (slash≡message platforms)
       this.recentRouted.set(key, now);
     }
@@ -466,20 +1092,23 @@ export class Daemon {
 
   /**
    * Native slash command: the daemon doesn't interpret it; it synthesizes a `/<name> <input>` inbound
-   * message for the agent (command semantics, /help, etc. are the agent's job). ev.reply only consumes
-   * the interaction (some platforms, e.g. Discord, auto-defer and need one followup), best-effort;
-   * the real answer streams back via the normal channel.
+   * message for the agent (command semantics, /help, etc. are the agent's job). The real answer
+   * streams back via the normal channel.
    */
   private onCommand(ev: CommandInteraction): void {
-    console.log(`[slash] received native command /${ev.name} (${ev.platform} ch=${ev.channelId})`);
+    console.log(
+      `[slash] received native command /${ev.name} (${ev.conversation.platform} ${formatAddress(addressOf(ev.conversation))})`
+    );
     // Reconstruct the raw slash text: input (our registered named param) or raw (platforms without
     // structured params, e.g. Telegram).
     const input = String(ev.options.input ?? ev.options.raw ?? '').trim();
     const content = input ? `/${ev.name} ${input}` : `/${ev.name}`;
+    // The interaction carries a full ConversationRef, resolved by the same profile method as the
+    // message path. That matters: the synthesized message used to be built from a bare channel id
+    // with no kind and no space, so `when.chat` always read 'group' and `when.serverId` could never
+    // match — a rule could route a typed message and its slash equivalent to different places.
     const msg: InboundMessage = {
-      platform: ev.platform,
-      channelId: ev.channelId,
-      userId: ev.userId,
+      conversation: ev.conversation,
       messageId: ev.messageId,
       content,
       timestamp: Date.now(),
@@ -488,47 +1117,787 @@ export class Daemon {
       mentionedSelf: true,
     };
     this.onInbound(msg);
-    // Consume the interaction (best-effort; failures only logged). Short receipt, no command semantics.
-    void ev.reply(`▸ /${ev.name}`).catch((e) =>
-      console.error('[slash] interaction acknowledgement failed:', e instanceof Error ? e.message : e)
-    );
-  }
-
-  /** A session's agent reported its command list: record it (empty clears the entry), then debounce re-register. */
-  private onAgentCommands(sessionId: SessionId, cmds: AgentCommand[]): void {
-    if (cmds.length === 0) this.sessionCommands.delete(sessionId);
-    else this.sessionCommands.set(sessionId, cmds);
-    this.scheduleRegister();
-  }
-
-  /** Debounce one union registration (merge bursts of reports into a single platform call). */
-  private scheduleRegister(): void {
-    if (this.registerTimer) clearTimeout(this.registerTimer);
-    this.registerTimer = setTimeout(() => {
-      this.registerTimer = null;
-      void this.registerDiscoveredCommands();
-    }, REGISTER_DEBOUNCE_MS);
+    // Acknowledge only where the platform requires it to close out the interaction (Discord's
+    // auto-DEFERRED response needs a followup or the UI reads "the application did not respond").
+    // Where slash arrives as an ordinary message the receipt is pure noise — the agent's own reply
+    // is already on its way — so it is skipped. Best-effort; failures only logged.
+    if (this.platforms.get(ev.conversation.platform)?.capabilities.slashNeedsAck) {
+      void ev.reply(`▸ /${ev.name}`).catch((e) =>
+        console.error('[slash] interaction acknowledgement failed:', e instanceof Error ? e.message : e)
+      );
+    }
   }
 
   /**
-   * Register the union of all sessions' reported commands on EVERY slash-capable instance.
-   * Per-instance: capability gating, count cap, registration signature (skip when unchanged),
-   * and discord's commandGuildId. Best-effort — failures only logged, never thrown.
+   * An agent reported its command list: record it under that agent (empty clears the entry).
+   *
+   * Keyed by agent rather than by session because the list is a property of the harness and its
+   * configuration — every session of one agent reports the same set, and the previous per-session
+   * keying made the newest report look like a change to the menu. Registration no longer depends on
+   * this at all; it only feeds the harness pickers.
    */
-  private async registerDiscoveredCommands(): Promise<void> {
-    const { specs: discovered, dropped } = buildUnionSpecs(this.sessionCommands.values());
-    // Daemon-level context commands lead the list (they are intercepted in SessionRegistry.route and
-    // must win any same-named agent command; leading also keeps them inside platform count caps).
-    const all = [...DAEMON_COMMANDS, ...discovered.filter((s) => !DAEMON_COMMANDS.some((d) => d.name === s.name))];
-    if (dropped.length > 0) {
-      console.warn(`[slash] skipping ${dropped.length} command(s) with invalid names: ${dropped.join(', ')}`);
+  private onAgentCommands(agentId: string, cmds: AgentCommand[]): void {
+    if (cmds.length === 0) this.agentCommands.delete(agentId);
+    else this.agentCommands.set(agentId, cmds);
+  }
+
+  /**
+   * `/skills` — post the skills installed for the bound agent, read off disk.
+   *
+   * Disk rather than the agent's own ACP report, because the report only exists once a session has
+   * been built and the daemon holds it in memory: every restart emptied it, so the first `/skills`
+   * after an update answered "has not reported any commands" (seen 2026-09-11, on the deploy of
+   * this very feature). See skills-scan.ts for what is read and the coupling that buys.
+   *
+   * The conversation's own directory is used, not the agent's root, so a `/cd`-ed conversation sees
+   * that project's skills — the same directory its next session will start in.
+   */
+  private onSkillsRequest(conversationId: ConversationId, agentId: string, msg: InboundMessage): void {
+    const adapter = this.platforms.get(msg.conversation.platform);
+    if (!adapter) return;
+    const address = addressOf(msg.conversation);
+
+    const def = findAgent(this.config, agentId);
+    const label = agentDisplayName(def, agentId);
+
+    void (async () => {
+      const home = agentHome(def);
+      const cwd = def ? resolveConversationCwd(def, conversationId, this.store) : home;
+      const configured = def?.harness === 'opencode' ? await opencodeSkillDirs(home, process.env) : [];
+      const dirs = skillDirsFor(def, { home, cwd, configured });
+      const found = await scanSkillDirs(dirs);
+
+      const body = found.length === 0 ? formatEmptyCatalog(label, dirs) : formatSkillCatalog(label, found);
+      console.log(`[skills] ${label}: ${found.length} from ${dirs.length} dir(s)`);
+
+      // The one gateway reply whose length scales with somebody else's config, so the one that has
+      // to chunk. splitIntoChunks is what the stream path uses, so a long list breaks the same way
+      // a long answer does rather than inventing a second rule.
+      const limit = adapter.capabilities.maxMessageLength;
+      const parts = limit > 0 ? splitIntoChunks(body, limit) : [body];
+      for (const part of parts) await adapter.sendMessage(address, part);
+    })().catch((e) => console.error('[skills] reply failed:', e instanceof Error ? e.message : e));
+  }
+
+  /**
+   * A bare agent command (`/cc`, `/oc`) was invoked: post that agent's own commands as buttons.
+   *
+   * Only the commands the agent actually reported are offered — no guessed list. Ones already
+   * reachable through the generic vocabulary are filtered out, since they have a top-level entry.
+   */
+  private onPickerRequest(conversationId: ConversationId, agentId: string, msg: InboundMessage): void {
+    const adapter = this.platforms.get(msg.conversation.platform);
+    if (!adapter) return;
+    const address = addressOf(msg.conversation);
+    const send = (text: string): void => {
+      void adapter
+        .sendMessage(address, text)
+        .catch((e) => console.error('[picker] reply failed:', e instanceof Error ? e.message : e));
+    };
+
+    const def = findAgent(this.config, agentId);
+    const label = agentDisplayName(def, agentId);
+    // The command to name in a "try again" hint is the registered one, not the harness name.
+    const cmd = harnessCommandName(def?.harness) ?? label;
+    const reported = this.agentCommands.get(agentId);
+    if (!reported || reported.length === 0) {
+      // Truthful about the cause rather than showing an empty menu: the list arrives over ACP once a
+      // session exists, and spawning an agent subprocess merely to populate a menu is a worse trade.
+      // Names the binding too, since a bare `/oc` is also how a user switches agents.
+      send(
+        `▸ this conversation is now answered by ${label}.\nNo command list from it yet — send it a message first, then /${cmd} again.`
+      );
+      return;
     }
+
+    // Drop names already reachable generically (a second entry for the same thing is noise), and
+    // any the platform would reject.
+    const generic = genericNativeNames(def?.harness);
+    const offered = reported.filter((c) => !generic.has(c.name) && agentCommandToSpec(c) !== null);
+    if (offered.length === 0) {
+      send(`${label} reports no commands beyond the ones already in the menu.`);
+      return;
+    }
+
+    // Buttons are capped (Discord allows 25 per message); the remainder is listed as text rather
+    // than silently dropped, and stays invokable by typing.
+    const shown = offered.slice(0, PICKER_BUTTON_MAX);
+    const overflow = offered.slice(PICKER_BUTTON_MAX);
+    const reqId = randomUUID().slice(0, 8);
+    this.pendingPicks.set(reqId, {
+      conversationId,
+      names: shown.map((c) => c.name),
+      conversation: msg.conversation,
+    });
+
+    let prompt = `${label} commands:`;
+    if (overflow.length > 0) {
+      prompt += `\n\n${overflow.length} more (type them directly): ${overflow.map((c) => `/${c.name}`).join(', ')}`;
+    }
+    const buttons = shown.map((c, i) => ({ id: `${PICK_PREFIX}${reqId}:${i}`, label: `/${c.name}` }));
+    void adapter
+      .sendButtons(address, prompt, buttons)
+      .then((ref) => {
+        // Keep the menu's own ref: the click ack edits this message, and the click event's
+        // messageId is not a reliable stand-in on every platform.
+        const pending = this.pendingPicks.get(reqId);
+        if (pending) pending.ref = ref;
+      })
+      .catch((e) => {
+        this.pendingPicks.delete(reqId);
+        console.error('[picker] failed to post the menu:', e instanceof Error ? e.message : e);
+      });
+  }
+
+  /**
+   * A picker button was clicked: run that command in the session the menu was opened for.
+   *
+   * Delivered straight to the recorded session, NOT re-routed: a bare `/init` carries no agent
+   * prefix, so routing would send it to `routing.default` — the exact misdelivery this design
+   * removes. The clicker is re-checked against the allowlist because a button in a shared channel
+   * can be pressed by someone other than the person who opened the menu.
+   */
+  private onPickClick(ev: ButtonInteraction, parsed: { reqId: string; index: number }): void {
+    const pick = this.pendingPicks.get(parsed.reqId);
+    if (!pick) {
+      // A menu the daemon no longer knows about: it was already used (one-shot), or the daemon
+      // restarted since it was posted (pendingPicks is in-memory). Say so — returning silently is
+      // indistinguishable from a broken button, which is how this surfaced as "I click and nothing
+      // happens". Answered where the click happened, since the recorded conversation is gone too.
+      console.log(`[picker] click on an expired menu (${parsed.reqId})`);
+      void this.platforms
+        .get(ev.conversation.platform)
+        ?.sendMessage(
+          addressOf(ev.conversation),
+          'That menu has expired (already used, or the gateway restarted). Re-open it with the agent command (`/oc`, `/cc`, …), or /help for the full list.'
+        )
+        .catch(() => undefined);
+      return;
+    }
+    const name = pick.names[parsed.index];
+    if (name === undefined) return;
+
+    const clicker = ev.conversation;
+    const allow = this.config.access.allowFrom;
+    if (allow.length > 0 && !allow.includes(`${clicker.platform}:${clicker.user}`)) {
+      console.log(`[access] denied picker click from ${clicker.platform}:${clicker.user}`);
+      return;
+    }
+
+    // One-shot: a menu button runs once, so drop it rather than let a stale menu be re-clicked.
+    this.pendingPicks.delete(parsed.reqId);
+    const platformId = pick.conversation.platform;
+    const address = addressOf(pick.conversation);
+    const delivered = this.registry.dispatchTo(pick.conversationId, {
+      // The menu's own conversation, with the clicker as sender: the command must run where the
+      // menu was posted, by whoever pressed it.
+      conversation: { ...pick.conversation, user: clicker.user },
+      messageId: ev.messageId,
+      content: `/${name}`,
+      timestamp: Date.now(),
+      // A click is an explicit, directed invocation: bypass the "server channel needs @" gate.
+      mentionedSelf: true,
+    });
+    if (!delivered) {
+      void this.platforms
+        .get(platformId)
+        ?.sendMessage(address, `That conversation is gone — send a message first, then run /${name}.`)
+        .catch(() => undefined);
+      return;
+    }
+    // Ack on the menu message itself (captured at send). Falls back to the click's own messageId
+    // only when the send never reported one.
+    const ackRef = pick.ref ?? { address, messageId: ev.messageId };
+    void this.platforms
+      .get(platformId)
+      ?.editMessage(ackRef, `→ /${name}`)
+      .catch((e) => console.warn('[picker] click ack edit failed:', e instanceof Error ? e.message : e));
+  }
+
+  /**
+   * A bare `/model` on a platform that can carry a menu: post the first page of the model list.
+   *
+   * Opened on the page holding the CURRENT model rather than always page one — the question behind
+   * `/model` is usually "what am I on, and what else is there", and answering the first half by
+   * making the user page to it is a poor trade for one line of arithmetic.
+   */
+  private onModelMenuRequest(
+    conversationId: ConversationId,
+    agentId: string,
+    msg: InboundMessage,
+    selector: ModelSelector
+  ): void {
+    const adapter = this.platforms.get(msg.conversation.platform);
+    if (!adapter) return;
+
+    // One live menu per conversation (see pendingModelMenus): retire the previous one before
+    // posting, so its buttons cannot keep answering for a list the user has moved on from.
+    this.retireModelMenusFor(conversationId);
+
+    const reqId = randomUUID().slice(0, 8);
+    // Copied, not referenced: the harness owns that array and may rebuild it mid-session.
+    const options = [...selector.options];
+    const pageSize = resolvePageSize(adapter.capabilities.menuPageSize);
+    const pending: PendingModelMenu = {
+      conversationId,
+      agentId,
+      conversation: msg.conversation,
+      options,
+      current: selector.current,
+      pageSize,
+    };
+    this.pendingModelMenus.set(reqId, pending);
+
+    const index = modelIndexOf(options, selector.current);
+    const view = buildModelMenu({
+      reqId,
+      options,
+      current: selector.current,
+      page: index >= 0 ? modelPageOf(index, pageSize) : 0,
+      pageSize,
+    });
+    void adapter
+      .sendButtons(addressOf(msg.conversation), view.text, view.buttons)
+      .then((ref) => {
+        // Keep the menu's own ref: page turns and the ack both edit THIS message, and the click
+        // event's messageId is not a reliable stand-in on every platform (Telegram reports the
+        // callback_query id there).
+        pending.ref = ref;
+      })
+      .catch((e) => {
+        this.pendingModelMenus.delete(reqId);
+        console.error('[model] failed to post the menu:', e instanceof Error ? e.message : e);
+      });
+  }
+
+  /** Retire every live menu of one conversation, saying so on the message rather than going quiet. */
+  private retireModelMenusFor(conversationId: ConversationId): void {
+    for (const [reqId, menu] of this.pendingModelMenus) {
+      if (menu.conversationId !== conversationId) continue;
+      this.pendingModelMenus.delete(reqId);
+      this.editModelMenu(menu, modelMenuSupersededText(menu.current), []);
+    }
+  }
+
+  /**
+   * Best-effort in-place edit of a menu message. Menu edits are `void`-and-`catch` like every other
+   * cosmetic side effect here — a failed edit must never take down the click that caused it.
+   *
+   * An EMPTY button array is how a menu is retired: `editMessage` would leave the buttons on Slack
+   * and Lark (only Discord and Telegram drop components on a text-only edit), which is the whole
+   * reason editButtons exists.
+   */
+  private editModelMenu(
+    menu: PendingModelMenu,
+    text: string,
+    buttons: Array<{ id: string; label: string }>
+  ): void {
+    const adapter = this.platforms.get(menu.conversation.platform);
+    if (!adapter) return;
+    if (!menu.ref) {
+      // The send has not resolved yet — a microsecond window, but editing ev.messageId instead
+      // would address the wrong thing on Telegram. Say nothing on the message, log the cause.
+      console.warn('[model] menu has no message ref yet; skipping the edit');
+      return;
+    }
+    void adapter
+      .editButtons(menu.ref, text, buttons)
+      .catch((e) => console.warn('[model] menu edit failed:', e instanceof Error ? e.message : e));
+  }
+
+  /**
+   * A model-menu button was clicked: turn the page, or switch the model.
+   *
+   * The clicker is re-checked against the allowlist first, because a menu in a shared channel can
+   * be pressed by someone other than the person who opened it — and unlike a picker click, this one
+   * changes which model answers for everyone in that conversation.
+   */
+  private onModelClick(ev: ButtonInteraction, click: ModelButtonClick): void {
+    const clicker = ev.conversation;
+    const allow = this.config.access.allowFrom;
+    if (allow.length > 0 && !allow.includes(`${clicker.platform}:${clicker.user}`)) {
+      console.log(`[access] denied model-menu click from ${clicker.platform}:${clicker.user}`);
+      return;
+    }
+
+    const menu = this.pendingModelMenus.get(click.reqId);
+    if (!menu) {
+      // Superseded, already used, or the daemon restarted (this map is in-memory). Answered where
+      // the click happened, since the recorded conversation may be gone too — a silent return is
+      // indistinguishable, from the chat, from a broken button.
+      console.log(`[model] click on an expired menu (${click.reqId})`);
+      this.replyToClick(ev, modelMenuExpiredText());
+      return;
+    }
+
+    if (click.kind === 'page') {
+      const view = buildModelMenu({
+        reqId: click.reqId,
+        options: menu.options,
+        current: menu.current,
+        page: click.page,
+        pageSize: menu.pageSize,
+      });
+      this.editModelMenu(menu, view.text, view.buttons);
+      return;
+    }
+    void this.onModelPickClick(ev, click.reqId, menu, click.index);
+  }
+
+  /** A model button was clicked: apply it, then say what happened on the menu itself. */
+  private async onModelPickClick(
+    ev: ButtonInteraction,
+    reqId: string,
+    menu: PendingModelMenu,
+    index: number
+  ): Promise<void> {
+    const option = menu.options[index];
+    if (!option) {
+      // Only reachable from a mangled id (Telegram hashes callback_data over 64 bytes). Our ids are
+      // ~16, so this is defence, not an expected path — and it still gets an answer.
+      console.warn(`[model] click index ${index} is outside the menu's ${menu.options.length} options`);
+      this.replyToClick(ev, modelMenuExpiredText());
+      return;
+    }
+
+    const result = await this.registry.applyModelChoice(menu.conversationId, menu.agentId, option.value);
+    const text = modelChoiceText(result);
+    console.log(`[model] ${menu.conversationId}: ${option.value} → ${result.kind}`);
+
+    // Retire the menu when it can no longer be trusted or is no longer wanted: a successful switch
+    // moves the ● marker, and gone/rebound/missing all mean the snapshot no longer describes
+    // anything real. A transient refusal keeps the menu, so retrying is one tap.
+    const retire =
+      result.kind === 'applied' ||
+      result.kind === 'gone' ||
+      result.kind === 'rebound' ||
+      result.kind === 'missing';
+    if (retire) {
+      this.pendingModelMenus.delete(reqId);
+      this.editModelMenu(menu, text, []);
+      return;
+    }
+    const view = buildModelMenu({
+      reqId,
+      options: menu.options,
+      current: menu.current,
+      page: modelPageOf(index, menu.pageSize),
+      pageSize: menu.pageSize,
+    });
+    this.editModelMenu(menu, `${view.text}\n\n${text}`, view.buttons);
+  }
+
+  /** Answer where a click happened (not where the menu lives) — used when the menu is gone. */
+  private replyToClick(ev: ButtonInteraction, text: string): void {
+    void this.platforms
+      .get(ev.conversation.platform)
+      ?.sendMessage(addressOf(ev.conversation), text)
+      .catch((e) => console.warn('[menu] failed to answer a click:', e instanceof Error ? e.message : e));
+  }
+
+  /**
+   * A directory menu is wanted here: post the page holding the CURRENT directory.
+   *
+   * Opened on that page rather than page one for the reason onModelMenuRequest is: half the question
+   * is "where am I", and answering it by making the user page to the ● marker is a poor trade for
+   * one line of arithmetic.
+   *
+   * The truncation notice is appended rather than folded into the menu text, because a scan that hit
+   * the cap is an unusual state and the sentence describing it should not be paid for on every
+   * normal menu (core/workdir-menu.ts owns the normal one).
+   */
+  private onWorkdirMenuRequest(
+    conversationId: ConversationId,
+    agentId: string,
+    msg: InboundMessage,
+    menu: { options: WorkdirOption[]; current: string; truncated: number }
+  ): void {
+    const adapter = this.platforms.get(msg.conversation.platform);
+    if (!adapter) return;
+
+    // One live menu per conversation: retire the previous one before posting, so its buttons cannot
+    // keep answering for a list the user has moved on from.
+    this.retireWorkdirMenusFor(conversationId);
+
+    const reqId = randomUUID().slice(0, 8);
+    // Copied, not referenced: the scan's array must not be shared with a later scan's.
+    const options = [...menu.options];
+    const pageSize = resolvePageSize(adapter.capabilities.menuPageSize);
+    const pending: PendingWorkdirMenu = {
+      conversationId,
+      agentId,
+      conversation: msg.conversation,
+      options,
+      current: menu.current,
+      pageSize,
+    };
+    this.pendingWorkdirMenus.set(reqId, pending);
+
+    const index = workdirIndexOf(options, menu.current);
+    const view = buildWorkdirMenu({
+      reqId,
+      options,
+      current: menu.current,
+      page: index >= 0 ? workdirPageOf(index, pageSize) : 0,
+      pageSize,
+    });
+    const text =
+      menu.truncated > 0
+        ? `${view.text}\n(+${menu.truncated} more not shown — type part of a name instead.)`
+        : view.text;
+    void adapter
+      .sendButtons(addressOf(msg.conversation), text, view.buttons)
+      .then((ref) => {
+        // Keep the menu's own ref: page turns and the ack both edit THIS message, and the click
+        // event's messageId is not a reliable stand-in on every platform.
+        pending.ref = ref;
+      })
+      .catch((e) => {
+        this.pendingWorkdirMenus.delete(reqId);
+        console.error('[workdir] failed to post the menu:', e instanceof Error ? e.message : e);
+      });
+  }
+
+  /** Retire every live directory menu of one conversation, saying so rather than going quiet. */
+  private retireWorkdirMenusFor(conversationId: ConversationId): void {
+    for (const [reqId, menu] of this.pendingWorkdirMenus) {
+      if (menu.conversationId !== conversationId) continue;
+      this.pendingWorkdirMenus.delete(reqId);
+      this.editWorkdirMenu(menu, workdirMenuSupersededText(menu.current), []);
+    }
+  }
+
+  /** Best-effort in-place edit of a directory menu; an empty button array retires it (see editModelMenu). */
+  private editWorkdirMenu(
+    menu: PendingWorkdirMenu,
+    text: string,
+    buttons: Array<{ id: string; label: string }>
+  ): void {
+    const adapter = this.platforms.get(menu.conversation.platform);
+    if (!adapter) return;
+    if (!menu.ref) {
+      console.warn('[workdir] menu has no message ref yet; skipping the edit');
+      return;
+    }
+    void adapter
+      .editButtons(menu.ref, text, buttons)
+      .catch((e) => console.warn('[workdir] menu edit failed:', e instanceof Error ? e.message : e));
+  }
+
+  /**
+   * A directory-menu button was clicked: turn the page, or move the conversation.
+   *
+   * The clicker is re-checked against the allowlist first, for the reason onModelClick is — a menu
+   * in a shared channel can be pressed by someone other than whoever opened it, and this one does
+   * more than change an answer: it ends the session everyone in that conversation was using.
+   */
+  private onWorkdirClick(ev: ButtonInteraction, click: WorkdirButtonClick): void {
+    const clicker = ev.conversation;
+    const allow = this.config.access.allowFrom;
+    if (allow.length > 0 && !allow.includes(`${clicker.platform}:${clicker.user}`)) {
+      console.log(`[access] denied workdir-menu click from ${clicker.platform}:${clicker.user}`);
+      return;
+    }
+
+    const menu = this.pendingWorkdirMenus.get(click.reqId);
+    if (!menu) {
+      // Superseded, already used, or the daemon restarted (this map is in-memory). Answered where
+      // the click happened: a silent return is indistinguishable, from the chat, from a dead button.
+      console.log(`[workdir] click on an expired menu (${click.reqId})`);
+      this.replyToClick(ev, workdirMenuExpiredText());
+      return;
+    }
+
+    if (click.kind === 'page') {
+      const view = buildWorkdirMenu({
+        reqId: click.reqId,
+        options: menu.options,
+        current: menu.current,
+        page: click.page,
+        pageSize: menu.pageSize,
+      });
+      this.editWorkdirMenu(menu, view.text, view.buttons);
+      return;
+    }
+
+    const option = menu.options[click.index];
+    if (!option) {
+      // Only reachable from a mangled id (Telegram hashes callback_data over 64 bytes); ours are
+      // ~16, so this is defence rather than an expected path — and it still gets an answer.
+      console.warn(`[workdir] click index ${click.index} is outside the menu's ${menu.options.length} options`);
+      this.replyToClick(ev, workdirMenuExpiredText());
+      return;
+    }
+
+    const result = this.registry.applyWorkdirChoice(menu.conversationId, menu.agentId, option.path);
+    const text = workdirChoiceText(result);
+    console.log(`[workdir] ${menu.conversationId}: ${option.path} → ${result.kind}`);
+
+    // Every outcome except a failed write retires the menu. `applied` ended the session the menu
+    // described; `unchanged` answered it; `rebound` and `missing` mean the snapshot no longer
+    // describes anything real. Only a `failed` write is worth a second tap.
+    if (result.kind === 'failed') {
+      const view = buildWorkdirMenu({
+        reqId: click.reqId,
+        options: menu.options,
+        current: menu.current,
+        page: workdirPageOf(click.index, menu.pageSize),
+        pageSize: menu.pageSize,
+      });
+      this.editWorkdirMenu(menu, `${view.text}\n\n${text}`, view.buttons);
+      return;
+    }
+    this.pendingWorkdirMenus.delete(click.reqId);
+    this.editWorkdirMenu(menu, text, []);
+  }
+
+  /**
+   * A `/setting` on a platform that can carry a menu: post the settings screen.
+   *
+   * `menu.open` lands straight on one setting's values, because `/setting idle` already said which
+   * one — making the user tap through a list to the thing they just named is a step for nothing.
+   */
+  private onSettingMenuRequest(
+    conversationId: ConversationId,
+    msg: InboundMessage,
+    menu: {
+      rows: SettingRow[];
+      open?: { row: SettingRow; options: SettingOption[]; hint?: string };
+    }
+  ): void {
+    const adapter = this.platforms.get(msg.conversation.platform);
+    if (!adapter) return;
+
+    // One live menu per conversation: retire the previous one before posting, so its buttons cannot
+    // keep writing config.yaml on behalf of a screen the user has moved on from.
+    this.retireSettingsMenusFor(conversationId);
+
+    const reqId = randomUUID().slice(0, 8);
+    const pending: PendingSettingsMenu = {
+      conversationId,
+      conversation: msg.conversation,
+      // Copied, not referenced: the caller built these from the live config and may rebuild them.
+      rows: [...menu.rows],
+      pageSize: resolvePageSize(adapter.capabilities.menuPageSize),
+      ...(menu.open ? { open: { ...menu.open, options: [...menu.open.options] } } : {}),
+    };
+    this.pendingSettingsMenus.set(reqId, pending);
+
+    const view = this.renderSettingsMenu(reqId, pending);
+    void adapter
+      .sendButtons(addressOf(msg.conversation), view.text, view.buttons)
+      .then((ref) => {
+        // Keep the menu's own ref: every level change edits THIS message, and the click event's
+        // messageId is not a reliable stand-in on every platform (Telegram reports the
+        // callback_query id there).
+        pending.ref = ref;
+      })
+      .catch((e) => {
+        this.pendingSettingsMenus.delete(reqId);
+        console.error('[setting] failed to post the menu:', e instanceof Error ? e.message : e);
+      });
+  }
+
+  /** The view for whichever level a settings menu is on, plus an optional line above it. */
+  private renderSettingsMenu(
+    reqId: string,
+    menu: PendingSettingsMenu,
+    page = 0,
+    prefix?: string
+  ): { text: string; buttons: Array<{ id: string; label: string }> } {
+    const view = menu.open
+      ? buildSettingValueMenu({
+          reqId,
+          row: menu.open.row,
+          options: menu.open.options,
+          page,
+          pageSize: menu.pageSize,
+          ...(menu.open.hint ? { hint: menu.open.hint } : {}),
+        })
+      : buildSettingsMenu({ reqId, rows: menu.rows });
+    return { text: prefix ? `${prefix}\n\n${view.text}` : view.text, buttons: view.buttons };
+  }
+
+  /** Retire every live settings menu of one conversation, saying so rather than going quiet. */
+  private retireSettingsMenusFor(conversationId: ConversationId): void {
+    for (const [reqId, menu] of this.pendingSettingsMenus) {
+      if (menu.conversationId !== conversationId) continue;
+      this.pendingSettingsMenus.delete(reqId);
+      this.editSettingsMenu(menu, settingsMenuSupersededText(), []);
+    }
+  }
+
+  /**
+   * Best-effort in-place edit of a settings menu. `void`-and-`catch` like every other cosmetic side
+   * effect here — a failed edit must never take down the click that caused it, and least of all
+   * after the write it was reporting already succeeded.
+   */
+  private editSettingsMenu(
+    menu: PendingSettingsMenu,
+    text: string,
+    buttons: Array<{ id: string; label: string }>
+  ): void {
+    const adapter = this.platforms.get(menu.conversation.platform);
+    if (!adapter) return;
+    if (!menu.ref) {
+      console.warn('[setting] menu has no message ref yet; skipping the edit');
+      return;
+    }
+    void adapter
+      .editButtons(menu.ref, text, buttons)
+      .catch((e) => console.warn('[setting] menu edit failed:', e instanceof Error ? e.message : e));
+  }
+
+  /**
+   * A settings-menu button was clicked: open a setting, write a value, turn a page, or go back.
+   *
+   * The clicker is re-checked against the allowlist first — a menu in a shared channel can be
+   * pressed by someone other than whoever opened it, and this one does not merely change what
+   * answers a conversation: it edits the operator's config.yaml.
+   *
+   * (Where `allowFrom` is empty there is nothing to check, and nothing new is granted either:
+   * agents already run with full tool access, so anyone who can message the bot can already edit
+   * that file directly. See AGENTS.md security invariant #1.)
+   */
+  private onSettingClick(ev: ButtonInteraction, click: SettingButtonClick): void {
+    const clicker = ev.conversation;
+    const allow = this.config.access.allowFrom;
+    if (allow.length > 0 && !allow.includes(`${clicker.platform}:${clicker.user}`)) {
+      console.log(`[access] denied settings-menu click from ${clicker.platform}:${clicker.user}`);
+      return;
+    }
+
+    const menu = this.pendingSettingsMenus.get(click.reqId);
+    if (!menu) {
+      // Superseded, or the daemon restarted (this map is in-memory). Answered where the click
+      // happened, since the recorded conversation may be gone too — a silent return is
+      // indistinguishable, from the chat, from a broken button.
+      console.log(`[setting] click on an expired menu (${click.reqId})`);
+      this.replyToClick(ev, settingsMenuExpiredText());
+      return;
+    }
+
+    switch (click.kind) {
+      case 'open':
+        this.openSettingLevel(click.reqId, menu, click.index);
+        return;
+      case 'choose':
+        this.chooseSettingValue(click.reqId, menu, click.index);
+        return;
+      case 'page':
+        this.editSettingsMenu(menu, ...this.viewParts(click.reqId, menu, click.page));
+        return;
+      case 'back':
+        delete menu.open;
+        menu.rows = this.registry.settingRows(); // values may have changed while the level was open
+        this.editSettingsMenu(menu, ...this.viewParts(click.reqId, menu));
+        return;
+      default: {
+        // Exhaustiveness guard: a new click kind missed here fails to compile.
+        const _exhaustive: never = click;
+        throw new Error(`unknown settings click: ${JSON.stringify(_exhaustive)}`);
+      }
+    }
+  }
+
+  /** renderSettingsMenu as positional args, so editSettingsMenu can be spread-called. */
+  private viewParts(
+    reqId: string,
+    menu: PendingSettingsMenu,
+    page = 0,
+    prefix?: string
+  ): [string, Array<{ id: string; label: string }>] {
+    const view = this.renderSettingsMenu(reqId, menu, page, prefix);
+    return [view.text, view.buttons];
+  }
+
+  /**
+   * Descend to one setting's values.
+   *
+   * Identity comes from the frozen row list (so a button always means the setting it was drawn for)
+   * while the value and the option list are read fresh — the same freeze-identity / re-read-value
+   * split the model menu uses, and the reason a menu left open across a change never shows a stale
+   * number.
+   */
+  private openSettingLevel(reqId: string, menu: PendingSettingsMenu, index: number): void {
+    const frozen = menu.rows[index];
+    if (!frozen) {
+      // Only reachable from a mangled id (Telegram hashes callback_data over 64 bytes). Ours are
+      // ~16 bytes, so this is defence, not an expected path — and it still gets an answer.
+      console.warn(`[setting] click index ${index} is outside the menu's ${menu.rows.length} rows`);
+      this.editSettingsMenu(menu, ...this.viewParts(reqId, menu));
+      return;
+    }
+    const rows = this.registry.settingRows();
+    const row = rows.find((r) => r.id === frozen.id && r.target === frozen.target) ?? frozen;
+    const { options, hint } = this.registry.settingOptionsFor(menu.conversationId, row);
+    menu.rows = rows;
+    menu.open = { row, options, ...(hint ? { hint } : {}) };
+    this.editSettingsMenu(
+      menu,
+      ...this.viewParts(reqId, menu, settingValuePage(row, options, menu.pageSize))
+    );
+  }
+
+  /**
+   * A value was clicked: write it, then say what happened.
+   *
+   * A successful write returns to the LIST level with the ack above it, so the new value is visible
+   * on the row that was just changed — a settings screen that keeps working is the point, and
+   * changing two things in a row is the normal case. Anything that did NOT write stays on the value
+   * level instead: retrying is one tap, and a level change would suggest something happened.
+   */
+  private chooseSettingValue(reqId: string, menu: PendingSettingsMenu, index: number): void {
+    const open = menu.open;
+    if (!open) {
+      this.editSettingsMenu(menu, ...this.viewParts(reqId, menu));
+      return;
+    }
+    const option = open.options[index];
+    if (!option) {
+      console.warn(`[setting] value index ${index} is outside ${open.options.length} options`);
+      this.editSettingsMenu(menu, ...this.viewParts(reqId, menu, 0, settingsMenuExpiredText()));
+      return;
+    }
+
+    const result = this.registry.applySetting(menu.conversationId, open.row, option.raw);
+    const ack = settingAckText(result);
+    console.log(`[setting] ${menu.conversationId}: ${open.row.label} ← ${option.raw} → ${result.kind}`);
+
+    if (result.kind !== 'saved') {
+      this.editSettingsMenu(
+        menu,
+        ...this.viewParts(reqId, menu, settingValuePage(open.row, open.options, menu.pageSize), ack)
+      );
+      return;
+    }
+    delete menu.open;
+    menu.rows = this.registry.settingRows();
+    this.editSettingsMenu(menu, ...this.viewParts(reqId, menu, 0, ack));
+  }
+
+  /**
+   * Register this deployment's fixed command set on every slash-capable instance.
+   *
+   * Called once at startup: the set derives from config alone (see buildRegisteredSpecs), so unlike
+   * the previous agent-reported union it cannot change while running. Best-effort — a failure is
+   * logged and never throws, since slash is a convenience over plain-text commands.
+   */
+  private async registerCommands(): Promise<void> {
+    const all = buildRegisteredSpecs(this.config);
+    // Say which agent commands exist and who each one selects. Without this the only way to tell a
+    // harness apart from a missing one was to try it in chat: an unconfigured `/agy` is not
+    // registered, so it reaches the bound agent as plain text and dies as an unknown command of
+    // that agent's own (route() now answers it, but the log is where the cause is visible).
+    const agentCmds = agentCommandSpecs(this.config)
+      .map((s) => `/${s.name}→${agentForCommand(this.config, s.name) ?? '?'}`)
+      .join(' ');
+    console.log(`[slash] agent commands from config: ${agentCmds || '(none)'}`);
     for (const [id, adapter] of this.platforms) {
       if (!adapter.capabilities.slashCommands) continue; // no registration support: plain-text passthrough still works
       // slashCommands=true only means "can receive slash", not "can register at runtime". Platforms with
       // canRegisterSlashAtRuntime===false (e.g. Slack: slash registered out-of-band via App panel/manifest)
-      // have a no-op registerCommands, so skip — don't re-invoke a no-op on every debounce.
-      // Missing/undefined is treated as true (Discord/Telegram and other runtime-registering profiles).
+      // have a no-op registerCommands, so skip it.
       if (adapter.capabilities.canRegisterSlashAtRuntime === false) {
         if (!this.skipRuntimeRegisterLogged.has(id)) {
           this.skipRuntimeRegisterLogged.add(id);
@@ -538,32 +1907,26 @@ export class Daemon {
         }
         continue;
       }
-      // Instance count cap (per-IM capability; unset = unlimited). Beyond it, register only the first N
-      // (built-ins already sorted first, see buildUnionSpecs); the rest are logged (still text-invokable),
-      // never silently truncated.
+      // Instance count cap (per-IM capability; unset = unlimited). The fixed set is far below every
+      // real cap, but truncation is reported rather than silent if that ever stops being true.
       const cap = adapter.capabilities.maxSlashCommands ?? Infinity;
       let specs = all;
       if (all.length > cap) {
         const over = all.slice(cap).map((s) => s.name);
         specs = all.slice(0, cap);
         console.warn(
-          `[slash] instance "${id}": command count ${all.length} exceeds the cap ${cap}; registering only the first ${cap} (built-ins prioritized); ` +
+          `[slash] instance "${id}": command count ${all.length} exceeds the cap ${cap}; registering only the first ${cap}; ` +
             `not registered (still invokable as /cmd text): ${over.join(', ')}`
         );
       }
-      const sig = JSON.stringify(specs);
-      if (sig === this.registeredSigs.get(id)) continue; // same as registered set; skip redundant platform API call
-      this.registeredSigs.set(id, sig);
       try {
         // commandGuildId is discord-only (instant guild-level registration); other types register globally.
         const cfg = this.config.platforms[id];
         const guildId = cfg?.type === 'discord' ? cfg.commandGuildId : undefined;
         await adapter.registerCommands(specs, guildId ? { guildId } : undefined);
-        console.log(`[slash] instance "${id}": registered ${specs.length} agent command(s)`);
+        console.log(`[slash] instance "${id}": registered ${specs.length} command(s)`);
       } catch (e) {
-        // On failure, reset the signature so the next change retries.
-        this.registeredSigs.delete(id);
-        console.error(`[slash] instance "${id}": dynamic registration failed:`, e instanceof Error ? e.message : e);
+        console.error(`[slash] instance "${id}": registration failed:`, e instanceof Error ? e.message : e);
       }
     }
   }

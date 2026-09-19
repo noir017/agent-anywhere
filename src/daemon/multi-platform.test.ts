@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { SessionRegistry } from './session.js';
+import { ConversationRegistry } from './conversation.js';
 import { TurnRunner } from './turn-runner.js';
 import { parseConfig } from '../config/schema.js';
 import type { PlatformAdapter } from '../platform/adapter.js';
@@ -21,19 +21,21 @@ function stubAdapter(id: string): PlatformAdapter & { sent: string[]; reacted: s
     platform: id,
     platformType: 'discord',
     capabilities: { editMessage: true, reaction: true, typing: false, maxMessageLength: 2000,
-      reply: false, thread: false, buttons: false, slashCommands: false },
+      reply: false, thread: false, buttons: false, editButtons: false, slashCommands: false },
     sent,
     reacted,
-    async sendMessage(channelId, text) { sent.push(text); return { channelId, messageId: `m${sent.length}` }; },
+    async sendMessage(address, text) { sent.push(text); return { address, messageId: `m${sent.length}` }; },
     async editMessage() {},
     measureRendered: (t) => t.length,
     async deleteMessage() {},
-    async sendFile(channelId) { return { channelId, messageId: 'f' }; },
+    async sendFile(address) { return { address, messageId: 'f' }; },
     async addReaction(_ref, emoji) { reacted.push(emoji); },
     async removeReaction() {},
     async replyMessage(ref, text) { sent.push(text); return ref; },
-    async createThread() { return { threadId: 't' }; },
-    async sendButtons(channelId) { return { channelId, messageId: 'b' }; },
+    async createThread() { return { address: { channel: 't' } }; },
+    async renameThread() {},
+    async sendButtons(address) { return { address, messageId: 'b' }; },
+    async editButtons() {},
     async registerCommands() {},
     async startTyping() {},
     async stopTyping() {},
@@ -49,12 +51,14 @@ function stubAdapter(id: string): PlatformAdapter & { sent: string[]; reacted: s
 const clock = { now: () => 0, schedule: () => () => {} };
 
 const stubAgents: AgentFactory = {
-  getOrCreate: (sessionId) => ({
-    sessionId,
+  getOrCreate: (conversationId) => ({
+    conversationId,
     runTurn: async (_turn, handlers) => { handlers.onText('hello'); },
     abort: () => {},
     dispose: () => {},
   }),
+  // No session map in this stub: nothing here is ever reclaimed.
+  peek: () => undefined,
   dispose: () => {},
 };
 
@@ -69,9 +73,7 @@ const cfg = parseConfig({
 
 function msg(platform: string, over: Partial<InboundMessage> = {}): InboundMessage {
   return {
-    platform,
-    channelId: 'c1',
-    userId: 'u1',
+    conversation: { platform, channel: 'c1', kind: 'group', user: 'u1' },
     messageId: `id-${Math.random()}`,
     content: 'hi',
     timestamp: 0,
@@ -83,7 +85,7 @@ describe('multi-platform runtime', () => {
   it('gating applies per instance: strict drops unmentioned guild messages, open accepts them', () => {
     const strict = stubAdapter('strict');
     const open = stubAdapter('open');
-    const reg = new SessionRegistry(cfg, new Map([['strict', strict], ['open', open]]), stubAgents, clock);
+    const reg = new ConversationRegistry(cfg, new Map([['strict', strict], ['open', open]]), stubAgents, clock);
     reg.route(msg('strict')); // no mention → gated out; no merger, no reaction
     reg.route(msg('open')); // requireMention=false → ingested; 👀 reaction goes to open's adapter
     expect(strict.reacted).toEqual([]);
@@ -98,10 +100,9 @@ describe('multi-platform runtime', () => {
       tokenFor: () => 'tok',
       agentIdOf: () => 'a',
       getModelOverride: () => undefined,
-      setActiveChannel: (_sid, _ch, platformId) => { expect(platformId).toBe('open'); },
-      deleteActiveChannel: () => {},
+      setLane: (_id, _address, platformId) => { expect(platformId).toBe('open'); },
     });
-    await runner.runTurn('open:c:c1', [msg('open')]);
+    await runner.runTurn('open#c1', [msg('open')]);
     expect(open.sent).toContain('hello');
     expect(strict.sent).toEqual([]);
   });
@@ -112,8 +113,7 @@ describe('multi-platform runtime', () => {
       tokenFor: () => 'tok',
       agentIdOf: () => 'a',
       getModelOverride: () => undefined,
-      setActiveChannel: () => {},
-      deleteActiveChannel: () => {},
+      setLane: () => {},
     });
     await expect(runner.runTurn('x', [msg('ghost')])).rejects.toThrowError(/no platform adapter for instance "ghost"/);
   });

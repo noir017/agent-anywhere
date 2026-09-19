@@ -20,6 +20,20 @@ import type { InboundMessage } from '../types.js';
 const channelId = z.string().min(1).optional();
 
 /**
+ * How long an unanswered `ask` waits before giving up, when the caller names no `--timeout`.
+ *
+ * Lives in the protocol rather than in either side because BOTH sides need it and they need the
+ * same number: the daemon arms its timer with it, and the CLI sizes its own socket deadline as this
+ * plus a margin. They used to hold separate copies of `120_000`, which is the kind of duplication
+ * that survives right up until one of them is tuned — and then the CLI abandons a question the
+ * daemon is still waiting on, reporting "no selection" while the buttons are live in the chat.
+ */
+export const DEFAULT_ASK_TIMEOUT_MS = 600_000;
+
+/** Extra socket-deadline headroom the CLI adds on top of the ask timeout, so the daemon gives up first. */
+export const ASK_CLIENT_TIMEOUT_MARGIN_MS = 10_000;
+
+/**
  * Zod schema per action kind. Each arm maps one-to-one to the IpcAction union below;
  * a new action must be added in both, kept aligned at compile time via z.infer.
  * strict() rejects extra fields, narrowing the trusted input surface.

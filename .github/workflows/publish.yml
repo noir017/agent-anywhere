@@ -1,5 +1,11 @@
 name: Publish to npm
 
+# Fenced to the upstream repository. Forks build the same tarball and attach it
+# to their own GitHub Release (see release.yml), but they do not own
+# `agent-anywhere-cli` on the registry: publishing from one would either fail on
+# a 403 or, with credentials that happen to work, push a fork's build as the
+# package's `latest`. The registry has one owner, so the workflow does too.
+
 on:
   release:
     types: [published]
@@ -10,6 +16,7 @@ permissions:
 
 jobs:
   publish:
+    if: github.repository == 'l0ng-ai/agent-anywhere'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

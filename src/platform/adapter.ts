@@ -1,3 +1,4 @@
+import type { ConversationAddress } from '../core/conversation.js';
 import type {
   ButtonInteraction,
   CommandInteraction,
@@ -7,9 +8,26 @@ import type {
 } from '../types.js';
 
 /**
+ * One interactive button, as the daemon describes it before any platform encoding.
+ *
+ * Named rather than repeated inline because two methods now take the same list and they must not
+ * drift: a menu is posted with sendButtons and then advanced with editButtons, so a shape accepted
+ * by one and rejected by the other would only surface on the second page.
+ */
+export interface ButtonSpec {
+  id: string;
+  label: string;
+  style?: 'primary' | 'secondary' | 'success' | 'danger';
+}
+
+/**
  * Platform capability interface. One layer above Satori so the core classes depend only on
  * capabilities, not concrete platforms; missing capabilities degrade gracefully in the
  * implementation (see capabilities).
+ *
+ * Every outbound method addresses a ConversationAddress ({channel, thread?}) rather than a
+ * channel string, so a sub-lane (Telegram forum topic, Slack thread_ts) can never be lost in
+ * transit or smuggled through as a composite string that some path forgets to decode.
  */
 export interface PlatformAdapter {
   /** Platform INSTANCE id (the `platforms:` map key this adapter was built from). */
@@ -19,7 +37,7 @@ export interface PlatformAdapter {
   readonly capabilities: PlatformCapabilities;
 
   /** First send; the returned MessageRef is later used for editMessage. */
-  sendMessage(channelId: string, text: string): Promise<MessageRef>;
+  sendMessage(address: ConversationAddress, text: string): Promise<MessageRef>;
 
   /** In-place edit. When capabilities.editMessage is false the impl should throw, and the caller degrades to resending the whole segment. */
   editMessage(ref: MessageRef, text: string): Promise<void>;
@@ -34,7 +52,7 @@ export interface PlatformAdapter {
   deleteMessage(ref: MessageRef): Promise<void>;
 
   sendFile(
-    channelId: string,
+    address: ConversationAddress,
     file: { path: string; name?: string; caption?: string }
   ): Promise<MessageRef>;
 
@@ -43,13 +61,20 @@ export interface PlatformAdapter {
   removeReaction(ref: MessageRef, emoji: string): Promise<void>;
 
   /** Typing indicator; some platforms have no stop, the impl may be a no-op. */
-  startTyping(channelId: string): Promise<void>;
-  stopTyping(channelId: string): Promise<void>;
+  startTyping(address: ConversationAddress): Promise<void>;
+  stopTyping(address: ConversationAddress): Promise<void>;
 
   fetchHistory(
-    channelId: string,
+    address: ConversationAddress,
     opts: { limit?: number; before?: string }
   ): Promise<InboundMessage[]>;
+
+  /**
+   * Fetch an inbound attachment the generic HTTP downloader cannot reach (Lark's
+   * `internal:` resource URLs). Absent on platforms whose media elements are public URLs;
+   * `undefined` from the call itself means "not my URL, use HTTP". See PlatformProfile.fetchAttachment.
+   */
+  fetchAttachment?(url: string): Promise<{ bytes: Uint8Array; mime?: string; name?: string } | undefined>;
 
   /** Register the inbound callback, attached when daemon starts. */
   onMessage(handler: (msg: InboundMessage) => void): void;
@@ -59,23 +84,50 @@ export interface PlatformAdapter {
   /** True reply: send a platform-native reply targeting ref (Discord message_reference). */
   replyMessage(ref: MessageRef, text: string): Promise<MessageRef>;
 
-  /** Create a thread from a message; returns the thread channelId (used by later sendMessage). */
+  /**
+   * Create a thread from a message; returns the new thread's address, which later sends
+   * target directly. `{channel}` where a thread is a channel (Discord); `{channel, thread}`
+   * where it is a lane (Telegram topic, Slack thread_ts).
+   */
   createThread(
     ref: MessageRef,
     name: string,
     opts?: { autoArchiveMinutes?: 60 | 1440 | 4320 | 10080 }
-  ): Promise<{ threadId: string }>;
+  ): Promise<{ address: ConversationAddress }>;
+
+  /**
+   * Rename the lane an address points at — a Telegram forum topic's title.
+   *
+   * Distinct from createThread's `name`, which only ever applies at creation: a conversation's
+   * subject is not knowable then (the agent has not read anything yet), so the useful name arrives
+   * later, from the harness. Without this the lane keeps whatever it was called when it was made,
+   * which for a hand-created topic is whatever the user typed before starting.
+   *
+   * Only call when capabilities.renameThread is true; the implementation throws otherwise. Requires
+   * `address.thread` — renaming "the whole channel" is a different and much more dangerous
+   * operation, and no caller wants it.
+   */
+  renameThread(address: ConversationAddress, name: string): Promise<void>;
 
   /** Send a message with buttons (used by clarify). */
   sendButtons(
-    channelId: string,
+    address: ConversationAddress,
     text: string,
-    buttons: Array<{
-      id: string;
-      label: string;
-      style?: 'primary' | 'secondary' | 'success' | 'danger';
-    }>
+    buttons: ButtonSpec[]
   ): Promise<MessageRef>;
+
+  /**
+   * Replace an existing message's text AND its buttons, in place.
+   *
+   * Not expressible through editMessage, which carries no component payload: on Discord a
+   * text-only PATCH drops the components entirely. That is exactly right for retiring a menu and
+   * exactly wrong for advancing one, and a paginated menu needs the message to keep working after
+   * the edit — otherwise every page turn is a new message and the old buttons stay live above it.
+   *
+   * An empty array strips the buttons and leaves plain text. Only call when
+   * capabilities.editButtons is true; the implementation throws otherwise.
+   */
+  editButtons(ref: MessageRef, text: string, buttons: ButtonSpec[]): Promise<void>;
 
   /**
    * Register slash commands (called once after the bot logs in).
@@ -99,12 +151,61 @@ export interface PlatformCapabilities {
   typing: boolean;
   /** Per-message text limit; StreamBuffer chunks by it. */
   maxMessageLength: number;
+  /**
+   * How many in-place edits ONE message accepts over its lifetime. Omit when the platform only
+   * rate-limits edits (Telegram/Discord/Slack) — that is the common case and means "unbounded".
+   *
+   * Lark declares 20: past that `im.message.update` answers 230072 permanently. StreamBuffer and
+   * ToolRenderer spend this budget deliberately and seal the message when it runs out, continuing
+   * in a fresh one. Declaring it is strictly better than waiting for the rejection — every rejected
+   * edit is a wasted round trip and a visibly frozen message — but the rejection path
+   * (MessageNotEditableError) still backs it up if a platform tightens the cap.
+   */
+  maxEditsPerMessage?: number;
   /** True reply (message_reference). */
   reply: boolean;
   /** Thread creation. */
   thread: boolean;
+  /**
+   * Whether an existing lane can be RENAMED (renameThread).
+   *
+   * Its own flag rather than something read off `thread`, for the reason editButtons is: `thread`
+   * is true on platforms where the operation does not exist. Slack threads have no name to change
+   * at all, and Telegram's `editForumTopic` works only in a topic-enabled supergroup — the same
+   * `thread: true` covers both a Telegram forum, a Telegram DM topic, a Discord thread and a Slack
+   * `thread_ts`, which are four different answers to "can this be renamed".
+   *
+   * Absent/undefined treated as false, so a profile that has not thought about it is never asked.
+   */
+  renameThread?: boolean;
   /** Interactive buttons (send + receive). */
   buttons: boolean;
+  /**
+   * Whether an already-sent message's buttons can be REPLACED in place (editButtons).
+   *
+   * Deliberately its own flag rather than `editMessage && buttons`. Lark has both of those true
+   * and still needs a different endpoint here — its editMessage posts `msg_type:'post'` through
+   * `im.message.update`, which cannot touch a card, while buttons live on a card and are updated
+   * through `im.message.patch`. A derived predicate would be right about Lark by accident and
+   * wrong about the mechanism, and wrong about LINE/QQ for a third reason (no edit endpoint at
+   * all). Same reasoning as canRegisterSlashAtRuntime below.
+   */
+  editButtons: boolean;
+  /**
+   * How many items one page of a button menu may hold here (`/cd`, `/model`, `/setting`).
+   *
+   * Declared per platform rather than shared, because the limits are not close to each other:
+   * Discord allows 25 components per message, Telegram's inline keyboard is effectively unbounded
+   * but costs one screen ROW per button (its profile puts one per row — a shared row squeezes long
+   * labels into unreadable slivers), LINE bundles at most 4 per template and QQ 5 per row. One
+   * number for all of them has to be the smallest, and the smallest made `/cd` page through a
+   * ten-project workspace two items at a time.
+   *
+   * Absent means "nobody has checked this platform's limits", which core reads as the conservative
+   * PAGE_SIZE rather than as no limit (core/paging.ts `resolvePageSize`, which also clamps a
+   * declared number to what Discord can physically carry). Meaningless when buttons=false.
+   */
+  menuPageSize?: number;
   /** Slash commands (register + receive). */
   slashCommands: boolean;
   /**
@@ -113,6 +214,14 @@ export interface PlatformCapabilities {
    * registration leave 0. Meaningless when slashCommands=false.
    */
   maxSlashCommands?: number;
+  /**
+   * Whether a received slash command MUST be answered to close out the platform's interaction
+   * (Discord: the adapter auto-emits a DEFERRED response and the UI shows "the application did not
+   * respond" until a followup lands, so the daemon sends a short receipt). Telegram-style platforms
+   * deliver slash as an ordinary message with nothing to close, where that receipt is pure noise —
+   * the real reply is already coming. Absent/undefined treated as false.
+   */
+  slashNeedsAck?: boolean;
   /**
    * Whether the platform supports purely-runtime slash registration (no manual out-of-band step).
    * Absent/undefined treated as true, compatible with all existing profiles (Discord

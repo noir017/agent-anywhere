@@ -9,18 +9,68 @@ import type { AttachmentIngestDeps } from '../core/attachment-ingest.js';
 
 /**
  * Build attachment IO deps (daemon layer does real IO; core's attachment-ingest stays pure).
- *  - download: Node global fetch with AbortController timeout; early-exit on the content-length header
- *    over maxDownloadBytes; returns bytes and the content-type header.
+ *  - download: the platform's own fetcher when it claims the URL, else Node global fetch with an
+ *    AbortController timeout and a content-length early-exit over maxDownloadBytes; returns bytes
+ *    plus whatever was learned about them (content-type header, filename).
  *  - save: write to the cache dir (config.cacheDir defaults to ~/.config/agent-anywhere/attachments); filename
  *    sanitized against traversal, short hash prefix to avoid overwrite; mkdir recursive + writeFile.
+ *
+ * `fetchPlatform` is the adapter's `fetchAttachment` (absent for platforms whose media URLs are
+ * public https links, which is seven of the eight). See PlatformProfile.fetchAttachment.
  */
-export function createAttachmentIngestDeps(config: Config): AttachmentIngestDeps {
+export function createAttachmentIngestDeps(
+  config: Config,
+  fetchPlatform?: (
+    url: string
+  ) => Promise<{ bytes: Uint8Array; mime?: string; name?: string } | undefined>
+): AttachmentIngestDeps {
   const maxDownloadBytes = config.attachments.maxDownloadBytes;
   const cacheDir =
     config.attachments.cacheDir ?? path.join(homedir(), '.config/agent-anywhere/attachments');
 
   return {
     download: async (url) => {
+      // A platform whose inbound media lives behind its own API (Lark hands out
+      // `internal:lark/…` resource addresses) fetches through its authenticated client. Tried
+      // FIRST, and only for URLs it recognizes — `undefined` means "not mine" and falls through.
+      //
+      // Security: this does NOT weaken the SSRF invariant below. That guard exists because a
+      // message can name any host it likes; here the message names only a path segment (validated
+      // against the id alphabet in the profile) and the request goes to the vendor endpoint the
+      // operator configured, with the bot's own token. What the guard *does* still owe us is the
+      // size cap, enforced here: this route reports no content-length to pre-check, so the bytes
+      // are already in memory when we can measure them.
+      if (fetchPlatform) {
+        const got = await fetchPlatform(url);
+        if (got) {
+          if (got.bytes.length > maxDownloadBytes) {
+            throw new Error(`download size ${got.bytes.length} exceeds maxDownloadBytes`);
+          }
+          return {
+            bytes: got.bytes,
+            ...(got.mime ? { contentType: got.mime } : {}),
+            ...(got.name ? { name: got.name } : {}),
+          };
+        }
+      }
+      // A `data:` URL carries the bytes inline instead of naming somewhere to fetch them from.
+      // Satori's adapters produce these for platforms whose media sits behind an authenticated API:
+      // adapter-telegram downloads the file with the bot token and hands it over as
+      // `data:<mime>;base64,…` (adapter-telegram 4.5.11, src/bot.ts:169), so this is the shape EVERY
+      // inbound Telegram photo arrives in.
+      //
+      // Security: this does not weaken the SSRF invariant below, because there is nothing for it to
+      // act on — no host, no DNS lookup, no request. The guard rejects `data:` precisely so a URL
+      // cannot be coerced into reading something local, and a payload that is already in hand reads
+      // nothing. The size cap is the limit that does apply here, and it is enforced before the bytes
+      // go any further.
+      const inline = decodeDataUrl(url);
+      if (inline) {
+        if (inline.bytes.length > maxDownloadBytes) {
+          throw new Error(`download size ${inline.bytes.length} exceeds maxDownloadBytes`);
+        }
+        return inline;
+      }
       // SSRF block: the url comes from an inbound IM attachment (user-controlled), so validate scheme and
       // target before fetch and reject internal/loopback/cloud-metadata endpoints. On hit, throw (caught
       // upstream, attachment skipped). Normal platform CDNs (public https domains) are unaffected.
@@ -77,6 +127,25 @@ const ATTACHMENT_DOWNLOAD_TIMEOUT_MS = 30_000;
 
 /** Max redirect hops to follow during an attachment download (each hop is SSRF-re-validated). */
 const MAX_ATTACHMENT_REDIRECTS = 5;
+
+/**
+ * The bytes a `data:` URL carries, or nothing if this is not one.
+ *
+ * Exported for its tests. Deliberately strict about the prefix and forgiving about the payload: an
+ * adapter builds these itself (never a remote peer), so the risk worth guarding is mistaking some
+ * other scheme for one of these, not a malformed body — which simply decodes to fewer bytes.
+ */
+export function decodeDataUrl(url: string): { bytes: Uint8Array; contentType?: string } | undefined {
+  const head = /^data:([^;,]*)((?:;[^,]*)*),/.exec(url);
+  if (!head) return undefined;
+  const payload = url.slice(head[0].length);
+  const base64 = /;base64/i.test(head[2] ?? '');
+  const bytes = base64
+    ? new Uint8Array(Buffer.from(payload, 'base64'))
+    : new Uint8Array(Buffer.from(decodeURIComponent(payload), 'utf8'));
+  const contentType = head[1] || undefined;
+  return { bytes, ...(contentType ? { contentType } : {}) };
+}
 
 /**
  * SSRF protection for an attachment download URL (called before download, throws on hit).

@@ -41,7 +41,7 @@ routing:
   pipeline: []      # ordered; first fully-matching rule wins
 
 session:
-  scope: per_channel   # per_thread | per_channel | per_user | shared
+  scope: per_thread    # per_thread | per_channel | per_user | shared
 
 access:
   allowFrom: []     # identities "<instance-id>:<userId>"; EMPTY = anyone can drive
@@ -114,6 +114,17 @@ secret: <AppSecret / Client Secret>
 agentId: 123456           # optional; only resolves the bot's display name/avatar
 protocol: ws              # ws = Stream mode (default, no public URL) | http = webhook
 # http-only extras: host, port (DingTalk POSTs to <public host>/dingtalk)
+
+# Web UI — a browser page the daemon serves itself. No bot, no account, no upstream
+# service. One conversation only: no threads, no room list.
+type: webui
+token: <shared secret the login page asks for>   # required
+host: 0.0.0.0             # default; 127.0.0.1 keeps it to an SSH tunnel
+port: 8787                # default
+title: Chat               # default; the browser tab's title
+# Its identity for access.allowFrom is "<this instance id>:owner".
+# It binds every interface and speaks plain HTTP: the token is the only protection.
+# Two instances cannot share a host:port — config validation refuses it.
 ```
 
 ### Fields shared by every platform entry
@@ -136,7 +147,7 @@ DMs always get a response regardless of `requireMention` (frozen behavior).
 
 ```yaml
 - id: claude            # unique; referenced by routing
-  harness: claude       # claude | gemini | codex | opencode | custom
+  harness: claude       # claude | gemini | codex | opencode | agy | custom
   command: /path/bin    # required only when harness: custom (any ACP-speaking executable)
   args: []              # extra CLI args appended to the harness command
                         # (harness-specific switches go here, e.g. claude's --setting-sources)
@@ -148,6 +159,13 @@ DMs always get a response regardless of `requireMention` (frozen behavior).
 
 Notes:
 - `harness: claude` with no API key reuses the machine's `claude /login` session.
+- `harness: agy` (Google Antigravity CLI) is the one preset that does not speak ACP —
+  it has no ACP mode — so it runs over agy's own headless `stream-json` protocol.
+  Needs `agy` on PATH (`agy install`) and one interactive sign-in; headless runs never
+  prompt. It launches with `--disable-slash-commands`, because in stream-json mode a
+  CLI-answered slash (`/model`, `/usage`) aborts the whole session; pass
+  `args: ["--disable-slash-commands=false"]` to opt back in. Every default flag is
+  overridable via `args` (appended after the defaults; agy's parsing is last-wins).
 - There is **no per-tool permission config**: the daemon auto-approves every tool
   request, so agents run with full tool access. The only gate is `access.allowFrom`.
 
@@ -177,25 +195,69 @@ routing:
 `command` matches the leading `/name` of the message **text**, so it works on every
 platform — no native slash-command support needed (native slash invocations arrive as
 the same `/name input` text). When a rule matches via `command`, the router consumes
-the prefix: the agent receives only the rest (`/codex fix it` → codex gets `fix it`),
-and a bare `/name` with nothing after it is acked with a usage hint instead of
-starting a turn. Commands matching no rule pass through to the agent untouched
-(that's how agent-native commands like `/model` keep working). Sessions are keyed
-per routed agent, so `/codex …` next to default-agent chat in the same channel keeps
-two separate conversations; `/codex /new` clears codex's.
+the prefix: the agent receives only the rest (`/cx fix it` → codex gets `fix it`).
+Commands matching no rule pass through to the agent untouched (that's how agent-native
+commands like `/model` keep working).
+
+A `when.command` rule also **binds** the conversation to that agent: `/cx fix the
+tests` routes to codex, and every plain message after it stays with codex until someone
+types another `/<agent>`. Config chooses a conversation's *first* agent; the user
+chooses it thereafter.
+
+You do **not** need a rule to reach a configured harness by name. Each one already has a
+built-in command — `/cc` claude, `/oc` opencode, `/cx` codex, `/gm` gemini, `/agy`
+Antigravity (the full harness name is accepted too) — which selects the first configured
+agent of that harness. A bare `/oc` binds and then lists that agent's own commands; on a
+harness that reports none (`agy`) it just confirms the binding.
+
+A command naming a harness you never configured (`/agy` with no `harness: agy` agent)
+is answered with that fact and runs no turn — it would otherwise reach the bound agent
+with its `/agy` prefix intact and be swallowed as an unknown command of that agent's own.
+
+Write a `when.command` rule when you want something the built-ins cannot express: an
+alias of your own, or pointing a name at a *second* agent of the same harness. A rule
+matching on `command` outranks the built-in table.
+
+Switching agents never discards context. Each conversation remembers every agent's own
+session separately, so `/codex` → `/claude` → `/codex` resumes codex where it left off.
+Only `/new` clears anything, and it clears the whole conversation.
 
 ## `session.scope`
 
-Which conversations share one agent session (context/memory):
+What counts as one conversation (i.e. what shares an agent's context):
 
-| value | one session per |
+| value | one conversation per |
 |---|---|
-| `per_channel` | channel (default) |
-| `per_thread` | thread |
-| `per_user` | user |
+| `per_thread` | thread / Telegram topic / Slack thread — plus the channel root, separately (default) |
+| `per_channel` | channel, with all its threads folded in |
+| `per_user` | user, wherever they write |
 | `shared` | whole deployment |
 
-Sessions live for the daemon's lifetime; `/new` (sent in chat) clears one.
+Conversations live for the daemon's lifetime; `/new` (sent in chat) clears one.
+
+State lives in `<configDir>/conversations.json`: per conversation, the bound agent plus
+each agent's own session id. A pre-0.3 `sessions.json` is migrated automatically on
+first start, so in-flight work survives the upgrade.
+
+## `stream.enabled`
+
+```yaml
+stream:
+  enabled: false   # default
+```
+
+`false` (default): each finished part of a reply is sent as a whole message, split across
+several when it exceeds the platform's per-message limit. `true`: the reply is typed out by
+editing one message in place as text arrives.
+
+Off is the default because every streaming flush spends a message edit and platforms cap
+those per message — Feishu allows 20, then refuses that message permanently — so a long
+reply is the one that runs out of edits partway through delivery. Sent-once text has no such
+ceiling. Either way the turn is not silent: a finished text segment is sent at every tool
+boundary, and tool bubbles refresh in place regardless.
+
+Ignored on platforms that cannot edit messages (QQ, LINE, WeCom, DingTalk). Also settable
+from chat with `/setting stream on|off`, which takes effect on the next reply.
 
 ## `access.allowFrom`
 
@@ -206,7 +268,11 @@ can execute code on this machine — always fill it for shared deployments.
 
 ## Not configurable (don't add these)
 
-Streaming/edit throttling, tool-bubble rendering, inbound merge windows, attachment
-size limits, lifecycle reaction emojis, turn timeout, and the IPC socket path are
-frozen in code (`EXPERIENCE` in `src/config/schema.ts`), not config surface. If the
-user asks to tune them, explain it requires a code change, not a config edit.
+Streaming/edit *throttling* (`charThreshold`, `flushIntervalMs`, backoff), tool-bubble
+rendering, inbound merge windows, attachment size limits, lifecycle reaction emojis, turn
+timeout, and the IPC socket path are frozen in code (`EXPERIENCE` in `src/config/schema.ts`),
+not config surface. If the user asks to tune them, explain it requires a code change, not a
+config edit.
+
+Note the split: `stream.enabled` (above) IS config surface — whether to stream at all is the
+operator's decision — while the numbers that pace a stream are not.

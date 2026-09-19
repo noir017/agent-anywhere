@@ -2,15 +2,16 @@ import fs from 'node:fs';
 import net from 'node:net';
 import { StringDecoder } from 'node:string_decoder';
 import { parseIpcRequest, type IpcAction, type IpcResponse } from './protocol.js';
+import { parseAddress, type ConversationAddress } from '../core/conversation.js';
 
 /**
- * Daemon-side IPC server over a unix socket. Token validation and channel
+ * Daemon-side IPC server over a unix socket. Token validation and address
  * resolution are delegated to the handler (daemon).
  */
 export interface IpcServerHandler {
-  /** Validate token, return the channelId bound to that turn (throws if invalid). */
-  resolveChannel(token: string, override?: string): string;
-  handle(action: IpcAction, channelId: string): Promise<unknown>;
+  /** Validate token, return the address bound to that turn (throws if invalid). */
+  resolveAddress(token: string, override?: ConversationAddress): ConversationAddress;
+  handle(action: IpcAction, address: ConversationAddress): Promise<unknown>;
 }
 
 const IDLE_TIMEOUT_MS = 30_000;
@@ -176,8 +177,8 @@ export class IpcServer {
         resp = { ok: false, error: parsed.error };
       } else {
         const req = parsed.req;
-        const channelId = this.handler.resolveChannel(req.token, channelOf(req.action));
-        const data = await this.handler.handle(req.action, channelId);
+        const address = this.handler.resolveAddress(req.token, overrideAddress(req.action));
+        const data = await this.handler.handle(req.action, address);
         resp = { ok: true, data };
       }
     } catch (err) {
@@ -213,6 +214,14 @@ export class IpcServer {
   }
 }
 
-function channelOf(action: IpcAction): string | undefined {
-  return 'channelId' in action ? action.channelId : undefined;
+/**
+ * The `--channel` override, parsed and validated.
+ *
+ * Accepts `<channel>` or `<channel>/<thread>` so an agent can target a specific topic/thread, not
+ * just a channel root. Malformed input throws here (the message reaches the agent as
+ * `ok:false, error`) rather than reaching a platform API as a garbled id.
+ */
+function overrideAddress(action: IpcAction): ConversationAddress | undefined {
+  const raw = 'channelId' in action ? action.channelId : undefined;
+  return raw == null ? undefined : parseAddress(raw);
 }

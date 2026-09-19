@@ -41,19 +41,19 @@ describe('wecom profile delivery contract (text is flattened before send)', () =
 
   it('sendMessage flattens markdown: no **, no #, no raw table pipes', async () => {
     const { bot, sent } = fakeBot();
-    const ref = await profile.sendMessage!(bot, 'user1', MD);
+    const ref = await profile.sendMessage!(bot, { channel: 'user1' }, MD);
     const text = textOf(sent[0]!);
     expect(text).not.toMatch(/\*\*/);
     expect(text).not.toMatch(/^#/m);
     expect(text).not.toContain('|');
     expect(text).toContain('Title');
     expect(text).toContain('docs (https://x.com/a)');
-    expect(ref).toEqual({ channelId: 'user1', messageId: 'wecom-1' });
+    expect(ref).toEqual({ address: { channel: 'user1' }, messageId: 'wecom-1' });
   });
 
   it('falls back to raw text only on flattener error (graceful degradation, plain text untouched)', async () => {
     const { bot, sent } = fakeBot();
-    await profile.sendMessage!(bot, 'user1', 'just a plain line');
+    await profile.sendMessage!(bot, { channel: 'user1' }, 'just a plain line');
     expect(textOf(sent[0]!)).toBe('just a plain line');
   });
 });

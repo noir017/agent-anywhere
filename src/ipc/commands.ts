@@ -28,8 +28,30 @@ export interface ReverseCommandSpec {
   options: ReverseOption[];
   /** Build one IpcAction from positionals + options. */
   build(positionals: string[], opts: Record<string, unknown>): IpcAction;
-  /** One-line usage hint for the agent (rendered by buildSkillHint). */
+  /** One-line usage hint for the agent (rendered by buildReverseHint when `inject` is set). */
   hint: string;
+  /**
+   * Whether — and where — this command's hint is injected into the agent's prompt.
+   *
+   * Omitted means never, which is most of the catalog, because each turned out to be a worse way
+   * to do something the gateway already does:
+   *  - the agent's plain text IS the reply — it streams into the chat on its own, so `send-message`
+   *    and `reply` ask the model to spend a tool call re-sending what was already sent;
+   *  - `edit-message` duplicates the live-edited message the daemon maintains for every turn;
+   *  - `react` / `delete` / `create-thread` / `fetch-messages` describe a chat client's chrome,
+   *    which is not what the model was asked to work on.
+   *
+   * They stay registered on the CLI (`agent-anywhere --help` lists them, scripts keep working) —
+   * this flag governs one thing only: what is spent from the model's attention before it has read
+   * the user's first word. The full block was ~350 tokens of "you are an IM bot" ahead of every
+   * session's opening question, which is a framing the work rarely needs and never asked for.
+   *
+   * `'always'` — every harness is told.
+   * `'no-native-ask'` — told only to harnesses that cannot ask over ACP `elicitation/create`.
+   *   Exists for `ask`, which is superseded by the model's own question tool where there is one
+   *   (claude) and is still the only way to get buttons where there is not (opencode, dsh).
+   */
+  inject?: 'always' | 'no-native-ask';
 }
 
 /** The "target channel" option shared by all reverse commands; empty = current session. */
@@ -150,6 +172,8 @@ export const REVERSE_COMMANDS: ReverseCommandSpec[] = [
       channelId: str(opts.channel),
     }),
     hint: 'Send a file: agent-anywhere send-file <path> [--caption "caption"]',
+    // The one capability plain text cannot reach: a file has to be uploaded, not described.
+    inject: 'always',
   },
   {
     usage: 'react <messageId> <emoji>',
@@ -218,6 +242,19 @@ export const REVERSE_COMMANDS: ReverseCommandSpec[] = [
       timeoutMs: typeof opts.timeout === 'number' ? opts.timeout : undefined,
       channelId: str(opts.channel),
     }),
-    hint: 'Ask a clarifying question (blocks until the user chooses): agent-anywhere ask "question" -o optionA -o optionB (writes the chosen label to stdout; empty on timeout)',
+    // The hint is what reaches an agent's prompt, so it has to carry the two things that were
+    // learned the hard way: `--timeout` exists, and a blank answer is "nobody clicked", not
+    // "this command does not work". An agent that reads the blank as a malfunction stops using
+    // ask entirely — which is worse than the unanswered question it started with.
+    hint:
+      'Ask a clarifying question (blocks until the user chooses): agent-anywhere ask "question" ' +
+      '-o optionA -o optionB [--timeout <ms>, default 10min] (writes the chosen label to stdout; ' +
+      'empty stdout plus a stderr note means nobody clicked in time — the question WAS delivered, ' +
+      'so follow up in plain text instead of assuming the command is broken)',
+    // Only where the harness has no question tool of its own. On claude the model asks over ACP
+    // elicitation and this hint would advertise a second, worse way to do the same thing; on
+    // opencode and dsh (probed 2026-09-11: neither sends any reverse request) it is the only way
+    // to put buttons in front of the user, and without it they can only ask in prose.
+    inject: 'no-native-ask',
   },
 ];

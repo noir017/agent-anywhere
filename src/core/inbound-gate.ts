@@ -7,6 +7,7 @@
  */
 
 import type { InboundMessage } from '../types.js';
+import { addressListed, addressOf } from './conversation.js';
 
 /** Gating config (mirrors config.inbound.gating). */
 export interface GateConfig {
@@ -16,9 +17,13 @@ export interface GateConfig {
   respondInDirect: boolean;
   /** Responding to other bots: none / mentions (only when @-ed) / all. */
   allowBots: 'none' | 'mentions' | 'all';
-  /** Allowlist: these channels trigger without a mention. */
+  /**
+   * Allowlist: these channels trigger without a mention. Matched with `addressSelects`, so an
+   * operator may name a whole chat (`123`, which covers its topics too) or one topic in it
+   * (`123/7353`).
+   */
   freeResponseChannels: string[];
-  /** Blocklist: these channels are fully ignored. */
+  /** Blocklist: these channels are fully ignored. Same address matching as freeResponseChannels. */
   ignoredChannels: string[];
   /** Whether already-participated threads are exempt from the mention requirement. */
   threadParticipationExempt: boolean;
@@ -26,7 +31,7 @@ export interface GateConfig {
 
 /** Runtime context for gating (injected by the caller; this module queries nothing). */
 export interface GateContext {
-  /** Whether this routing key has an active session — proxy for "bot already in this thread". */
+  /** Whether this conversation is already live — proxy for "bot already in this thread". */
   hasActiveSession: boolean;
 }
 
@@ -40,6 +45,7 @@ export interface GateDecision {
  * Decide whether to respond to an inbound message.
  *
  * Strict order, short-circuiting on the first hit; each branch yields a stable `reason`:
+ *  0. nothing to act on      → false 'empty'
  *  1. blocklisted channel    → false 'ignored-channel'
  *  2. bot author filter      → 'bot-blocked' / 'bot-no-mention' (else continue)
  *  3. DM                     → 'dm' / 'dm-disabled'
@@ -48,17 +54,31 @@ export interface GateDecision {
  *  6. guild requires mention  → false 'no-mention' (when not mentioned)
  *  7. default allow           → true 'default'
  *
- * `authorIsBot/isDirect/isThread/mentionedSelf` are optional and tested with
- * `=== true`; undefined is treated as false (i.e. a missing mention counts as
- * "not mentioned", per step 6).
+ * `authorIsBot` and `mentionedSelf` are optional and tested with `=== true`; undefined
+ * is treated as false (i.e. a missing mention counts as "not mentioned", per step 6).
+ * DM and thread come from `conversation.kind`, which is always present.
  */
 export function shouldRespond(
   msg: InboundMessage,
   cfg: GateConfig,
   ctx: GateContext
 ): GateDecision {
-  // 1) Blocklisted channel: highest priority, ignore outright.
-  if (cfg.ignoredChannels.includes(msg.channelId)) {
+  // 0) Nothing to act on: no text and no attachments. Platforms genuinely deliver these — a
+  // Telegram native slash command arrives as BOTH an empty text message and a command event, and
+  // the empty one carries no command, so it would route to the DEFAULT agent and start a second,
+  // pointless turn alongside the real one (`/oc hi` answered by oc AND cc). An attachment-only
+  // message (image with no caption) is real input, so it must still pass.
+  if (msg.content.trim().length === 0 && (msg.attachments?.length ?? 0) === 0) {
+    return { respond: false, reason: 'empty' };
+  }
+
+  const address = addressOf(msg.conversation);
+
+  // 1) Blocklisted channel: highest priority among the real gates, ignore outright.
+  // Matched with addressListed, not `includes`: a bare chat entry has to cover the chat's
+  // topics, or a Feishu topic-mode group (a new topic id per root message) could not be
+  // blocked at all — see addressSelects.
+  if (addressListed(cfg.ignoredChannels, address)) {
     return { respond: false, reason: 'ignored-channel' };
   }
 
@@ -75,21 +95,23 @@ export function shouldRespond(
   }
 
   // 3) DM: separate switch, usually no mention required.
-  if (msg.isDirect === true) {
+  if (msg.conversation.kind === 'direct') {
     return cfg.respondInDirect
       ? { respond: true, reason: 'dm' }
       : { respond: false, reason: 'dm-disabled' };
   }
 
-  // 4) Free-response channel: allowlisted, respond without a mention.
-  if (cfg.freeResponseChannels.includes(msg.channelId)) {
+  // 4) Free-response channel: allowlisted, respond without a mention. Same chat-covers-its-
+  // topics matching as the blocklist above — in a topic-mode group EVERY message carries a
+  // lane, so an exact-match list could never exempt one.
+  if (addressListed(cfg.freeResponseChannels, address)) {
     return { respond: true, reason: 'free-response' };
   }
 
   // 5) Participated-thread exemption: in a thread with an active session, treat as
   // "already participated" and skip the mention requirement.
   if (
-    msg.isThread === true &&
+    msg.conversation.kind === 'thread' &&
     cfg.threadParticipationExempt &&
     ctx.hasActiveSession
   ) {

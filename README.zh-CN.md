@@ -4,7 +4,7 @@
 
 **让你的编码智能体进驻每一个聊天软件。**
 
-[![CI](https://github.com/l0ng-ai/agent-anywhere/actions/workflows/ci.yml/badge.svg)](https://github.com/l0ng-ai/agent-anywhere/actions/workflows/ci.yml)
+[![CI](https://github.com/noir017/agent-anywhere/actions/workflows/ci.yml/badge.svg)](https://github.com/noir017/agent-anywhere/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/agent-anywhere-cli)](https://www.npmjs.com/package/agent-anywhere-cli)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
@@ -59,9 +59,9 @@ agent-anywhere start    # 给机器人发消息即可
 把下面这段粘贴给 Claude Code（或任何编码智能体）：
 
 ```text
-Set up https://github.com/l0ng-ai/agent-anywhere for me: install the CLI
+Set up https://github.com/noir017/agent-anywhere for me: install the CLI
 (npm i -g agent-anywhere-cli) and its skill (npx skills add
-https://github.com/l0ng-ai/agent-anywhere/tree/main/skill -g), then follow
+https://github.com/noir017/agent-anywhere/tree/main/skill -g), then follow
 the skill to configure and start it.
 ```
 
@@ -414,7 +414,7 @@ agent-anywhere send-file ./report.pdf --caption "Q3 数据"
 按需加载，而不是每个会话都注入一遍：
 
 ```bash
-npx skills add https://github.com/l0ng-ai/agent-anywhere/tree/main/skill -g
+npx skills add https://github.com/noir017/agent-anywhere/tree/main/skill -g
 ```
 
 ## CLI
@@ -438,3 +438,8 @@ npx skills add https://github.com/l0ng-ai/agent-anywhere/tree/main/skill -g
 ## 许可证
 
 [MIT](LICENSE)
+
+本项目起初是 [l0ng-ai/agent-anywhere](https://github.com/l0ng-ai/agent-anywhere) 在 `3d855f8`
+处的一个分支，原作者的架构设计（尤其是 platform 的 profile 抽象层）至今仍是这套代码的骨架。
+此后两边已大幅分化、各自独立开发，不再相互跟踪。上游的 MIT 版权声明保留在
+[LICENSE](LICENSE) 中，该声明同时覆盖两边的代码。

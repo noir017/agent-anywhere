@@ -4,7 +4,7 @@
 
 **Your coding agent, in every chat app.**
 
-[![CI](https://github.com/l0ng-ai/agent-anywhere/actions/workflows/ci.yml/badge.svg)](https://github.com/l0ng-ai/agent-anywhere/actions/workflows/ci.yml)
+[![CI](https://github.com/noir017/agent-anywhere/actions/workflows/ci.yml/badge.svg)](https://github.com/noir017/agent-anywhere/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/agent-anywhere-cli)](https://www.npmjs.com/package/agent-anywhere-cli)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
@@ -60,9 +60,9 @@ needed for personal use.
 Paste into Claude Code (or any coding agent):
 
 ```text
-Set up https://github.com/l0ng-ai/agent-anywhere for me: install the CLI
+Set up https://github.com/noir017/agent-anywhere for me: install the CLI
 (npm i -g agent-anywhere-cli) and its skill (npx skills add
-https://github.com/l0ng-ai/agent-anywhere/tree/main/skill -g), then follow
+https://github.com/noir017/agent-anywhere/tree/main/skill -g), then follow
 the skill to configure and start it.
 ```
 
@@ -471,7 +471,7 @@ If you want an agent to use them fluently, install the bundled
 than injected every session:
 
 ```bash
-npx skills add https://github.com/l0ng-ai/agent-anywhere/tree/main/skill -g
+npx skills add https://github.com/noir017/agent-anywhere/tree/main/skill -g
 ```
 
 ## CLI
@@ -497,3 +497,9 @@ plus an index of the per-module docs ([config](src/config/README.md) ·
 ## License
 
 [MIT](LICENSE)
+
+This project began as a fork of [l0ng-ai/agent-anywhere](https://github.com/l0ng-ai/agent-anywhere)
+at `3d855f8`, and the original architecture — the platform profile seam in particular — is still
+recognisable underneath. It has since diverged substantially and is developed independently; the
+two no longer track each other. The upstream MIT copyright notice is retained in [LICENSE](LICENSE),
+which covers both codebases.

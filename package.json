@@ -70,11 +70,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/l0ng-ai/agent-anywhere.git"
+    "url": "git+https://github.com/noir017/agent-anywhere.git"
   },
-  "homepage": "https://github.com/l0ng-ai/agent-anywhere#readme",
+  "homepage": "https://github.com/noir017/agent-anywhere#readme",
   "bugs": {
-    "url": "https://github.com/l0ng-ai/agent-anywhere/issues"
+    "url": "https://github.com/noir017/agent-anywhere/issues"
   },
   "keywords": [
     "claude-code",

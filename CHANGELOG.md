@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.16.0] - 2026-09-19
+
 ### Changed
 
 - **Agent questions (`ask`) wait up to 1 hour, post a 30-minute reminder notice, and reclaim the resident process upon timing out.**

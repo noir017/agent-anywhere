@@ -103,7 +103,30 @@ body{background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,-apple-system,
 .chat-status.running{color:#38bdf8}
 
 #log{flex:1;overflow-y:auto;padding:20px 16px 8px;max-width:860px;width:100%;margin:0 auto}
-.m{margin:0 0 18px;max-width:100%;overflow-wrap:anywhere}
+.m{margin:0 0 18px;max-width:100%;overflow-wrap:anywhere;animation:fade .18s ease-out}
+/* Only on the element's first appearance, which is the whole reason messages are now reconciled
+   rather than rebuilt: an animation restarts every time a node is created, so under the old
+   empty-and-repaint sync this would have flickered the entire transcript on every reconnect. */
+@keyframes fade{from{opacity:0}to{opacity:1}}
+/* Message-shaped placeholders, held in the transcript while a topic's first sync is in flight.
+   Entering a topic was a blank panel followed by the whole conversation arriving in one frame;
+   the point of these is that the panel already has the SHAPE of what is coming, so the real
+   messages replace something instead of landing in an empty box. Widths are uneven on purpose —
+   four identical bars read as a broken layout rather than as text that has not arrived. */
+.sk{margin:0 0 18px}
+.sk.own{background:var(--own);border-left:2px solid var(--own-edge);border-radius:0 6px 6px 0;padding:9px 12px}
+.sk i{display:block;height:11px;margin-bottom:7px;border-radius:3px;background:#242424;animation:breathe 1.6s ease-in-out infinite}
+/* Inside the tinted panel a neutral grey bar disappears, the same way --line borders do there. */
+.sk.own i{background:#2b333e}
+.sk i:last-child{margin-bottom:0}
+/* Its own swing rather than the running-topic dot's pulse: that one fades to .3, which on a 6px
+   dot reads as blinking and on an 11px bar over this background reads as gone. Half opacity is
+   the point where the bar still breathes and never stops being a bar. */
+@keyframes breathe{0%,100%{opacity:1}50%{opacity:.45}}
+/* Both of the above are decoration over content that is arriving anyway, which is exactly what
+   this query is for: without motion the skeleton is still a placeholder and a message still
+   appears, they just do it instantly. */
+@media(prefers-reduced-motion:reduce){.m,.sk i{animation:none}}
 /* A rule and an indent were all that separated the two sides of the conversation, and at a
    glance down a long transcript that is not enough to find where your own question ended and
    the answer began. Own messages get a tinted panel instead — cool where the page is neutral,
@@ -185,6 +208,11 @@ const SCRIPT = `
       expandBtn=$('expand-sidebar'), newTopicBtn=$('new-topic'), backdrop=$('backdrop'),
       chatTitle=$('topic-title'), chatStatus=$('topic-status');
   var data={}, els={}, files=[], commands=[], stream=null, done=false;
+  // Last markup written per message, so a sync that re-sends an unchanged message touches no DOM.
+  var sig={};
+  // Whether #log currently holds placeholders rather than messages, and whether the next sync is
+  // the one that opens a topic (which lands at the bottom no matter where the old one was read).
+  var skeleton=false, entering=true;
   var topic = new URLSearchParams(location.search).get('t') || '';
   var topics = [];
   var readCounts = {};
@@ -297,8 +325,8 @@ const SCRIPT = `
   function paint(id){
     var m=data[id]; if(!m) return;
     var el=els[id];
-    if(!el){ el=document.createElement('div'); log.appendChild(el); els[id]=el; }
-    el.className = 'm' + (m.own ? ' own' : '');
+    if(!el){ clearSkeleton(); el=document.createElement('div'); log.appendChild(el); els[id]=el; }
+    var cls = 'm' + (m.own ? ' own' : '');
     var h='';
     if(m.quote && m.quote.html) h += '<div class="q">'+m.quote.html+'</div>';
     h += '<div class="b">'+m.html+'</div>';
@@ -313,7 +341,14 @@ const SCRIPT = `
     }
     var meta = clock(m.at) + (m.reactions && m.reactions.length ? '  '+m.reactions.join(' ') : '');
     h += '<div class="t">'+text(meta)+'</div>';
+    // Write nothing when nothing changed. A sync re-paints every message it carries, and most of
+    // them are messages already on screen unchanged — rewriting innerHTML for those would drop
+    // the caret out of a selection, restart any <img> decode, and undo the enabled state of a
+    // button the click handler just disabled, all for identical markup.
+    if(sig[id]===h && el.className===cls) return;
+    el.className = cls;
     el.innerHTML = h;
+    sig[id] = h;
   }
 
   function upsert(m){ var stick=atBottom(); data[m.id]=m; paint(m.id); if(stick) toBottom(); }
@@ -321,6 +356,56 @@ const SCRIPT = `
   function drop(id){
     if(els[id]) { els[id].remove(); delete els[id]; }
     delete data[id];
+    delete sig[id];
+  }
+
+  /**
+   * Bring the transcript to exactly the list given, reusing what is already on screen.
+   *
+   * The predecessor emptied #log and rebuilt every message from the sync. That is what made
+   * entering a topic jarring: the scroll container was destroyed along with its scrollTop, then
+   * refilled and snapped, so a topic whose messages were ALREADY painted from cache still flashed
+   * through blank. Here an unchanged message is left untouched (paint writes nothing when the
+   * markup matches), and appendChild MOVES a node that already exists rather than cloning it — so
+   * ordering costs no re-creation either, and nothing re-runs the fade-in animation.
+   */
+  function reconcile(list){
+    clearSkeleton();
+    var keep={};
+    for(var i=0;i<list.length;i++){
+      var m=list[i];
+      keep[m.id]=1;
+      data[m.id]=m;
+      paint(m.id);
+      log.appendChild(els[m.id]);
+    }
+    var gone=[];
+    for(var id in els){ if(!keep[id]) gone.push(id); }
+    for(var j=0;j<gone.length;j++) drop(gone[j]);
+  }
+
+  /**
+   * Hold the shape of a transcript that has not arrived yet.
+   *
+   * Only ever shown into an EMPTY log: a topic painted from cache has real content to look at,
+   * and stacking placeholders under it would claim messages are still coming when the next event
+   * is going to replace what is there rather than extend it.
+   */
+  var SKELETON = '<div class="sk own"><i style="width:34%"></i></div>'
+    + '<div class="sk"><i style="width:86%"></i><i style="width:73%"></i><i style="width:41%"></i></div>'
+    + '<div class="sk own"><i style="width:52%"></i><i style="width:28%"></i></div>'
+    + '<div class="sk"><i style="width:79%"></i><i style="width:62%"></i></div>';
+
+  function showSkeleton(){
+    if(log.firstChild) return;
+    log.innerHTML = SKELETON;
+    skeleton = true;
+  }
+
+  function clearSkeleton(){
+    if(!skeleton) return;
+    skeleton = false;
+    log.innerHTML = '';
   }
 
   function paintTopics(){
@@ -383,6 +468,9 @@ const SCRIPT = `
     log.innerHTML='';
     data={};
     els={};
+    sig={};
+    skeleton=false;
+    entering=true;
     var cached = topicCache[id];
     if(cached && cached.length){
       for(var j=0;j<cached.length;j++){
@@ -390,6 +478,8 @@ const SCRIPT = `
         paint(cached[j].id);
       }
       toBottom();
+    } else {
+      showSkeleton();
     }
     connect();
   }
@@ -428,15 +518,20 @@ const SCRIPT = `
       if(topic && ev.topic !== topic) return;
       topic = ev.topic;
       history.replaceState(null,'','?t='+encodeURIComponent(topic));
-      log.innerHTML=''; data={}; els={};
-      for(var i=0;i<ev.messages.length;i++){ data[ev.messages[i].id]=ev.messages[i]; paint(ev.messages[i].id); }
+      // Where the reader was, decided BEFORE the transcript moves under them. Opening a topic goes
+      // to the bottom; a resync after a dropped connection must not yank someone out of the
+      // history they were reading, which is only a choice at all now that the reconcile leaves
+      // their scroll position intact.
+      var stick = entering || atBottom();
+      entering = false;
+      reconcile(ev.messages);
       setCachedMsgs(topic, ev.messages);
       readCounts[topic] = ev.messages.length;
       saveReads();
       commands = ev.commands || [];
       topics = ev.topics || [];
       paintTopics();
-      note.textContent=''; toBottom();
+      note.textContent=''; if(stick) toBottom();
     }
     else if(ev.t==='msg'){
       upsert(ev.msg);
@@ -504,6 +599,10 @@ const SCRIPT = `
 
   function connect(){
     if(stream) stream.close();
+    // Placeholders for the wait that is about to start. Guarded on an empty log inside, so a
+    // reconnect after a blip — where the conversation is still on screen and only the stream went
+    // away — is not answered by replacing it with skeletons.
+    showSkeleton();
     // EventSource resends the last id it saw on its own, so a blip is answered with the few
     // events that were missed rather than the whole conversation.
     stream = new EventSource('api/events' + (topic ? '?t='+encodeURIComponent(topic) : ''));

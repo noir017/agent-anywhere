@@ -59,6 +59,8 @@ interface Harness {
   el: (id: string) => HTMLElement;
   /** Messages currently painted in the transcript. */
   painted: () => number;
+  /** Placeholder blocks held in the transcript while a sync is in flight. */
+  skeletons: () => number;
   /** Topic rows currently painted in the sidebar. */
   rows: () => number;
   click: (selector: string) => Promise<void>;
@@ -161,7 +163,8 @@ async function open(opts: { url?: string; width?: number; height?: number } = {}
       if (!found) throw new Error(`#${id} is not in the document`);
       return found;
     },
-    painted: () => doc.getElementById('log')!.children.length,
+    painted: () => doc.getElementById('log')!.querySelectorAll(':scope > .m').length,
+    skeletons: () => doc.getElementById('log')!.querySelectorAll(':scope > .sk').length,
     rows: () => doc.getElementById('topics')!.children.length,
     click: async (selector) => {
       const target = doc.querySelector<HTMLElement>(selector);
@@ -224,6 +227,60 @@ describe('webui page: rendering', () => {
     expect(h.el('log').textContent).not.toContain('second');
   });
 
+  it('a sync reuses the elements already on screen instead of rebuilding the transcript', async () => {
+    // Entering a topic used to empty #log and repaint everything, which destroyed the scroll
+    // container along with its position and flashed through blank even when the messages were
+    // already there from cache. Node identity is the observable half of that: if these are the
+    // same elements afterwards, nothing was rebuilt and nothing re-ran the fade-in.
+    const h = await open();
+    await h.emit(sync('a1b2c3d4', [message('m1', '<p>first</p>'), message('m2', '<p>second</p>')], ['a1b2c3d4']));
+    const before = [...h.el('log').children];
+    expect(before).toHaveLength(2);
+
+    // A reconnect replays the same conversation with one more message on the end.
+    await h.emit(
+      sync('a1b2c3d4', [message('m1', '<p>first</p>'), message('m2', '<p>second</p>'), message('m3', '<p>third</p>')], ['a1b2c3d4'])
+    );
+    const after = [...h.el('log').children];
+    expect(after).toHaveLength(3);
+    expect(after[0]).toBe(before[0]);
+    expect(after[1]).toBe(before[1]);
+  });
+
+  it('a sync drops what the server no longer has, and reorders without re-creating', async () => {
+    const h = await open();
+    await h.emit(sync('a1b2c3d4', [message('m1', '<p>first</p>'), message('m2', '<p>second</p>')], ['a1b2c3d4']));
+    const kept = h.el('log').children[1];
+
+    // m1 aged out of the server's ring; m2 survives and is now the only thing in the topic.
+    await h.emit(sync('a1b2c3d4', [message('m2', '<p>second</p>')], ['a1b2c3d4']));
+    expect(h.painted()).toBe(1);
+    expect(h.el('log').children[0]).toBe(kept);
+    expect(h.el('log').textContent).not.toContain('first');
+  });
+
+  it('holds the shape of the transcript until the first sync lands, then gives the space back', async () => {
+    const h = await open();
+    // Nothing has been synced yet: the page is waiting on its very first payload.
+    expect(h.skeletons()).toBeGreaterThan(0);
+    expect(h.painted()).toBe(0);
+
+    await h.emit(sync('a1b2c3d4', [message('m1', '<p>first</p>')], ['a1b2c3d4']));
+    expect(h.skeletons()).toBe(0);
+    expect(h.painted()).toBe(1);
+  });
+
+  it('a reconnect with the conversation still on screen shows no placeholders', async () => {
+    // The skeleton answers "there is nothing here yet", not "the socket went away". Replacing a
+    // transcript someone is reading with grey bars every time the stream blips would be worse
+    // than the blank panel this replaced.
+    const h = await open();
+    await h.emit(sync('a1b2c3d4', [message('m1', '<p>first</p>')], ['a1b2c3d4']));
+    h.live().onerror?.();
+    expect(h.skeletons()).toBe(0);
+    expect(h.painted()).toBe(1);
+  });
+
   it('marks your own messages apart from the agent', async () => {
     // The only thing that separates the two sides of the transcript is this class, and the
     // stylesheet hangs a tinted panel off it. Painted onto the wrong side — or onto neither —
@@ -258,8 +315,10 @@ describe('webui page: topics', () => {
     expect(h.painted()).toBe(2);
 
     await h.click('[data-topic="b2c3d4e5"]');
-    // Nothing cached for B yet, and its stream has said nothing: an honest blank.
+    // Nothing cached for B yet and its stream has said nothing — so what is on screen is the
+    // shape of a transcript rather than either an empty panel or a message.
     expect(h.painted()).toBe(0);
+    expect(h.skeletons()).toBeGreaterThan(0);
     expect(h.live().url).toBe('api/events?t=b2c3d4e5');
 
     await h.click('[data-topic="a1b2c3d4"]');

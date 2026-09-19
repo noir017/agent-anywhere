@@ -189,6 +189,20 @@ Two consequences worth knowing:
   success. `StreamBuffer` answers it by sealing and continuing in a fresh message. A silent
   success would have it record text as delivered that nobody can see.
 
+**The page reconciles; it does not rebuild.** A `sync` carries the whole topic, and the obvious
+reading of that — empty `#log`, paint it again — is what made entering a topic jarring: the
+scroll container was destroyed along with its position, so a topic already painted from the
+session cache still flashed through blank on its way to looking identical, and every message
+re-ran its entrance animation. Instead each message in the sync is upserted by id, moved into
+place (`appendChild` on a node that already exists moves it rather than cloning it), and
+anything the sync no longer carries is dropped. `paint` writes no DOM at all when the markup it
+builds matches what is there, so an unchanged message is genuinely untouched — which is also
+what keeps a repaint from undoing the disabled state of a button the click handler just set.
+
+While a topic's first sync is in flight the log holds message-shaped placeholders (`.sk`).
+They are only ever shown into an EMPTY log: a topic painted from cache has real content to read,
+and a reconnect where the conversation is still on screen must not replace it with grey bars.
+
 ## Security
 
 New trust boundary, so it is spelled out. The port binds every interface by default and what

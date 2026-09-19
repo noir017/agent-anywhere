@@ -213,11 +213,12 @@ shared secret is what stands in its place.
   that promise's `finally`.
 - **A reverse proxy must not buffer**, and must not strip `Content-Encoding` without
   re-adding it. `proxy_buffering off;` in nginx.
-- **`page.ts` is invisible to the toolchain.** Not typechecked, not linted, not unit-tested —
-  to TypeScript it is a string. So the script is kept stupid, uses string concatenation
-  rather than template literals (a literal `` ` `` or `${` would be eaten by the surrounding
-  template and become a module-load error), and `page.test.ts` at least proves it parses.
-  Any change that needs a new *decision* belongs on the other side of the wire.
+- **`page.ts` is invisible to the toolchain.** Not typechecked, not linted — to TypeScript it is
+  a string. So the script is kept stupid, uses string concatenation rather than template literals
+  (a literal `` ` `` or `${` would be eaten by the surrounding template and become a module-load
+  error), and any change that needs a new *decision* belongs on the other side of the wire. It
+  is no longer untested, though: `page.dom.test.ts` runs it in jsdom, and a behavioural change
+  in there should arrive with a test, because nothing else in the repo can see it.
 - **The page can render nothing while the event stream is perfectly healthy**, and this has
   already shipped once. A client that names no topic sends `GET /api/events` with no `?t=`,
   and `stream()` answers for `topics.current()` — so the sync that comes back carries a topic
@@ -250,3 +251,24 @@ safety), `auth.test.ts` (constant-time compare, throttle, expiry), `protocol.tes
 rejection), `room.test.ts` and `index.test.ts` (the adapter contract), `server.test.ts` (real
 sockets: the auth gate, the CSRF locks, the download headers, and that `stop()` terminates
 with a stream open), `page.test.ts` (the script parses and nothing was eaten).
+
+`page.dom.test.ts` is the one that covers the client script's *behaviour*. It loads what the
+daemon serves into jsdom, stubs `EventSource` and `fetch`, and drives the page through the
+events `room.ts` actually emits — asserting on what a person would see: messages on screen, the
+drawer open or shut, where the URL points. Add to it whenever you touch `page.ts`; the string
+assertions in `page.test.ts` were green throughout the release that rendered nothing.
+
+Three things about it that are not obvious:
+
+- **The stubs are installed in `beforeParse`**, before the inline script runs. Evaluating the
+  script a second time to hand it a global would register every listener twice.
+- **jsdom does not evaluate `@media` at all**, so `getComputedStyle` always reports the desktop
+  cascade. The narrow-screen rules are asserted by walking `document.styleSheets`; the script's
+  own `narrow()` branches respond to `innerWidth` and are driven normally.
+- **Its CSSOM keeps only the last of two declarations of one property**, so the deliberate
+  `height:100vh; height:100dvh` fallback pair reads as collapsed there while being correct in a
+  browser. Do not rewrite the stylesheet to satisfy that.
+
+The suite is mutation-checked: restoring the sync-guard bug fails eight tests, removing the
+backdrop element fails the whole file, and dropping either the 16px field rule or the
+narrow-screen focus guard fails exactly the test that names it.

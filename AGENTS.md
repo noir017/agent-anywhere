@@ -107,8 +107,8 @@ edits are `void`-and-`catch`: a failure is logged and the turn continues.
 
 ## Testing
 
-Vitest, colocated: `foo.ts` is tested by `foo.test.ts` in the same directory. ~630
-tests across 43 files.
+Vitest, colocated: `foo.ts` is tested by `foo.test.ts` in the same directory. ~1670
+tests across 92 files.
 
 ```bash
 npm test              # vitest run
@@ -127,6 +127,13 @@ What is worth testing here: pure functions in `core/`, the parsers and renderers
 `ipc/protocol.ts` validation, `conversation-token-registry.ts`), and routing/gating
 decisions. What is not: Satori adapter plumbing and live network paths — there is no
 integration harness, so those are verified by hand.
+
+The one exception to "no browser, no DOM" is `platform/webui/page.dom.test.ts`, which runs the
+web UI's inline client script in jsdom. That script is a TypeScript string, so typecheck, lint
+and every other gate are blind to it — and a page that renders nothing has already shipped
+green once. Behaviour changes to `webui/page.ts` are expected to arrive with a test there; read
+[its README](src/platform/webui/README.md#testing) first, because jsdom's handling of `@media`
+and of duplicate declarations will otherwise mislead you.
 
 Lint rules are machine-enforced discipline, not suggestions: zero `any` in non-test
 code, no unused vars (`_`-prefix to opt out), `complexity ≤ 18`,

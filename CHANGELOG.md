@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.15.0] - 2026-09-19
+
 ### Added
 
 - **Topics in the web UI can be deleted directly from the sidebar.**

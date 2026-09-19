@@ -230,6 +230,8 @@ interface ConversationState {
   agentId: string;
   /** Model override (/model); undefined means use agent.model. */
   modelOverride?: string;
+  /** If set, reclaim this conversation's agent child as soon as the merger becomes idle. */
+  reclaimOnIdle?: boolean;
   /** Platform instance of the most recently routed message (a shared-scope conversation may hop instances). */
   platform: string;
   /**
@@ -562,6 +564,35 @@ export class ConversationRegistry {
    * Public because the timer is not the interesting part — the decision is, and the sweep is tested
    * by calling it against a controlled clock.
    */
+  /**
+   * Stop an idle resident agent child, preserving conversation state and session ID for later resumption.
+   * Returns true when the session child was actually disposed.
+   */
+  private reclaimSession(id: ConversationId, reason: string): boolean {
+    if (this.hooks?.hasPendingWork?.(id)) return false;
+    const session = this.agents.peek(id);
+    if (!session) return false; // never started here: nothing resident to reclaim
+    const reclaim = session.reclaimState?.() ?? 'unresumable';
+    if (reclaim === 'no-child') return false; // already down (an earlier sweep, or a crash)
+    if (reclaim === 'unresumable') {
+      if (!this.unresumableWarned.has(id)) {
+        this.unresumableWarned.add(id);
+        console.warn(
+          `[reclaim] ${id} is idle but its agent cannot resume a stored session; leaving the child ` +
+            `resident (stopping it would silently restart the conversation)`
+        );
+      }
+      return false;
+    }
+
+    // dispose() on the SESSION, not on the factory: the factory would drop the handle as well,
+    // and with it this conversation's runtime /model choice. Both runtimes reset their handles
+    // and respawn on the next turn — the same self-healing path a crashed child takes.
+    session.dispose();
+    console.log(`[reclaim] ${id} ${reason} — agent child stopped; the next message resumes it`);
+    return true;
+  }
+
   reclaimIdleSessions(): void {
     const idleMs = this.config.session.idleTimeoutMs;
     if (!(idleMs > 0)) return; // disabled, or absent from a hand-built config (see startIdleSweeper)
@@ -569,31 +600,23 @@ export class ConversationRegistry {
     for (const [id, state] of this.conversations) {
       if (now - state.lastActivityAt <= idleMs) continue;
       if (!state.merger.isIdle()) continue;
-      if (this.hooks?.hasPendingWork?.(id)) continue;
-
-      const session = this.agents.peek(id);
-      if (!session) continue; // never started here: nothing resident to reclaim
-      const reclaim = session.reclaimState?.() ?? 'unresumable';
-      if (reclaim === 'no-child') continue; // already down (an earlier sweep, or a crash)
-      if (reclaim === 'unresumable') {
-        if (!this.unresumableWarned.has(id)) {
-          this.unresumableWarned.add(id);
-          console.warn(
-            `[reclaim] ${id} is idle but its agent cannot resume a stored session; leaving the child ` +
-              `resident (stopping it would silently restart the conversation)`
-          );
-        }
-        continue;
-      }
-
-      // dispose() on the SESSION, not on the factory: the factory would drop the handle as well,
-      // and with it this conversation's runtime /model choice. Both runtimes reset their handles
-      // and respawn on the next turn — the same self-healing path a crashed child takes.
-      session.dispose();
       const idleMin = Math.round((now - state.lastActivityAt) / 60_000);
-      console.log(
-        `[reclaim] ${id} idle for ${idleMin}m — agent child stopped; the next message resumes it`
-      );
+      this.reclaimSession(id, `idle for ${idleMin}m`);
+    }
+  }
+
+  /**
+   * Called when an ask timed out after 1h with no response from the user.
+   * Reclaims the agent child process (session.dispose()) as soon as the conversation is idle,
+   * so that memory is freed while the stored session ID is preserved for later resumption.
+   */
+  reclaimAfterAskTimeout(id: ConversationId): void {
+    const state = this.conversations.get(id);
+    if (!state) return;
+    if (state.merger.isIdle()) {
+      this.reclaimSession(id, 'ask timed out (1h)');
+    } else {
+      state.reclaimOnIdle = true;
     }
   }
 
@@ -800,6 +823,7 @@ export class ConversationRegistry {
     // every gate above so it can't become a probe: a message that isn't going to be answered gets no
     // acknowledgement of any kind.
     this.sendHeader(state, msg);
+    state.reclaimOnIdle = false;
     void state.merger.ingest(msg);
   }
 
@@ -2127,6 +2151,7 @@ ${formatTokens(left)} left before compaction — ${name}`;
     const state = this.conversations.get(id);
     if (!state) return false;
     state.platform = msg.conversation.platform;
+    state.reclaimOnIdle = false;
     void state.merger.ingest(msg);
     return true;
   }
@@ -2267,7 +2292,14 @@ ${formatTokens(left)} left before compaction — ${name}`;
         // The turn ended and nothing is queued behind it: that instant, not the moment the message
         // arrived, is when this conversation started being idle. Reclaim measures from here, which
         // is why a task that runs for hours is never a candidate while it runs.
-        onIdle: () => this.touch(conversationId),
+        onIdle: () => {
+          this.touch(conversationId);
+          const state = this.conversations.get(conversationId);
+          if (state?.reclaimOnIdle) {
+            state.reclaimOnIdle = false;
+            this.reclaimSession(conversationId, 'ask timed out (1h)');
+          }
+        },
       }
     );
   }

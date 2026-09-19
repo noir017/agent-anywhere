@@ -24,11 +24,21 @@ const channelId = z.string().min(1).optional();
  *
  * Lives in the protocol rather than in either side because BOTH sides need it and they need the
  * same number: the daemon arms its timer with it, and the CLI sizes its own socket deadline as this
- * plus a margin. They used to hold separate copies of `120_000`, which is the kind of duplication
- * that survives right up until one of them is tuned — and then the CLI abandons a question the
- * daemon is still waiting on, reporting "no selection" while the buttons are live in the chat.
+ * plus a margin. Default is 1 hour (3,600,000ms), matching session.idleTimeoutMs.
  */
-export const DEFAULT_ASK_TIMEOUT_MS = 600_000;
+export const DEFAULT_ASK_TIMEOUT_MS = 3_600_000;
+
+/**
+ * How long an unanswered `ask` waits before sending an intermediate reminder notice.
+ * Default is 30 minutes (1,800,000ms).
+ */
+export const DEFAULT_ASK_REMINDER_MS = 1_800_000;
+
+/**
+ * Intermediate reminder message sent when a question has been pending with no answer for 30 minutes.
+ */
+export const DEFAULT_ASK_REMINDER_TEXT =
+  '⏳ Still waiting for a response to the question above (30 minutes elapsed). Click an option or type a reply; the question will automatically close after 1 hour.';
 
 /** Extra socket-deadline headroom the CLI adds on top of the ask timeout, so the daemon gives up first. */
 export const ASK_CLIENT_TIMEOUT_MARGIN_MS = 10_000;
@@ -132,7 +142,6 @@ type _AssertActionAligned = [
   IpcAction extends z.infer<typeof IpcActionSchema> ? true : never,
   z.infer<typeof IpcActionSchema> extends IpcAction ? true : never,
 ];
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
 const _assertActionAligned: _AssertActionAligned = [true, true];
 
 export interface IpcRequest {

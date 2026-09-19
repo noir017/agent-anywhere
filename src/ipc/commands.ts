@@ -248,7 +248,7 @@ export const REVERSE_COMMANDS: ReverseCommandSpec[] = [
     // ask entirely — which is worse than the unanswered question it started with.
     hint:
       'Ask a clarifying question (blocks until the user chooses): agent-anywhere ask "question" ' +
-      '-o optionA -o optionB [--timeout <ms>, default 10min] (writes the chosen label to stdout; ' +
+      '-o optionA -o optionB [--timeout <ms>, default 1h] (writes the chosen label to stdout; ' +
       'empty stdout plus a stderr note means nobody clicked in time — the question WAS delivered, ' +
       'so follow up in plain text instead of assuming the command is broken)',
     // Only where the harness has no question tool of its own. On claude the model asks over ACP

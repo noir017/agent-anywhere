@@ -680,13 +680,16 @@ convenience over plain text. Duplicate names are deduped defensively (Telegram r
 the whole `setMyCommands` batch on one duplicate).
 
 **`ask` buttons.** `handleAsk` posts a button message and suspends the IPC response until
-a click or timeout (default 120 s), then returns `{ chosen }` to the blocked CLI process.
+a click or timeout (default 1 h, matching `session.idleTimeoutMs`), then returns `{ chosen }` to
+the blocked CLI process. An intermediate reminder is posted after 30 minutes if no answer has arrived.
 Button ids are `ask:<reqId>:<index>` — the **index**, not the label, because Telegram
 caps `callback_data` at 64 bytes and a longer id degrades to a lossy hash. On resolve or
-timeout the buttons are stripped and the message annotated. On shutdown every pending ask
-is resolved `null` so no caller hangs forever. A pending ask also holds its conversation
-against idle reclaim (`hasPendingWork`): from the registry's side that conversation looks
-idle, while a CLI process sits blocked on a button nobody has pressed yet.
+timeout the buttons are stripped and the message annotated. On 1 h timeout, the resident agent
+child process is automatically reclaimed to free system resources (either immediately if idle, or as
+soon as the turn settles). When the user later responds, the session is resumed seamlessly via
+ACP `session/load` or agy `--conversation`. On shutdown every pending ask is resolved `null` so no
+caller hangs forever. While pending, an ask also holds its conversation against idle reclaim
+(`hasPendingWork`) until the ask timeout fires.
 
 **Harness pickers** — the bare form of an agent command (`/cc`, `/oc`) — post the agent's
 *reported* commands as buttons, never a guessed list. Names already reachable through the

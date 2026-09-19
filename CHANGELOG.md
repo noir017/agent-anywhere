@@ -7,6 +7,11 @@ All notable changes to this project are documented here. The format is based on
 
 ### Changed
 
+- **Agent questions (`ask`) wait up to 1 hour, post a 30-minute reminder notice, and reclaim the resident process upon timing out.**
+  - The previous 10-minute timeout caused questions to close prematurely if the operator stepped away, while an indefinite wait would tie up hundreds of megabytes of resident agent memory indefinitely.
+  - Clarifying questions now remain open for 1 hour by default (matching `session.idleTimeoutMs`). If unanswered after 30 minutes, an intermediate reminder notice is automatically posted to the channel.
+  - When the 1-hour window expires without a response, buttons are retired, the question is marked timed out, and the resident agent child process is reclaimed cleanly. When the user eventually responds, the conversation is automatically rehydrated from stored session state (via ACP `session/load` or agy `--conversation`) and their answer is processed as normal.
+
 - **Repository metadata and README links now point at this fork rather than at the repository it came from.**
   - `repository`, `homepage` and `bugs` in `package.json` still named the upstream repo, so `npm bugs` opened their tracker and the npm page linked to their code. The README badge rendered *their* CI status, and the `npx skills add` one-liner installed *their* skill rather than the one in this tree — the four references a reader is most likely to act on all pointed at a different project. All now point here.
   - Both READMEs credit the origin in their License section. `LICENSE` is unchanged and still carries the upstream copyright notice, which is what MIT asks for and what covers this tree too.

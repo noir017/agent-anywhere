@@ -237,4 +237,35 @@ describe('idle reclaim', () => {
 
     expect(h.disposed).toEqual([KEY]);
   });
+
+  it('reclaimAfterAskTimeout stops the child immediately when conversation is idle', async () => {
+    const h = rig();
+    h.reg.route(inbound('hello', 'm1'));
+    await drain();
+
+    expect(h.disposed).toEqual([]);
+    h.reg.reclaimAfterAskTimeout(KEY);
+    expect(h.disposed).toEqual([KEY]);
+  });
+
+  it('reclaimAfterAskTimeout defers reclaim if a turn is running, and stops child when turn ends', async () => {
+    let finishTurn: () => void = () => {};
+    const turnPromise = new Promise<void>((resolve) => {
+      finishTurn = resolve;
+    });
+    const h = rig();
+    const session = h.factory.getOrCreate(KEY, 'cc');
+    (session as unknown as { runTurn: () => Promise<void> }).runTurn = () => turnPromise;
+
+    h.reg.route(inbound('hello', 'm1'));
+    await new Promise((r) => setTimeout(r, 10));
+
+    h.reg.reclaimAfterAskTimeout(KEY);
+    expect(h.disposed).toEqual([]);
+
+    finishTurn();
+    await drain();
+
+    expect(h.disposed).toEqual([KEY]);
+  });
 });

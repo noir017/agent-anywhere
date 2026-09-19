@@ -82,7 +82,11 @@ import type { WorkdirUsageStore } from './workdir-usage.js';
 import { resolvePageSize } from '../core/paging.js';
 import { IpcServer } from '../ipc/server.js';
 import type { IpcAction } from '../ipc/protocol.js';
-import { DEFAULT_ASK_TIMEOUT_MS as PROTOCOL_DEFAULT_ASK_TIMEOUT_MS } from '../ipc/protocol.js';
+import {
+  DEFAULT_ASK_TIMEOUT_MS as PROTOCOL_DEFAULT_ASK_TIMEOUT_MS,
+  DEFAULT_ASK_REMINDER_MS,
+  DEFAULT_ASK_REMINDER_TEXT,
+} from '../ipc/protocol.js';
 
 /** Valid slash name: lowercase/digit/_/-, 1-32 chars (Discord constraint). Non-matching names are skipped on registration. */
 const SLASH_NAME_RE = /^[a-z0-9_-]{1,32}$/;
@@ -275,6 +279,7 @@ interface ElicitGap {
 interface PendingAsk {
   resolve: (outcome: AskOutcome | null) => void;
   timer: NodeJS.Timeout;
+  reminderTimer?: NodeJS.Timeout;
   ref: MessageRef;
   labels: string[];
   prompt: string;
@@ -646,6 +651,7 @@ export class Daemon {
     for (const pending of this.pendingAsks.values()) {
       try {
         clearTimeout(pending.timer);
+        if (pending.reminderTimer) clearTimeout(pending.reminderTimer);
         pending.resolve(null);
       } catch {
         // Cleanup must not block exit; swallow and continue to the next item.
@@ -809,10 +815,30 @@ export class Daemon {
     return platform.sendButtons(address, prompt, buttons).then(
       (ref) =>
         new Promise<AskOutcome | null>((resolve) => {
-          const timer = setTimeout(() => this.settleAsk(reqId, null, '(timed out)'), timeoutMs);
+          const timer = setTimeout(() => {
+            if (this.settleAsk(reqId, null, '(timed out)')) {
+              if (conversationId !== undefined && timeoutMs >= DEFAULT_ASK_TIMEOUT_MS) {
+                this.registry.reclaimAfterAskTimeout(conversationId);
+              }
+            }
+          }, timeoutMs);
+          const reminderTimer =
+            timeoutMs > DEFAULT_ASK_REMINDER_MS
+              ? setTimeout(() => {
+                  void platform
+                    .sendMessage(address, DEFAULT_ASK_REMINDER_TEXT)
+                    .catch((err) =>
+                      console.warn(
+                        `[ask] ${conversationId ?? reqId}: failed to send reminder notice:`,
+                        err instanceof Error ? err.message : err
+                      )
+                    );
+                }, DEFAULT_ASK_REMINDER_MS)
+              : undefined;
           this.pendingAsks.set(reqId, {
             resolve,
             timer,
+            reminderTimer,
             ref,
             labels,
             prompt,
@@ -838,6 +864,7 @@ export class Daemon {
     const pending = this.pendingAsks.get(reqId);
     if (!pending) return false;
     clearTimeout(pending.timer);
+    if (pending.reminderTimer) clearTimeout(pending.reminderTimer);
     this.pendingAsks.delete(reqId);
     pending.resolve(outcome);
     this.retireAsk(pending, shown);

@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.18.0] - 2026-09-19
+
 ### Fixed
 
 - **A question the agent asked with "select all that apply" could only be answered with one option.** The wire shape for a multi-select question was parsed correctly — `type: 'array'`, options under `items.anyOf` — and then collected with the ordinary one-tap question and sent back as a single-element array, so the model asked for several answers and was told one. The round is now a stateful bubble: every option carries its own checkbox, a tap toggles it and repaints the row, and a Done button sitting one index past the options resolves with everything ticked, in the order the agent listed them rather than the order they were tapped. Done with nothing ticked says so and leaves the question up — there is no answer to give, and doing nothing at all reads as the bot ignoring the tap. Because all of that rests on repainting buttons that are already posted, it happens only where the platform can replace them (Discord, Telegram, Slack, Lark, the web UI); on LINE and QQ the round stays one tap and the message says why, pointing at typing, which genuinely carries several answers since a typed reply travels under the question's own free-text field and the harness prefers it over the enum.

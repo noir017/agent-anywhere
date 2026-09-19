@@ -191,7 +191,9 @@ Do not weaken these without saying so explicitly in the PR:
 
 ## Git
 
-- Branches: work lands on `dev`, PRs target `main`.
+- Branches: work lands on `main`. `dev` was the integration branch through 1.15.1 and is no
+  longer used — do not branch from it or push to it. This also means CI (`ci.yml`, which only
+  triggers on `main`) now actually sees your work before a release does.
 - Merges use `--no-ff` (a real merge commit), never fast-forward.
 - Commits carry no AI attribution or generated-with trailers.
 - User-visible changes get a `CHANGELOG.md` entry under `## [Unreleased]`

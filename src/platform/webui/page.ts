@@ -61,6 +61,9 @@ body{background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,-apple-system,
 
 #sidebar{width:240px;flex:0 0 240px;background:#171717;border-right:1px solid var(--line);display:flex;flex-direction:column;height:100%;transition:margin-left .18s ease;z-index:10}
 #sidebar.collapsed{margin-left:-240px}
+/* Only ever on screen under the narrow-screen rules below, where the sidebar is an overlay
+   rather than a column and there is otherwise nothing to tap to dismiss it. */
+#backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:5}
 #sidebar-header{display:flex;align-items:center;gap:6px;padding:10px 12px;border-bottom:1px solid var(--line);min-height:42px}
 .sidebar-title{flex:1;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--dim)}
 .btn-icon{background:none;border:0;padding:4px 7px;color:var(--dim);font:inherit;font-size:13px;cursor:pointer;border-radius:4px;line-height:1}
@@ -122,11 +125,36 @@ button:disabled{opacity:.5;cursor:default}
 .chip{background:var(--field);border:1px solid var(--line);border-radius:3px;padding:1px 6px;font-size:12px;color:var(--dim)}
 .files{margin-top:6px;display:flex;flex-wrap:wrap;gap:6px}
 #row{display:flex;gap:8px;align-items:flex-end}
-#input{flex:1;resize:none;max-height:40vh;padding:8px 10px;background:var(--field);color:var(--fg);border:1px solid var(--line);border-radius:4px;font:inherit}
+#input{flex:1;resize:none;max-height:40vh;max-height:40dvh;padding:8px 10px;background:var(--field);color:var(--fg);border:1px solid var(--line);border-radius:4px;font:inherit;overflow-y:auto}
 #input:focus,#login input:focus{outline:none;border-color:#3d3d3d}
 #note{color:var(--dim);font-size:12px;padding:0 16px 8px;max-width:860px;width:100%;margin:0 auto}
+/* Phones and tablets held upright. Everything here is about the parts of a handset a desktop
+   layout has no concept of: a URL bar that eats viewport height, a home indicator under the
+   composer, Safari's zoom-on-focus, and a finger instead of a pointer. */
 @media(max-width:640px){
-  #sidebar{position:absolute;box-shadow:3px 0 12px rgba(0,0,0,.6)}
+  /* height:100% resolves against a viewport that still counts the collapsing browser chrome,
+     so the composer sits below the fold until the page is scrolled. dvh is the height actually
+     on screen; the plain vh declaration above it stays as the fallback for older engines. */
+  html,body{height:100vh;height:100dvh}
+  /* A column 240px wide leaves nothing of the chat on a 360px screen, so it becomes a drawer
+     over it, dismissed by tapping the backdrop. Fixed rather than absolute so it tracks the
+     visible viewport as the URL bar collapses instead of the taller page box behind it, and
+     the collapsed offset moves with the width — -240px would leave a strip of a 300px drawer
+     still on screen. */
+  #sidebar{position:fixed;top:0;bottom:0;left:0;height:auto;width:min(82vw,300px);flex-basis:min(82vw,300px);box-shadow:3px 0 12px rgba(0,0,0,.6)}
+  #sidebar.collapsed{margin-left:-100%}
+  #backdrop{display:block}
+  #topics .topic-item{padding:10px 9px}
+  #chat-header{padding:8px 12px}
+  .chat-title{max-width:none}
+  #log{padding:14px 12px 6px}
+  #typing,#note{padding-left:12px;padding-right:12px}
+  /* env() keeps the Send row clear of the home indicator rather than under it. */
+  #bar{padding:8px 12px calc(10px + env(safe-area-inset-bottom,0px))}
+  /* Safari zooms the whole page in when a field it focuses is under 16px, and it does not zoom
+     back out afterwards — every tap on the composer would leave the page a little larger. */
+  #input,#secret{font-size:16px}
+  #input{max-height:30dvh}
 }
 `;
 
@@ -136,7 +164,7 @@ const SCRIPT = `
   var log=$('log'), app=$('app'), gate=$('login'), err=$('err'), input=$('input'),
       chips=$('chips'), hints=$('hints'), typing=$('typing'), note=$('note'), picker=$('picker'),
       bar=$('topics'), sidebar=$('sidebar'), collapseBtn=$('collapse-sidebar'),
-      expandBtn=$('expand-sidebar'), newTopicBtn=$('new-topic'),
+      expandBtn=$('expand-sidebar'), newTopicBtn=$('new-topic'), backdrop=$('backdrop'),
       chatTitle=$('topic-title'), chatStatus=$('topic-status');
   var data={}, els={}, files=[], commands=[], stream=null, done=false;
   var topic = new URLSearchParams(location.search).get('t') || '';
@@ -187,27 +215,30 @@ const SCRIPT = `
     saveCache();
   }
 
+  // The one place the narrow-screen breakpoint lives on this side of the wire. It has to stay
+  // the same number as the @media rule above: the CSS turns the sidebar into an overlay, and
+  // this decides whether opening a topic should then get it back out of the way.
+  var NARROW = 640;
+  function narrow(){ return window.innerWidth <= NARROW; }
+
   var sidebarOpen = localStorage.getItem('aa_sb_open');
-  if(sidebarOpen === null){ sidebarOpen = window.innerWidth > 640 ? '1' : '0'; }
+  if(sidebarOpen === null){ sidebarOpen = narrow() ? '0' : '1'; }
   function applySidebar(){
-    if(sidebarOpen === '0'){
-      sidebar.className = 'collapsed';
-      expandBtn.hidden = false;
-    } else {
-      sidebar.className = '';
-      expandBtn.hidden = true;
-    }
+    var open = sidebarOpen !== '0';
+    sidebar.className = open ? '' : 'collapsed';
+    expandBtn.hidden = open;
+    // Hidden wins over the media query's display:block, so on a wide screen this stays off
+    // regardless of the drawer's state.
+    backdrop.hidden = !open;
   }
-  collapseBtn.addEventListener('click', function(){
-    sidebarOpen = '0';
-    try { localStorage.setItem('aa_sb_open', '0'); } catch(x){}
+  function setSidebar(open){
+    sidebarOpen = open ? '1' : '0';
+    try { localStorage.setItem('aa_sb_open', sidebarOpen); } catch(x){}
     applySidebar();
-  });
-  expandBtn.addEventListener('click', function(){
-    sidebarOpen = '1';
-    try { localStorage.setItem('aa_sb_open', '1'); } catch(x){}
-    applySidebar();
-  });
+  }
+  collapseBtn.addEventListener('click', function(){ setSidebar(false); });
+  expandBtn.addEventListener('click', function(){ setSidebar(true); });
+  backdrop.addEventListener('click', function(){ setSidebar(false); });
   applySidebar();
 
   function text(s){ var d=document.createElement('div'); d.textContent=s==null?'':String(s); return d.innerHTML; }
@@ -356,7 +387,11 @@ const SCRIPT = `
 
   function handle(ev){
     if(ev.t==='sync'){
-      if(ev.topic !== topic) return;
+      // Only a sync for a topic we have since left is stale enough to drop. A first visit has
+      // no topic at all — nothing put ?t= in the URL yet — and the server answers by picking
+      // one for us, so testing ev.topic against an empty string threw away the only sync that
+      // visit was ever going to get and left the page an empty shell.
+      if(topic && ev.topic !== topic) return;
       topic = ev.topic;
       history.replaceState(null,'','?t='+encodeURIComponent(topic));
       log.innerHTML=''; data={}; els={};
@@ -439,7 +474,9 @@ const SCRIPT = `
     // events that were missed rather than the whole conversation.
     stream = new EventSource('api/events' + (topic ? '?t='+encodeURIComponent(topic) : ''));
     stream.onmessage = function(e){ try{ handle(JSON.parse(e.data)); }catch(x){} };
-    stream.onopen = function(){ gate.hidden=true; app.hidden=false; note.textContent=''; input.focus(); };
+    // Not focused on a phone: the keyboard would come up before a word has been read, and on
+    // a portrait screen that is half the viewport gone to reach a field nobody asked for yet.
+    stream.onopen = function(){ gate.hidden=true; app.hidden=false; note.textContent=''; if(!narrow()) input.focus(); };
     stream.onerror = function(){
       if(done) return;
       if(stream.readyState === 2){
@@ -465,11 +502,7 @@ const SCRIPT = `
     var id = b.getAttribute('data-topic');
     if(!id || id===topic) return;
     switchTopic(id);
-    if(window.innerWidth <= 640){
-      sidebarOpen = '0';
-      try { localStorage.setItem('aa_sb_open', '0'); } catch(x){}
-      applySidebar();
-    }
+    if(narrow()) setSidebar(false);
   });
 
   bar.addEventListener('keydown', function(e){
@@ -488,11 +521,7 @@ const SCRIPT = `
     post('api/topics',{},1).then(function(r){ return r.ok ? r.json() : null; }).then(function(d){
       if(!d || !d.topic) return;
       switchTopic(d.topic.id);
-      if(window.innerWidth <= 640){
-        sidebarOpen = '0';
-        try { localStorage.setItem('aa_sb_open', '0'); } catch(x){}
-        applySidebar();
-      }
+      if(narrow()) setSidebar(false);
     });
   }
 
@@ -515,7 +544,11 @@ const SCRIPT = `
       .catch(function(){ b.disabled=false; });
   });
 
-  function grow(){ input.style.height='auto'; input.style.height=Math.min(input.scrollHeight, window.innerHeight*0.4)+'px'; }
+  // Grow to fit, and let the max-height in the stylesheet decide where to stop — it is stated
+  // in dvh there, which on a phone with the keyboard up is the viewport that is actually left.
+  // Clamping here as well would mean two numbers for one cap, and the JS one cannot see which
+  // media query won.
+  function grow(){ input.style.height='auto'; input.style.height=input.scrollHeight+'px'; }
 
   function renderChips(){
     var h='';
@@ -615,6 +648,7 @@ const PAGE = `<!doctype html>
     </div>
     <div id="topics"></div>
   </aside>
+  <div id="backdrop" hidden></div>
   <section id="chat">
     <div id="chat-header">
       <button type="button" class="btn-icon" id="expand-sidebar" title="Show topics" hidden>☰</button>

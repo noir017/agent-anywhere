@@ -100,4 +100,26 @@ describe('webui page', () => {
     expect(html).toContain('MAX_CACHE_TOPICS');
     expect(html).toContain('MAX_CACHE_MSGS');
   });
+
+  it('accepts the sync for a topic it did not name', () => {
+    // A visit with no ?t= starts with topic === '', and the server answers by picking a topic
+    // for the client — so a bare `ev.topic !== topic` drops the only sync that visit will ever
+    // get and the page stays an empty shell with a healthy event stream behind it. The guard
+    // must only fire once we are actually on a topic.
+    expect(html).toContain('if(topic && ev.topic !== topic) return;');
+  });
+
+  it('adapts to a screen held upright', () => {
+    expect(html).toContain('@media(max-width:640px)');
+    // The drawer needs something to tap beside itself, or the only way out on a phone is the
+    // one button it covers half the screen to show.
+    expect(html).toContain('id="backdrop"');
+    // dvh, not vh: the mobile URL bar is counted by the latter and not by the former, and the
+    // difference is whether the composer is on screen.
+    expect(html).toContain('100dvh');
+    // Under 16px, Safari zooms the page in on focus and never zooms back out.
+    expect(html).toContain('#input,#secret{font-size:16px}');
+    // The Send row belongs above the home indicator, not under it.
+    expect(html).toContain('env(safe-area-inset-bottom');
+  });
 });

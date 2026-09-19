@@ -5,6 +5,18 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **The web UI showed an empty page while its event stream was working perfectly.**
+  - Opening the UI at its own address — no `?t=` on the URL, which is how anyone reaches it the first time — rendered nothing at all: no messages, no topic list, no title. The stream was connected and the `sync` event was arriving; the browser was throwing it away.
+  - The stale-sync guard added alongside the 1.15.0 message cache compared the event's topic against the client's own, but a first visit has no topic yet — the server is the one that picks it, precisely because the client named none. Comparing against the empty string discarded the only `sync` that visit was ever going to receive, and the page had no second chance to ask. The guard now only fires once the client is actually on a topic, so the server's choice is accepted and written into the URL for the reload after it.
+
+### Changed
+
+- **The web UI is usable on a phone held upright.**
+  - It was laid out for a desktop and only conceded a narrow screen the sidebar's position. On a portrait handset the composer sat under the collapsing URL bar, tapping it zoomed the page in and left it there, the Send row hid behind the home indicator, and the topic drawer covered the chat with nothing but the one button it obscured to dismiss it.
+  - Below 640px the sidebar is now a fixed drawer sized to the screen with a backdrop that closes it, viewport heights are stated in `dvh` so the composer stays where the browser chrome actually ends, the composer and token fields are 16px because Safari zooms in below that and never zooms back out, the Send row clears the home indicator via `env(safe-area-inset-bottom)`, and the input is no longer focused on open — the keyboard took half the screen before anything had been read.
+
 ## [1.15.0] - 2026-09-19
 
 ### Added

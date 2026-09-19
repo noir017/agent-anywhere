@@ -218,6 +218,21 @@ shared secret is what stands in its place.
   rather than template literals (a literal `` ` `` or `${` would be eaten by the surrounding
   template and become a module-load error), and `page.test.ts` at least proves it parses.
   Any change that needs a new *decision* belongs on the other side of the wire.
+- **The page can render nothing while the event stream is perfectly healthy**, and this has
+  already shipped once. A client that names no topic sends `GET /api/events` with no `?t=`,
+  and `stream()` answers for `topics.current()` — so the sync that comes back carries a topic
+  id the page never asked for. Any filter of the form `ev.topic !== topic` therefore drops the
+  only sync a first visit will ever get, and the symptom is an empty shell with data visibly
+  arriving in the network panel. The client's `topic` is the empty string until a sync or a
+  click sets it; a guard against a stale sync has to check that it is set at all first.
+- **The narrow-screen breakpoint is stated twice** — the `@media(max-width:640px)` block and
+  `NARROW` in the script — because CSS decides the layout and the script decides whether
+  picking a topic should then close the drawer. They have to hold the same number. Under it
+  the sidebar is a fixed-position drawer over the chat with a backdrop to dismiss it, heights
+  are `dvh` so the collapsing URL bar does not push the composer off screen, the composer and
+  the token field are 16px so Safari does not zoom in on focus and stay there, the Send row
+  clears the home indicator via `env(safe-area-inset-bottom)`, and the input is not focused on
+  open — the keyboard would take half the viewport before a word had been read.
 - **A reverse proxy must not buffer.** nginx buffers SSE by default; the response carries
   `X-Accel-Buffering: no` and `Cache-Control: no-transform`, but a proxy configured to ignore
   them shows nothing until the turn ends, which reads exactly like a hung daemon. Set

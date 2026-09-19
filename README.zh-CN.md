@@ -440,6 +440,6 @@ npx skills add https://github.com/noir017/agent-anywhere/tree/main/skill -g
 [MIT](LICENSE)
 
 本项目起初是 [l0ng-ai/agent-anywhere](https://github.com/l0ng-ai/agent-anywhere) 在 `3d855f8`
-处的一个分支，原作者的架构设计（尤其是 platform 的 profile 抽象层）至今仍是这套代码的骨架。
-此后两边已大幅分化、各自独立开发，不再相互跟踪。上游的 MIT 版权声明保留在
-[LICENSE](LICENSE) 中，该声明同时覆盖两边的代码。
+处的一个分支，原作者的架构设计（尤其是 platform 的 profile 抽象层）至今仍是这套代码的骨架，
+此后在其基础上做了大量扩展。上游的 MIT 版权声明保留在 [LICENSE](LICENSE) 中，该声明同时
+覆盖两边的代码。

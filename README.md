@@ -500,6 +500,5 @@ plus an index of the per-module docs ([config](src/config/README.md) ·
 
 This project began as a fork of [l0ng-ai/agent-anywhere](https://github.com/l0ng-ai/agent-anywhere)
 at `3d855f8`, and the original architecture — the platform profile seam in particular — is still
-recognisable underneath. It has since diverged substantially and is developed independently; the
-two no longer track each other. The upstream MIT copyright notice is retained in [LICENSE](LICENSE),
-which covers both codebases.
+recognisable underneath. It has grown a long way past that point since. The upstream MIT copyright
+notice is retained in [LICENSE](LICENSE), which covers both codebases.

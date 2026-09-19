@@ -7,9 +7,8 @@ All notable changes to this project are documented here. The format is based on
 
 ### Changed
 
-- **The project is now developed independently of the repository it was forked from.**
-  - It began as a fork of `l0ng-ai/agent-anywhere` at `3d855f8` and has since gone 135 commits and roughly 44,000 lines past that point, from their `0.3.1` to `1.15.1` here. Upstream was told ([their issue #3](https://github.com/l0ng-ai/agent-anywhere/issues/3)) and is welcome to take anything under the shared MIT licence; the two trees no longer track each other.
-  - `repository`, `homepage` and `bugs` in `package.json` pointed at the upstream repo, so `npm bugs` opened their tracker and the npm page linked to their code. The README badge rendered *their* CI status, and the `npx skills add` one-liner installed *their* skill rather than the one in this tree — the four references people were most likely to act on were all aimed at the wrong project. All now point here.
+- **Repository metadata and README links now point at this fork rather than at the repository it came from.**
+  - `repository`, `homepage` and `bugs` in `package.json` still named the upstream repo, so `npm bugs` opened their tracker and the npm page linked to their code. The README badge rendered *their* CI status, and the `npx skills add` one-liner installed *their* skill rather than the one in this tree — the four references a reader is most likely to act on all pointed at a different project. All now point here.
   - Both READMEs credit the origin in their License section. `LICENSE` is unchanged and still carries the upstream copyright notice, which is what MIT asks for and what covers this tree too.
 
 ## [1.15.1] - 2026-09-19

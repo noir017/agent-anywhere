@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.15.1] - 2026-09-19
+
 ### Fixed
 
 - **The web UI showed an empty page while its event stream was working perfectly.**

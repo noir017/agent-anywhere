@@ -323,6 +323,25 @@ describe('webui page: topics', () => {
     expect(h.doc.querySelector('.topic-title')?.textContent).toBe('Topic a1b2c3d4');
   });
 
+  it('survives a directory name with a quote in it', async () => {
+    // The path goes into a title attribute, and textContent-based escaping leaves the quote
+    // alone — so an unescaped one ends the attribute and spills the rest of the path into the
+    // tag. Legal on every filesystem this runs on, and the row is unreadable when it happens.
+    const h = await open({ url: 'http://localhost:8787/?t=a1b2c3d4' });
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+
+    await h.emit({
+      t: 'topics',
+      topics: [{ id: 'a1b2c3d4', title: 'odd', lastAt: 1, msgCount: 0, dir: { name: 'say "hi"', path: '/tmp/say "hi"' } }],
+    });
+
+    const dir = h.doc.querySelector('.topic-dir');
+    expect(dir?.textContent).toBe('say "hi"');
+    expect(dir?.getAttribute('title')).toBe('/tmp/say "hi"');
+    // Nothing leaked out of the attribute and became markup.
+    expect(h.el('topics').querySelectorAll('.topic-dir')).toHaveLength(1);
+  });
+
   it('badges unread messages on a topic that is not the one being read', async () => {    const h = await open({ url: 'http://localhost:8787/?t=a1b2c3d4' });
     await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4', 'b2c3d4e5']));
     expect(h.doc.querySelector('.topic-badge')).toBeNull();

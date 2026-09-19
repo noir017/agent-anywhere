@@ -259,7 +259,17 @@ const SCRIPT = `
   backdrop.addEventListener('click', function(){ setSidebar(false); });
   applySidebar();
 
-  function text(s){ var d=document.createElement('div'); d.textContent=s==null?'':String(s); return d.innerHTML; }
+  // Escapes for BOTH uses this page makes of it: element content, and the inside of a
+  // double-quoted attribute. textContent alone covers the first and leaves the quote, which is
+  // what the second needs — a directory whose name contains a double quote would end the title
+  // attribute early and put the rest of the path in the tag. Everything interpolated here is the
+  // (their paths, their command list), so this is a rendering bug rather than a way in; the
+  // load-bearing escaping is web-markdown.ts, which never lets agent output near a tag at all.
+  function text(s){
+    var d=document.createElement('div');
+    d.textContent=s==null?'':String(s);
+    return d.innerHTML.replace(/"/g,'&quot;');
+  }
   function wait(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
 
   // Retried, which is only safe because every send carries a nonce the server remembers: on a

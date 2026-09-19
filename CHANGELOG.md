@@ -5,6 +5,10 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **A double quote in anything the web UI put inside an HTML attribute broke the element it was in.** The page's escaping helper set `textContent` and read `innerHTML` back, which escapes `<`, `>` and `&` — right for element content, and one character short for the inside of a double-quoted attribute, which is the other thing it was used for. A directory name containing a quote (legal on every filesystem this runs on) ended the new topic row's `title=` early and spilled the rest of the path into the tag; the same held for a slash command's description in the autocomplete. The helper now escapes the quote as well. Not a way in — everything it renders is the operator's own paths and their own command list, and agent output goes through `web-markdown.ts`, which never builds a tag from it at all.
+
 ## [1.17.0] - 2026-09-19
 
 ### Added

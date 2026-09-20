@@ -89,6 +89,12 @@ describe('webui page', () => {
     expect(html).not.toContain('.m:not(.own){background:');
   });
 
+  it('lays out the unrendered operator message so its own line breaks survive', () => {
+    // room.ts escapes that text instead of rendering it, which leaves the newlines as the only
+    // structure it has — collapsed by default HTML whitespace into one run-on line.
+    expect(html).toContain('.b .raw{white-space:pre-wrap');
+  });
+
   it('takes a file off the clipboard and names it before it can collide', () => {
     expect(html).toContain("addEventListener('paste'");
     expect(html).toContain('getAsFile()');

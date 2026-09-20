@@ -152,6 +152,12 @@ body{background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,-apple-system,
 .m.own .b pre,.m.own .b :not(pre)>code{background:#161b22;border-color:#2b3441}
 .b>:first-child{margin-top:0}
 .b>:last-child{margin-bottom:0}
+/* The operator's own message, which renderBody escapes and does not render (see room.ts).
+   pre-wrap is what makes "not rendered" legible rather than a single run-on line: their
+   newlines and indentation are the structure, since nothing turned them into tags. The break
+   rules are for the other half of a pasted prompt — a URL or a path with no spaces in it,
+   which would otherwise widen the bubble past the viewport. */
+.b .raw{white-space:pre-wrap;overflow-wrap:break-word;word-break:break-word}
 .b p{margin:0 0 .6em}
 .b pre{background:var(--field);border:1px solid var(--line);border-radius:4px;padding:10px;overflow-x:auto;margin:.6em 0}
 .b code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px}

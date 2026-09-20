@@ -207,6 +207,8 @@ const ITEM_RE = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
 interface Item {
   indent: number;
   ordered: boolean;
+  /** The number the author wrote, for an ordered item. Used only to start the list at it. */
+  num: number;
   text: string;
 }
 
@@ -228,6 +230,7 @@ function takeList(lines: readonly string[], i: number, out: string[]): number | 
       items.push({
         indent: (m[1] ?? '').length,
         ordered: /\d/.test(m[2] ?? ''),
+        num: parseInt(m[2] ?? '', 10) || 1,
         text: m[3] ?? '',
       });
       n += 1;
@@ -251,6 +254,19 @@ interface OpenList {
   tag: 'ul' | 'ol';
 }
 
+/**
+ * The opening tag for a list, carrying `start` when an ordered one does not begin at 1.
+ *
+ * A numbered list interrupted by anything that is not a list item — a paragraph, a code
+ * block, a line the author forgot to put a space after the dash in — ends there, and what
+ * follows it is a second `<ol>`. Without `start` that second list renumbers from 1, so
+ * "1. … 2. …" written by hand comes out as "1. … 1. …". The browser's own numbering is
+ * still used within a list; this only says where it begins.
+ */
+function openTag(tag: 'ul' | 'ol', num: number): string {
+  return tag === 'ol' && num !== 1 ? `<ol start="${num}">` : `<${tag}>`;
+}
+
 function renderList(items: readonly Item[]): string {
   const out: string[] = [];
   const stack: OpenList[] = [];
@@ -266,12 +282,12 @@ function renderList(items: readonly Item[]): string {
       // purpose — that is what makes the nested list a child of the item above it rather
       // than a sibling of it.
       stack.push({ indent: item.indent, tag });
-      out.push(`<${tag}>`);
+      out.push(openTag(tag, item.num));
     } else {
       out.push('</li>');
       if (top.tag !== tag) {
         // A bulleted run turning numbered (or back) at the same indent is two lists, not one.
-        out.push(`</${top.tag}><${tag}>`);
+        out.push(`</${top.tag}>${openTag(tag, item.num)}`);
         stack[stack.length - 1] = { indent: item.indent, tag };
       }
     }

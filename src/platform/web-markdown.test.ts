@@ -165,6 +165,22 @@ describe('web-markdown: lists', () => {
   it('folds an indented continuation line into the item above it', () => {
     expect(renderWebMarkdown('- a\n  more')).toBe('<ul><li>a<br>more</li></ul>');
   });
+
+  it('resumes a numbered list at the number written, not at 1', () => {
+    // The paragraph ends the first list, so "2." opens a second one. Renumbering that one from
+    // 1 is how a hand-written "1. … 2. …" came back as "1. … 1. …" in the web UI.
+    expect(renderWebMarkdown('1. a\n\nbreak\n\n2. b')).toBe(
+      '<ol><li>a</li></ol><p>break</p><ol start="2"><li>b</li></ol>'
+    );
+  });
+
+  it('starts a numbered run following a bulleted one at its own number', () => {
+    expect(renderWebMarkdown('- a\n3. b')).toBe('<ul><li>a</li></ul><ol start="3"><li>b</li></ol>');
+  });
+
+  it('leaves a list that does begin at 1 without a start attribute', () => {
+    expect(renderWebMarkdown('1. a\n2. b')).toBe('<ol><li>a</li><li>b</li></ol>');
+  });
 });
 
 describe('web-markdown: inline', () => {

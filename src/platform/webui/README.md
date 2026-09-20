@@ -174,6 +174,13 @@ retries — which is only safe because each send carries a nonce the server reme
 daemon's own inbound dedup cannot help here: it keys on a message id, and a retry mints a fresh
 one.
 
+**The echo of your own message is not rendered markdown.** `renderBody` escapes it and stops
+there, where the agent's side goes through `web-markdown.ts`. What the operator typed is a
+prompt: the exact characters are what the agent received, and this echo is where that gets
+checked — a numbered list that markdown renumbered read as a different message from the one in
+the compose box. `.b .raw` in `page.ts` carries the `pre-wrap` that keeps its line breaks, since
+nothing turned them into tags.
+
 ## Transport: SSE, not WebSocket
 
 `GET api/events` is an event stream; the page uses the browser's own `EventSource`, which

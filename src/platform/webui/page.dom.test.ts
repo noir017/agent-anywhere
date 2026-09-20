@@ -212,6 +212,20 @@ describe('webui page: rendering', () => {
     expect(h.window.location.search).toBe('?t=a1b2c3d4');
   });
 
+  it('shows an operator message as typed, numbers and line breaks intact', async () => {
+    // The bug this is here for: rendered as markdown, "-ce 2" ends the first list and "2." opens
+    // a second one that renumbers from 1, so a prompt written 1./2. read back 1./1. `room.ts`
+    // now sends the text escaped rather than rendered — this checks the page shows it that way,
+    // which is the half of the fix a server-side test cannot see.
+    const h = await open();
+    const typed = '1. sada\n- ces1\n-ce 2\n2. test3';
+    await h.emit(sync('a1b2c3d4', [message('m1', `<div class="raw">${typed}</div>`, true)], ['a1b2c3d4']));
+
+    expect(h.painted()).toBe(1);
+    expect(h.el('log').querySelector('ol')).toBeNull();
+    expect(h.el('log').querySelector('.raw')?.textContent).toBe(typed);
+  });
+
   it('still ignores a sync for a topic it has already left', async () => {
     // The guard the regression came from is real, just misaimed: once we ARE on a topic, a sync
     // for another one is a stale stream talking and must not repaint the transcript.

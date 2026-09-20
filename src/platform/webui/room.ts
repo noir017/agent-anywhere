@@ -710,9 +710,21 @@ function toAttachment(file: { name: string; mime: string; data: string }): NonNu
   };
 }
 
-/** The operator's own message: their markdown, plus a line naming whatever they attached. */
+/**
+ * The operator's own message: their text verbatim, plus a line naming whatever they attached.
+ *
+ * Verbatim, NOT through `renderWebMarkdown` the way the agent's side is. What the operator
+ * typed is a prompt, and a prompt is the one text on this page whose exact characters matter:
+ * it is what the agent received, and this echo is where you check that. Rendering it swallowed
+ * the difference — a list written "1. … 2. …" and interrupted by a line the parser did not read
+ * as an item came back "1. … 1. …", so the transcript disagreed with the compose box about what
+ * had been sent. Every other platform in this directory shows the user's own message as their
+ * client typed it; this is that same behaviour, arrived at from a bug report.
+ *
+ * `escapeHtml` still runs, and must: verbatim means the characters, not the markup.
+ */
 function renderBody(text: string, attachments: ReadonlyArray<{ name?: string }>): string {
-  const body = renderWebMarkdown(text);
+  const body = `<div class="raw">${escapeHtml(text)}</div>`;
   if (attachments.length === 0) return body;
   const names = attachments.map((a) => `<span class="chip">${escapeHtml(a.name ?? 'file')}</span>`).join('');
   return `${body}<div class="files">${names}</div>`;

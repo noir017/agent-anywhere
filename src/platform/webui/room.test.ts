@@ -363,6 +363,25 @@ describe('WebRoom: inbound', () => {
     expect(got[0]?.messageId).toBe(echoed.msg.id);
   });
 
+  it('echoes what the operator typed verbatim, not as rendered markdown', () => {
+    // A prompt is checked against the compose box, so the echo has to be the same characters.
+    // Rendered, this list came back numbered "1." twice — the "-ce" line is not an item, so it
+    // ends the first list and "2." opened a second one that renumbered from 1.
+    const { room, topic, seen } = attached();
+    const text = '1. sada\n- ces1\n-ce 2\n2. test3';
+    room.submit({ topic, text });
+    const echoed = seen.filter((s) => s.ev.t === 'msg').pop()?.ev as { msg: { html: string } };
+    expect(echoed.msg.html).toBe(`<div class="raw">${text}</div>`);
+  });
+
+  it('escapes the operator message it does not render', () => {
+    const { room, topic, seen } = attached();
+    room.submit({ topic, text: '<img src=x onerror=alert(1)>' });
+    const echoed = seen.filter((s) => s.ev.t === 'msg').pop()?.ev as { msg: { html: string } };
+    expect(echoed.msg.html).not.toContain('<img');
+    expect(echoed.msg.html).toContain('&lt;img');
+  });
+
   it('delivers a retried send exactly once', () => {
     // The nonce is what makes the page's retry safe on a bad link: a request can be accepted
     // and still time out, and the daemon's own dedup cannot help — it keys on a message id,

@@ -21,6 +21,12 @@ All notable changes to this project are documented here. The format is based on
 
   `.agents/skills` is the one that would have been missed by analogy and the one that carries the actual content. On the machine this was built for, `~/.codex/skills` holds only codex's six bundled skills — which this feature excludes on principle, since "the skills I installed" is what `/skills` answers — and all 25 real ones live in `~/.agents/skills`, the cross-vendor location the agy harness already scanned. A codex entry naming only the `.codex` paths would have reported an empty catalogue on a machine that visibly has skills, which is the confidently-wrong answer this feature was written to avoid rather than a smaller version of the right one.
 
+### Fixed
+
+- **The web UI shows your own message exactly as you typed it.** It used to run the operator's text through the same markdown renderer as the agent's, which is wrong for the one text on that page whose exact characters matter: what you send is a prompt, and the echo above the compose box is where you check what the agent actually received. Rendering hid the difference, and did it most visibly on numbered lists — "1. … 2. …" with a line in between that markdown does not read as a list item came back as "1. … 1. …", because the interruption ends the first list and the second one renumbers from the top. Your side is now escaped and shown verbatim, with its line breaks intact. Every other platform in the gateway already behaved this way; the web UI is the only one that renders its own inbound, so it was the only one that could disagree with the user about what they had sent.
+
+- **A numbered list that resumes after an interruption keeps counting in the web UI.** The same renumbering, on the agent's side of the conversation, where it is not fixable by refusing to render: a numbered list broken by a paragraph, a code block or an indentation change is two `<ol>`s to any markdown parser, and the second one started at 1 regardless of what the agent wrote. It now carries `start`, so the numbers on screen are the numbers in the text.
+
 ## [1.19.0] - 2026-09-20
 
 ### Added

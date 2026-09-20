@@ -121,7 +121,7 @@ the YAML can be committed.
 | Harness | Launches | Extra install | Auth |
 |---|---|---|---|
 | `claude` | bundled [claude-agent-acp](https://www.npmjs.com/package/@agentclientprotocol/claude-agent-acp) | none | `claude /login` or `ANTHROPIC_API_KEY` |
-| `codex` | bundled [codex-acp](https://www.npmjs.com/package/@zed-industries/codex-acp) | none | Codex CLI's login |
+| `codex` | `codex-acp` | [@agentclientprotocol/codex-acp](https://www.npmjs.com/package/@agentclientprotocol/codex-acp) (`npm i -g`) | Codex CLI's login |
 | `opencode` | `opencode acp` | OpenCode CLI | OpenCode's login |
 | `agy` | `agy --input-format stream-json` | Antigravity CLI | `agy` Google sign-in (OS keyring) |
 | `custom` | your `command` + `args` | any ACP executable | your agent's |

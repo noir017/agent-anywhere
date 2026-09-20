@@ -24,9 +24,11 @@ import type { SlashCommandSpec } from '../types.js';
  * `claude` and `opencode` were captured live over ACP (available_commands_update)
  * from the harness versions this daemon launches. `gemini` is best-effort and
  * UNVERIFIED — carried over from names the CLI documents, no install to probe.
- * `codex` is deliberately empty: its ACP adapter could not be probed, and inventing
- * a native name would send a command the agent may silently misinterpret, which is
- * strictly worse than telling the user it is unsupported.
+ * `codex` was empty for the same reason gemini is thin — Zed's adapter advertised six
+ * commands and no model list, so there was nothing worth translating to. It was probed
+ * on 2026-09-20 against @agentclientprotocol/codex-acp 1.12.0, which advertises 42
+ * (11 built in, the rest the operator's own skills as `$name`); the entries below are
+ * that capture, and the ones deliberately still absent are named at their own keys.
  */
 
 /** Harness kinds an agent can declare (mirrors AgentDefSchema.harness). */
@@ -120,7 +122,7 @@ interface GenericCommand {
 const GENERIC_COMMANDS: Record<string, GenericCommand> = {
   compact: {
     description: 'Compact the conversation to free up context',
-    native: { claude: 'compact', gemini: 'compress' },
+    native: { claude: 'compact', gemini: 'compress', codex: 'compact' },
   },
   context: {
     description: 'Show current context usage',
@@ -140,7 +142,12 @@ const GENERIC_COMMANDS: Record<string, GenericCommand> = {
     // all, but it does hand a context snapshot to whatever `statusLine` command its settings name,
     // in headless mode as well as the TUI (verified on 1.2.0). The daemon installs a shim there and
     // reads the numbers back at the end of each turn — see daemon/agy-statusline.ts.
-    local: ['opencode', 'dsh', 'agy'],
+    //
+    // codex answers locally for the same reason opencode does, and unconditionally: probed on
+    // codex-acp 1.12.0, a turn emits `usage_update {used, size}` with a real window (258400 for
+    // gpt-5.6-terra). Notably this one predates the migration — Zed's adapter reported it too — so
+    // it is the one context-related thing codex did not gain by switching.
+    local: ['opencode', 'dsh', 'agy', 'codex'],
   },
   model: {
     description: 'Show or change the model',
@@ -154,11 +161,28 @@ const GENERIC_COMMANDS: Record<string, GenericCommand> = {
     //
     // agy: stream-json has no in-process switch, but `agy models` provides the selector list, and
     // setModel uses kill-and-respawn with --model and --conversation (resuming history).
-    local: ['opencode', 'claude', 'agy', 'dsh'],
+    //
+    // codex: session/new reports both a `models` block and a `model` configOption, switched the
+    // same way. Its selector is two-level in a way the others are not, and the two levels disagree
+    // about what a model id is — `models.availableModels` has 31 entries, one per model per
+    // reasoning effort (`gpt-5.6-terra[medium]`, `[high]`, `[xhigh]`, `[max]`, `[ultra]`), while
+    // `configOptions.model` has 6 bare ids. modelSelector reads configOptions, so the menu is the
+    // 6, which is the right list to put in front of a user.
+    //
+    // The effort half is NOT reachable from here, and that is a harness limit rather than a choice:
+    // probed on 1.12.0, `session/set_config_option {configId:"model", value:"gpt-5.6-terra[high]"}`
+    // is rejected with -32602 Invalid params even though that exact string is a modelId in
+    // availableModels. So `agents[].model` must name a bare id too, and effort is set in codex's
+    // own config.toml (`model_reasoning_effort = "high"` at TOP level — put it after a
+    // `[model_providers.x]` header and TOML silently makes it that table's key, which reads as
+    // "the setting does nothing"). With it set, session/new reports `gpt-5.6-terra[high]`.
+    local: ['opencode', 'claude', 'agy', 'dsh', 'codex'],
   },
   usage: {
     description: 'Show token usage and limits',
-    native: { claude: 'usage' },
+    // codex spells it `status` — "Display session configuration and token usage", a superset of
+    // what was asked for rather than a near-miss, so it is worth the translation.
+    native: { claude: 'usage', codex: 'status' },
     // agy's CLI answers /usage itself, which is precisely why it cannot be forwarded: reaching the
     // resident session it would kill it (see HARNESS_CLI_ANSWERED). The gateway runs it as its own
     // one-shot process instead. Probed on 1.2.0 — four tab-separated columns of pool, metric,
@@ -167,19 +191,26 @@ const GENERIC_COMMANDS: Record<string, GenericCommand> = {
   },
   doctor: {
     description: "Health-check this agent's own setup",
+    // No codex entry: 1.12.0 advertises nothing of the kind, and `status` is already spent on
+    // /usage above. Sending it twice under two names would answer the wrong question the second time.
     native: { claude: 'doctor' },
   },
   mcp: {
     description: 'Manage MCP servers',
-    native: { claude: 'mcp', gemini: 'mcp' },
+    native: { claude: 'mcp', gemini: 'mcp', codex: 'mcp' },
   },
   init: {
     description: "Set up this project's agent instructions file",
+    // codex HAD this — Zed's adapter advertised `init`, "create an AGENTS.md file with instructions
+    // for Codex" — and 1.12.0 dropped it. Left unsupported rather than forwarded as plain text: the
+    // harness no longer recognises the name, so `/init` would spend a turn on a model guessing.
     native: { claude: 'init', opencode: 'init' },
   },
   review: {
     description: 'Review the current changes',
-    native: { claude: 'review', opencode: 'review' },
+    // codex also has review-branch and review-commit, which take arguments and stay reachable
+    // through the `/cx` picker; only the bare form means the same thing on every harness.
+    native: { claude: 'review', opencode: 'review', codex: 'review' },
   },
 };
 

@@ -118,7 +118,7 @@ access:
 | Harness | 启动方式 | 额外安装 | 认证 |
 |---|---|---|---|
 | `claude` | 内置 [claude-agent-acp](https://www.npmjs.com/package/@agentclientprotocol/claude-agent-acp) | 无 | `claude /login` 或 `ANTHROPIC_API_KEY` |
-| `codex` | 内置 [codex-acp](https://www.npmjs.com/package/@zed-industries/codex-acp) | 无 | Codex CLI 登录态 |
+| `codex` | `codex-acp` | [@agentclientprotocol/codex-acp](https://www.npmjs.com/package/@agentclientprotocol/codex-acp)（`npm i -g`） | Codex CLI 登录态 |
 | `opencode` | `opencode acp` | OpenCode CLI | OpenCode 登录态 |
 | `agy` | `agy --input-format stream-json` | Antigravity CLI | `agy` 的 Google 登录态（系统钥匙串） |
 | `custom` | 你的 `command` + `args` | 任意 ACP 可执行文件 | 由智能体自身决定 |

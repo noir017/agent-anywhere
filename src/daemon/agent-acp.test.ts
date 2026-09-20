@@ -459,6 +459,27 @@ describe('liveModelName label choice (real claude-agent-acp option list)', () =>
  * must be JSON-encoded to cross the wire (a bare "provider/model" is "unknown model option") and
  * decoded again to present a readable /model menu.
  */
+describe('codex harness preset', () => {
+  const def = (o: Record<string, unknown>): AgentDef => o as AgentDef;
+
+  it('resolveHarness runs codex-acp from PATH, not a bundled dependency', () => {
+    // The contract this pins is a packaging decision, not a spelling: codex-acp pulls in
+    // @openai/codex's ~284 MB platform binary, so it is installed alongside the daemon (by the
+    // image, or by hand) the way gemini/opencode/dsh are — never resolved out of node_modules.
+    expect(resolveHarness(def({ id: 'cx', harness: 'codex', args: [] }))).toEqual({
+      command: 'codex-acp',
+      args: [],
+    });
+  });
+
+  it('resolveHarness appends def.args', () => {
+    expect(resolveHarness(def({ id: 'cx', harness: 'codex', args: ['--foo'] }))).toEqual({
+      command: 'codex-acp',
+      args: ['--foo'],
+    });
+  });
+});
+
 describe('dsh harness preset', () => {
   const def = (o: Record<string, unknown>): AgentDef => o as AgentDef;
 

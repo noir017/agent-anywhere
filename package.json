@@ -43,7 +43,6 @@
     "@satorijs/adapter-wecom": "^2.5.0",
     "@satorijs/core": "4.6.0",
     "@toon-format/toon": "^2.3.0",
-    "@zed-industries/codex-acp": "^0.16.0",
     "commander": "^12.0.0",
     "https-proxy-agent": "^7.0.6",
     "picocolors": "^1.1.0",

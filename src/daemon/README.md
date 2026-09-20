@@ -383,9 +383,17 @@ back into `AgentStreamHandlers`:
 | `session_info_update` | `onTitle` (renames the chat lane — see below) |
 | `session/request_permission` | **auto-approved** — see below |
 
-`claude` and `codex` adapters are **bundled** as dependencies and resolved via
-`resolveClaudeAdapterEntry` / `resolveCodexAdapterEntry`, so neither needs a separate
-install. `opencode` and `custom` are located on PATH.
+The `claude` adapter is **bundled** as a dependency and resolved via
+`resolveClaudeAdapterEntry`, so it needs no separate install. Every other harness —
+`codex`, `gemini`, `opencode`, `dsh`, `custom` — is located on PATH.
+
+`codex` is the one worth explaining, because it used to be bundled too. Its adapter
+(`@agentclientprotocol/codex-acp`, replacing Zed's deprecated `@zed-industries/codex-acp`)
+declares `@openai/codex` as a regular dependency, whose platform binary is ~284 MB
+unpacked. Bundling that would tax every `npm i -g agent-anywhere-cli` for a harness most
+operators never configure, while the operator who *does* configure it has already installed
+and logged into the codex CLI by hand. So it follows the opencode/dsh contract instead:
+install it alongside the daemon, and `doctor` names the package when it is missing.
 
 #### One reader for the whole session, not one per turn
 

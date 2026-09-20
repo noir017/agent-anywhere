@@ -52,6 +52,15 @@ describe('skillDirsFor', () => {
     expect(skillDirsFor(def(), { home: '/h', cwd: '/h' })).toEqual(['/h/.claude/skills']);
   });
 
+  it('scans the user and project locations for codex', () => {
+    // Four, not two: `.agents/skills` is where a codex operator's skills actually live — the
+    // `.codex/skills` tree holds codex's own bundled `.system` set and often nothing else — and
+    // all four were confirmed by planting marker skills and reading the adapter's command list
+    // back. See the note in skills-scan.ts, including why `.claude/skills` is absent.
+    const dirs = skillDirsFor(def({ harness: 'codex' }), { home: '/h', cwd: '/proj' });
+    expect(dirs).toEqual(['/h/.codex/skills', '/h/.agents/skills', '/proj/.codex/skills', '/proj/.agents/skills']);
+  });
+
   it('uses only what opencode’s own config named', () => {
     // No convention is assumed for opencode: nothing was found that says it has one.
     const dirs = skillDirsFor(def({ harness: 'opencode' }), {

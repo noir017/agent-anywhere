@@ -5,6 +5,22 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **The `codex` harness is no longer bundled, and now points at a different adapter.** Two changes that only make sense together. The adapter moved from Zed's `@zed-industries/codex-acp`, deprecated upstream, to `@agentclientprotocol/codex-acp`; and it stopped being a dependency of this package, so it is installed alongside the daemon the way `opencode` and `dsh` already are. The packaging half is the reason the migration is not free: the new adapter declares `@openai/codex` as an ordinary dependency, whose platform binary is ~284 MB unpacked, and nothing justifies putting that inside every `npm i -g agent-anywhere-cli` for a harness most installs never configure — particularly when the operator who *does* configure it has already installed and logged into the codex CLI by hand. Net effect for everyone not using codex: this package is 209 MB smaller. For everyone using it: one `npm i -g @agentclientprotocol/codex-acp`, which `doctor` now names when the command is missing.
+
+  The old adapter was worth leaving behind on its own merits. Probed side by side against the same gateway: it advertised 6 commands to the new one's 42, reported no model list at all (so `/model` had only a stale selector two model generations old), had no equivalent of `/usage`, `/skills` or `/mcp`, and prefixed its first answer with `Model metadata for <model> not found. Defaulting to fallback metadata` — not on stderr, but inside the agent's message text, which is to say in the user's chat bubble.
+
+### Added
+
+- **`/usage`, `/compact`, `/mcp` and `/review` now work on codex, and `/context` and `/model` are answered for it.** The generic command table had nothing at all under `codex`, deliberately, because the adapter of the day could not be probed and a guessed native name is worse than an honest "unsupported". The new one can be, so the entries are a capture rather than a guess: `/usage` translates to codex's `status`, the rest keep their names, and `/context` and `/model` are answered by the gateway itself from `usage_update` and the session's `model` config option. Two holes remain and stay honest — `/doctor`, which codex has never had, and `/init`, which it *did* have until the new adapter dropped it.
+
+  One asymmetry is worth knowing before you go looking for it: codex exposes reasoning effort as part of the model id (`gpt-5.6-terra[high]`), but only in a list the `/model` menu does not read, and feeding a suffixed id back is rejected outright. Effort is a `model_reasoning_effort` line in codex's own `config.toml`, and it has to sit above the first `[table]` header or TOML quietly makes it that table's key.
+
+- **`/skills` lists codex's skills.** It read nothing for codex before, because the per-harness directory table had no entry for it and an absent entry degrades to an empty catalogue. The four directories now scanned were established by planting a uniquely-named marker skill under each candidate inside an isolated `HOME` and reading the adapter's own command list back — it publishes every skill as `$name` — rather than by assuming codex looks where claude looks. It does not: a marker under `~/.claude/skills` was ignored, while `.codex/skills` and `.agents/skills`, each at both the home and the project level, all came back.
+
+  `.agents/skills` is the one that would have been missed by analogy and the one that carries the actual content. On the machine this was built for, `~/.codex/skills` holds only codex's six bundled skills — which this feature excludes on principle, since "the skills I installed" is what `/skills` answers — and all 25 real ones live in `~/.agents/skills`, the cross-vendor location the agy harness already scanned. A codex entry naming only the `.codex` paths would have reported an empty catalogue on a machine that visibly has skills, which is the confidently-wrong answer this feature was written to avoid rather than a smaller version of the right one.
+
 ## [1.19.0] - 2026-09-20
 
 ### Added

@@ -40,8 +40,11 @@ describe('translateCommand', () => {
     // set_config_option|set_mode) and opencode's is TUI-only, so there is nothing to answer with.
     expect(translateCommand('compact', 'opencode')).toEqual({ kind: 'unsupported' });
     expect(translateCommand('mcp', 'opencode')).toEqual({ kind: 'unsupported' });
-    // codex is intentionally unmapped rather than guessed.
-    expect(translateCommand('compact', 'codex')).toEqual({ kind: 'unsupported' });
+    // codex keeps two deliberate holes, and they are holes for opposite reasons: it never had a
+    // /doctor, and it HAD /init until codex-acp 1.12.0 dropped it. Both stay unsupported rather
+    // than being aimed at a near-miss command — see the notes at those keys.
+    expect(translateCommand('doctor', 'codex')).toEqual({ kind: 'unsupported' });
+    expect(translateCommand('init', 'codex')).toEqual({ kind: 'unsupported' });
   });
 
   it('answers locally where the capability exists over ACP but not as a slash command', () => {
@@ -284,10 +287,30 @@ describe('buildHelpText', () => {
   });
 
   it('drops the whole generic section for a harness that supports none of it', () => {
-    const cfgCodex = { agents: [agent('cx', 'codex'), agent('cc', 'claude')] };
-    const text = buildHelpText(cfgCodex, { agent: 'cx', harness: 'codex' });
+    // codex used to be this case and no longer is, and nothing shipped replaces it: every harness
+    // in HARNESS_COMMANDS now claims at least one generic command, and `custom` passes everything
+    // through by design. So the empty-section branch is reached here with a harness value that is
+    // not in the table — it guards a real code path against the next preset added with nothing
+    // probed yet, which is the state every harness here started in.
+    const unprobed = 'unprobed' as AgentDef['harness'];
+    const cfgNone = { agents: [agent('x', unprobed), agent('cc', 'claude')] };
+    const text = buildHelpText(cfgNone, { agent: 'x', harness: unprobed });
     expect(text).not.toContain('Works on the current agent');
+    // The agent commands still list, because switching away is what a stuck user needs.
     expect(text).toContain('/cc');
+  });
+
+  it('codex offers the generic commands its adapter was probed to have', () => {
+    // Guards the migration off Zed's adapter: that one advertised six commands and no model list,
+    // so codex answered "unsupported" to everything here. Probed against
+    // @agentclientprotocol/codex-acp 1.12.0 — forwarded natives, plus the two answered locally
+    // because they exist over ACP (usage_update, the `model` config option) with no slash command.
+    expect(translateCommand('usage', 'codex')).toEqual({ kind: 'translated', native: 'status' });
+    expect(translateCommand('compact', 'codex')).toEqual({ kind: 'translated', native: 'compact' });
+    expect(translateCommand('mcp', 'codex')).toEqual({ kind: 'translated', native: 'mcp' });
+    expect(translateCommand('review', 'codex')).toEqual({ kind: 'translated', native: 'review' });
+    expect(translateCommand('context', 'codex')).toEqual({ kind: 'local' });
+    expect(translateCommand('model', 'codex')).toEqual({ kind: 'local' });
   });
 
   it('cannot drift from what gets registered', () => {

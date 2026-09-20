@@ -5,7 +5,7 @@ import path from 'node:path';
 import { loadConfig, resolveSocketPath, configPath, readRawConfigIfExists, saveConfig } from '../config/load.js';
 import { ConfigSchema, accessUnrestricted, platformInstances, type Config } from '../config/schema.js';
 import { isLegacyConfig, migrateLegacyConfig } from '../config/migrate.js';
-import { resolveClaudeAdapterEntry, resolveCodexAdapterEntry } from '../daemon/agent-acp.js';
+import { resolveClaudeAdapterEntry } from '../daemon/agent-acp.js';
 import { AGY_COMMAND } from '../daemon/agent-agy.js';
 import { agentHome } from '../daemon/skills-scan.js';
 import { OWNER } from '../platform/webui/room.js';
@@ -46,7 +46,7 @@ function locateCommand(cmd: string): string | null {
   return null;
 }
 
-/** Agent definition -> its harness's main executable name (doctor only checks reachability, same convention as agent-acp's resolveHarness / agent-agy's AGY_COMMAND). claude/codex are handled separately (local dependencies, not PATH). */
+/** Agent definition -> its harness's main executable name (doctor only checks reachability, same convention as agent-acp's resolveHarness / agent-agy's AGY_COMMAND). claude is handled separately (a local dependency, not PATH). */
 function harnessCommand(def: import('../config/schema.js').AgentDef): string {
   switch (def.harness) {
     case 'claude':
@@ -66,7 +66,7 @@ function harnessCommand(def: import('../config/schema.js').AgentDef): string {
   }
 }
 
-/** Whether a local adapter dependency resolves (claude/codex harnesses spawn a dependency, not a PATH command). */
+/** Whether a local adapter dependency resolves (the claude harness spawns a dependency, not a PATH command). */
 function adapterResolves(resolve: () => string): boolean {
   try {
     resolve();
@@ -367,19 +367,21 @@ export async function runDoctor(opts: { migrateConfig?: boolean } = {}): Promise
         for (const def of cfg.agents) {
           const cmd = harnessCommand(def);
           const auth = authNote(def);
-          // claude/codex run locally installed adapter dependencies (claude-agent-acp / Zed's
-          // codex-acp native binary), so the check is "does the dependency resolve", not a PATH
-          // lookup. Whether they can actually log in is covered by authNote.
+          // claude runs a locally installed adapter dependency (claude-agent-acp), so its check is
+          // "does the dependency resolve", not a PATH lookup. Every other harness, codex included,
+          // is a command the operator installed — see the codex arm of resolveHarness for why that
+          // adapter is deliberately not bundled. Whether they can actually log in is covered by authNote.
           const found =
             def.harness === 'claude'
               ? adapterResolves(resolveClaudeAdapterEntry)
-              : def.harness === 'codex'
-                ? adapterResolves(resolveCodexAdapterEntry)
-                : Boolean(locateCommand(cmd));
-          const note =
-            (def.harness === 'claude' || def.harness === 'codex') && !found
+              : Boolean(locateCommand(cmd));
+          const note = !found
+            ? def.harness === 'claude'
               ? ' (dependency missing — run npm install)'
-              : '';
+              : def.harness === 'codex'
+                ? ' (install it with `npm i -g @agentclientprotocol/codex-acp`)'
+                : ''
+            : '';
           if (found) {
             lines.push(`${def.id} (${def.harness}) → ${cmd} ✓${auth}`);
           } else {

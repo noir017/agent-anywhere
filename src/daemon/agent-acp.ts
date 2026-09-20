@@ -106,20 +106,6 @@ export function resolveClaudeAdapterEntry(): string {
   return createRequire(import.meta.url).resolve('@agentclientprotocol/claude-agent-acp/dist/index.js');
 }
 
-/**
- * Native binary of Zed's codex-acp adapter (a declared dependency; the platform binary arrives via
- * its optionalDependencies). Resolved directly instead of going through the package's node bin
- * wrapper: the wrapper spawnSync-execs this same binary, adding a process layer that can orphan
- * the child when the daemon kills the agent. Exported for the doctor check; throws when the
- * platform package is missing (unsupported platform or incomplete npm install).
- */
-export function resolveCodexAdapterEntry(): string {
-  const bin = process.platform === 'win32' ? 'codex-acp.exe' : 'codex-acp';
-  return createRequire(import.meta.url).resolve(
-    `@zed-industries/codex-acp-${process.platform}-${process.arch}/bin/${bin}`
-  );
-}
-
 /** Resolve an agent def into the actual spawn command + args (presets default; custom self-configures; then append def.args). Exported for the doctor check and the harness unit tests. */
 export function resolveHarness(def: AgentDef): { command: string; args: string[] } {
   switch (def.harness) {
@@ -133,10 +119,27 @@ export function resolveHarness(def: AgentDef): { command: string; args: string[]
       // Gemini CLI native ACP (exact flag per `gemini --help`; override/extend via def.args).
       return { command: 'gemini', args: ['--experimental-acp', ...def.args] };
     case 'codex':
-      // Codex via Zed's codex-acp adapter (the codex CLI itself has no ACP mode — a bare
+      // Codex via @agentclientprotocol/codex-acp (the codex CLI itself has no ACP mode — a bare
       // `codex acp` falls into the TUI and dies with "stdin is not a terminal" when headless).
-      // Auth reuses the codex CLI's own login state (~/.codex).
-      return { command: resolveCodexAdapterEntry(), args: [...def.args] };
+      // Auth reuses the codex CLI's own login state (~/.codex), including a custom
+      // `model_providers` gateway, which the adapter reports back as authStatus kind "gateway".
+      //
+      // A PATH command, NOT a bundled dependency, which is the opposite of the claude arm above
+      // and deliberate: the adapter declares `@openai/codex` as a regular dependency, whose
+      // platform binary is ~284 MB unpacked. Bundling that taxes every `npm i -g
+      // agent-anywhere-cli` for a harness most operators never configure, and the operator who
+      // does configure it already had to install and log into the codex CLI by hand. So codex
+      // follows the same contract as gemini/opencode/dsh — the image (or the operator) installs
+      // `@agentclientprotocol/codex-acp` globally, and doctor reports a missing one.
+      //
+      // The predecessor here was Zed's `@zed-industries/codex-acp`, a declared dependency shipping
+      // a Rust binary. It is deprecated upstream in favour of this package, and was worth leaving
+      // behind on its own merits: probed side by side on 2026-09-20 against the same newapi
+      // gateway, it advertised 6 commands to 1.12.0's 42, reported no model list (so `/model` had
+      // only a stale gpt-5.2-era selector), had no `status`/`skills`/`mcp`, and prefixed its first
+      // answer with "Model metadata for <model> not found. Defaulting to fallback metadata" —
+      // inside the agent's message text, i.e. straight into the user's chat bubble.
+      return { command: 'codex-acp', args: [...def.args] };
     case 'opencode':
       // OpenCode native ACP mode (per the ACP registry's official launch spec: `opencode acp`).
       return { command: 'opencode', args: ['acp', ...def.args] };

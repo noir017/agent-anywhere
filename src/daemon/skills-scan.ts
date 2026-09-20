@@ -67,6 +67,28 @@ export function agentHome(def: AgentDef | undefined): string {
  *               project's own skills are exactly the ones relevant to the work being asked for.
  *  - opencode — no convention is assumed: it reads whatever `skills` names in `opencode.json`
  *               (`/home/user/agent-skills/skills` here). Passed in as `configured`.
+ *  - codex    — four: `<home>/.codex/skills`, `<home>/.agents/skills`, and the same two under the
+ *               conversation's own directory. Established by experiment on codex-acp 1.12.0
+ *               (2026-09-20), not by analogy: a uniquely-named marker skill was planted under each
+ *               candidate inside an isolated `HOME`, and the adapter's own
+ *               available_commands_update read back (it publishes every skill as `$name`). All four
+ *               came back; `<home>/.claude/skills` planted the same way did NOT, so codex does not
+ *               read claude's tree even though both use the SKILL.md shape.
+ *
+ *               `.agents/skills` is the one that matters and the one easiest to miss. On this
+ *               machine `~/.codex/skills` holds nothing but `.system` — codex's own six bundled
+ *               skills, which this file excludes on principle — while the operator's 25 live in
+ *               `~/.agents/skills`, the cross-vendor location agy already scans. A codex arm
+ *               listing only the `.codex` paths therefore reports an empty catalogue on a machine
+ *               that visibly has skills, which is exactly the confident-but-wrong answer the header
+ *               warns about. (`.system` needs no special-casing: it holds one directory per skill
+ *               rather than a SKILL.md of its own, so the scan below already passes over it.)
+ *
+ *               `$CODEX_HOME/skills` is read too — same marker, same result — and is deliberately
+ *               NOT scanned. It is the same directory as `<home>/.codex/skills` whenever CODEX_HOME
+ *               is unset, which is the normal case, and when it is set it is set in the agent's
+ *               `env` block, where `agentHome` already gives that operator a supported way to move
+ *               the whole tree.
  *  - agy      — five locations, which is agy's own layout rather than a guess: its "Create new
  *               skills" help names a workspace dir (`<workspace>/.agents/skills`), a global one
  *               (`<home>/.gemini/antigravity-cli/skills`) and a shared one (`<home>/.gemini/skills`),
@@ -97,6 +119,12 @@ export function skillDirsFor(
     case 'claude':
       dirs.push(join(opts.home, '.claude', 'skills'));
       dirs.push(join(opts.cwd, '.claude', 'skills'));
+      break;
+    case 'codex':
+      dirs.push(join(opts.home, '.codex', 'skills'));
+      dirs.push(join(opts.home, '.agents', 'skills'));
+      dirs.push(join(opts.cwd, '.codex', 'skills'));
+      dirs.push(join(opts.cwd, '.agents', 'skills'));
       break;
     case 'opencode':
       // Relative entries resolve against the agent's working directory, which is how a

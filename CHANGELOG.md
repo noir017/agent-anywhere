@@ -5,6 +5,18 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **The web UI keeps its own copy of the conversation, so a restart no longer empties the page.** The daemon's transcript is memory and stays that way; what changed is that the browser now writes down what it has seen, in IndexedDB — one record per topic, a rotating 200 messages and 512KB each, 24 topics, evicted least-recently-written-first. Two things follow from it. A topic paints from the last visit before its stream has answered, which on a slow link is the difference between reading and waiting. And when the daemon comes back, the messages from before it went away stay on screen above a divider saying where they came from, instead of the room going blank under an apology.
+
+  The part that makes this safe is not the storage, it is the key. Message ids are counted per process and start again at `w1`, so a restarted daemon hands out ids a cached transcript is already using — the first reply after a restart really is `w1` again. A sync therefore now carries an `epoch`, the daemon's generation, and the page keys every message by `<epoch>:<id>`. Cached messages from an older generation are *history*: they keep their place, no reconcile drops them, and their buttons are stripped, because the process that would answer them is gone and the id they name now means a different message. Cached messages from the CURRENT generation produce exactly the keys the sync produces, so the ordinary path reuses every node and writes no DOM at all — the cache is a head start, not a second source of truth. A browser with no IndexedDB (a private window, an old engine) loses the cache and nothing else.
+
+- **A message typed in the web UI is on screen before the request leaves, and stays there if the request fails.** It used to be drawn only when the daemon echoed it back, so there was a visibly empty transcript for the length of the round trip — and on a POST that failed after its retries the text was simply gone: cleared out of the composer, never in the conversation, nowhere left to copy it from. The bubble is now local first: dimmed while the request is in flight, taken over by the echo when it arrives (the same DOM node, claimed by the send nonce, so nothing re-runs the fade-in or moves the scroll), and on failure edged red with **Retry / Copy / Discard** under it. Retry re-posts the original nonce, which the server already dedupes, so retrying something that actually landed cannot double it. A failed message survives a reload; its Retry does not, because the body it would re-send carries attachments as base64 and that does not belong in a transcript cache — the restored bubble offers Copy rather than pretending it can re-send files it no longer has.
+
+### Fixed
+
+- **The web UI's message cache no longer fills up with the same message.** Every streaming edit arrives as an upsert of one id, and the old per-topic cache appended each one instead of replacing it, so a single long answer could occupy most of the 40 slots a topic had.
+
 ## [1.20.0] - 2026-09-20
 
 ### Changed

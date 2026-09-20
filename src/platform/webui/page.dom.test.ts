@@ -23,10 +23,13 @@
  *
  * `EventSource` is installed in `beforeParse`, before the script runs, deliberately: evaluating
  * the script a second time to give it a stubbed global would register every listener twice and
- * fire every click handler twice.
+ * fire every click handler twice. `indexedDB` — which jsdom does not implement at all — goes in
+ * the same way, as a `fake-indexeddb` factory the harness can hand to a SECOND page so a reload,
+ * or a daemon restart under a page that is still open, can be driven end to end.
  */
 import { describe, it, expect } from 'vitest';
 import { JSDOM, type DOMWindow } from 'jsdom';
+import { IDBFactory } from 'fake-indexeddb';
 
 import { renderPage } from './page.js';
 
@@ -56,6 +59,14 @@ interface Harness {
   /** Deliver a server event down the live stream, as `api/events` would. */
   emit: (ev: Record<string, unknown>) => Promise<void>;
   calls: Call[];
+  /** Mutable per-path HTTP status, so a send can be made to fail (and then succeed) mid-test. */
+  status: Record<string, number>;
+  /** The page's own database, to hand to a second page or to read back. */
+  idb: IDBFactory | null;
+  /** What this browser has cached for a topic, as the page would read it back. */
+  cached: (topic: string) => Promise<Array<Record<string, unknown>> | null>;
+  /** Everything written to `navigator.clipboard` by the page. */
+  clipboard: string[];
   el: (id: string) => HTMLElement;
   /** Messages currently painted in the transcript. */
   painted: () => number;
@@ -70,15 +81,28 @@ interface Harness {
 
 const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
 
+/** Long enough for the page's write debounce (SAVE_MS) to have fired and the write to land. */
+const saved = (): Promise<void> => new Promise((r) => setTimeout(r, 550));
+
 /**
  * Spin the macrotask queue until something becomes true.
  *
  * `FileReader` resolves over several turns in jsdom, and how many is an implementation detail —
- * a fixed number of `tick()`s here would be a test that passes until jsdom changes its mind.
+ * a fixed number of `tick()`s here would be a test that passes until jsdom changes its mind. The
+ * cache read on the way into a topic is the same shape of wait, one IndexedDB turn instead.
  */
 async function until(what: string, ok: () => boolean): Promise<void> {
   for (let i = 0; i < 50; i++) {
     if (ok()) return;
+    await tick();
+  }
+  throw new Error(`never happened: ${what}`);
+}
+
+/** The same wait, for a condition that is itself a database read. */
+async function untilAsync(what: string, ok: () => Promise<boolean>): Promise<void> {
+  for (let i = 0; i < 50; i++) {
+    if (await ok()) return;
     await tick();
   }
   throw new Error(`never happened: ${what}`);
@@ -96,6 +120,9 @@ function sync(
     topic,
     messages,
     commands: [{ name: 'new', description: 'start over' }],
+    // One daemon, unless a test is specifically about a restart. Ids are per process, so this is
+    // what keeps a cached `w1` and a fresh `w1` from being taken for the same message.
+    epoch: 1,
     topics: topics.map((id, i) => ({
       id,
       title: `Topic ${id}`,
@@ -118,13 +145,30 @@ async function open(
     height?: number;
     /** What each POST answers with; anything unlisted answers `{}`, as most routes do. */
     replies?: Record<string, unknown>;
+    /** Per-path HTTP status. Anything unlisted answers 200; ≥400 is `ok: false`. */
+    status?: Record<string, number>;
+    /**
+     * The database this page opens. Pass a previous harness's to reload the same browser;
+     * pass `null` for one that has no IndexedDB at all, which is a real browser configuration
+     * and must not take the page down with it.
+     */
+    idb?: IDBFactory | null;
     /** What `confirm()` returns — a destructive control is only half tested by the yes path. */
     confirm?: boolean;
   } = {}
 ): Promise<Harness> {
-  const { url = 'http://localhost:8787/', width = 1440, height = 900, replies = {}, confirm = true } = opts;
+  const {
+    url = 'http://localhost:8787/',
+    width = 1440,
+    height = 900,
+    replies = {},
+    status = {},
+    idb = new IDBFactory(),
+    confirm = true,
+  } = opts;
   const streams: Stream[] = [];
   const calls: Call[] = [];
+  const clipboard: string[] = [];
 
   const dom = new JSDOM(renderPage('Chat'), {
     url,
@@ -133,6 +177,16 @@ async function open(
     beforeParse(w) {
       Object.defineProperty(w, 'innerWidth', { value: width, configurable: true });
       Object.defineProperty(w, 'innerHeight', { value: height, configurable: true });
+      if (idb) (w as any).indexedDB = idb;
+      Object.defineProperty(w.navigator, 'clipboard', {
+        configurable: true,
+        value: {
+          writeText: (s: string) => {
+            clipboard.push(s);
+            return Promise.resolve();
+          },
+        },
+      });
       class FakeEventSource implements Stream {
         readyState = 1;
         closed = false;
@@ -153,7 +207,12 @@ async function open(
       (w as any).confirm = () => confirm;
       (w as any).fetch = (path: string, init: { body: string }) => {
         calls.push({ path, body: JSON.parse(init.body) });
-        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(replies[path] ?? {}) });
+        const code = status[path] ?? 200;
+        return Promise.resolve({
+          ok: code < 400,
+          status: code,
+          json: () => Promise.resolve(replies[path] ?? {}),
+        });
       };
     },
   });
@@ -172,6 +231,10 @@ async function open(
     streams,
     live,
     calls,
+    status,
+    idb,
+    clipboard,
+    cached: (topic) => readCache(idb, topic),
     emit: async (ev) => {
       live().onmessage?.({ data: JSON.stringify(ev) });
       await tick();
@@ -192,6 +255,37 @@ async function open(
       await tick();
     },
   };
+}
+
+/**
+ * Read one topic's cached transcript straight out of the database.
+ *
+ * Deliberately not through the page: what is asserted is what a RELOAD would find, so it is read
+ * the way the next page would read it rather than the way this one remembers writing it.
+ */
+function readCache(idb: IDBFactory | null, topic: string): Promise<Array<Record<string, unknown>> | null> {
+  if (!idb) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const rq = idb.open('aa_cache', 1);
+    rq.onerror = () => resolve(null);
+    rq.onsuccess = () => {
+      const db = rq.result;
+      if (!db.objectStoreNames.contains('topics')) {
+        db.close();
+        return resolve(null);
+      }
+      const get = db.transaction('topics').objectStore('topics').get(topic);
+      get.onerror = () => {
+        db.close();
+        resolve(null);
+      };
+      get.onsuccess = () => {
+        const rec = get.result as { json?: string } | undefined;
+        db.close();
+        resolve(rec?.json ? (JSON.parse(rec.json) as Array<Record<string, unknown>>) : null);
+      };
+    };
+  });
 }
 
 describe('webui page: rendering', () => {
@@ -355,8 +449,9 @@ describe('webui page: topics', () => {
     expect(h.live().url).toBe('api/events?t=b2c3d4e5');
 
     await h.click('[data-topic="a1b2c3d4"]');
-    // A came back with no sync emitted at all — this is the cache, and the point of it.
-    expect(h.painted()).toBe(2);
+    // A came back with no sync emitted at all — this is the cache, and the point of it. It is
+    // read rather than remembered, so it arrives an IndexedDB turn later than the click.
+    await until('A is painted from cache', () => h.painted() === 2);
     expect(h.el('log').textContent).toContain('in A');
     expect(h.window.location.search).toBe('?t=a1b2c3d4');
   });
@@ -453,6 +548,8 @@ describe('webui page: topics', () => {
     const h = await open({ replies: { 'api/topics/clear': { topic: { id: 'deadbeef', title: '', lastAt: 2000 } } } });
     await h.emit(sync('a1b2c3d4', [message('m1', '<p>in A</p>')], ['a1b2c3d4', 'b2c3d4e5']));
     expect(h.painted()).toBe(1);
+    await saved();
+    expect(await h.cached('a1b2c3d4')).toHaveLength(1);
 
     await h.click('#clear-topics');
 
@@ -465,7 +562,8 @@ describe('webui page: topics', () => {
     // Every local record of the old rooms went with them: a cache left behind would repaint
     // messages for ids the daemon has forgotten the moment one of them was opened again, and a
     // read mark left behind would badge the replacement against a count from a dead room.
-    expect(h.window.sessionStorage.getItem('aa_cache')).toBe(JSON.stringify({ data: {}, order: [] }));
+    await untilAsync('the cached transcript is gone', async () => (await h.cached('a1b2c3d4')) === null);
+    expect(await h.cached('a1b2c3d4')).toBeNull();
     expect(JSON.parse(h.window.localStorage.getItem('aa_reads') ?? 'null')).toEqual({ deadbeef: 0 });
   });
 
@@ -589,6 +687,197 @@ describe('webui page: sending', () => {
     await h.click('#composer button[type="submit"]');
 
     expect(h.calls.filter((c) => c.path === 'api/send')).toHaveLength(0);
+  });
+
+  it('shows the message as soon as it is typed, before the request is answered', async () => {
+    const h = await open();
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+    (h.el('input') as HTMLTextAreaElement).value = 'ship it';
+
+    // Clicked WITHOUT awaiting: the assertion is that the bubble is there before the fetch has
+    // resolved, which is the whole of this feature.
+    h.doc.querySelector<HTMLElement>('#composer button[type="submit"]')!.click();
+
+    expect(h.painted()).toBe(1);
+    const bubble = h.el('log').querySelector('.m');
+    expect(bubble?.className).toContain('own');
+    expect(bubble?.className).toContain('pending');
+    expect(bubble?.textContent).toContain('ship it');
+
+    await tick();
+    // Answered: still one message, and no longer dimmed as in flight.
+    expect(h.painted()).toBe(1);
+    expect(h.el('log').querySelector('.m')?.className).not.toContain('pending');
+  });
+
+  it('lets the echo take over the local bubble rather than doubling it', async () => {
+    // The node identity is the assertion. Removing the local bubble and painting the server's
+    // copy would re-run the fade-in and move the scroll, for a message that has been on screen
+    // since it was typed.
+    const h = await open();
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+    (h.el('input') as HTMLTextAreaElement).value = 'ship it';
+    await h.click('#composer button[type="submit"]');
+    const before = h.el('log').children[0];
+    const nonce = h.calls.find((c) => c.path === 'api/send')?.body.nonce as string;
+
+    await h.emit({ t: 'msg', msg: { ...message('w1', '<div class="raw">ship it</div>', true), nonce } });
+
+    expect(h.painted()).toBe(1);
+    expect(h.el('log').children[0]).toBe(before);
+    expect(h.el('log').textContent).toContain('ship it');
+  });
+
+  it('keeps a message that did not reach the daemon, with something to do about it', async () => {
+    // What used to happen instead: the composer was cleared, the POST failed, and a line of note
+    // text was all that was left of the prompt. The text IS the message here.
+    const h = await open({ status: { 'api/send': 400 } });
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+    (h.el('input') as HTMLTextAreaElement).value = 'a prompt worth not retyping';
+
+    await h.click('#composer button[type="submit"]');
+
+    await until('the failure is drawn', () => h.doc.querySelector('.m.failed') !== null);
+    expect(h.el('log').textContent).toContain('a prompt worth not retyping');
+    expect(h.el('log').textContent).toContain('Not delivered');
+    expect(h.doc.querySelector('[data-retry]')).not.toBeNull();
+    expect(h.doc.querySelector('[data-copy]')).not.toBeNull();
+    expect(h.doc.querySelector('[data-discard]')).not.toBeNull();
+  });
+
+  it('retries under the original nonce, so a request that did land cannot double', async () => {
+    const h = await open({ status: { 'api/send': 400 } });
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+    (h.el('input') as HTMLTextAreaElement).value = 'try again';
+    await h.click('#composer button[type="submit"]');
+    await until('the failure is drawn', () => h.doc.querySelector('.m.failed') !== null);
+
+    h.status['api/send'] = 200;
+    await h.click('[data-retry]');
+
+    const sends = h.calls.filter((c) => c.path === 'api/send');
+    expect(sends).toHaveLength(2);
+    expect(sends[1]?.body.nonce).toBe(sends[0]?.body.nonce);
+    expect(h.doc.querySelector('.m.failed')).toBeNull();
+  });
+
+  it('copies the text of a failed message, and forgets one that is discarded', async () => {
+    const h = await open({ status: { 'api/send': 400 } });
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+    (h.el('input') as HTMLTextAreaElement).value = 'the prompt itself';
+    await h.click('#composer button[type="submit"]');
+    await until('the failure is drawn', () => h.doc.querySelector('.m.failed') !== null);
+
+    await h.click('[data-copy]');
+    expect(h.clipboard).toEqual(['the prompt itself']);
+    expect(h.doc.querySelector('[data-copy]')?.textContent).toBe('Copied');
+
+    await h.click('[data-discard]');
+    expect(h.painted()).toBe(0);
+  });
+
+  it('keeps a failed message across a reload, offering what it can still honour', async () => {
+    // The body it would be retried with holds its attachments as base64 and is deliberately not
+    // written to the cache, so the reloaded page offers Copy and Discard and does not pretend it
+    // can re-send something it no longer has.
+    const h = await open({ url: 'http://localhost:8787/?t=a1b2c3d4', status: { 'api/send': 400 } });
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+    (h.el('input') as HTMLTextAreaElement).value = 'do not lose this';
+    await h.click('#composer button[type="submit"]');
+    await until('the failure is drawn', () => h.doc.querySelector('.m.failed') !== null);
+    await saved();
+
+    const again = await open({ url: 'http://localhost:8787/?t=a1b2c3d4', idb: h.idb });
+
+    await until('the failure is restored', () => again.doc.querySelector('.m.failed') !== null);
+    expect(again.el('log').textContent).toContain('do not lose this');
+    expect(again.doc.querySelector('[data-retry]')).toBeNull();
+    expect(again.doc.querySelector('[data-copy]')).not.toBeNull();
+    expect(again.doc.querySelector('[data-discard]')).not.toBeNull();
+  });
+});
+
+describe('webui page: the local transcript cache', () => {
+  it('paints a topic from the last visit before the daemon has said anything', async () => {
+    const h = await open({ url: 'http://localhost:8787/?t=a1b2c3d4' });
+    await h.emit(sync('a1b2c3d4', [message('m1', '<p>first</p>'), message('m2', '<p>second</p>')], ['a1b2c3d4']));
+    await saved();
+    expect(await h.cached('a1b2c3d4')).toHaveLength(2);
+
+    // A different page object on the same browser: everything in memory is gone, the database is
+    // not. Nothing is emitted down this one's stream at all.
+    const again = await open({ url: 'http://localhost:8787/?t=a1b2c3d4', idb: h.idb });
+
+    await until('the cached transcript is painted', () => again.painted() === 2);
+    expect(again.el('log').textContent).toContain('first');
+    expect(again.skeletons()).toBe(0);
+  });
+
+  it('keeps what a restarted daemon has lost, says so, and leaves nothing to click', async () => {
+    const withButton = { ...message('m2', '<p>pick one</p>'), buttons: [{ id: 'b:yes', label: 'Yes' }] };
+    const first = await open({ url: 'http://localhost:8787/?t=a1b2c3d4' });
+    await first.emit(sync('a1b2c3d4', [message('m1', '<p>from before</p>'), withButton], ['a1b2c3d4']));
+    await saved();
+
+    const h = await open({ url: 'http://localhost:8787/?t=a1b2c3d4', idb: first.idb });
+    await until('the cached transcript is painted', () => h.painted() === 2);
+
+    // The daemon came back: a new generation, an empty ring, and a topic older than the process.
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4'], { epoch: 2, stale: true }));
+
+    expect(h.painted()).toBe(2);
+    expect(h.doc.querySelectorAll('#log > .m.hist')).toHaveLength(2);
+    expect(h.doc.querySelector('#log > .divider')?.textContent).toContain('before the daemon restarted');
+    // The apology is for a room with nothing in it; there is something in this one.
+    expect(h.notice()).toBeNull();
+    // The process that would answer that button is gone, and the id it names now means nothing.
+    expect(h.doc.querySelector('button[data-btn]')).toBeNull();
+  });
+
+  it('does not let a restarted daemon reuse an id over a cached message', async () => {
+    // Ids are counted per process and start again at w1, so a cached message and a fresh one can
+    // both be called m1. Keyed by id alone the reply overwrites the history; keyed by generation
+    // they are two messages, which is what they are.
+    const first = await open({ url: 'http://localhost:8787/?t=a1b2c3d4' });
+    await first.emit(sync('a1b2c3d4', [message('m1', '<p>from before</p>')], ['a1b2c3d4']));
+    await saved();
+
+    const h = await open({ url: 'http://localhost:8787/?t=a1b2c3d4', idb: first.idb });
+    await until('the cached transcript is painted', () => h.painted() === 1);
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4'], { epoch: 2, stale: true }));
+
+    await h.emit({ t: 'msg', msg: message('m1', '<p>brand new</p>') });
+
+    expect(h.painted()).toBe(2);
+    expect(h.el('log').textContent).toContain('from before');
+    expect(h.el('log').textContent).toContain('brand new');
+  });
+
+  it('keeps only the tail of a long topic', async () => {
+    const many: Array<Record<string, unknown>> = [];
+    for (let i = 0; i < 210; i++) many.push(message(`m${i}`, `<p>line ${i}</p>`));
+    const h = await open({ url: 'http://localhost:8787/?t=a1b2c3d4' });
+
+    await h.emit(sync('a1b2c3d4', many, ['a1b2c3d4']));
+    await saved();
+
+    const kept = await h.cached('a1b2c3d4');
+    expect(kept).toHaveLength(200);
+    expect(kept?.[0]?.id).toBe('m10');
+    expect(kept?.[199]?.id).toBe('m209');
+  });
+
+  it('works on a browser with no IndexedDB at all', async () => {
+    // Private windows and old engines both produce one. The cache is the only thing that goes.
+    const h = await open({ idb: null });
+
+    await h.emit(sync('a1b2c3d4', [message('m1', '<p>still here</p>')], ['a1b2c3d4']));
+    expect(h.painted()).toBe(1);
+
+    (h.el('input') as HTMLTextAreaElement).value = 'and sending still works';
+    await h.click('#composer button[type="submit"]');
+    expect(h.painted()).toBe(2);
+    expect(h.calls.find((c) => c.path === 'api/send')?.body.text).toBe('and sending still works');
   });
 });
 

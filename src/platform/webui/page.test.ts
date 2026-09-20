@@ -118,9 +118,21 @@ describe('webui page', () => {
 
   it('caches topic messages in browser storage for instant switching', () => {
     expect(html).toContain('aa_cache');
-    expect(html).toContain('sessionStorage');
+    // IndexedDB, not localStorage: a transcript with code blocks in it runs to hundreds of
+    // kilobytes and the ~5MB there is shared with everything else this origin keeps.
+    expect(html).toContain('indexedDB');
     expect(html).toContain('MAX_CACHE_TOPICS');
     expect(html).toContain('MAX_CACHE_MSGS');
+    expect(html).toContain('MAX_CACHE_BYTES');
+  });
+
+  it('shows a message the moment it is typed, and keeps one that failed to send', () => {
+    // The local bubble and its three ways out. `page.dom.test.ts` is what proves they work;
+    // this only proves the markup that carries them survived the template.
+    expect(html).toContain('data-retry=');
+    expect(html).toContain('data-copy=');
+    expect(html).toContain('data-discard=');
+    expect(html).toContain('Not delivered');
   });
 
   it('accepts the sync for a topic it did not name', () => {

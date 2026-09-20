@@ -140,6 +140,18 @@ export type WebEvent =
       commands: SlashCommandSpec[];
       topics: Topic[];
       /**
+       * Which run of the daemon these messages come from — `WebRoom`'s construction time.
+       *
+       * The page caches transcripts locally and paints them before this sync arrives, so it
+       * needs to know whether a cached message and an incoming one that share an id are the
+       * same message. They are not, necessarily: `nextId` counts from `w1` per process, and a
+       * restart hands the same ids out again. Without a generation to key on, the first reply
+       * after a restart would silently overwrite a cached message from before it.
+       *
+       * Epochs are only ever compared for equality — the page reads no meaning into the value.
+       */
+      epoch: number;
+      /**
        * This topic is older than the running daemon and has nothing left in memory.
        *
        * Set so the page can say WHY it is showing an empty room. The topic list is persisted
@@ -197,4 +209,13 @@ export interface WebMessage {
   quote?: { html: string };
   /** Set when the message IS a file the agent sent. */
   file?: { name: string; url: string };
+  /**
+   * The `nonce` of the send this message is the echo of. Only ever set on the operator's own.
+   *
+   * The page shows a message the moment it is typed, before the POST has been answered, and
+   * that local bubble has to be retired when the real one arrives or the transcript shows it
+   * twice. Matching on the text would be a guess; the nonce is already round-tripping for
+   * idempotency, so it is the exact answer and costs one field.
+   */
+  nonce?: string;
 }

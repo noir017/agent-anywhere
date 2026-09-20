@@ -8,7 +8,7 @@ import { WebuiConfigSchema } from '../config-schemas.js';
 import { CHANNEL, DIR_TTL_MS, OWNER, WebRoom, type WebuiInstance } from './room.js';
 import { TopicStore } from './topics.js';
 import type { InboundMessage } from '../../types.js';
-import type { WebEvent } from './protocol.js';
+import type { WebEvent, WebMessage } from './protocol.js';
 
 let dir = '';
 beforeEach(() => {
@@ -312,6 +312,21 @@ describe('WebRoom: resuming a dropped stream', () => {
     expect(seen[0]?.ev).toMatchObject({ t: 'sync', topic, messages: [{ html: '<p>x</p>' }] });
     expect((seen[0]?.ev as { topics: unknown[] }).topics).toHaveLength(1);
   });
+
+  it('a sync says which run of the daemon its ids belong to', () => {
+    // Ids are counted per process and start again at w1, and the page caches transcripts across
+    // restarts — so without a generation to compare, a cached w1 and a fresh w1 are the same
+    // message to it, and the first reply after a restart overwrites what it kept.
+    const { room, topic } = attached();
+    const first: Seen[] = [];
+    room.subscribe(topic, (id, ev) => first.push({ id, ev }));
+    const epoch = (first[0]?.ev as { epoch: number }).epoch;
+    expect(typeof epoch).toBe('number');
+    // Stable for the life of one room, and different for the one that replaces it.
+    const again: Seen[] = [];
+    room.subscribe(topic, (id, ev) => again.push({ id, ev }));
+    expect((again[0]?.ev as { epoch: number }).epoch).toBe(epoch);
+  });
 });
 
 describe('WebRoom: a topic older than the process', () => {
@@ -392,6 +407,19 @@ describe('WebRoom: inbound', () => {
     expect(room.submit({ topic, text: 'once', nonce: 'n1' })).toBe('accepted');
     expect(room.submit({ topic, text: 'once', nonce: 'n1' })).toBe('duplicate');
     expect(got).toHaveLength(1);
+  });
+
+  it('echoes the nonce back on the operator message, and only when one was sent', () => {
+    // The page draws a message the moment it is typed. That local bubble is retired by the echo
+    // that claims it, and this is what it claims it by — matching on the text would be a guess.
+    const { room, topic } = attached();
+    const seen: Seen[] = [];
+    room.subscribe(topic, (id, ev) => seen.push({ id, ev }));
+    room.submit({ topic, text: 'hello', nonce: 'n1' });
+    room.submit({ topic, text: 'again' });
+    const posted = seen.filter((s) => s.ev.t === 'msg').map((s) => (s.ev as { msg: WebMessage }).msg);
+    expect(posted[0]?.nonce).toBe('n1');
+    expect(posted[1]).not.toHaveProperty('nonce');
   });
 
   it('names a blank topic from the first thing said in it', () => {

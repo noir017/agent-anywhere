@@ -150,6 +150,20 @@ body{background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,-apple-system,
    any code block it carries are lifted a step. */
 .m.own .q{border-left-color:#3d4a5a;color:#8b96a3}
 .m.own .b pre,.m.own .b :not(pre)>code{background:#161b22;border-color:#2b3441}
+/* A message that is on screen because it was typed here, not because the daemon sent it back.
+   Dimmed while the request is in flight; edged red and given something to do about it once the
+   request has failed, since the text in it is the only copy left. */
+.m.pending{opacity:.6}
+.m.failed{border-left-color:#a14a4a}
+.m .warn{color:#e08a8a;font-size:12px;margin-top:7px}
+.m .acts{margin-top:7px;display:flex;flex-wrap:wrap;gap:6px}
+.m .acts button{font-size:12px;padding:4px 10px}
+/* Cached from a daemon that is no longer running. Legible, just half a step back: it is real
+   conversation, it is only no longer anything the process on the other end can be asked about. */
+.m.hist{opacity:.9}
+/* Says so, once, between the cached messages and the live ones. Sized like .empty rather than
+   like a message, because it is about the room and not in it. */
+.divider{margin:2px auto 20px;max-width:46ch;padding-top:10px;border-top:1px solid var(--line);text-align:center;font-size:11.5px;line-height:1.6;color:var(--dim)}
 .b>:first-child{margin-top:0}
 .b>:last-child{margin-bottom:0}
 /* The operator's own message, which renderBody escapes and does not render (see room.ts).
@@ -238,6 +252,10 @@ const SCRIPT = `
   // What the last sync said about this topic being older than the daemon, and the notice element
   // that says so. Both are per topic, so both are reset on the way into one.
   var stale=false, emptyEl=null;
+  // Which run of the daemon the live stream belongs to, and whether this topic's first sync has
+  // landed. 0 until one has: every message below is qualified by the generation it came from,
+  // and before the first sync the only generations known are the ones out of the cache.
+  var epoch=0, synced=false;
   var topic = new URLSearchParams(location.search).get('t') || '';
   var topics = [];
   var readCounts = {};
@@ -247,43 +265,171 @@ const SCRIPT = `
     try { localStorage.setItem('aa_reads', JSON.stringify(readCounts)); } catch(x){}
   }
 
-  var MAX_CACHE_TOPICS = 10;
-  var MAX_CACHE_MSGS = 40;
-  var topicCache = {};
-  var cacheOrder = [];
-  try {
-    var saved = JSON.parse(sessionStorage.getItem('aa_cache') || '{}');
-    if(saved && typeof saved === 'object'){
-      topicCache = saved.data || {};
-      cacheOrder = saved.order || [];
-    }
-  } catch(x){}
+  /**
+   * How a message is identified ON THIS PAGE, which is deliberately not its server id.
+   *
+   * Server ids are 'w1', 'w2'..., counted per PROCESS — so a restarted daemon hands the same
+   * ones out again, and this page keeps transcripts across restarts. Keyed by id alone, the
+   * first reply after a restart silently overwrites a cached message from before it. The
+   * generation — a sync's epoch field — is what tells the two apart. A message typed here and
+   * not yet acknowledged has no server id at all and travels under its nonce instead, behind a
+   * prefix no server id can collide with.
+   */
+  function keyOf(m){ return m._local ? m.id : m._g + ':' + m.id; }
 
-  function saveCache(){
-    try {
-      sessionStorage.setItem('aa_cache', JSON.stringify({ data: topicCache, order: cacheOrder }));
-    } catch(x){}
+  /** A cached message from a daemon that is no longer the one on the other end of the stream. */
+  function isHistory(m){ return Boolean(m) && !m._local && epoch !== 0 && m._g !== epoch; }
+
+  // ── The local transcript cache ─────────────────────────────────────────────
+  // What lets a topic paint before the stream has answered, and what makes a daemon restart cost
+  // the conversation its liveness rather than its contents. IndexedDB rather than localStorage:
+  // one transcript with code blocks in it runs to hundreds of kilobytes, and localStorage's ~5MB
+  // is shared with everything else this origin keeps.
+  //
+  // One record per topic, holding the message list as a STRING rather than an object graph. The
+  // byte budget below is then something that can actually be measured, and nothing rests on how
+  // a structured clone treats these objects.
+  var DB_NAME='aa_cache', DB_VER=1, STORE='topics';
+  // Rotation, because a cache that only grows is just a slower version of the bug being fixed:
+  // the TAIL of a topic is kept, and the least recently written topics go first.
+  var MAX_CACHE_TOPICS=24, MAX_CACHE_MSGS=200, MAX_CACHE_BYTES=512*1024;
+  // How long writes are held together. A streamed reply upserts the same message every second or
+  // so, and each one would otherwise re-serialise the whole topic.
+  var SAVE_MS=400;
+  var db=null, dbOff=false, saveTimer=null;
+
+  function cacheOff(why){
+    if(dbOff) return;
+    dbOff=true; db=null;
+    // Once, and only once. The page works without the cache, and a line per attempted write
+    // would be the loudest thing in the console for a feature nobody can see failing.
+    try { console.warn('[webui] local transcript cache disabled:', (why && why.message) || why || 'unavailable'); } catch(x){}
   }
 
-  function setCachedMsgs(tId, msgs){
-    if(!tId || !msgs) return;
-    var slice = msgs.length > MAX_CACHE_MSGS ? msgs.slice(-MAX_CACHE_MSGS) : msgs.slice();
-    topicCache[tId] = slice;
-    var idx = cacheOrder.indexOf(tId);
-    if(idx >= 0) cacheOrder.splice(idx, 1);
-    cacheOrder.push(tId);
-    while(cacheOrder.length > MAX_CACHE_TOPICS){
-      var evict = cacheOrder.shift();
-      delete topicCache[evict];
-    }
-    saveCache();
+  function idb(){
+    if(db) return Promise.resolve(db);
+    if(dbOff || !window.indexedDB) return Promise.resolve(null);
+    return new Promise(function(res){
+      var rq;
+      try { rq = window.indexedDB.open(DB_NAME, DB_VER); } catch(x){ cacheOff(x); return res(null); }
+      rq.onupgradeneeded = function(){
+        var d = rq.result;
+        if(d.objectStoreNames.contains(STORE)) return;
+        // The at field is indexed so eviction can walk oldest-first over KEYS alone — a cursor
+        // over the records would read every cached transcript into memory to delete one of them.
+        d.createObjectStore(STORE, {keyPath:'topic'}).createIndex('at','at');
+      };
+      rq.onsuccess = function(){ db = rq.result; res(db); };
+      rq.onerror = function(){ cacheOff(rq.error); res(null); };
+      rq.onblocked = function(){ cacheOff('another tab holds an older version'); res(null); };
+    });
   }
 
-  function dropCachedTopic(tId){
-    delete topicCache[tId];
-    var idx = cacheOrder.indexOf(tId);
-    if(idx >= 0) cacheOrder.splice(idx, 1);
-    saveCache();
+  /** One transaction. Resolves {ok:true, value} with whatever body asked for, or {ok:false}. */
+  function cacheTx(mode, body){
+    return idb().then(function(d){
+      if(!d) return {ok:false};
+      return new Promise(function(res){
+        var t, out=null;
+        try { t = d.transaction(STORE, mode); } catch(x){ cacheOff(x); return res({ok:false}); }
+        var rq = body(t.objectStore(STORE));
+        if(rq) rq.onsuccess = function(){ out = rq.result; };
+        t.oncomplete = function(){ res({ok:true, value:out}); };
+        t.onabort = function(){ res({ok:false, error:t.error}); };
+        t.onerror = function(){ res({ok:false, error:t.error}); };
+      });
+    });
+  }
+
+  /** The slice of a topic worth keeping: its tail, trimmed to the byte budget. */
+  function cacheBody(msgs){
+    var out = msgs.length > MAX_CACHE_MSGS ? msgs.slice(-MAX_CACHE_MSGS) : msgs;
+    var json = JSON.stringify(out);
+    // A quarter at a time rather than one message at a time: a topic of long answers would
+    // otherwise re-serialise itself dozens of times on the way under the budget.
+    while(json.length > MAX_CACHE_BYTES && out.length > 1){
+      out = out.slice(Math.max(1, Math.round(out.length/4)));
+      json = JSON.stringify(out);
+    }
+    return json;
+  }
+
+  function cacheWrite(tId, msgs, retried){
+    var rec = { topic: tId, at: Date.now(), json: cacheBody(msgs) };
+    return cacheTx('readwrite', function(store){ store.put(rec); evict(store, tId, false); return null; })
+      .then(function(r){
+        if(r.ok || dbOff) return;
+        if(retried) return cacheOff(r.error || 'the write was refused twice');
+        // Out of room, most likely. Everything except the topic being read goes, and the write
+        // is tried once more before the cache is written off for this session.
+        return cacheTx('readwrite', function(store){ evict(store, tId, true); return null; })
+          .then(function(){ return cacheWrite(tId, msgs, true); });
+      });
+  }
+
+  /** Drop the least recently written topics. all throws away everything except keep. */
+  function evict(store, keep, all){
+    var count = store.count();
+    count.onsuccess = function(){
+      var over = all ? count.result : count.result - MAX_CACHE_TOPICS;
+      if(over <= 0) return;
+      var cur = store.index('at').openKeyCursor();
+      cur.onsuccess = function(){
+        var at = cur.result;
+        if(!at || over <= 0) return;
+        if(at.primaryKey !== keep){ store.delete(at.primaryKey); over--; }
+        at.continue();
+      };
+    };
+  }
+
+  function cacheRead(tId){
+    return cacheTx('readonly', function(store){ return store.get(tId); }).then(function(r){
+      if(!r.ok || !r.value || !r.value.json) return null;
+      try { var list = JSON.parse(r.value.json); return (list && list.length) ? list : null; } catch(x){ return null; }
+    });
+  }
+
+  function cacheDrop(tId){ cacheTx('readwrite', function(store){ store.delete(tId); return null; }); }
+  function cacheClear(){ cacheTx('readwrite', function(store){ store.clear(); return null; }); }
+
+  /**
+   * What is on screen, in the order it is on screen, as the cache should hold it.
+   *
+   * Read off #log rather than from a list of our own, because here the DOM IS the order — and
+   * what it holds is already the union of cached history and what the daemon has since sent,
+   * which is exactly what the next reload should get back.
+   *
+   * A local message is included only once it has FAILED. One still in flight is a question this
+   * tab alone can answer, and restoring it after a reload would either duplicate a message the
+   * daemon did receive or claim one was lost that was not.
+   */
+  function cacheable(){
+    var out=[];
+    for(var n=log.firstChild; n; n=n.nextSibling){
+      var k = n.getAttribute ? n.getAttribute('data-k') : null;
+      var m = k ? data[k] : null;
+      if(!m) continue;
+      if(m._local && m._state !== 'failed') continue;
+      out.push(m);
+    }
+    return out;
+  }
+
+  /** Remember the current topic, at most once every SAVE_MS. */
+  function cacheSave(){
+    if(!topic || dbOff || saveTimer) return;
+    saveTimer = setTimeout(function(){
+      saveTimer = null;
+      if(topic) cacheWrite(topic, cacheable(), false);
+    }, SAVE_MS);
+  }
+
+  /** Write now rather than at the end of the window — for the way out of a topic. */
+  function cacheFlush(){
+    if(!saveTimer) return;
+    clearTimeout(saveTimer); saveTimer = null;
+    if(topic) cacheWrite(topic, cacheable(), false);
   }
 
   // The one place the narrow-screen breakpoint lives on this side of the wire. It has to stay
@@ -347,16 +493,36 @@ const SCRIPT = `
     return p(d.getHours())+':'+p(d.getMinutes());
   }
 
-  function paint(id){
-    var m=data[id]; if(!m) return;
-    var el=els[id];
-    if(!el){ clearSkeleton(); el=document.createElement('div'); log.appendChild(el); els[id]=el; }
-    var cls = 'm' + (m.own ? ' own' : '');
+  /**
+   * Draw one message, creating its element if this is the first sight of it.
+   *
+   * before is how cached history gets ABOVE a transcript the daemon has already sent: the node
+   * is inserted in front of the first live message instead of appended after the last one.
+   */
+  function paint(key, before){
+    var m=data[key]; if(!m) return;
+    var el=els[key];
+    if(!el){
+      clearSkeleton();
+      el=document.createElement('div');
+      // The page's own key, on the node, so the order on screen can be read back off #log —
+      // which is what the cache writes and what places the history divider.
+      el.setAttribute('data-k', key);
+      if(before && before.parentNode === log) log.insertBefore(el, before); else log.appendChild(el);
+      els[key]=el;
+    }
+    var hist = isHistory(m);
+    var cls = 'm' + (m.own ? ' own' : '') + (hist ? ' hist' : '')
+      + (m._local && m._state === 'sending' ? ' pending' : '')
+      + (m._local && m._state === 'failed' ? ' failed' : '');
     var h='';
     if(m.quote && m.quote.html) h += '<div class="q">'+m.quote.html+'</div>';
     h += '<div class="b">'+m.html+'</div>';
     if(m.file) h += '<div class="files"><a href="'+text(m.file.url)+'" download>'+text(m.file.name)+'</a></div>';
-    if(m.buttons && m.buttons.length){
+    // Buttons are dropped from a message that came out of the cache: the process that would
+    // answer them is gone, and the id they name now means a different message or nothing at
+    // all. A control that cannot act is worse than no control.
+    if(!hist && m.buttons && m.buttons.length){
       h += '<div class="btns">';
       for(var i=0;i<m.buttons.length;i++){
         h += '<button type="button" data-msg="'+text(m.id)+'" data-btn="'+text(m.buttons[i].id)+'">'
@@ -364,24 +530,45 @@ const SCRIPT = `
       }
       h += '</div>';
     }
+    if(m._local && m._state === 'failed') h += failedActions(m);
     var meta = clock(m.at) + (m.reactions && m.reactions.length ? '  '+m.reactions.join(' ') : '');
     h += '<div class="t">'+text(meta)+'</div>';
     // Write nothing when nothing changed. A sync re-paints every message it carries, and most of
     // them are messages already on screen unchanged — rewriting innerHTML for those would drop
     // the caret out of a selection, restart any <img> decode, and undo the enabled state of a
     // button the click handler just disabled, all for identical markup.
-    if(sig[id]===h && el.className===cls) return;
+    if(sig[key]===h && el.className===cls) return;
     el.className = cls;
     el.innerHTML = h;
-    sig[id] = h;
+    sig[key] = h;
   }
 
-  function upsert(m){ var stick=atBottom(); data[m.id]=m; paint(m.id); syncEmptyNote(); if(stick) toBottom(); }
+  /**
+   * What a message that never reached the daemon offers instead of silence.
+   *
+   * Retry is only there while this tab still holds the body it would re-send — the attachments
+   * in it are base64 and deliberately never written to the cache, so a failed message restored
+   * after a reload offers Copy and Discard alone. Re-sending the text without the files it was
+   * written about would be a different message.
+   */
+  function failedActions(m){
+    var h = '<div class="warn">Not delivered — the agent never saw this.</div><div class="acts">';
+    if(outbox[m._nonce]) h += '<button type="button" data-retry="'+text(m._nonce)+'">Retry</button>';
+    return h + '<button type="button" data-copy="'+text(m._nonce)+'">Copy</button>'
+      + '<button type="button" data-discard="'+text(m._nonce)+'">Discard</button></div>';
+  }
 
-  function drop(id){
-    if(els[id]) { els[id].remove(); delete els[id]; }
-    delete data[id];
-    delete sig[id];
+  function upsert(m){
+    m._g = epoch;
+    var stick=atBottom();
+    var key = keyOf(m);
+    data[key]=m; paint(key); syncEmptyNote(); if(stick) toBottom();
+  }
+
+  function drop(key){
+    if(els[key]) { els[key].remove(); delete els[key]; }
+    delete data[key];
+    delete sig[key];
     syncEmptyNote();
   }
 
@@ -394,19 +581,31 @@ const SCRIPT = `
    * through blank. Here an unchanged message is left untouched (paint writes nothing when the
    * markup matches), and appendChild MOVES a node that already exists rather than cloning it — so
    * ordering costs no re-creation either, and nothing re-runs the fade-in animation.
+   *
+   * Only messages of the CURRENT generation are the sync's to remove. Cached history belongs to
+   * a daemon that is not on the other end of this stream, and a local message still waiting on
+   * its POST was never the server's to know about; both would otherwise vanish the moment the
+   * connection blipped.
    */
   function reconcile(list){
     clearSkeleton();
     var keep={};
     for(var i=0;i<list.length;i++){
       var m=list[i];
-      keep[m.id]=1;
-      data[m.id]=m;
-      paint(m.id);
-      log.appendChild(els[m.id]);
+      m._g = epoch;
+      var key=keyOf(m);
+      keep[key]=1;
+      data[key]=m;
+      paint(key);
+      log.appendChild(els[key]);
     }
     var gone=[];
-    for(var id in els){ if(!keep[id]) gone.push(id); }
+    for(var k in els){
+      if(keep[k]) continue;
+      var held=data[k];
+      if(!held || held._local || held._g !== epoch) continue;
+      gone.push(k);
+    }
     for(var j=0;j<gone.length;j++) drop(gone[j]);
   }
 
@@ -432,9 +631,10 @@ const SCRIPT = `
     if(!skeleton) return;
     skeleton = false;
     log.innerHTML = '';
-    // Emptying #log invalidates anything held by reference into it, and this is the only other
-    // thing that lives in there.
+    // Emptying #log invalidates anything held by reference into it, and these are the only two
+    // things in there that are not messages.
     emptyEl = null;
+    dividerEl = null;
   }
 
   /**
@@ -466,6 +666,99 @@ const SCRIPT = `
       if(emptyEl.parentNode) emptyEl.parentNode.removeChild(emptyEl);
       emptyEl = null;
     }
+  }
+
+  /**
+   * The line between what this browser remembers and what the daemon is actually serving.
+   *
+   * A transcript lives in the daemon's memory, so a restart takes it — but it does not take the
+   * conversation, which the agent still has, and it no longer takes what this page saw of it
+   * either. The messages above this line came back out of the local cache: they are real, they
+   * are just no longer anything the daemon can be asked about, which is why nothing up there has
+   * a button on it.
+   */
+  var DIVIDER_NOTE = 'Everything above came from this browser, kept from before the daemon restarted.'
+    + ' The agent still has its context, so you can carry on below.';
+  var dividerEl=null;
+
+  /** Keep the divider immediately after the last cached message, or gone when there are none. */
+  function placeDivider(){
+    var last=null;
+    for(var n=log.firstChild; n; n=n.nextSibling){
+      var k = n.getAttribute ? n.getAttribute('data-k') : null;
+      if(k && isHistory(data[k])) last=n;
+    }
+    if(!last){
+      if(dividerEl && dividerEl.parentNode) dividerEl.parentNode.removeChild(dividerEl);
+      dividerEl=null;
+      return;
+    }
+    if(!dividerEl){
+      dividerEl=document.createElement('div');
+      dividerEl.className='divider';
+      dividerEl.textContent=DIVIDER_NOTE;
+    }
+    if(last.nextSibling !== dividerEl) log.insertBefore(dividerEl, last.nextSibling);
+  }
+
+  /**
+   * Re-draw whatever the cache handed us once a sync has said which generation is live.
+   *
+   * Before the first sync a cached message is painted as an ordinary message, because there is
+   * nothing yet to say it is not one. The sync answers that: if the daemon has been restarted
+   * since, every one of them is history, which changes how it is drawn (no buttons) and puts a
+   * line under the lot. paint writes nothing for the messages whose markup did not change, so on
+   * the ordinary path — same daemon, cache matching the ring — this costs one loop and no DOM.
+   */
+  function repaintHistory(){
+    for(var k in els){ if(isHistory(data[k])) paint(k); }
+    placeDivider();
+  }
+
+  // Guards a cache read that comes back after the reader has moved on, and keeps one topic from
+  // being read twice (the page asks on the way in, and again when a sync names a topic it was
+  // never told about).
+  var restoreToken = 0, restoreFor = null;
+
+  function restore(tId){
+    if(!tId || restoreFor === tId) return;
+    restoreFor = tId;
+    var mine = ++restoreToken;
+    cacheRead(tId).then(function(list){
+      if(list && mine === restoreToken && tId === topic) adopt(list);
+    });
+  }
+
+  /**
+   * Put cached messages on screen around whatever is already there.
+   *
+   * Both orders happen and both are normal. Usually the cache wins the race against the first
+   * sync, and is then simply the transcript, painted early — its keys are the ones the sync is
+   * about to produce, so the sync reuses the nodes and writes nothing. When the sync gets there
+   * first the only cached messages still worth showing are the ones the daemon does NOT have,
+   * and those belong above what it sent.
+   */
+  function adopt(list){
+    clearSkeleton();
+    var stick = entering || atBottom();
+    // Captured once: every history node goes in front of the same first live message, which is
+    // what keeps them in the order they were said rather than reversing them.
+    var anchor = synced ? log.firstChild : null;
+    for(var i=0;i<list.length;i++){
+      var m=list[i];
+      if(!m || !m.id) continue;
+      // A cached local message is a message that failed to send; nothing else is written. The
+      // body it would be retried with is not on this side of a reload, so it offers Copy alone.
+      if(m._local) m._state = 'failed';
+      var key = keyOf(m);
+      if(data[key] || els[key]) continue;
+      if(synced && !m._local && !isHistory(m)) continue;
+      data[key]=m;
+      paint(key, (synced && !m._local) ? anchor : null);
+    }
+    placeDivider();
+    syncEmptyNote();
+    if(stick) toBottom();
   }
 
   function paintTopics(){
@@ -515,6 +808,9 @@ const SCRIPT = `
 
   function switchTopic(id){
     if(!id || id===topic) return;
+    // The topic being left, written now rather than at the end of its window — in a moment
+    // nothing on screen belongs to it any more and there is nothing left to write.
+    cacheFlush();
     topic = id;
     history.replaceState(null,'','?t='+encodeURIComponent(topic));
     for(var i=0;i<topics.length;i++){
@@ -530,21 +826,20 @@ const SCRIPT = `
     els={};
     sig={};
     skeleton=false;
-    // Both belong to the topic being left: the notice element is gone with #log's children, and
-    // whether the NEXT topic predates the daemon is the incoming sync's answer to give.
+    // All of these belong to the topic being left: the notice and divider elements are gone with
+    // #log's children, whether the NEXT topic predates the daemon is the incoming sync's answer
+    // to give, and its transcript has not been read back yet. epoch is NOT reset — it is a
+    // property of the daemon on the other end, not of the room being entered.
     stale=false;
     emptyEl=null;
+    dividerEl=null;
     entering=true;
-    var cached = topicCache[id];
-    if(cached && cached.length){
-      for(var j=0;j<cached.length;j++){
-        data[cached[j].id] = cached[j];
-        paint(cached[j].id);
-      }
-      toBottom();
-    } else {
-      showSkeleton();
-    }
+    synced=false;
+    // The shape of a transcript while both the cache read and the stream are outstanding. The
+    // cache normally answers first and replaces it; nothing about that is guaranteed, which is
+    // why the placeholders go in regardless.
+    showSkeleton();
+    restore(id);
     connect();
   }
 
@@ -559,7 +854,7 @@ const SCRIPT = `
       return r.ok ? r.json() : null;
     }).then(function(d){
       if(!d) return;
-      dropCachedTopic(delId);
+      cacheDrop(delId);
       delete readCounts[delId];
       saveReads();
       if(topic === delId){
@@ -588,12 +883,21 @@ const SCRIPT = `
       // their scroll position intact.
       var stick = entering || atBottom();
       entering = false;
+      // Which run of the daemon everything in this sync belongs to. Anything already on screen
+      // from another one is cached history from here on, whatever it was painted as.
+      epoch = ev.epoch || 0;
+      synced = true;
       // What the server says about this room BEFORE the transcript is reconciled, so the drops
       // that reconcile performs already know whether an emptied log needs explaining.
       stale = Boolean(ev.stale);
+      repaintHistory();
       reconcile(ev.messages);
+      placeDivider();
       syncEmptyNote();
-      setCachedMsgs(topic, ev.messages);
+      cacheSave();
+      // A visit that named no topic is only told which room it is in here, so this is also where
+      // that room's cached transcript is asked for. Reading one twice is a no-op.
+      restore(topic);
       readCounts[topic] = ev.messages.length;
       saveReads();
       commands = ev.commands || [];
@@ -602,12 +906,11 @@ const SCRIPT = `
       note.textContent=''; if(stick) toBottom();
     }
     else if(ev.t==='msg'){
+      // Before the upsert: if this is the echo of something typed here, it takes over the node
+      // that local message is already occupying rather than appearing underneath it.
+      claim(ev.msg);
       upsert(ev.msg);
-      if(topicCache[topic]){
-        topicCache[topic].push(ev.msg);
-        if(topicCache[topic].length > MAX_CACHE_MSGS) topicCache[topic].shift();
-        saveCache();
-      }
+      cacheSave();
       readCounts[topic] = (readCounts[topic] || 0) + 1;
       saveReads();
       for(var i=0;i<topics.length;i++){
@@ -619,26 +922,16 @@ const SCRIPT = `
       paintTopics();
     }
     else if(ev.t==='del'){
-      drop(ev.id);
-      if(topicCache[topic]){
-        topicCache[topic] = topicCache[topic].filter(function(m){ return m.id !== ev.id; });
-        saveCache();
-      }
+      drop(epoch+':'+ev.id);
+      cacheSave();
     }
     else if(ev.t==='react'){
-      var m=data[ev.id]; if(!m) return;
+      var rk = epoch+':'+ev.id;
+      var m=data[rk]; if(!m) return;
       var kept=(m.reactions||[]).filter(function(e){ return e!==ev.emoji; });
       m.reactions = ev.on ? kept.concat([ev.emoji]) : kept;
-      paint(ev.id);
-      if(topicCache[topic]){
-        for(var k=0;k<topicCache[topic].length;k++){
-          if(topicCache[topic][k].id === ev.id){
-            topicCache[topic][k].reactions = m.reactions;
-            saveCache();
-            break;
-          }
-        }
-      }
+      paint(rk);
+      cacheSave();
     }
     else if(ev.t==='typing'){
       typing.hidden = !ev.on;
@@ -735,9 +1028,7 @@ const SCRIPT = `
       // Every local record of the old rooms goes with them. Leaving the caches would put
       // messages on screen for ids the daemon has forgotten, and leaving the read marks would
       // badge the replacement topic against a count from a room that no longer exists.
-      topicCache={};
-      cacheOrder=[];
-      saveCache();
+      cacheClear();
       readCounts={};
       saveReads();
       // The list is replaced with what the server just told us rather than left to the broadcast
@@ -764,6 +1055,19 @@ const SCRIPT = `
   });
 
   log.addEventListener('click', function(e){
+    // What a message that failed to send offers. Checked before the ordinary buttons: these are
+    // answered here, locally, and never posted as a click on a message the daemon has no idea
+    // about.
+    var act = e.target.closest ? e.target.closest('[data-retry],[data-copy],[data-discard]') : null;
+    if(act){
+      var retry = act.getAttribute('data-retry');
+      if(retry) return deliver(retry);
+      var copy = act.getAttribute('data-copy');
+      if(copy) return copyLocal(copy, act);
+      var discard = act.getAttribute('data-discard');
+      if(discard) return discardLocal(discard);
+      return;
+    }
     var b = e.target.closest ? e.target.closest('button[data-btn]') : null;
     if(!b) return;
     b.disabled = true;
@@ -860,13 +1164,123 @@ const SCRIPT = `
     suggest(); input.focus(); grow();
   });
 
+  /**
+   * Sends that have not been acknowledged, by nonce.
+   *
+   * In memory only, and that is the whole reason Retry disappears across a reload: the body in
+   * here carries the attachments as base64, which is not something to write into a cache meant
+   * to hold a transcript. Re-sending the text without the files it was written about would be a
+   * different message, so a restored failure offers Copy instead of pretending otherwise.
+   */
+  var outbox = {};
+
+  /** The same shape renderBody builds server-side, so the echo can replace it invisibly. */
+  function localBody(typed, names){
+    var h = '<div class="raw">'+text(typed)+'</div>';
+    if(!names.length) return h;
+    var chips='';
+    for(var i=0;i<names.length;i++) chips += '<span class="chip">'+text(names[i])+'</span>';
+    return h + '<div class="files">'+chips+'</div>';
+  }
+
+  /**
+   * Show the message, then send it — in that order, and independently.
+   *
+   * Waiting for the daemon's echo to draw it meant a visibly empty transcript for as long as the
+   * round trip took, and on a request that failed after its retries it meant the text was gone:
+   * out of the composer, never into the conversation, nowhere to copy it back from. The local
+   * bubble is the message until the echo claims it, and if nothing ever claims it, it stays and
+   * says so.
+   */
   function send(){
-    var body={topic:topic, text:input.value,
-      nonce:Math.random().toString(36).slice(2)+Date.now().toString(36)};
-    if(files.length) body.files=files;
-    if(!body.text.trim() && !files.length) return;
+    var typed = input.value;
+    if(!typed.trim() && !files.length) return;
+    var nonce = Math.random().toString(36).slice(2)+Date.now().toString(36);
+    var body = {topic:topic, text:typed, nonce:nonce};
+    var names = [];
+    for(var i=0;i<files.length;i++) names.push(files[i].name);
+    if(files.length) body.files = files;
     input.value=''; files=[]; renderChips(); suggest(); grow();
-    post('api/send', body, 2).catch(function(){ note.textContent='That message did not reach the daemon.'; });
+    outbox[nonce] = body;
+    data['p:'+nonce] = { id:'p:'+nonce, _local:1, _nonce:nonce, _state:'sending', _text:typed,
+      own:true, html:localBody(typed, names), at:Date.now(), buttons:[], reactions:[] };
+    paint('p:'+nonce);
+    syncEmptyNote();
+    // Unconditionally, unlike an arriving message: you have just written this one, so wherever
+    // you were in the history is not where you want to be now.
+    toBottom();
+    deliver(nonce);
+  }
+
+  /**
+   * Post one queued message, for the first time or on a Retry.
+   *
+   * The same nonce goes out every time on purpose: the server remembers the last 64 and answers
+   * a repeat as if it were the original, so a Retry after a request that actually landed cannot
+   * duplicate the message — and the echo of the first attempt retires this bubble either way.
+   */
+  function deliver(nonce){
+    var body = outbox[nonce];
+    if(!body) return;
+    setLocal(nonce, 'sending');
+    post('api/send', body, 2).then(function(r){
+      setLocal(nonce, (r && r.ok) ? 'sent' : 'failed');
+    }, function(){
+      setLocal(nonce, 'failed');
+    });
+  }
+
+  function setLocal(nonce, state){
+    var key='p:'+nonce, m=data[key];
+    if(!m) return;
+    // Measured before the repaint: a failure grows the bubble by a warning line and three
+    // buttons, and a reader sitting at the bottom would otherwise have the new controls pushed
+    // off the screen they were just looking at.
+    var stick = atBottom();
+    m._state = state;
+    paint(key);
+    if(stick) toBottom();
+    // Only a failure is worth writing down. One still in flight is a question this tab alone can
+    // answer, and one that got through comes back as the daemon's own echo.
+    if(state === 'failed') cacheSave();
+  }
+
+  /**
+   * Put the text of a failed message on the clipboard.
+   *
+   * With a fallback, because navigator.clipboard does not exist on an insecure origin and
+   * plain http is exactly how this page is expected to be reached on a LAN. The button says
+   * which way it went rather than reporting success it did not have.
+   */
+  function copyLocal(nonce, btn){
+    var m=data['p:'+nonce]; if(!m) return;
+    var said=function(ok){ btn.textContent = ok ? 'Copied' : 'Select it above'; };
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(m._text).then(function(){ said(true); }, function(){ said(fallbackCopy(m._text)); });
+      return;
+    }
+    said(fallbackCopy(m._text));
+  }
+
+  function fallbackCopy(s){
+    try {
+      var ta=document.createElement('textarea');
+      ta.value=s;
+      ta.setAttribute('readonly','');
+      ta.style.position='fixed';
+      ta.style.top='-1000px';
+      document.body.appendChild(ta);
+      ta.select();
+      var ok=document.execCommand('copy');
+      document.body.removeChild(ta);
+      return Boolean(ok);
+    } catch(x){ return false; }
+  }
+
+  function discardLocal(nonce){
+    delete outbox[nonce];
+    drop('p:'+nonce);
+    cacheSave();
   }
 
   input.addEventListener('input', function(){ grow(); suggest(); });
@@ -874,14 +1288,37 @@ const SCRIPT = `
     if(e.key==='Enter' && !e.shiftKey && !e.isComposing){ e.preventDefault(); send(); }
   });
   $('composer').addEventListener('submit', function(e){ e.preventDefault(); send(); });
-  if(topic && topicCache[topic]){
-    var initialCached = topicCache[topic];
-    for(var j=0;j<initialCached.length;j++){
-      data[initialCached[j].id] = initialCached[j];
-      paint(initialCached[j].id);
+
+  /**
+   * Retire the local bubble this message is the echo of.
+   *
+   * The node is REUSED rather than replaced: creating another element with the same content
+   * would re-run the fade-in and move the scroll under whoever is reading, for a message that
+   * has been on screen since it was typed.
+   */
+  function claim(m){
+    if(!m.nonce) return;
+    var pk = 'p:' + m.nonce;
+    delete outbox[m.nonce];
+    if(!els[pk]) return;
+    var key = epoch + ':' + m.id;
+    if(els[key]){ els[pk].remove(); }
+    else {
+      els[key]=els[pk];
+      sig[key]=sig[pk];
+      els[key].setAttribute('data-k', key);
     }
-    toBottom();
+    delete els[pk];
+    delete sig[pk];
+    delete data[pk];
   }
+
+  // The transcript this browser already has, asked for before anything has been heard from the
+  // daemon — which is the point: on a slow link the conversation is on screen long before the
+  // stream has said anything, and after a restart it is on screen even though the daemon can no
+  // longer produce it. A visit with no ?t= has no topic to ask about yet and is restored from
+  // the sync instead.
+  restore(topic);
 
   connect();
 })();

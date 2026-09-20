@@ -89,7 +89,9 @@ one rate-limit budget — exactly as Telegram forum topics share their chat's.
 **The topic list is persisted; the transcripts are not.** Losing the list is not "the page looks
 empty": `conversations.json` still holds the agent binding and session id under
 `<instance>#main#<topic id>`, so every context would still be running and no longer reachable.
-See `topics.ts` for why its `title` duplicates one the daemon also stores.
+See `topics.ts` for why its `title` duplicates one the daemon also stores. The *browser* keeps a
+rotating copy of the transcripts ([below](#the-local-transcript-cache)); the daemon still does
+not, and nothing here reads that cache back.
 
 **Neither the per-topic `×` nor "Clear all topics" ends an agent session.** Both reach exactly as
 far as this module: the room goes, the list entry goes, and the daemon's binding under
@@ -172,7 +174,69 @@ failing an assertion if the flush goes away — which is the honest reproduction
 **Sends are idempotent.** A POST can be accepted and still time out on a bad link, so the page
 retries — which is only safe because each send carries a nonce the server remembers. The
 daemon's own inbound dedup cannot help here: it keys on a message id, and a retry mints a fresh
-one.
+one. That nonce comes back out on the echo (`WebMessage.nonce`), which is how the page knows
+which of its local bubbles the echo is.
+
+**A message is on screen before the request leaves.** Waiting for the echo to draw it meant a
+visibly empty transcript for as long as the round trip took — and on a request that failed after
+its retries it meant the text was simply gone: out of the composer, never into the conversation,
+nowhere to copy it back from. So `send` paints the message locally first, keyed `p:<nonce>`, and
+the POST is a separate concern:
+
+- while it is in flight the bubble is dimmed (`.pending`);
+- the echo claims it by nonce and REUSES its node, so nothing re-runs the fade-in or moves the
+  scroll for a message that has been on screen since it was typed;
+- a failure leaves it there, edged red, carrying **Retry / Copy / Discard**. Retry re-posts the
+  same nonce, so a request that actually landed cannot double.
+
+The one asymmetry worth knowing: **Retry lives in memory and Copy does not.** The body it would
+re-send holds its attachments as base64, and that is not something to write into a cache meant
+for a transcript — so a failed message restored after a reload offers Copy and Discard alone,
+rather than pretending it can re-send files it no longer has.
+
+## The local transcript cache
+
+A transcript lives in the daemon's memory. That is still true, and it used to mean the page went
+blank whenever the daemon did. Now the browser keeps its own copy, in **IndexedDB** — one record
+per topic, holding the message list as a JSON *string* rather than an object graph, so the byte
+budget below is measurable and nothing rests on how a structured clone treats these objects.
+localStorage was the obvious alternative and is too small: one topic with code blocks in it runs
+to hundreds of kilobytes against a ~5MB origin budget shared with everything else.
+
+It buys two things:
+
+- **A topic paints before the stream has answered** — on a reload, on a topic switch, on a link
+  slow enough that the round trip is visible.
+- **A daemon restart costs the conversation its liveness, not its contents.** The old messages
+  stay on screen, above a divider that says where they came from, and the agent still has the
+  context to carry on below them.
+
+**Messages are keyed `<epoch>:<id>`, not `<id>`, and that is load-bearing.** `nextId` counts from
+`w1` per process, so a restarted daemon hands the same ids out again — verified on the wire: the
+first message after a restart really is `w1` again. Keyed by id alone, that message would upsert
+itself straight over a cached one and the transcript would quietly corrupt. `epoch` is the sync's
+generation (`WebRoom`'s construction time); it is only ever compared for equality. A message from
+another generation is *history*: it keeps its place at the top, it is never dropped by a
+reconcile, and its buttons are stripped, because the process that would answer them is gone and
+the id they name now means something else.
+
+Cached messages of the CURRENT generation produce exactly the keys the incoming sync produces, so
+the ordinary path — same daemon, cache matching the ring — reuses every node and writes no DOM at
+all. The cache is a head start, not a second source of truth.
+
+**Rotation, because a cache that only grows is the same bug more slowly.** The TAIL of a topic is
+kept (200 messages, 512KB), the least recently written topics are evicted past 24, and a write
+refused for space drops everything but the topic being read and tries once before the cache is
+written off for the session with one `console.warn`. Writes are coalesced into a 400ms window:
+a streamed reply upserts the same message every second or so and each one would otherwise
+re-serialise the whole topic.
+
+**A browser with no IndexedDB is a supported configuration.** Private windows and old engines
+both produce one; the cache is the only thing that goes, and `page.dom.test.ts` holds that.
+
+**What is NOT cached: a send still in flight.** Only a FAILED local message is written down. One
+in flight is a question this tab alone can answer, and restoring it after a reload would either
+duplicate a message the daemon did receive or claim one was lost that was not.
 
 **The echo of your own message is not rendered markdown.** `renderBody` escapes it and stops
 there, where the agent's side goes through `web-markdown.ts`. What the operator typed is a
@@ -281,17 +345,18 @@ shared secret is what stands in its place.
   `X-Accel-Buffering: no` and `Cache-Control: no-transform`, but a proxy configured to ignore
   them shows nothing until the turn ends, which reads exactly like a hung daemon. Set
   `proxy_buffering off;`.
-- **The page is empty after a restart while the agent still remembers everything.** The ring
-  is memory; the agent's session is persisted by `conversation-store.ts`. So `/context` will
-  report real numbers against a blank transcript. Deliberate — persisting a chat log to disk
-  is a different feature with different questions attached. What is *not* acceptable is doing
-  it silently: the topic list is a file, so a restart leaves rows that open onto nothing, and
-  an empty panel rendered faithfully is indistinguishable from a page that failed to load.
-  That is how it was reported. `syncEvent` therefore sets `stale` when a room holds no messages
-  and the topic's persisted `lastAt` predates the `WebRoom`, and the page answers it with a
-  line saying the topic is older than the daemon and the agent still has its context. It also
-  covers the milder case of a topic created before the restart and never spoken in; both are
-  honestly described by "older than this process, nothing here".
+- **A restart empties the daemon's ring while the agent still remembers everything.** The
+  transcript is memory; the agent's session is persisted by `conversation-store.ts`. So
+  `/context` reports real numbers against a room the daemon can no longer replay. The browser's
+  own cache now answers most of that (see [above](#the-local-transcript-cache)) — the messages
+  come back, above a divider saying where they came from. What it cannot answer is a topic this
+  browser has never opened, or one whose cache has rotated out, and those still have to be
+  explained rather than rendered as a blank panel: `syncEvent` sets `stale` when a room holds no
+  messages and the topic's persisted `lastAt` predates the `WebRoom`, and the page answers it
+  with a line saying the topic is older than the daemon and the agent still has its context. It
+  also covers the milder case of a topic created before the restart and never spoken in. The
+  notice is only shown when there is genuinely nothing on screen — with cached messages up
+  there, the divider is the honest version of the same sentence.
 
 ## Testing
 
@@ -311,7 +376,11 @@ assertions in `page.test.ts` were green throughout the release that rendered not
 Three things about it that are not obvious:
 
 - **The stubs are installed in `beforeParse`**, before the inline script runs. Evaluating the
-  script a second time to hand it a global would register every listener twice.
+  script a second time to hand it a global would register every listener twice. `indexedDB` is
+  one of them — jsdom does not implement it at all, so the harness installs a `fake-indexeddb`
+  factory. It can hand the SAME factory to a second page, which is how a reload, and a daemon
+  restart under a page that is still open, are driven end to end; passing `idb: null` covers the
+  browser that has none.
 - **Do not assert CSS through the CSSOM.** jsdom does not evaluate `@media` at all, so
   `getComputedStyle` only ever reports the desktop cascade — and its CSS parser silently drops
   declarations it cannot parse (jsdom 27 discards `calc(… + env(safe-area-inset-bottom))`

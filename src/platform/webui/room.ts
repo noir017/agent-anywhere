@@ -335,6 +335,10 @@ export class WebRoom {
       messages: [...room.stored.values()].map((s) => s.msg),
       commands: this.commands,
       topics: this.topicList(),
+      // Which run of the daemon the ids in `messages` belong to. The page caches transcripts
+      // and `nextId` restarts at `w1` every process, so without this a cached `w3` and a fresh
+      // `w3` are indistinguishable to it — see the field's comment in `protocol.ts`.
+      epoch: this.startedAt,
       ...(this.isStale(topicId, room) ? { stale: true } : {}),
     };
   }
@@ -600,7 +604,14 @@ export class WebRoom {
     // from appearing in the transcript as a blank bubble the agent never saw.
     if (!text && attachments.length === 0) return 'accepted';
     if (this.topics.seed(req.topic, req.text)) this.announceTopics();
-    const msg = this.post(req.topic, { own: true, html: renderBody(req.text, attachments) }, req.text);
+    // The nonce rides back out on the echo: the page has already shown this message locally,
+    // and that placeholder is retired by the echo that claims it. Absent when the client did
+    // not send one, in which case the page had no placeholder to retire either.
+    const msg = this.post(
+      req.topic,
+      { own: true, html: renderBody(req.text, attachments), ...(req.nonce !== undefined ? { nonce: req.nonce } : {}) },
+      req.text
+    );
     const inbound: InboundMessage = {
       conversation: this.conversation(req.topic),
       platformType: 'webui',

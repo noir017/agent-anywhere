@@ -227,11 +227,11 @@ button:disabled{opacity:.5;cursor:default}
      HIG asks for. Pad it out to 44px square and grow the glyph to match; the header's own
      vertical padding gives way to it, so the title bar goes 42px -> 49px rather than 42 -> 56.
      The negative margin puts the glyph's ink back where .btn-icon had it, now that it sits in
-     a box twice the width. :not([hidden]) because setting display here would otherwise beat
-     the UA's [hidden] rule and leave the button on screen while the drawer is open — it is
-     toggled by .hidden. */
+     a box twice the width. Setting display here is only safe because of the global
+     [hidden]{display:none!important} above — without it this rule would win over the UA's
+     own [hidden] rule and strand the button on screen while the drawer is open. */
   #chat-header{padding:2px 12px}
-  #expand-sidebar:not([hidden]){display:inline-flex;align-items:center;justify-content:center;
+  #expand-sidebar{display:inline-flex;align-items:center;justify-content:center;
     min-width:44px;height:44px;margin-left:-10px;font-size:20px;color:var(--fg)}
   .chat-title{max-width:none}
   #log{padding:14px 12px 6px}
@@ -1348,7 +1348,23 @@ const PAGE = `<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex,nofollow">
 <title>__TITLE__</title>
-<link rel="icon" href="data:,">
+<!-- Installable as an app. Every href is relative for the same reason the fetches are: a
+     reverse proxy may mount the daemon under a sub-path, and an absolute "/" walks out of it.
+     No viewport-fit=cover, deliberately — it would extend the page under the status bar and
+     the gesture bar, which is work the browser is already doing correctly, and the composer's
+     env(safe-area-inset-bottom) padding is there for the browsers that inset nothing. -->
+<link rel="manifest" href="manifest.webmanifest">
+<!-- Android paints the status bar this colour in standalone, so the app starts at its own
+     background instead of being framed in white. -->
+<meta name="theme-color" content="#131313">
+<!-- iOS ignores the manifest for both of these. "black" is the closest opaque bar to #131313;
+     "black-translucent" would put the clock on top of the chat header. -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<link rel="apple-touch-icon" href="icon.png">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="icon" href="icon.png" sizes="192x192" type="image/png">
 <style>${STYLE}</style>
 </head>
 <body>

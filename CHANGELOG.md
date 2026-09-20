@@ -5,6 +5,14 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **The web UI can be installed as an app.** Chrome, Edge and Safari will now offer "install" or "add to home screen" rather than a bookmark, and what opens is a standalone window with no URL bar, its own launcher icon, and the status bar drawn in the app's own colour instead of framing it in white. The daemon serves a web app manifest and an icon — a `>_` prompt, which is what is on the other end — from three new routes alongside the page.
+
+  Two decisions inside it are worth stating. There is **no service worker**, and one should not be added to make this work: Chrome dropped that requirement because the check was only ever a proxy for "has an offline story" and sites defeated it with empty fetch handlers, and a worker here would mean caching the app shell — which is served `no-store` precisely so that an upgrade cannot leave a stale copy behind. And the three routes are reachable **without signing in**, because a browser fetches them while deciding whether the site is installable, which is before anyone has signed in; a 401 there is indistinguishable from "not installable", with nothing in the UI to say so. They carry the configured title and a drawing, and the title is already in the `<title>` of the equally-open page.
+
+  Every URL in the manifest is relative, so a daemon mounted under a sub-path by a reverse proxy still installs to the right place.
+
 ### Changed
 
 - **Enter in the web UI's composer writes a newline; Ctrl/Cmd-Enter sends.** This is the inverse

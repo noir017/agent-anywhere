@@ -50,6 +50,7 @@ naming it, and they are all of them:
 | `auth.ts` | Shared-secret login, session cookies, brute-force throttle |
 | `protocol.ts` | `.strict()` zod schemas for every inbound body; the outbound event union |
 | `page.ts` | The whole page (HTML + CSS + JS) as a module-level string |
+| `manifest.ts` | The web app manifest and the icon, as strings, for the same reason `page.ts` is one |
 | [`../web-markdown.ts`](../web-markdown.ts) | Markdown → escaped HTML; lives with the other converters |
 
 `room.ts` is deliberately free of HTTP so the adapter's behaviour is testable without opening
@@ -305,10 +306,47 @@ is behind it is an agent with full tool access.
 6. **Uploads become `data:` URLs**, the shape `adapter-telegram` already uses, so
    `daemon/attachment-io.ts` handles them through its existing branch and its SSRF guard has
    nothing to act on. A temp file and a `file://` URL would be refused by that guard outright.
+7. **Three routes are open besides the page**: `manifest.webmanifest`, `icon.svg`, `icon.png`.
+   They have to be — a browser fetches all three while deciding whether the site is
+   installable, which happens before anyone signs in, and a 401 there is indistinguishable
+   from "not installable". They carry the configured title and a drawing; the title is already
+   in the `<title>` of the equally-open page, so this widens nothing.
 
 **Not solved here:** TLS (put a reverse proxy in front), and DNS rebinding — a `Host`
 allowlist would break the reverse-proxy deployment this is expected to run behind, so the
 shared secret is what stands in its place.
+
+## Installing it as an app
+
+`manifest.ts` is what makes a phone offer "install" rather than "bookmark", and the page's
+head carries the tags that go with it. Three things worth knowing before changing any of it.
+
+**There is no service worker, and adding one for installability would be a mistake.** Chrome
+dropped the service-worker-with-a-fetch-handler requirement — the check was a proxy for "has
+an offline story", sites defeated it with empty handlers, and it was removed rather than
+tightened ([Chrome for Developers](https://developer.chrome.com/blog/update-install-criteria),
+read 2026-09-20). What remains is HTTPS and a manifest. A worker here would also mean caching
+the app shell, and the shell is served `no-store` on purpose: a stale copy after an upgrade is
+a support question with no error message. If offline reading is ever wanted, the local
+transcript cache above is the place for it, not a second copy of the shell.
+
+**The icon exists twice on purpose.** `ICON_SVG` is the drawing; the base64 PNG beside it is
+that same drawing rasterised to 192px, because iOS reads `<link rel="apple-touch-icon">` and
+has never accepted SVG there, and an Android launcher that declines to rasterise SVG falls
+back to a generated letter tile — which looks like a bug rather than a fallback. 1760 bytes
+buys not having to know which builds those are. They can drift; the regeneration command is in
+the comment above the base64, and `server.test.ts` at least asserts the bytes are still a
+192×192 PNG.
+
+**Every URL in the manifest is relative**, resolved against the manifest's own URL, for the
+same reason `api/events` is: a reverse proxy may mount the daemon under a sub-path and an
+absolute `/` walks straight out of it. `scope` and `start_url` come out right without the
+daemon having to be told where it lives.
+
+One thing deliberately *not* done: `viewport-fit=cover`. It would extend the page under the
+status bar and the gesture bar, and while the composer pads for the bottom one, nothing pads
+for the top — the clock would land on the chat header. The browser already insets correctly
+without it. `page.test.ts` pins the viewport tag so this does not get added by reflex.
 
 ## Things that bite
 

@@ -41,6 +41,32 @@ describe('webui page', () => {
     expect(html).toContain("EventSource('api/events'");
     expect(html).not.toMatch(/fetch\('\//);
     expect(html).toContain("post('api/send'");
+    // The app-install tags are subject to the same rule — an absolute href walks out of a
+    // sub-path mount, and the symptom is an installed app that opens on the proxy's root.
+    expect(html).toContain('href="manifest.webmanifest"');
+    expect(html).not.toMatch(/href="\/(manifest|icon)/);
+  });
+
+  it('carries what a phone needs to install it as an app', () => {
+    expect(html).toContain('rel="manifest"');
+    // Android colours the status bar with this in standalone; iOS reads neither the manifest
+    // nor theme-color and needs its own three.
+    expect(html).toContain('name="theme-color"');
+    expect(html).toContain('name="apple-mobile-web-app-capable"');
+    expect(html).toContain('name="apple-mobile-web-app-status-bar-style"');
+    expect(html).toContain('rel="apple-touch-icon"');
+    // iOS has never accepted SVG for apple-touch-icon, so the PNG has to exist and be the one
+    // that link points at.
+    expect(html).toMatch(/rel="apple-touch-icon" href="icon\.png"/);
+  });
+
+  it('does not claim a viewport it has not laid out for', () => {
+    // viewport-fit=cover extends the page under the status bar and the gesture bar. The layout
+    // pads for the bottom one and nothing pads for the top, so turning it on would put the
+    // clock over the chat header. Left off deliberately; this is the reminder. Matched against
+    // the tag rather than the whole document, which also mentions it in a comment.
+    const meta = html.match(/<meta name="viewport" content="([^"]*)"/)?.[1];
+    expect(meta).toBe('width=device-width,initial-scale=1');
   });
 
   it('escapes the configured title', () => {

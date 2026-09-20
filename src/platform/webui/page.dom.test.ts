@@ -1166,13 +1166,12 @@ describe('webui page: the narrow-screen stylesheet', () => {
 
   it('gives the drawer toggle a finger-sized target', () => {
     const css = narrowBlock();
-    // At the inherited .btn-icon size this is a ~21px box, and it is the only way back to the
-    // topic list once the drawer is shut.
-    expect(css).toMatch(/#expand-sidebar:not\(\[hidden\]\)\{[^}]*min-width:44px/);
-    expect(css).toMatch(/#expand-sidebar:not\(\[hidden\]\)\{[^}]*height:44px/);
-    // :not([hidden]) is load-bearing: the rule sets `display`, which would otherwise beat the
-    // UA's [hidden] rule and leave the toggle on screen while the drawer is open.
-    expect(css).not.toMatch(/#expand-sidebar\{/);
+    // At the inherited .btn-icon size this is a 26x21 box, and it is the only way back to the
+    // topic list once the drawer is shut. Measured in Chromium at 390px: 44x44, header 42->49.
+    expect(css).toMatch(/#expand-sidebar\{[^}]*min-width:44px/);
+    expect(css).toMatch(/#expand-sidebar\{[^}]*height:44px/);
+    // The rule sets `display`, which is only safe because of the page-wide `!important` guard.
+    expect(renderPage('Chat')).toContain('[hidden]{display:none!important}');
   });
 
   it('scopes all of that to the narrow screen and nothing else', () => {

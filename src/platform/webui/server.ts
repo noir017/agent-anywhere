@@ -40,6 +40,7 @@ import type { Socket } from 'node:net';
 import { constants as zlibConstants, createGzip, gzipSync } from 'node:zlib';
 
 import { sessionCookie, type WebAuth } from './auth.js';
+import { ICON_PNG, ICON_SVG, renderManifest } from './manifest.js';
 import { renderPage } from './page.js';
 import {
   ClickRequestSchema,
@@ -216,6 +217,13 @@ interface Route {
 const OPEN: Route[] = [
   { method: 'GET', path: '/', run: ({ req, res }, ctx) => sendPage(req, res, ctx.instance) },
   { method: 'POST', path: '/api/login', run: login },
+  // Open on purpose. The browser fetches these while deciding whether the site can be
+  // installed, which is before anyone has signed in, and a 401 there is indistinguishable from
+  // "not installable". They carry the configured title and a drawing — the title is already in
+  // the `<title>` of the equally-open page above, so nothing is disclosed that was not already.
+  { method: 'GET', path: '/manifest.webmanifest', run: ({ req, res }, ctx) => sendManifest(req, res, ctx.instance) },
+  { method: 'GET', path: '/icon.svg', run: ({ req, res }) => sendIcon(req, res, 'svg') },
+  { method: 'GET', path: '/icon.png', run: ({ req, res }) => sendIcon(req, res, 'png') },
 ];
 
 /** Everything else. */
@@ -279,9 +287,40 @@ function sendPage(req: IncomingMessage, res: ServerResponse, instance: WebuiInst
     // Belt and braces around web-markdown's escaping: even if something did get through, an
     // inline script from it would not run and no external origin could be reached.
     'Content-Security-Policy':
-      "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; connect-src 'self'; form-action 'none'; base-uri 'none'",
+      "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; manifest-src 'self'; form-action 'none'; base-uri 'none'",
     'X-Content-Type-Options': 'nosniff',
     'Referrer-Policy': 'no-referrer',
+  });
+}
+
+/**
+ * The manifest, which is what makes "add to home screen" offer an app rather than a bookmark.
+ *
+ * `no-store` for the same reason the page has it: the name and the colours come from config,
+ * and an installed app holding last week's title is a support question with no error message.
+ * The icons below are the opposite case — bytes that only change when this file does — so they
+ * get a long cache and save the round trip on every launch.
+ */
+function sendManifest(req: IncomingMessage, res: ServerResponse, instance: WebuiInstance): void {
+  body(req, res, 200, Buffer.from(renderManifest(instance.title), 'utf8'), {
+    'Content-Type': 'application/manifest+json; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+  });
+}
+
+function sendIcon(req: IncomingMessage, res: ServerResponse, kind: 'svg' | 'png'): void {
+  const [payload, type] =
+    kind === 'svg'
+      ? [Buffer.from(ICON_SVG, 'utf8'), 'image/svg+xml']
+      : [ICON_PNG, 'image/png'];
+  body(req, res, 200, payload, {
+    'Content-Type': type,
+    'Cache-Control': 'public, max-age=604800',
+    // An SVG fetched as a document can script; served with nosniff and only ever referenced as
+    // an image it cannot, but the header costs nothing and the reasoning should not have to be
+    // re-derived by whoever adds the next asset route.
+    'X-Content-Type-Options': 'nosniff',
   });
 }
 

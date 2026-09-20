@@ -155,6 +155,60 @@ describe('webui server: the page', () => {
   });
 });
 
+describe('webui server: installing it as an app', () => {
+  it('serves the manifest and both icons without a session', async () => {
+    // The browser fetches all three while deciding whether the site can be installed, which is
+    // before anyone has signed in. A 401 here reads as "not installable", with no error to see.
+    const { base } = await boot();
+
+    const manifest = await fetch(`${base}/manifest.webmanifest`);
+    expect(manifest.status).toBe(200);
+    expect(manifest.headers.get('content-type')).toContain('application/manifest+json');
+
+    const svg = await fetch(`${base}/icon.svg`);
+    expect(svg.status).toBe(200);
+    expect(svg.headers.get('content-type')).toBe('image/svg+xml');
+
+    const png = await fetch(`${base}/icon.png`);
+    expect(png.status).toBe(200);
+    expect(png.headers.get('content-type')).toBe('image/png');
+    // The PNG signature. Proves the base64 in manifest.ts survived whatever edited it, which
+    // is the one way these bytes can rot without anything else noticing.
+    const bytes = Buffer.from(await png.arrayBuffer());
+    expect(bytes.subarray(0, 8).toString('hex')).toBe('89504e470d0a1a0a');
+    expect([bytes.readUInt32BE(16), bytes.readUInt32BE(20)]).toEqual([192, 192]);
+  });
+
+  it('names the app after the configured title', async () => {
+    const { base } = await boot({ title: 'Ops box' });
+    const m = await fetch(`${base}/manifest.webmanifest`).then((r) => r.json());
+    expect(m.name).toBe('Ops box');
+    expect(m.short_name).toBe('Ops box');
+    expect(m.display).toBe('standalone');
+  });
+
+  it('keeps every manifest URL relative, so a sub-path mount still resolves', async () => {
+    // Same rule the page follows for api/events. An absolute "/" would walk out of a prefix a
+    // reverse proxy put the daemon under, and the installed app would open on the proxy's root.
+    const { base } = await boot();
+    const m = await fetch(`${base}/manifest.webmanifest`).then((r) => r.json());
+    for (const url of [m.start_url, m.scope, ...m.icons.map((i: { src: string }) => i.src)]) {
+      expect(url.startsWith('/')).toBe(false);
+      expect(url).not.toMatch(/^https?:/);
+    }
+  });
+
+  it('lets the page reach its own manifest and icons through the CSP', async () => {
+    // default-src is 'none', and manifest-src/img-src both fall back to it — so without these
+    // two the browser blocks the very files that make the site installable, and the only
+    // symptom is a console warning nobody is watching on a phone.
+    const { base } = await boot();
+    const csp = (await fetch(`${base}/`)).headers.get('content-security-policy') ?? '';
+    expect(csp).toContain("manifest-src 'self'");
+    expect(csp).toContain("img-src 'self' data:");
+  });
+});
+
 describe('webui server: the door', () => {
   it('refuses every guarded route without a session', async () => {
     const { base, topic } = await boot();

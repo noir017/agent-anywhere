@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.22.0] - 2026-09-20
+
 ### Added
 
 - **The web UI can be installed as an app.** Chrome, Edge and Safari will now offer "install" or "add to home screen" rather than a bookmark, and what opens is a standalone window with no URL bar, its own launcher icon, and the status bar drawn in the app's own colour instead of framing it in white. The daemon serves a web app manifest and an icon — a `>_` prompt, which is what is on the other end — from three new routes alongside the page.

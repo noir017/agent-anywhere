@@ -222,7 +222,15 @@ button:disabled{opacity:.5;cursor:default}
      the composer gets — without it "Clear all topics" sits under the indicator, which is both
      hard to hit and the wrong control to make hard to hit accurately. */
   #sidebar-footer{padding:8px 8px calc(8px + env(safe-area-inset-bottom,0px))}
-  #chat-header{padding:8px 12px}
+  /* The drawer toggle is the only way back to the topic list on a phone, but it inherits
+     .btn-icon's 13px glyph and 4px padding — a ~21x21 target, well under the 44px every mobile
+     HIG asks for. Pad it out to 44px square and grow the glyph to match; the header's own
+     vertical padding shrinks so the taller button does not push the title bar down with it.
+     :not([hidden]) because setting display here would otherwise beat the UA's [hidden]
+     rule and leave the button on screen while the drawer is open — it is toggled by .hidden. */
+  #chat-header{padding:2px 12px}
+  #expand-sidebar:not([hidden]){display:inline-flex;align-items:center;justify-content:center;
+    min-width:44px;height:44px;margin-left:-10px;font-size:20px;color:var(--fg)}
   .chat-title{max-width:none}
   #log{padding:14px 12px 6px}
   #typing,#note{padding-left:12px;padding-right:12px}
@@ -1284,8 +1292,15 @@ const SCRIPT = `
   }
 
   input.addEventListener('input', function(){ grow(); suggest(); });
+  // Enter writes a newline; Ctrl/Cmd-Enter and the Send button are what send.
+  //
+  // This is the inverse of the chat-app convention, and deliberately so. The composer is most
+  // often reached from a phone, where there is no Shift key to hold — Enter-to-send made a
+  // multi-line message impossible to type rather than merely awkward, and the messages worth
+  // typing here are prompts, which are multi-line more often than chat lines are. Losing a
+  // half-written prompt to a stray Enter is also the more expensive mistake of the two.
   input.addEventListener('keydown', function(e){
-    if(e.key==='Enter' && !e.shiftKey && !e.isComposing){ e.preventDefault(); send(); }
+    if(e.key==='Enter' && (e.ctrlKey || e.metaKey) && !e.isComposing){ e.preventDefault(); send(); }
   });
   $('composer').addEventListener('submit', function(e){ e.preventDefault(); send(); });
 
@@ -1370,7 +1385,7 @@ const PAGE = `<!doctype html>
           <textarea id="input" rows="1" placeholder="Message" autocomplete="off"></textarea>
           <input id="picker" type="file" multiple hidden>
           <button type="button" id="attach" title="Attach a file">+</button>
-          <button type="submit">Send</button>
+          <button type="submit" title="Send (Ctrl+Enter)">Send</button>
         </div>
       </form>
     </div>

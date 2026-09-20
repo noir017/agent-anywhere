@@ -679,6 +679,55 @@ describe('webui page: sending', () => {
     expect(input.value).toBe('');
   });
 
+  /**
+   * Enter in the composer, as a browser delivers it. `win.KeyboardEvent` rather than the global
+   * one: the event has to come from the same realm as the listener, or jsdom's `instanceof`
+   * checks inside the dispatch path disagree about what it is.
+   */
+  const pressEnter = async (h: Harness, mods: KeyboardEventInit = {}): Promise<void> => {
+    const win = h.doc.defaultView as Window & typeof globalThis;
+    h.el('input').dispatchEvent(
+      new win.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true, ...mods }),
+    );
+    await tick();
+  };
+
+  it('leaves a plain Enter to write a newline instead of sending', async () => {
+    const h = await open();
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+    const input = h.el('input') as HTMLTextAreaElement;
+    input.value = 'first line';
+
+    await pressEnter(h);
+
+    // Nothing sent, and the keystroke was not swallowed — jsdom does not insert the newline
+    // itself, so the default being left alone is the whole of what "writes a newline" means here.
+    expect(h.calls.filter((c) => c.path === 'api/send')).toHaveLength(0);
+    expect(input.value).toBe('first line');
+  });
+
+  it('sends on Ctrl-Enter and on Cmd-Enter', async () => {
+    for (const mods of [{ ctrlKey: true }, { metaKey: true }]) {
+      const h = await open();
+      await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+      (h.el('input') as HTMLTextAreaElement).value = 'ship it';
+
+      await pressEnter(h, mods);
+
+      expect(h.calls.find((c) => c.path === 'api/send')?.body.text).toBe('ship it');
+    }
+  });
+
+  it('ignores Enter mid-composition, which is a candidate being chosen and not a send', async () => {
+    const h = await open();
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+    (h.el('input') as HTMLTextAreaElement).value = '你好';
+
+    await pressEnter(h, { ctrlKey: true, isComposing: true } as KeyboardEventInit);
+
+    expect(h.calls.filter((c) => c.path === 'api/send')).toHaveLength(0);
+  });
+
   it('refuses to send nothing', async () => {
     const h = await open();
     await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
@@ -965,6 +1014,50 @@ describe('webui page: pasting', () => {
   });
 });
 
+describe('webui page: the file picker', () => {
+  /**
+   * Pick files through the `+` button.
+   *
+   * jsdom has no FileList and will not let one be assigned to `picker.files`, so the property is
+   * redefined — configurable, because the handler sets `picker.value=''` afterwards and jsdom
+   * routes that through the same internal file list.
+   */
+  const pick = (h: Harness, files: File[]): void => {
+    const picker = h.el('picker');
+    Object.defineProperty(picker, 'files', { value: files, configurable: true, writable: true });
+    picker.dispatchEvent(new h.window.Event('change', { bubbles: true }));
+  };
+
+  it('takes a document as readily as an image', async () => {
+    // The picker carries no `accept`, so the browser offers every file — and nothing downstream
+    // narrows that either: `mime.startsWith('image/')` in room.ts only chooses between the
+    // `image` and `file` attachment kinds, it does not reject the second one.
+    const h = await open();
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+
+    pick(h, [
+      new h.window.File(['%PDF-1.7'], 'report.pdf', { type: 'application/pdf' }),
+      // Empty type is what a browser reports for an extension it does not recognise.
+      new h.window.File(['zipbytes'], 'logs.tar.zst', { type: '' }),
+    ]);
+
+    await until('both chips are rendered', () => h.el('chips').children.length === 2);
+    expect(Array.from(h.el('chips').children).map((c) => c.textContent)).toEqual([
+      'report.pdf',
+      'logs.tar.zst',
+    ]);
+
+    (h.el('input') as HTMLTextAreaElement).value = 'read these';
+    await h.click('#composer button[type="submit"]');
+
+    const files = h.calls.find((c) => c.path === 'api/send')?.body.files as Array<Record<string, string>>;
+    expect(files.map((f) => [f.name, f.mime])).toEqual([
+      ['report.pdf', 'application/pdf'],
+      ['logs.tar.zst', ''],
+    ]);
+  });
+});
+
 describe('webui page: a screen held upright', () => {
   it('starts with the drawer shut and the keyboard down', async () => {
     const h = await open({ width: 390, height: 844 });
@@ -1069,6 +1162,17 @@ describe('webui page: the narrow-screen stylesheet', () => {
 
   it('pads the send row past the home indicator', () => {
     expect(narrowBlock()).toContain('env(safe-area-inset-bottom');
+  });
+
+  it('gives the drawer toggle a finger-sized target', () => {
+    const css = narrowBlock();
+    // At the inherited .btn-icon size this is a ~21px box, and it is the only way back to the
+    // topic list once the drawer is shut.
+    expect(css).toMatch(/#expand-sidebar:not\(\[hidden\]\)\{[^}]*min-width:44px/);
+    expect(css).toMatch(/#expand-sidebar:not\(\[hidden\]\)\{[^}]*height:44px/);
+    // :not([hidden]) is load-bearing: the rule sets `display`, which would otherwise beat the
+    // UA's [hidden] rule and leave the toggle on screen while the drawer is open.
+    expect(css).not.toMatch(/#expand-sidebar\{/);
   });
 
   it('scopes all of that to the narrow screen and nothing else', () => {

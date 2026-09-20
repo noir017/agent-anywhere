@@ -339,8 +339,15 @@ shared secret is what stands in its place.
   the sidebar is a fixed-position drawer over the chat with a backdrop to dismiss it, heights
   are `dvh` so the collapsing URL bar does not push the composer off screen, the composer and
   the token field are 16px so Safari does not zoom in on focus and stay there, the Send row
-  clears the home indicator via `env(safe-area-inset-bottom)`, and the input is not focused on
-  open — the keyboard would take half the viewport before a word had been read.
+  clears the home indicator via `env(safe-area-inset-bottom)`, the drawer toggle is padded out
+  to a 44px square (a `:not([hidden])` selector, because the rule sets `display` and would
+  otherwise beat the UA's `[hidden]` rule while the drawer is open), and the input is not
+  focused on open — the keyboard would take half the viewport before a word had been read.
+- **Enter writes a newline; Ctrl/Cmd-Enter sends.** The inverse of the chat-app convention, on
+  purpose: a phone keyboard has no Shift to hold, so Enter-to-send made a multi-line message
+  impossible to type rather than merely awkward, and what gets typed here is prompts. It is one
+  behaviour on every screen width rather than a narrow-screen special case — a send shortcut
+  that changes with the viewport is worse than either choice on its own.
 - **A reverse proxy must not buffer.** nginx buffers SSE by default; the response carries
   `X-Accel-Buffering: no` and `Cache-Control: no-transform`, but a proxy configured to ignore
   them shows nothing until the turn ends, which reads exactly like a hung daemon. Set

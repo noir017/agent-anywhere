@@ -5,6 +5,26 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **Enter in the web UI's composer writes a newline; Ctrl/Cmd-Enter sends.** This is the inverse
+  of the chat-app convention and is deliberate. The composer is most often reached from a phone,
+  where there is no Shift key to hold down — Enter-to-send did not make a multi-line message
+  awkward there, it made one impossible to type. What gets written into this box is prompts,
+  which run to several lines more often than chat messages do, and losing a half-composed one to
+  a stray Enter is the more expensive of the two mistakes. The shortcut is the same at every
+  screen width rather than a narrow-screen special case: a send key that changes under you when
+  the window is resized is worse than either choice on its own. The Send button's tooltip names
+  the shortcut, since the keystroke is no longer the one people arrive expecting.
+
+### Fixed
+
+- **The web UI's drawer toggle is big enough to hit with a thumb.** On a narrow screen the `☰` in
+  the chat header is the only way back to the topic list, and it was drawn at the desktop icon
+  size — a roughly 21px target, under half what every mobile interface guideline asks for. It is
+  now a 44px square with a larger glyph, and the header's vertical padding gives way to it so the
+  title bar grows by six pixels rather than by the whole difference.
+
 ## [1.21.0] - 2026-09-20
 
 ### Added

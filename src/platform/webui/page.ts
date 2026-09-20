@@ -223,11 +223,13 @@ button:disabled{opacity:.5;cursor:default}
      hard to hit and the wrong control to make hard to hit accurately. */
   #sidebar-footer{padding:8px 8px calc(8px + env(safe-area-inset-bottom,0px))}
   /* The drawer toggle is the only way back to the topic list on a phone, but it inherits
-     .btn-icon's 13px glyph and 4px padding — a ~21x21 target, well under the 44px every mobile
+     .btn-icon's 13px glyph and 4px padding — a 26x21 target, well under the 44px every mobile
      HIG asks for. Pad it out to 44px square and grow the glyph to match; the header's own
-     vertical padding shrinks so the taller button does not push the title bar down with it.
-     :not([hidden]) because setting display here would otherwise beat the UA's [hidden]
-     rule and leave the button on screen while the drawer is open — it is toggled by .hidden. */
+     vertical padding gives way to it, so the title bar goes 42px -> 49px rather than 42 -> 56.
+     The negative margin puts the glyph's ink back where .btn-icon had it, now that it sits in
+     a box twice the width. :not([hidden]) because setting display here would otherwise beat
+     the UA's [hidden] rule and leave the button on screen while the drawer is open — it is
+     toggled by .hidden. */
   #chat-header{padding:2px 12px}
   #expand-sidebar:not([hidden]){display:inline-flex;align-items:center;justify-content:center;
     min-width:44px;height:44px;margin-left:-10px;font-size:20px;color:var(--fg)}

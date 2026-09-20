@@ -21,9 +21,9 @@ All notable changes to this project are documented here. The format is based on
 
 - **The web UI's drawer toggle is big enough to hit with a thumb.** On a narrow screen the `☰` in
   the chat header is the only way back to the topic list, and it was drawn at the desktop icon
-  size — a roughly 21px target, under half what every mobile interface guideline asks for. It is
-  now a 44px square with a larger glyph, and the header's vertical padding gives way to it so the
-  title bar grows by six pixels rather than by the whole difference.
+  size — a 26×21 target, well under what every mobile interface guideline asks for. It is now a
+  44px square with a larger glyph, and the header's vertical padding gives way to it, so the title
+  bar goes from 42px to 49px rather than to 56.
 
 ## [1.21.0] - 2026-09-20
 

@@ -145,6 +145,13 @@ interface Room {
 
 export class WebRoom {
   private seqId = 0;
+  /**
+   * When this object was built, i.e. when the daemon came up.
+   *
+   * Only ever compared against a topic's persisted `lastAt`, to answer "is this room empty
+   * because it is new, or because the restart took its transcript". See `isStale`.
+   */
+  private readonly startedAt = Date.now();
   private readonly rooms = new Map<string, Room>();
   private readonly clients = new Set<Client>();
   private readonly downloads = new Map<string, { path: string; name: string }>();
@@ -180,15 +187,38 @@ export class WebRoom {
 
   /** Delete a topic, disposing its room state and announcing the new list. */
   deleteTopic(id: string): boolean {
+    this.disposeRoom(id);
+    if (!this.topics.delete(id)) return false;
+    this.announceTopics();
+    return true;
+  }
+
+  /**
+   * Forget every topic and open a fresh one, announcing once rather than once per topic.
+   *
+   * The sweep for a sidebar left full of dead rows: a transcript lives in memory only, so every
+   * topic older than this process opens onto nothing (see `syncEvent`'s `stale`). Deliberately
+   * the same reach as `deleteTopic` repeated — the rooms go, the daemon's conversation bindings
+   * for those ids do not. It clears the list; it does not end the agent sessions behind it.
+   *
+   * Returns the replacement topic, which `current()` mints because the store is now empty.
+   */
+  clearTopics(): Topic {
+    for (const id of [...this.rooms.keys()]) this.disposeRoom(id);
+    this.topics.clear();
+    const fresh = this.topics.current();
+    this.announceTopics();
+    return fresh;
+  }
+
+  /** Drop one topic's live state, stopping its hold timer so nothing fires into a dead room. */
+  private disposeRoom(id: string): void {
     const room = this.rooms.get(id);
     if (room) {
       if (room.timer) clearTimeout(room.timer);
       this.rooms.delete(id);
     }
     this.dirCache.delete(id);
-    if (!this.topics.delete(id)) return false;
-    this.announceTopics();
-    return true;
   }
 
   /**
@@ -305,7 +335,23 @@ export class WebRoom {
       messages: [...room.stored.values()].map((s) => s.msg),
       commands: this.commands,
       topics: this.topicList(),
+      ...(this.isStale(topicId, room) ? { stale: true } : {}),
     };
+  }
+
+  /**
+   * Whether an empty room is empty because this process is younger than the topic.
+   *
+   * The topic list is persisted and the transcript is not, so a restart turns every older topic
+   * into a row that opens onto nothing. The page needs to be able to tell that apart from a
+   * topic that is simply new, because rendered identically they look like a broken page — which
+   * is what they were reported as. `lastAt` is the persisted mark of activity, so a topic whose
+   * last message predates this object is one whose transcript we no longer have.
+   */
+  private isStale(topicId: string, room: Room): boolean {
+    if (room.stored.size > 0) return false;
+    const topic = this.topics.get(topicId);
+    return topic !== undefined && topic.lastAt < this.startedAt;
   }
 
   get watchers(): number {

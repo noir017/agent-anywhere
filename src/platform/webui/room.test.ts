@@ -157,6 +157,29 @@ describe('WebRoom: topics are separate conversations', () => {
     // Deleting again returns false
     expect(room.deleteTopic(second.id)).toBe(false);
   });
+
+  it('clears every topic at once, announcing the replacement rather than each removal', () => {
+    vi.useFakeTimers();
+    const { room, topic, seen } = attached();
+    const second = room.createTopic('second');
+    const msg = room.post(second.id, { own: false, html: '<p>msg</p>' }, 'msg');
+    // An edit left in flight, so the sweep is proved to stop the timers rather than leave one
+    // armed to fire into a room that no longer exists.
+    room.revise(second.id, msg.id, 'still typing');
+    seen.length = 0;
+
+    const fresh = room.clearTopics();
+
+    expect(room.topicList().map((t) => t.id)).toEqual([fresh.id]);
+    expect(fresh.id).not.toBe(topic);
+    expect(fresh.id).not.toBe(second.id);
+    // One announcement for the whole sweep, not one per topic dropped.
+    expect(kinds(seen)).toEqual(['topics']);
+    expect((last(seen) as { topics: Array<{ id: string }> }).topics.map((t) => t.id)).toEqual([fresh.id]);
+
+    vi.advanceTimersByTime(60_000);
+    expect(kinds(seen)).toEqual(['topics']);
+  });
 });
 
 describe('WebRoom: held edits', () => {
@@ -288,6 +311,42 @@ describe('WebRoom: resuming a dropped stream', () => {
     room.subscribe(topic, (id, ev) => seen.push({ id, ev }));
     expect(seen[0]?.ev).toMatchObject({ t: 'sync', topic, messages: [{ html: '<p>x</p>' }] });
     expect((seen[0]?.ev as { topics: unknown[] }).topics).toHaveLength(1);
+  });
+});
+
+describe('WebRoom: a topic older than the process', () => {
+  // A transcript is memory; the topic LIST is a file. So every restart leaves rows that open
+  // onto nothing, and a page that renders that faithfully looks broken rather than empty — which
+  // is exactly how it was reported. The sync says which of the two it is.
+  it('flags an empty room whose last activity predates this process', () => {
+    const store = new TopicStore(path.join(dir, 'stale.json'));
+    const old = store.create('from before');
+    // Persisted by a daemon that is now gone; this WebRoom is built after it.
+    store.touch(old.id, Date.now() - 60_000);
+    const room = new WebRoom(instance(), store);
+
+    const seen: Seen[] = [];
+    room.subscribe(old.id, (id, ev) => seen.push({ id, ev }));
+
+    expect(seen[0]?.ev).toMatchObject({ t: 'sync', topic: old.id, messages: [], stale: true });
+  });
+
+  it('says nothing about a topic that is merely new, or one that has something in it', () => {
+    const { room, topic } = attached();
+    const fresh: Seen[] = [];
+    room.subscribe(topic, (id, ev) => fresh.push({ id, ev }));
+    // Created by this process, so its emptiness needs no explaining — and explaining a restart
+    // here would be the first thing a new install ever read.
+    expect(fresh[0]?.ev).not.toHaveProperty('stale');
+
+    const store = new TopicStore(path.join(dir, 'spoken.json'));
+    const old = store.create('from before');
+    store.touch(old.id, Date.now() - 60_000);
+    const reopened = new WebRoom(instance(), store);
+    reopened.post(old.id, { own: false, html: '<p>said since</p>' }, 'said since');
+    const seen: Seen[] = [];
+    reopened.subscribe(old.id, (id, ev) => seen.push({ id, ev }));
+    expect(seen[0]?.ev).not.toHaveProperty('stale');
   });
 });
 

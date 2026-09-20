@@ -5,6 +5,14 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **The web UI's sidebar can forget every topic at once.** A restart leaves the switcher full of rows that open onto nothing (see below), and deleting a dozen of those one `×` at a time is not a feature. *Clear all topics* sits in a footer under the list rather than beside the `+` in the header, because it is a misclick away from throwing every room away and a one-character icon next to "new topic" is not where that belongs. It confirms, then sweeps the list and lands in the fresh topic that replaced it, dropping the page's own per-topic caches and read marks with it — a cache left behind would repaint messages for ids the daemon has forgotten. What it deliberately does *not* do, exactly like the per-topic `×` it repeats, is end the agent sessions: their bindings in `conversations.json` outlive the rows. It clears a list.
+
+### Fixed
+
+- **A web UI topic from before the last restart opened onto nothing, and said nothing about it.** The topic list is a file and the transcript is memory, so a restart turns every older topic into a row that opens onto a blank panel — and a blank panel rendered faithfully is indistinguishable from a page that failed to load. That is how it was reported: the sidebar has history in it, clicking through shows nothing, and the event stream can be watched arriving with the transcript genuinely empty. Keeping transcripts across restarts is a different feature with different questions attached; what was wrong here was the silence. A sync for a room that holds no messages and whose last activity predates the running daemon now says so, and the page answers with a line explaining that transcripts are kept in memory only and that the agent still has its context — so the conversation reads as one that can be carried on rather than one that was lost.
+
 ## [1.18.1] - 2026-09-19
 
 ### Fixed

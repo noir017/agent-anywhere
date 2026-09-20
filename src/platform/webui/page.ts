@@ -95,6 +95,13 @@ body{background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,-apple-system,
 #topics .topic-item:hover .topic-del,#topics .topic-item:focus-within .topic-del{opacity:1}
 .topic-del:hover{color:#f87171;background:rgba(248,113,113,.15)}
 @media(hover:none){.topic-del{opacity:.7}}
+/* Pinned under the list rather than beside the + in the header, and that is the whole reason it
+   is a footer: this throws away every room at once, and a one-character icon sitting next to
+   "new topic" is a misclick away from it. Down here it is out of the way, has room for words
+   that say what it does, and only turns red once the pointer is on it. */
+#sidebar-footer{border-top:1px solid var(--line);padding:8px}
+#clear-topics{display:block;width:100%;background:none;border:0;padding:7px 9px;border-radius:5px;color:var(--dim);font:inherit;font-size:12px;text-align:left;cursor:pointer;transition:color .15s,background .15s}
+#clear-topics:hover{color:#f87171;background:rgba(248,113,113,.12)}
 
 #chat{flex:1;display:flex;flex-direction:column;height:100%;min-width:0;position:relative}
 #chat-header{display:flex;align-items:center;gap:10px;padding:9px 16px;border-bottom:1px solid var(--line);min-height:42px;font-size:13px}
@@ -127,6 +134,11 @@ body{background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,-apple-system,
    this query is for: without motion the skeleton is still a placeholder and a message still
    appears, they just do it instantly. */
 @media(prefers-reduced-motion:reduce){.m,.sk i{animation:none}}
+/* Why an empty room is empty. A transcript lives in memory only while the topic LIST is
+   persisted, so every restart leaves rows that open onto nothing — and an empty panel rendered
+   faithfully is indistinguishable from a page that failed to load, which is how it was reported.
+   Sized and centred like a system note rather than a message: it is about the room, not in it. */
+.empty{margin:28px auto;max-width:46ch;text-align:center;font-size:12.5px;line-height:1.6;color:var(--dim)}
 /* A rule and an indent were all that separated the two sides of the conversation, and at a
    glance down a long transcript that is not enough to find where your own question ended and
    the answer began. Own messages get a tinted panel instead — cool where the page is neutral,
@@ -186,6 +198,10 @@ button:disabled{opacity:.5;cursor:default}
   #sidebar.collapsed{margin-left:-100%}
   #backdrop{display:block}
   #topics .topic-item{padding:10px 9px}
+  /* The drawer runs to the bottom edge, so its last row needs the same home-indicator clearance
+     the composer gets — without it "Clear all topics" sits under the indicator, which is both
+     hard to hit and the wrong control to make hard to hit accurately. */
+  #sidebar-footer{padding:8px 8px calc(8px + env(safe-area-inset-bottom,0px))}
   #chat-header{padding:8px 12px}
   .chat-title{max-width:none}
   #log{padding:14px 12px 6px}
@@ -206,13 +222,16 @@ const SCRIPT = `
       chips=$('chips'), hints=$('hints'), typing=$('typing'), note=$('note'), picker=$('picker'),
       bar=$('topics'), sidebar=$('sidebar'), collapseBtn=$('collapse-sidebar'),
       expandBtn=$('expand-sidebar'), newTopicBtn=$('new-topic'), backdrop=$('backdrop'),
-      chatTitle=$('topic-title'), chatStatus=$('topic-status');
+      clearBtn=$('clear-topics'), chatTitle=$('topic-title'), chatStatus=$('topic-status');
   var data={}, els={}, files=[], commands=[], stream=null, done=false;
   // Last markup written per message, so a sync that re-sends an unchanged message touches no DOM.
   var sig={};
   // Whether #log currently holds placeholders rather than messages, and whether the next sync is
   // the one that opens a topic (which lands at the bottom no matter where the old one was read).
   var skeleton=false, entering=true;
+  // What the last sync said about this topic being older than the daemon, and the notice element
+  // that says so. Both are per topic, so both are reset on the way into one.
+  var stale=false, emptyEl=null;
   var topic = new URLSearchParams(location.search).get('t') || '';
   var topics = [];
   var readCounts = {};
@@ -351,12 +370,13 @@ const SCRIPT = `
     sig[id] = h;
   }
 
-  function upsert(m){ var stick=atBottom(); data[m.id]=m; paint(m.id); if(stick) toBottom(); }
+  function upsert(m){ var stick=atBottom(); data[m.id]=m; paint(m.id); syncEmptyNote(); if(stick) toBottom(); }
 
   function drop(id){
     if(els[id]) { els[id].remove(); delete els[id]; }
     delete data[id];
     delete sig[id];
+    syncEmptyNote();
   }
 
   /**
@@ -406,6 +426,40 @@ const SCRIPT = `
     if(!skeleton) return;
     skeleton = false;
     log.innerHTML = '';
+    // Emptying #log invalidates anything held by reference into it, and this is the only other
+    // thing that lives in there.
+    emptyEl = null;
+  }
+
+  /**
+   * Say why an empty room is empty, when the server said this topic predates the daemon.
+   *
+   * A transcript lives in the daemon's memory while the topic LIST lives on disk, so every
+   * restart leaves rows that open onto nothing. Rendered faithfully that is a blank panel, which
+   * is indistinguishable from a page that failed to load — and is exactly how it was reported.
+   */
+  var EMPTY_NOTE = 'This topic is older than the running daemon. Transcripts are kept in memory only,'
+    + ' so anything said in it is no longer here. The agent still has its context, so you can carry'
+    + ' on where you left off.';
+
+  function hasMessages(){
+    for(var k in els) if(els.hasOwnProperty(k)) return true;
+    return false;
+  }
+
+  function syncEmptyNote(){
+    var want = stale && !hasMessages();
+    if(want === Boolean(emptyEl)) return;
+    if(want){
+      clearSkeleton();
+      emptyEl = document.createElement('div');
+      emptyEl.className = 'empty';
+      emptyEl.textContent = EMPTY_NOTE;
+      log.appendChild(emptyEl);
+    } else {
+      if(emptyEl.parentNode) emptyEl.parentNode.removeChild(emptyEl);
+      emptyEl = null;
+    }
   }
 
   function paintTopics(){
@@ -470,6 +524,10 @@ const SCRIPT = `
     els={};
     sig={};
     skeleton=false;
+    // Both belong to the topic being left: the notice element is gone with #log's children, and
+    // whether the NEXT topic predates the daemon is the incoming sync's answer to give.
+    stale=false;
+    emptyEl=null;
     entering=true;
     var cached = topicCache[id];
     if(cached && cached.length){
@@ -524,7 +582,11 @@ const SCRIPT = `
       // their scroll position intact.
       var stick = entering || atBottom();
       entering = false;
+      // What the server says about this room BEFORE the transcript is reconciled, so the drops
+      // that reconcile performs already know whether an emptied log needs explaining.
+      stale = Boolean(ev.stale);
       reconcile(ev.messages);
+      syncEmptyNote();
       setCachedMsgs(topic, ev.messages);
       readCounts[topic] = ev.messages.length;
       saveReads();
@@ -659,6 +721,32 @@ const SCRIPT = `
   }
 
   newTopicBtn.addEventListener('click', createTopic);
+
+  clearBtn.addEventListener('click', function(){
+    if(!confirm('Delete all ' + topics.length + ' topics? This cannot be undone.')) return;
+    post('api/topics/clear',{},1).then(function(r){ return r.ok ? r.json() : null; }).then(function(d){
+      if(!d || !d.topic) return;
+      // Every local record of the old rooms goes with them. Leaving the caches would put
+      // messages on screen for ids the daemon has forgotten, and leaving the read marks would
+      // badge the replacement topic against a count from a room that no longer exists.
+      topicCache={};
+      cacheOrder=[];
+      saveCache();
+      readCounts={};
+      saveReads();
+      // The list is replaced with what the server just told us rather than left to the broadcast
+      // that is also on its way: paintTopics re-seeds a read mark for every topic it renders, so
+      // painting the OLD list once more would write the ids we are here to forget straight back
+      // into storage.
+      topics=[d.topic];
+      // Cleared rather than handed straight to switchTopic, which answers an unchanged id by
+      // doing nothing: the replacement id is four random bytes and may repeat the one being
+      // read, and that one-in-4-billion case would leave a wiped transcript on screen.
+      topic='';
+      switchTopic(d.topic.id);
+      if(narrow()) setSidebar(false);
+    });
+  });
 
   $('gate').addEventListener('submit', function(e){
     e.preventDefault();
@@ -817,6 +905,9 @@ const PAGE = `<!doctype html>
       <button type="button" class="btn-icon" id="collapse-sidebar" title="Collapse sidebar">◀</button>
     </div>
     <div id="topics"></div>
+    <div id="sidebar-footer">
+      <button type="button" id="clear-topics" title="Forget every topic and start a new one">Clear all topics</button>
+    </div>
   </aside>
   <div id="backdrop" hidden></div>
   <section id="chat">

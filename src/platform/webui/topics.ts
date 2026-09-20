@@ -126,6 +126,23 @@ export class TopicStore {
   }
 
   /**
+   * Forget every topic, in one write.
+   *
+   * Leaves the store EMPTY rather than seeding a replacement: `current()` already creates one
+   * when the list is empty, and having two places that decide "the page is never without a room
+   * to be in" is how they come to disagree. Note what this does not reach — the daemon's
+   * `conversations.json` still holds the agent binding and session id for every id dropped here,
+   * exactly as `delete` leaves them. This clears the list, it does not end the sessions.
+   */
+  clear(): number {
+    const had = this.topics.size;
+    if (had === 0) return 0;
+    this.topics.clear();
+    this.flush();
+    return had;
+  }
+
+  /**
    * Give an unnamed topic a placeholder from the first thing said in it.
    *
    * Without it a run of new topics reads as several identical blanks in the switcher, and the

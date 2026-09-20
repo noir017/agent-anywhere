@@ -91,6 +91,13 @@ empty": `conversations.json` still holds the agent binding and session id under
 `<instance>#main#<topic id>`, so every context would still be running and no longer reachable.
 See `topics.ts` for why its `title` duplicates one the daemon also stores.
 
+**Neither the per-topic `×` nor "Clear all topics" ends an agent session.** Both reach exactly as
+far as this module: the room goes, the list entry goes, and the daemon's binding under
+`<instance>#main#<topic id>` stays behind. That is the same trade the cap in `topics.ts` refuses
+to make automatically — it is a list being cleared, not sessions being killed. The sweep exists
+because a restart leaves a sidebar full of rows that open onto nothing (see `stale` below), and
+deleting a dozen of those one at a time is not a feature.
+
 **Each row also says which directory that topic works in**, which is the one thing a title does
 not tell you when several topics are open on different projects. It is not stored beside the
 title, though, and that asymmetry is deliberate: the title is *this module's* (a topic has one
@@ -270,7 +277,14 @@ shared secret is what stands in its place.
 - **The page is empty after a restart while the agent still remembers everything.** The ring
   is memory; the agent's session is persisted by `conversation-store.ts`. So `/context` will
   report real numbers against a blank transcript. Deliberate — persisting a chat log to disk
-  is a different feature with different questions attached.
+  is a different feature with different questions attached. What is *not* acceptable is doing
+  it silently: the topic list is a file, so a restart leaves rows that open onto nothing, and
+  an empty panel rendered faithfully is indistinguishable from a page that failed to load.
+  That is how it was reported. `syncEvent` therefore sets `stale` when a room holds no messages
+  and the topic's persisted `lastAt` predates the `WebRoom`, and the page answers it with a
+  line saying the topic is older than the daemon and the agent still has its context. It also
+  covers the milder case of a topic created before the restart and never spoken in; both are
+  honestly described by "older than this process, nothing here".
 
 ## Testing
 

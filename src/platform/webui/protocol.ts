@@ -75,6 +75,12 @@ export const SendRequestSchema = z
 
 export const CreateTopicRequestSchema = z.object({ title: z.string().max(200).optional() }).strict();
 export const DeleteTopicRequestSchema = z.object({ topic: TopicId }).strict();
+/**
+ * Clear every topic. Takes no fields, and is still a schema rather than an ignored body:
+ * `.strict()` is what makes "no fields" mean it, so a request carrying one is refused instead
+ * of quietly discarded by the most destructive route here.
+ */
+export const ClearTopicsRequestSchema = z.object({}).strict();
 
 export const ClickRequestSchema = z
   .object({
@@ -89,6 +95,7 @@ export type SendRequest = z.infer<typeof SendRequestSchema>;
 export type ClickRequest = z.infer<typeof ClickRequestSchema>;
 export type CreateTopicRequest = z.infer<typeof CreateTopicRequestSchema>;
 export type DeleteTopicRequest = z.infer<typeof DeleteTopicRequestSchema>;
+export type ClearTopicsRequest = z.infer<typeof ClearTopicsRequestSchema>;
 
 /**
  * Validate one inbound body against a schema.
@@ -126,7 +133,23 @@ export type WebEvent =
    * conversation after every network blip was the single most expensive thing this protocol
    * did on a weak link.
    */
-  | { t: 'sync'; topic: string; messages: WebMessage[]; commands: SlashCommandSpec[]; topics: Topic[] }
+  | {
+      t: 'sync';
+      topic: string;
+      messages: WebMessage[];
+      commands: SlashCommandSpec[];
+      topics: Topic[];
+      /**
+       * This topic is older than the running daemon and has nothing left in memory.
+       *
+       * Set so the page can say WHY it is showing an empty room. The topic list is persisted
+       * and the transcript is not (see `room.ts`), so a restart leaves rows that open onto
+       * nothing — which, rendered faithfully, is indistinguishable from a page that failed to
+       * load. It also covers the milder case of a topic created before the restart and never
+       * spoken in; both are honestly described as "older than this process, nothing here".
+       */
+      stale?: boolean;
+    }
   | { t: 'msg'; msg: WebMessage }
   | { t: 'del'; id: string }
   | { t: 'react'; id: string; emoji: string; on: boolean }

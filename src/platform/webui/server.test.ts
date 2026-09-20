@@ -304,6 +304,28 @@ describe('webui server: topics', () => {
     expect(resDel.status).toBe(200);
     expect(room.topics.has(another)).toBe(false);
   });
+
+  it('clears every topic and answers with the one that replaced them', async () => {
+    const { base, room, topic } = await boot();
+    const cookie = await signIn(base);
+    room.createTopic('second');
+    room.createTopic('third');
+
+    const res = await fetch(`${base}/api/topics/clear`, {
+      method: 'POST',
+      headers: { ...JSON_HEADERS, cookie },
+      body: '{}',
+    });
+
+    expect(res.status).toBe(200);
+    const { topic: fresh } = (await res.json()) as { topic: { id: string } };
+    // The replacement comes back in the RESPONSE: the page has its own per-topic caches to drop
+    // and then has to land somewhere, and racing a POST against an SSE frame to find out where
+    // is a worse contract than being told.
+    expect(fresh.id).toMatch(/^[0-9a-f]{8}$/);
+    expect(room.topics.list().map((t) => t.id)).toEqual([fresh.id]);
+    expect(room.topics.has(topic)).toBe(false);
+  });
 });
 
 describe('webui server: built for a weak link', () => {

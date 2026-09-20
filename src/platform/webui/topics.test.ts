@@ -94,6 +94,22 @@ describe('TopicStore', () => {
     expect(reopened.has(b.id)).toBe(true);
   });
 
+  it('forgets every topic in one write, leaving current() to mint the replacement', () => {
+    const store = new TopicStore(file);
+    store.create('first');
+    store.create('second');
+
+    expect(store.clear()).toBe(2);
+    expect(store.list()).toEqual([]);
+    // Empty rather than pre-seeded: `current()` is the one place that decides the page is never
+    // without a room to be in, and two places deciding it is how they come to disagree.
+    expect(new TopicStore(file).list()).toEqual([]);
+    expect(store.clear()).toBe(0);
+
+    const fresh = store.current();
+    expect(new TopicStore(file).list().map((t) => t.id)).toEqual([fresh.id]);
+  });
+
   it('refuses past its cap instead of evicting, because evicting orphans a live session', () => {
     const store = new TopicStore(file);
     for (let i = 0; i < 64; i += 1) store.create();

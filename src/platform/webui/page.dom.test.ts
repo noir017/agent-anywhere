@@ -63,6 +63,8 @@ interface Harness {
   skeletons: () => number;
   /** Topic rows currently painted in the sidebar. */
   rows: () => number;
+  /** The "why is this room empty" notice, when one is on screen. */
+  notice: () => string | null;
   click: (selector: string) => Promise<void>;
 }
 
@@ -82,8 +84,13 @@ async function until(what: string, ok: () => boolean): Promise<void> {
   throw new Error(`never happened: ${what}`);
 }
 
-/** A sync in the shape `WebRoom.syncEvent` builds it. */
-function sync(topic: string, messages: Array<Record<string, unknown>>, topics: string[]): Record<string, unknown> {
+/** A sync in the shape `WebRoom.syncEvent` builds it. `extra` carries the optional flags. */
+function sync(
+  topic: string,
+  messages: Array<Record<string, unknown>>,
+  topics: string[],
+  extra: Record<string, unknown> = {}
+): Record<string, unknown> {
   return {
     t: 'sync',
     topic,
@@ -96,6 +103,7 @@ function sync(topic: string, messages: Array<Record<string, unknown>>, topics: s
       running: false,
       msgCount: id === topic ? messages.length : 0,
     })),
+    ...extra,
   };
 }
 
@@ -103,8 +111,18 @@ function message(id: string, html: string, own = false): Record<string, unknown>
   return { id, html, at: 1758240000000, own };
 }
 
-async function open(opts: { url?: string; width?: number; height?: number } = {}): Promise<Harness> {
-  const { url = 'http://localhost:8787/', width = 1440, height = 900 } = opts;
+async function open(
+  opts: {
+    url?: string;
+    width?: number;
+    height?: number;
+    /** What each POST answers with; anything unlisted answers `{}`, as most routes do. */
+    replies?: Record<string, unknown>;
+    /** What `confirm()` returns — a destructive control is only half tested by the yes path. */
+    confirm?: boolean;
+  } = {}
+): Promise<Harness> {
+  const { url = 'http://localhost:8787/', width = 1440, height = 900, replies = {}, confirm = true } = opts;
   const streams: Stream[] = [];
   const calls: Call[] = [];
 
@@ -132,10 +150,10 @@ async function open(opts: { url?: string; width?: number; height?: number } = {}
         }
       }
       (w as any).EventSource = FakeEventSource;
-      (w as any).confirm = () => true;
+      (w as any).confirm = () => confirm;
       (w as any).fetch = (path: string, init: { body: string }) => {
         calls.push({ path, body: JSON.parse(init.body) });
-        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({}) });
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(replies[path] ?? {}) });
       };
     },
   });
@@ -166,6 +184,7 @@ async function open(opts: { url?: string; width?: number; height?: number } = {}
     painted: () => doc.getElementById('log')!.querySelectorAll(':scope > .m').length,
     skeletons: () => doc.getElementById('log')!.querySelectorAll(':scope > .sk').length,
     rows: () => doc.getElementById('topics')!.children.length,
+    notice: () => doc.querySelector('#log > .empty')?.textContent ?? null,
     click: async (selector) => {
       const target = doc.querySelector<HTMLElement>(selector);
       if (!target) throw new Error(`nothing matches ${selector}`);
@@ -414,6 +433,86 @@ describe('webui page: topics', () => {
     });
 
     expect(h.doc.querySelector('.topic-badge')?.textContent).toBe('3');
+  });
+
+  it('sweeps every topic away and lands in the one that replaced them', async () => {
+    const h = await open({ replies: { 'api/topics/clear': { topic: { id: 'deadbeef', title: '', lastAt: 2000 } } } });
+    await h.emit(sync('a1b2c3d4', [message('m1', '<p>in A</p>')], ['a1b2c3d4', 'b2c3d4e5']));
+    expect(h.painted()).toBe(1);
+
+    await h.click('#clear-topics');
+
+    expect(h.calls.find((c) => c.path === 'api/topics/clear')?.body).toEqual({});
+    // Landed in the replacement rather than waiting for the broadcast list to say where to go.
+    expect(h.live().url).toBe('api/events?t=deadbeef');
+    expect(h.window.location.search).toBe('?t=deadbeef');
+    expect(h.painted()).toBe(0);
+    expect(h.rows()).toBe(1);
+    // Every local record of the old rooms went with them: a cache left behind would repaint
+    // messages for ids the daemon has forgotten the moment one of them was opened again, and a
+    // read mark left behind would badge the replacement against a count from a dead room.
+    expect(h.window.sessionStorage.getItem('aa_cache')).toBe(JSON.stringify({ data: {}, order: [] }));
+    expect(JSON.parse(h.window.localStorage.getItem('aa_reads') ?? 'null')).toEqual({ deadbeef: 0 });
+  });
+
+  it('does nothing at all when the confirmation is declined', async () => {
+    const h = await open({ confirm: false });
+    await h.emit(sync('a1b2c3d4', [message('m1', '<p>in A</p>')], ['a1b2c3d4', 'b2c3d4e5']));
+
+    await h.click('#clear-topics');
+
+    expect(h.calls.map((c) => c.path)).not.toContain('api/topics/clear');
+    expect(h.rows()).toBe(2);
+    expect(h.painted()).toBe(1);
+  });
+});
+
+describe('webui page: a topic the daemon no longer has', () => {
+  // A transcript lives in the daemon's memory while the topic LIST lives on disk, so every
+  // restart leaves rows that open onto nothing. Rendered faithfully that is a blank panel — which
+  // is indistinguishable from a page that failed to load, and is how it was reported.
+  it('says why an emptied topic is empty', async () => {
+    const h = await open({ url: 'http://localhost:8787/?t=a1b2c3d4' });
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4'], { stale: true }));
+
+    expect(h.painted()).toBe(0);
+    expect(h.skeletons()).toBe(0);
+    expect(h.notice()).toContain('older than the running daemon');
+    // The half that keeps it from reading as data loss: the agent's own context is persisted.
+    expect(h.notice()).toContain('still has its context');
+  });
+
+  it('takes the notice away as soon as the topic has something in it', async () => {
+    const h = await open({ url: 'http://localhost:8787/?t=a1b2c3d4' });
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4'], { stale: true }));
+    expect(h.notice()).not.toBeNull();
+
+    await h.emit({ t: 'msg', msg: message('m1', '<p>carrying on</p>') });
+
+    expect(h.notice()).toBeNull();
+    expect(h.painted()).toBe(1);
+  });
+
+  it('leaves a genuinely new topic to speak for itself', async () => {
+    // No flag, so this room is empty because nothing has been said in it yet. Explaining a
+    // restart here would be both wrong and the first thing a new install ever reads.
+    const h = await open({ url: 'http://localhost:8787/?t=a1b2c3d4' });
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+
+    expect(h.notice()).toBeNull();
+  });
+
+  it('does not carry the notice into the next topic', async () => {
+    const h = await open();
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4', 'b2c3d4e5'], { stale: true }));
+    expect(h.notice()).not.toBeNull();
+
+    await h.click('[data-topic="b2c3d4e5"]');
+
+    // Whether THAT room predates the daemon is its own sync's answer to give; until it lands the
+    // page is back to showing the shape of a transcript that is on its way.
+    expect(h.notice()).toBeNull();
+    expect(h.skeletons()).toBeGreaterThan(0);
   });
 });
 

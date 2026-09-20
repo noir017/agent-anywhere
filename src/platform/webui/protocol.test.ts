@@ -4,6 +4,7 @@ import {
   ClickRequestSchema,
   CreateTopicRequestSchema,
   DeleteTopicRequestSchema,
+  ClearTopicsRequestSchema,
   LoginRequestSchema,
   SendRequestSchema,
   parseBody,
@@ -101,5 +102,15 @@ describe('webui protocol: inbound validation', () => {
     ['an extra key', { topic: TOPIC, force: true }, false],
   ])('deleting a topic with %s', (_label, body, want) => {
     expect(parseBody(DeleteTopicRequestSchema, body).ok).toBe(want);
+  });
+
+  it.each([
+    ['nothing at all', {}, true],
+    // The most destructive route here takes no fields, and `.strict()` is what makes that mean
+    // it: a body carrying one is refused rather than quietly discarded.
+    ['a topic it might have meant to spare', { topic: TOPIC }, false],
+    ['an extra key', { confirm: true }, false],
+  ])('clearing every topic with %s', (_label, body, want) => {
+    expect(parseBody(ClearTopicsRequestSchema, body).ok).toBe(want);
   });
 });

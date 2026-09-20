@@ -44,6 +44,7 @@ import { renderPage } from './page.js';
 import {
   ClickRequestSchema,
   CreateTopicRequestSchema,
+  ClearTopicsRequestSchema,
   DeleteTopicRequestSchema,
   LoginRequestSchema,
   MAX_BODY_BYTES,
@@ -223,6 +224,7 @@ const GUARDED: Route[] = [
   { method: 'POST', path: '/api/send', run: submit },
   { method: 'POST', path: '/api/click', run: click },
   { method: 'POST', path: '/api/topics', run: createTopic },
+  { method: 'POST', path: '/api/topics/clear', run: clearTopics },
   { method: 'POST', path: '/api/topics/delete', run: deleteTopic },
   { method: 'DELETE', path: '/api/topics', run: deleteTopic },
   { method: 'POST', path: '/api/logout', run: logout },
@@ -396,6 +398,19 @@ async function deleteTopic({ req, res }: Req, ctx: Ctx): Promise<void> {
     return send(req, res, 404, { error: 'no such topic' });
   }
   send(req, res, 200, { ok: true });
+}
+
+/**
+ * Forget every topic and answer with the fresh one that replaced them.
+ *
+ * The new topic comes back in the response rather than being left for the broadcast `topics`
+ * event to reveal: the page has to drop its own per-topic caches and then land somewhere, and
+ * racing a POST against an SSE frame to find out where is a worse contract than being told.
+ */
+async function clearTopics({ req, res }: Req, ctx: Ctx): Promise<void> {
+  const parsed = await readBody(req, res, ClearTopicsRequestSchema);
+  if (!parsed) return;
+  send(req, res, 200, { topic: ctx.room.clearTopics() });
 }
 
 async function download(req: IncomingMessage, res: ServerResponse, room: WebRoom, token: string): Promise<void> {

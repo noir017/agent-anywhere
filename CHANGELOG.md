@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.20.0] - 2026-09-20
+
 ### Changed
 
 - **The `codex` harness is no longer bundled, and now points at a different adapter.** Two changes that only make sense together. The adapter moved from Zed's `@zed-industries/codex-acp`, deprecated upstream, to `@agentclientprotocol/codex-acp`; and it stopped being a dependency of this package, so it is installed alongside the daemon the way `opencode` and `dsh` already are. The packaging half is the reason the migration is not free: the new adapter declares `@openai/codex` as an ordinary dependency, whose platform binary is ~284 MB unpacked, and nothing justifies putting that inside every `npm i -g agent-anywhere-cli` for a harness most installs never configure — particularly when the operator who *does* configure it has already installed and logged into the codex CLI by hand. Net effect for everyone not using codex: this package is 209 MB smaller. For everyone using it: one `npm i -g @agentclientprotocol/codex-acp`, which `doctor` now names when the command is missing.

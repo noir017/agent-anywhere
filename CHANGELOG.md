@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.19.0] - 2026-09-20
+
 ### Added
 
 - **The web UI's sidebar can forget every topic at once.** A restart leaves the switcher full of rows that open onto nothing (see below), and deleting a dozen of those one `×` at a time is not a feature. *Clear all topics* sits in a footer under the list rather than beside the `+` in the header, because it is a misclick away from throwing every room away and a one-character icon next to "new topic" is not where that belongs. It confirms, then sweeps the list and lands in the fresh topic that replaced it, dropping the page's own per-topic caches and read marks with it — a cache left behind would repaint messages for ids the daemon has forgotten. What it deliberately does *not* do, exactly like the per-topic `×` it repeats, is end the agent sessions: their bindings in `conversations.json` outlive the rows. It clears a list.

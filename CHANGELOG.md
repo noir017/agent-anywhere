@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.21.0] - 2026-09-20
+
 ### Added
 
 - **The web UI keeps its own copy of the conversation, so a restart no longer empties the page.** The daemon's transcript is memory and stays that way; what changed is that the browser now writes down what it has seen, in IndexedDB — one record per topic, a rotating 200 messages and 512KB each, 24 topics, evicted least-recently-written-first. Two things follow from it. A topic paints from the last visit before its stream has answered, which on a slow link is the difference between reading and waiting. And when the daemon comes back, the messages from before it went away stay on screen above a divider saying where they came from, instead of the room going blank under an apology.

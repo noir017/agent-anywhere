@@ -157,6 +157,8 @@ async function open(
     idb?: IDBFactory | null;
     /** What `confirm()` returns — a destructive control is only half tested by the yes path. */
     confirm?: boolean;
+    /** Whether the daemon serves a terminal, which the page is told once at render time. */
+    terminal?: boolean;
   } = {}
 ): Promise<Harness> {
   const {
@@ -167,12 +169,13 @@ async function open(
     status = {},
     idb = new IDBFactory(),
     confirm = true,
+    terminal = false,
   } = opts;
   const streams: Stream[] = [];
   const calls: Call[] = [];
   const clipboard: string[] = [];
 
-  const dom = new JSDOM(renderPage('Chat'), {
+  const dom = new JSDOM(renderPage('Chat', terminal), {
     url,
     runScripts: 'dangerously',
     pretendToBeVisual: true,
@@ -1213,7 +1216,7 @@ describe('webui page: the narrow-screen stylesheet', () => {
    * than about one parser's coverage of modern CSS.
    */
   const narrowBlock = (): string => {
-    const html = renderPage('Chat');
+    const html = renderPage('Chat', false);
     const at = html.indexOf('@media(max-width:640px){');
     if (at < 0) throw new Error('there is no narrow-screen block in the stylesheet');
     let depth = 0;
@@ -1253,7 +1256,7 @@ describe('webui page: the narrow-screen stylesheet', () => {
     expect(css).toMatch(/#expand-sidebar\{[^}]*min-width:44px/);
     expect(css).toMatch(/#expand-sidebar\{[^}]*height:44px/);
     // The rule sets `display`, which is only safe because of the page-wide `!important` guard.
-    expect(renderPage('Chat')).toContain('[hidden]{display:none!important}');
+    expect(renderPage('Chat', false)).toContain('[hidden]{display:none!important}');
   });
 
   it('scopes all of that to the narrow screen and nothing else', () => {
@@ -1264,5 +1267,87 @@ describe('webui page: the narrow-screen stylesheet', () => {
     expect(css.startsWith('@media(max-width:640px){')).toBe(true);
     expect(css.endsWith('}')).toBe(true);
     expect(css.slice('@media'.length)).not.toContain('@media');
+  });
+});
+
+describe('webui page: the terminal pane', () => {
+  /** The iframe, or null. Created on demand, so its absence is a fact worth asserting. */
+  const frame = (h: { doc: Document }): HTMLIFrameElement | null =>
+    h.doc.querySelector<HTMLIFrameElement>('#term iframe');
+
+  it('offers nothing at all when the daemon serves no terminal', async () => {
+    const h = await open();
+    await h.emit(sync('a1b2c3d4', [message('m1', '<p>hi</p>')], ['a1b2c3d4']));
+
+    expect(h.el('term-toggle').hidden).toBe(true);
+    expect(frame(h)).toBeNull();
+    // And clicking it anyway — which a curious person can do from the console — changes nothing.
+    await h.click('#term-toggle');
+    expect(frame(h)).toBeNull();
+    expect(h.el('chat').className).not.toContain('term');
+  });
+
+  it('connects to ttyd only once the pane is opened', async () => {
+    // The whole point of building the iframe on demand: a page that never opens the terminal
+    // must never open a socket to it, whether or not the feature is on.
+    const h = await open({ terminal: true });
+    await h.emit(sync('a1b2c3d4', [message('m1', '<p>hi</p>')], ['a1b2c3d4']));
+
+    expect(h.el('term-toggle').hidden).toBe(false);
+    expect(frame(h)).toBeNull();
+
+    await h.click('#term-toggle');
+    expect(frame(h)?.getAttribute('src')).toBe('term/?arg=a1b2c3d4');
+    expect(h.el('chat').className).toContain('term');
+    // The transcript is still there underneath, not thrown away — going back is a class flip.
+    expect(h.painted()).toBe(1);
+  });
+
+  it('puts the pane in the URL, and comes back into it on reload', async () => {
+    const h = await open({ terminal: true });
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+    await h.click('#term-toggle');
+    expect(h.window.location.search).toBe('?t=a1b2c3d4&v=term');
+
+    const again = await open({ terminal: true, url: 'http://localhost:8787/?t=a1b2c3d4&v=term' });
+    await again.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+    expect(frame(again)?.getAttribute('src')).toBe('term/?arg=a1b2c3d4');
+    expect(again.el('chat').className).toContain('term');
+  });
+
+  it('waits for a topic before pointing a terminal at one', async () => {
+    // A first visit has no ?t= at all — the daemon picks the room and says so in the sync. Until
+    // then there is nothing to name in the URL, so the pane is asked for but not yet built.
+    const h = await open({ terminal: true, url: 'http://localhost:8787/?v=term' });
+    expect(frame(h)).toBeNull();
+
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+    expect(frame(h)?.getAttribute('src')).toBe('term/?arg=a1b2c3d4');
+  });
+
+  it('follows the topic switcher', async () => {
+    const h = await open({ terminal: true, replies: {} });
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4', 'b2c3d4e5']));
+    await h.click('#term-toggle');
+    expect(frame(h)?.getAttribute('src')).toBe('term/?arg=a1b2c3d4');
+
+    await h.click('[data-topic="b2c3d4e5"]');
+    expect(frame(h)?.getAttribute('src')).toBe('term/?arg=b2c3d4e5');
+    expect(h.window.location.search).toBe('?t=b2c3d4e5&v=term');
+  });
+
+  it('drops the iframe on the way back to the chat', async () => {
+    // Nothing is lost by dropping it: the session lives in tmux on the far side, so reopening
+    // is a redraw. Keeping it would hold a socket open for a pane nobody is looking at.
+    const h = await open({ terminal: true });
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+
+    await h.click('#term-toggle');
+    expect(frame(h)).not.toBeNull();
+
+    await h.click('#term-toggle');
+    expect(frame(h)).toBeNull();
+    expect(h.el('chat').className).not.toContain('term');
+    expect(h.window.location.search).toBe('?t=a1b2c3d4');
   });
 });

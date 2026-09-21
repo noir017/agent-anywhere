@@ -189,8 +189,8 @@ export const DingtalkConfigSchema = z.object({
  *
  * The only platform here with no account, no bot token and no upstream service — which is
  * the point of it. It is also the only one that opens a port for HUMANS rather than for a
- * platform's webhook, so two of its fields are security decisions rather than connection
- * details, and both are documented where the operator will read them.
+ * platform's webhook, so three of its fields are security decisions rather than connection
+ * details, and all three are documented where the operator will read them.
  */
 export const WebuiConfigSchema = z.object({
   type: z.literal('webui'),
@@ -217,6 +217,34 @@ export const WebuiConfigSchema = z.object({
    * someone glances past and one they ask about. The default says nothing.
    */
   title: z.string().default('Chat'),
+  /**
+   * The raw terminal pane: a real PTY in this machine, rendered in the page.
+   *
+   * Off by default, and this is the third security decision in this schema rather than a
+   * convenience toggle. Everything else here puts the login secret in front of *talking to an
+   * agent*; this puts it in front of *an interactive shell*. The agent already runs with full
+   * tool access, so the ceiling is the same — but the distance from a leaked token to
+   * arbitrary commands goes from "ask the agent nicely" to "type".
+   *
+   * The daemon does not own a PTY and never spawns one: it proxies, behind the session
+   * cookie, to a `ttyd` already listening on `socket`. So turning this on without that
+   * process running is inert rather than dangerous, and the terminal a user sees is whatever
+   * that ttyd was told to run — which is what makes the pane work with any CLI at all.
+   */
+  terminal: z
+    .object({
+      enabled: z.boolean().default(false),
+      /**
+       * Where ttyd listens. A unix socket, not a port: nothing on the network can reach it,
+       * so the session check in front of the proxy is the only way in rather than one of two.
+       *
+       * Defaults to `term.sock` beside the daemon's own state — resolved in `webui/index.ts`,
+       * not here, because `config/schema.ts` imports this file and reaching back to
+       * `config/load.ts` for `configDir()` would close the cycle.
+       */
+      socket: z.string().optional(),
+    })
+    .default({}),
   ...common,
 });
 

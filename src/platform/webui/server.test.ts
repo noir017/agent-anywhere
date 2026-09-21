@@ -51,7 +51,10 @@ interface Booted {
   instance: WebuiInstance;
 }
 
-async function boot(over: Partial<WebuiInstance> = {}): Promise<Booted> {
+async function boot(
+  over: Partial<WebuiInstance> = {},
+  terminal: { enabled: boolean; socket: string } = { enabled: false, socket: '/nonexistent.sock' }
+): Promise<Booted> {
   const port = await freePort();
   const instance: WebuiInstance = {
     ...WebuiConfigSchema.parse({ type: 'webui', token: 'open-sesame' }),
@@ -63,7 +66,7 @@ async function boot(over: Partial<WebuiInstance> = {}): Promise<Booted> {
   const topics = new TopicStore(path.join(dir, `${port}.json`));
   const topic = topics.current().id;
   const room = new WebRoom(instance, topics);
-  const server = createWebServer(room, new WebAuth({ token: instance.token }), instance);
+  const server = createWebServer(room, new WebAuth({ token: instance.token }), instance, terminal);
   await server.start();
   running.push(server);
   return { room, server, base: `http://127.0.0.1:${port}`, port, topic, instance };
@@ -491,7 +494,10 @@ describe('webui server: lifecycle', () => {
     // daemon's global [uncaughtException] handler, and the daemon runs forever with a dead UI.
     const { instance } = await boot();
     const topics = new TopicStore(path.join(dir, 'clash.json'));
-    const clash = createWebServer(new WebRoom(instance, topics), new WebAuth({ token: 'x' }), instance);
+    const clash = createWebServer(new WebRoom(instance, topics), new WebAuth({ token: 'x' }), instance, {
+      enabled: false,
+      socket: '/nonexistent.sock',
+    });
     await expect(clash.start()).rejects.toThrow(/cannot bind/);
   });
 
@@ -510,5 +516,189 @@ describe('webui server: lifecycle', () => {
     await server.stop();
     expect(Date.now() - started).toBeLessThan(1500);
     stream.close();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Terminal proxy
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * A stand-in for ttyd on a unix socket: answers one GET and echoes bytes after an upgrade.
+ *
+ * Deliberately not a WebSocket library — the proxy under test never parses a frame, so a
+ * handshake that looks right on the wire plus a byte echo is exactly the contract it has.
+ */
+function fakeTtyd(socketPath: string): Promise<{ seen: string[]; close: () => Promise<void> }> {
+  const seen: string[] = [];
+  const server = http.createServer((req, res) => {
+    seen.push(req.url ?? '');
+    res.writeHead(200, { 'content-type': 'text/html', 'x-from': 'ttyd' });
+    res.end('<html>terminal</html>');
+  });
+  server.on('upgrade', (req, socket) => {
+    seen.push(req.url ?? '');
+    socket.write(
+      'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
+        'Sec-WebSocket-Accept: stand-in\r\nSec-WebSocket-Protocol: tty\r\n\r\n'
+    );
+    socket.on('data', (d: Buffer) => socket.write(d));
+    // Hang up when the proxy does. An `http.Server` socket reports the proxy's FIN as `end`
+    // and then sits half-open forever, so without this the stand-in's own `close()` never
+    // returns and the test reads as a leak in the code under test. Real ttyd closes on FIN.
+    socket.on('end', () => socket.destroy());
+  });
+  return new Promise((resolve) => {
+    server.listen(socketPath, () =>
+      resolve({
+        seen,
+        close: () => new Promise<void>((done) => server.close(() => done())),
+      })
+    );
+  });
+}
+
+/** Attempt a WebSocket handshake against the daemon and report what came back. */
+function handshake(
+  port: number,
+  path_: string,
+  headers: Record<string, string>
+): Promise<{ status: number; echo?: string }> {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      host: '127.0.0.1',
+      port,
+      path: path_,
+      headers: {
+        connection: 'Upgrade',
+        upgrade: 'websocket',
+        'sec-websocket-version': '13',
+        'sec-websocket-key': 'AQIDBAUGBwgJCgsMDQ4PEC==',
+        ...headers,
+      },
+    });
+    req.on('upgrade', (_res, socket) => {
+      socket.once('data', (d: Buffer) => {
+        socket.destroy();
+        resolve({ status: 101, echo: d.toString('utf8') });
+      });
+      socket.write('hello');
+    });
+    req.on('response', (res) => {
+      res.resume();
+      resolve({ status: res.statusCode ?? 0 });
+    });
+    // A refusal that writes a status line and hangs up arrives here rather than as a parsed
+    // response, because `socket.end()` closes before the client has a body to finish.
+    req.on('error', (e: NodeJS.ErrnoException) => {
+      if (e.code === 'ECONNRESET') resolve({ status: 0 });
+      else reject(e);
+    });
+    req.end();
+    setTimeout(() => reject(new Error('handshake never settled')), 4000).unref();
+  });
+}
+
+describe('webui server: terminal', () => {
+  it('is not reachable at all when the feature is off', async () => {
+    const { base, port } = await boot();
+    const cookie = await signIn(base);
+    expect((await fetch(`${base}/term/`, { headers: { cookie } })).status).toBe(404);
+    // And neither is the handshake — which is the half that does NOT go through the route
+    // table, so a 404 on the GET says nothing about it.
+    const up = await handshake(port, '/term/ws', { cookie, origin: `http://127.0.0.1:${port}` });
+    expect(up.status).not.toBe(101);
+  });
+
+  it('proxies the page and the websocket once signed in', async () => {
+    const socketPath = path.join(dir, 'ttyd.sock');
+    const ttyd = await fakeTtyd(socketPath);
+    const { base, port } = await boot({}, { enabled: true, socket: socketPath });
+    const cookie = await signIn(base);
+
+    const page = await fetch(`${base}/term/`, { headers: { cookie } });
+    expect(page.status).toBe(200);
+    // Passed through rather than rebuilt: ttyd's own headers have to survive, because its
+    // Content-Encoding is how the browser knows to inflate the page.
+    expect(page.headers.get('x-from')).toBe('ttyd');
+    expect(await page.text()).toContain('terminal');
+
+    const up = await handshake(port, '/term/ws', { cookie, origin: `http://127.0.0.1:${port}` });
+    expect(up.status).toBe(101);
+    expect(up.echo).toBe('hello');
+    expect(ttyd.seen).toContain('/term/ws');
+    await ttyd.close();
+  });
+
+  it('refuses a handshake with no session, rather than leaving it hanging', async () => {
+    // The trap this pins: an upgrade never reaches `route()`, so none of the checks there
+    // apply to it. A hung handshake would also be indistinguishable from a slow backend and
+    // would hold a connection against the browser's per-origin limit for the tab's lifetime.
+    const socketPath = path.join(dir, 'ttyd.sock');
+    const ttyd = await fakeTtyd(socketPath);
+    const { port } = await boot({}, { enabled: true, socket: socketPath });
+    const up = await handshake(port, '/term/ws', { origin: `http://127.0.0.1:${port}` });
+    expect(up.status).not.toBe(101);
+    expect(ttyd.seen).toHaveLength(0);
+    await ttyd.close();
+  });
+
+  it('refuses a handshake from another origin, and one that names no origin', async () => {
+    // A handshake is exempt from the same-origin policy and carries cookies whatever
+    // `SameSite` says, so here the Origin check is the only lock rather than the second one.
+    const socketPath = path.join(dir, 'ttyd.sock');
+    const ttyd = await fakeTtyd(socketPath);
+    const { base, port } = await boot({}, { enabled: true, socket: socketPath });
+    const cookie = await signIn(base);
+
+    expect((await handshake(port, '/term/ws', { cookie, origin: 'http://evil.test' })).status).not.toBe(101);
+    expect((await handshake(port, '/term/ws', { cookie })).status).not.toBe(101);
+    expect(ttyd.seen).toHaveLength(0);
+    await ttyd.close();
+  });
+
+  it('refuses an arg that is not one of this room’s topics', async () => {
+    // ttyd runs with --url-arg, so this string reaches an exec on the other side. It is
+    // checked against the topic store before ttyd ever sees it.
+    const socketPath = path.join(dir, 'ttyd.sock');
+    const ttyd = await fakeTtyd(socketPath);
+    const { base, port, topic } = await boot({}, { enabled: true, socket: socketPath });
+    const cookie = await signIn(base);
+
+    expect((await fetch(`${base}/term/?arg=deadbeef`, { headers: { cookie } })).status).toBe(400);
+    expect((await fetch(`${base}/term/?arg=${topic}`, { headers: { cookie } })).status).toBe(200);
+    // Two args is nobody's legitimate request and would hand the wrapper a second parameter.
+    expect((await fetch(`${base}/term/?arg=${topic}&arg=${topic}`, { headers: { cookie } })).status).toBe(400);
+
+    const bad = await handshake(port, '/term/ws?arg=deadbeef', {
+      cookie,
+      origin: `http://127.0.0.1:${port}`,
+    });
+    expect(bad.status).not.toBe(101);
+    await ttyd.close();
+  });
+
+  it('says so plainly when the backend is not running', async () => {
+    const { base } = await boot({}, { enabled: true, socket: path.join(dir, 'absent.sock') });
+    const cookie = await signIn(base);
+    const res = await fetch(`${base}/term/`, { headers: { cookie } });
+    expect(res.status).toBe(502);
+    expect(await res.text()).toMatch(/not running/);
+  });
+
+  it('stops promptly with a proxied websocket still open', async () => {
+    // Same shape as the event-stream case above, one hop further out: the connection to ttyd
+    // is one `server.close()` would wait on forever and is not ours to wait for.
+    const socketPath = path.join(dir, 'ttyd.sock');
+    const ttyd = await fakeTtyd(socketPath);
+    const { base, port, server } = await boot({}, { enabled: true, socket: socketPath });
+    const cookie = await signIn(base);
+    const live = await handshake(port, '/term/ws', { cookie, origin: `http://127.0.0.1:${port}` });
+    expect(live.status).toBe(101);
+
+    const started = Date.now();
+    await server.stop();
+    expect(Date.now() - started).toBeLessThan(1500);
+    await ttyd.close();
   });
 });

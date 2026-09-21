@@ -1,11 +1,16 @@
 /**
- * The HTTP surface of the web UI: the page, the event stream, and four small POSTs.
+ * The HTTP surface of the web UI: the page, the event stream, four small POSTs, and a door to
+ * the terminal pane's backend.
  *
  * Plain `node:http`, and plain server-sent events rather than a WebSocket. Node has no
  * WebSocket server of its own, so that choice would mean a new dependency for one local page —
  * while SSE needs nothing on either side (`EventSource` is built into every browser, reconnects
  * by itself, and hands back the last id it saw) and the upstream direction is four ordinary
  * POSTs. The only thing given up is client→server streaming, which nothing here wants.
+ *
+ * A WebSocket does cross this server, for the terminal — but only as bytes. It is proxied to
+ * ttyd frame-unaware (`terminal-proxy.ts`), so that still costs no dependency and no protocol
+ * code here. What it does cost is a second gate: see `upgrade()`.
  *
  * ── This is a trust boundary ─────────────────────────────────────────────────
  * The port is bound to every interface by default and the thing behind it is an agent with
@@ -54,10 +59,18 @@ import {
   type WebEvent,
 } from './protocol.js';
 import type { WebRoom, WebuiInstance } from './room.js';
+import { proxyRequest, proxyUpgrade, type UpstreamSet } from './terminal-proxy.js';
 
 export interface WebServer {
   start(): Promise<void>;
   stop(): Promise<void>;
+}
+
+/** Where the terminal pane's ttyd is, and whether the pane exists at all. */
+export interface TerminalSettings {
+  enabled: boolean;
+  /** Resolved by `index.ts`; meaningless when `enabled` is false. */
+  socket: string;
 }
 
 /** Keeps proxies and NAT tables from dropping an idle stream. A comment line, not an event. */
@@ -75,10 +88,16 @@ interface Stream {
   end(): void;
 }
 
-export function createWebServer(room: WebRoom, auth: WebAuth, instance: WebuiInstance): WebServer {
+export function createWebServer(
+  room: WebRoom,
+  auth: WebAuth,
+  instance: WebuiInstance,
+  terminal: TerminalSettings
+): WebServer {
   const sockets = new Set<Socket>();
   const streams = new Set<Stream>();
-  const ctx: Ctx = { room, auth, instance, streams };
+  const upstreams: UpstreamSet = new Set<Socket>();
+  const ctx: Ctx = { room, auth, instance, streams, terminal, upstreams };
 
   const server = createServer((req, res) => {
     void route(req, res, ctx).catch((e: unknown) => {
@@ -91,6 +110,11 @@ export function createWebServer(room: WebRoom, auth: WebAuth, instance: WebuiIns
     sockets.add(socket);
     socket.on('close', () => sockets.delete(socket));
   });
+  // An upgrade NEVER reaches the request handler above, so it never reaches `route()` — which
+  // means the OPEN/GUARDED tables, the session check and the origin check all simply do not
+  // apply to it. A WebSocket route added by editing those tables would be wide open and look
+  // protected. Hence a second, deliberate gate; see `upgrade()`.
+  server.on('upgrade', (req, socket, head) => upgrade(req, socket as Socket, head, ctx));
 
   const heartbeat = setInterval(() => {
     for (const stream of streams) stream.write(': ping\n\n');
@@ -101,7 +125,7 @@ export function createWebServer(room: WebRoom, auth: WebAuth, instance: WebuiIns
 
   return {
     start: () => listen(server, instance, room),
-    stop: () => shutdown(server, streams, sockets, heartbeat),
+    stop: () => shutdown(server, streams, sockets, upstreams, heartbeat),
   };
 }
 
@@ -151,6 +175,7 @@ async function shutdown(
   server: Server,
   streams: Set<Stream>,
   sockets: Set<Socket>,
+  upstreams: UpstreamSet,
   heartbeat: NodeJS.Timeout
 ): Promise<void> {
   clearInterval(heartbeat);
@@ -166,6 +191,11 @@ async function shutdown(
     }
   }
   streams.clear();
+  // Same reason the streams above are ended by hand, one hop further out: a live proxy to ttyd
+  // is a connection `server.close()` would wait on forever, and it is not one of ours to wait
+  // for. The downstream half is in `sockets` already; this is the half pointing at ttyd.
+  for (const upstream of upstreams) upstream.destroy();
+  upstreams.clear();
   await new Promise<void>((resolve) => {
     let settled = false;
     const finish = (): void => {
@@ -195,6 +225,8 @@ interface Ctx {
   auth: WebAuth;
   instance: WebuiInstance;
   streams: Set<Stream>;
+  terminal: TerminalSettings;
+  upstreams: UpstreamSet;
 }
 
 /** One request, already parsed as far as routing needs it. */
@@ -215,7 +247,7 @@ interface Route {
 
 /** Reachable without a session: the page itself, and the exchange that gets you one. */
 const OPEN: Route[] = [
-  { method: 'GET', path: '/', run: ({ req, res }, ctx) => sendPage(req, res, ctx.instance) },
+  { method: 'GET', path: '/', run: ({ req, res }, ctx) => sendPage(req, res, ctx.instance, ctx.terminal) },
   { method: 'POST', path: '/api/login', run: login },
   // Open on purpose. The browser fetches these while deciding whether the site can be
   // installed, which is before anyone has signed in, and a 401 there is indistinguishable from
@@ -237,6 +269,10 @@ const GUARDED: Route[] = [
   { method: 'DELETE', path: '/api/topics', run: deleteTopic },
   { method: 'POST', path: '/api/logout', run: logout },
   { method: 'GET', path: '/f/', prefix: true, run: ({ req, res, rest }, ctx) => download(req, res, ctx.room, rest) },
+  // The terminal pane's backend. Listed unconditionally even though the feature is usually
+  // off, so this table stays the complete answer to "what is reachable"; `terminalPage`
+  // answers 404 when it is off, which is the truth about the route either way.
+  { method: 'GET', path: '/term/', prefix: true, run: terminalPage },
 ];
 
 /**
@@ -279,15 +315,26 @@ function logout({ req, res }: Req, ctx: Ctx): void {
   send(req, res, 200, { ok: true });
 }
 
-function sendPage(req: IncomingMessage, res: ServerResponse, instance: WebuiInstance): void {
-  body(req, res, 200, Buffer.from(renderPage(instance.title), 'utf8'), {
+function sendPage(
+  req: IncomingMessage,
+  res: ServerResponse,
+  instance: WebuiInstance,
+  terminal: TerminalSettings
+): void {
+  body(req, res, 200, Buffer.from(renderPage(instance.title, terminal.enabled), 'utf8'), {
     'Content-Type': 'text/html; charset=utf-8',
     // The page is the app; a stale cached copy after an upgrade is a support question.
     'Cache-Control': 'no-store',
     // Belt and braces around web-markdown's escaping: even if something did get through, an
     // inline script from it would not run and no external origin could be reached.
+    //
+    // `frame-src 'self'` is what lets the terminal pane exist. Same-origin is not a sandbox —
+    // ttyd's page can read this one's DOM and its cookie — and that is accepted knowingly:
+    // the alternative buys nothing, because a cross-origin iframe would need
+    // `allow-same-origin` to hold a session at all and that undoes the sandbox. The trade is
+    // ttyd's terminal, with its IME and file transfer, against re-implementing all of it here.
     'Content-Security-Policy':
-      "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; manifest-src 'self'; form-action 'none'; base-uri 'none'",
+      "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-src 'self'; manifest-src 'self'; form-action 'none'; base-uri 'none'",
     'X-Content-Type-Options': 'nosniff',
     'Referrer-Policy': 'no-referrer',
   });
@@ -475,6 +522,70 @@ async function download(req: IncomingMessage, res: ServerResponse, room: WebRoom
 function disposition(name: string): string {
   const ascii = name.replace(/[^\w.\- ]/g, '_') || 'download';
   return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Terminal
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * ttyd's page and its little JSON endpoint, behind this server's session.
+ *
+ * Ordinary requests arrive here having already passed `route()`'s gate, so there is nothing
+ * to check but whether the feature exists. The handshake that follows does NOT come through
+ * here — see `upgrade()`.
+ */
+function terminalPage({ req, res, url }: Req, ctx: Ctx): void {
+  if (!ctx.terminal.enabled) return send(req, res, 404, { error: 'no such route' });
+  if (!topicArgsOk(url, ctx)) return send(req, res, 400, { error: 'no such topic' });
+  proxyRequest(req, res, ctx.terminal.socket, ctx.upstreams);
+}
+
+/**
+ * The gate `route()` cannot be: an upgrade bypasses the request handler entirely.
+ *
+ * Everything `route()` does is redone here by hand, in the same order and for the same
+ * reasons, because none of it is reachable from an upgrade event. A refusal writes a status
+ * line and destroys the socket rather than leaving it open — a hung handshake is
+ * indistinguishable to the page from a backend that is merely slow, and it holds a connection
+ * open against the browser's per-origin limit for as long as the tab lives.
+ */
+function upgrade(req: IncomingMessage, socket: Socket, head: Buffer, ctx: Ctx): void {
+  const url = new URL(req.url ?? '/', 'http://x');
+  // Nothing else here speaks WebSocket. Anything outside the terminal prefix is either a
+  // probe or a future route that has not thought about this gate yet; both get nothing.
+  if (!ctx.terminal.enabled || !url.pathname.startsWith('/term/')) return refuse(socket, 404, 'Not Found');
+  if (!ctx.auth.check(req.headers.cookie)) return refuse(socket, 401, 'Unauthorized');
+  // A WebSocket handshake is not subject to the same-origin policy and carries cookies
+  // regardless of `SameSite` — so for this one route the Origin check is not the second lock
+  // it is elsewhere, it is the only one. A missing Origin is refused here for the same reason
+  // it is allowed in `sameOrigin`: no browser omits it on a handshake, so nothing legitimate
+  // is turned away, and the curl-shaped caller that `sameOrigin` exists to permit has no
+  // business opening this socket.
+  if (!req.headers.origin || !sameOrigin(req)) return refuse(socket, 403, 'Forbidden');
+  if (!topicArgsOk(url, ctx)) return refuse(socket, 400, 'Bad Request');
+  proxyUpgrade(req, socket, head, ctx.terminal.socket, ctx.upstreams);
+}
+
+/**
+ * Every `?arg=` must name a topic this room actually has.
+ *
+ * ttyd is run with `--url-arg`, which hands whatever the URL carries to the command it
+ * spawns. That is the feature that lets one ttyd serve a per-topic terminal, and it is also a
+ * string from the browser arriving at an exec — so it is checked against the topic store
+ * here, before ttyd ever sees it, and again by a pattern in the wrapper script on the far
+ * side. Anything else, including a second arg nobody asked for, is refused.
+ */
+function topicArgsOk(url: URL, ctx: Ctx): boolean {
+  const args = url.searchParams.getAll('arg');
+  if (args.length > 1) return false;
+  return args.every((arg) => ctx.room.topics.has(arg));
+}
+
+/** Answer a rejected handshake and hang up. */
+function refuse(socket: Socket, status: number, reason: string): void {
+  socket.end(`HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\n\r\n`);
+  socket.destroy();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

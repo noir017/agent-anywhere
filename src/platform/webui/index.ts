@@ -107,7 +107,13 @@ export function createWebuiAdapter(instance: WebuiInstance): PlatformAdapter {
   // The page is never without a room to be in, including on a brand-new install.
   topics.current();
   const room = new WebRoom(instance, topics);
-  const server = createWebServer(room, new WebAuth({ token: instance.token }), instance);
+  const server = createWebServer(room, new WebAuth({ token: instance.token }), instance, {
+    enabled: instance.terminal.enabled,
+    // Beside the topic file above, and for the same reason: this is the directory both ends
+    // of the terminal already share. The daemon's config lives here, so in a container it is
+    // the bind mount, which is where ttyd can reach it without a second volume.
+    socket: instance.terminal.socket ?? path.join(configDir(), `webui-term-${instance.id}.sock`),
+  });
   return { ...describe(instance), ...outbound(room, instance), ...lifecycle(room, server) };
 }
 

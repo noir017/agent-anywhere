@@ -221,13 +221,42 @@ conversation. In a 30-second streamed answer that is 13 updates collapsed to 3, 
 about a quarter of the bytes. Sends carry a nonce, so the page retries safely on a
 link that drops them.
 
+**A terminal, optionally.** Turned on, the chat header grows a `>_` button that
+swaps the transcript for a real shell on the machine the daemon runs on — so you
+can drive *any* coding-agent CLI, TUI and all, from the same page. The daemon does
+not implement a terminal: it proxies, behind the same login, to a
+[`ttyd`](https://github.com/tsl0922/ttyd) you run on a unix socket. Off unless you
+ask for it.
+
+```yaml
+platforms:
+  web:
+    type: webui
+    token: ${AA_WEB_TOKEN}
+    terminal:
+      enabled: true
+      socket: ~/.config/agent-anywhere/webui-term-web.sock   # where your ttyd listens
+```
+
+```bash
+# The other half, which is not this package's job to run. The wrapper should put the
+# session in tmux — otherwise closing the tab kills whatever was running in it.
+printf '#!/bin/sh\nexec tmux new -A -s "aa-$1"\n' > /usr/local/bin/aa-terminal.sh
+chmod +x /usr/local/bin/aa-terminal.sh
+ttyd -i ~/.config/agent-anywhere/webui-term-web.sock -b /term -W -a -O \
+     -T xterm-256color /usr/local/bin/aa-terminal.sh
+```
+
 > [!WARNING]
 > The default binds every interface and speaks plain HTTP, so the token is the
 > only thing between your network and an agent with full tool access. Put a
 > reverse proxy with TLS in front of it before exposing it beyond a network you
 > control, or set `host: 127.0.0.1` and reach it over an SSH tunnel.
 > If you do proxy it, turn response buffering **off** (`proxy_buffering off;` in
-> nginx) — buffered server-sent events show nothing until the turn ends.
+> nginx) — buffered server-sent events show nothing until the turn ends, and pass
+> `Upgrade`/`Connection` through if you enable the terminal.
+> Enabling the terminal moves that token from guarding *a conversation with an
+> agent* to guarding *a shell*. Same ceiling, much shorter path.
 
 Two things to expect: everyone who knows the token shares the one conversation,
 and a daemon restart empties the page while the agent keeps its context — the

@@ -204,12 +204,38 @@ access:
 断线重连从断点续传，而不是重新下载整个会话。一次 30 秒的流式回答，13 次更新被压成 3 次，
 字节数大约是原来的四分之一。发送带 nonce，所以页面可以放心重试。
 
+**可选的终端。** 打开之后，聊天页顶栏会多一个 `>_` 按钮，把聊天记录换成守护进程所在
+机器上的一个真终端——于是**任何** coding agent 的 CLI，连同它的 TUI，都能在同一个页面里
+直接跑。守护进程自己不实现终端：它只是把请求过同一道登录门之后，转发给你自己跑在 unix
+socket 上的 [`ttyd`](https://github.com/tsl0922/ttyd)。默认关闭，要自己打开。
+
+```yaml
+platforms:
+  web:
+    type: webui
+    token: ${AA_WEB_TOKEN}
+    terminal:
+      enabled: true
+      socket: ~/.config/agent-anywhere/webui-term-web.sock   # 你的 ttyd 监听在哪
+```
+
+```bash
+# 另一半不归这个包管。wrapper 里要套一层 tmux——否则关掉标签页，
+# 里面正在跑的东西会跟着被 SIGHUP 掉。
+printf '#!/bin/sh\nexec tmux new -A -s "aa-$1"\n' > /usr/local/bin/aa-terminal.sh
+chmod +x /usr/local/bin/aa-terminal.sh
+ttyd -i ~/.config/agent-anywhere/webui-term-web.sock -b /term -W -a -O \
+     -T xterm-256color /usr/local/bin/aa-terminal.sh
+```
+
 > [!WARNING]
 > 默认监听所有网卡且是明文 HTTP，所以那个密钥就是你的网络和一个拥有完整工具权限的
 > 智能体之间的全部屏障。要暴露到你掌控范围之外，先在前面加一层带 TLS 的反向代理；
 > 或者设 `host: 127.0.0.1`，用 SSH 隧道访问。
 > 如果确实过反代，务必**关掉响应缓冲**（nginx 里 `proxy_buffering off;`）——被缓冲的
-> SSE 会让整轮回复到结束才一次性出现。
+> SSE 会让整轮回复到结束才一次性出现；开了终端的话还要放行 `Upgrade`/`Connection`。
+> 另外：打开终端，等于把这个密钥从「守着一条和智能体的对话」变成「守着一个 shell」。
+> 权限上限没变，但从密钥泄漏到任意命令的距离短了很多。
 
 有两件事要有预期：知道密钥的人共用同一条会话；守护进程重启后页面是空的，但智能体
 的上下文还在——聊天记录在内存里，会话本身不在。

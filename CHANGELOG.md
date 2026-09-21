@@ -5,6 +5,43 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **A raw terminal in the web UI, for any coding-agent CLI at all.** Turned on, the chat header
+  grows a `>_` button that swaps the transcript and composer for a real shell on the machine the
+  daemon runs on — so a CLI with no ACP adapter, or one that only exists as a full-screen TUI, is
+  now reachable from the same page as everything else. Each topic gets its own terminal.
+
+  It could not have been built by tapping the agent, which is the thing worth recording here:
+  neither runtime has raw terminal output to offer. Both spawn their child over plain pipes and
+  read line-delimited JSON, a line that does not parse is *dropped*, and the ACP handshake
+  declares `terminal: false`. So the pane is a second, parallel thing rather than a view onto the
+  first — which is exactly why it works with any CLI, and also why nothing in it reaches the
+  conversation: no transcript, no reverse CLI, no topic history.
+
+  The daemon implements none of it. It proxies, behind the same session cookie, to a `ttyd` the
+  operator runs on a unix socket, and embeds ttyd's page in a same-origin iframe. Writing it here
+  instead would have meant a native PTY binding — node-pty publishes no Linux prebuilds at all,
+  so every Linux install would suddenly need a compiler — plus xterm.js, a WebSocket server,
+  scrollback, resize, reconnect and a mobile key bar. ttyd is 1.3 MB of static binary that already
+  does all of that, with CJK and IME handling this page would otherwise have to re-earn. **The
+  feature adds no dependency to this package.** Off by default: it moves the login token from
+  guarding a conversation with an agent to guarding a shell, which is the same ceiling by a much
+  shorter path. See the web UI section of the README for the ttyd invocation, and note that the
+  wrapper wants `tmux new -A` around it — without something holding the session, ttyd forks a
+  fresh process per connection and SIGHUPs it on disconnect, so switching apps on a phone would
+  kill whatever was running.
+
+  The gate this needed is not the one already there. A WebSocket upgrade never reaches the request
+  handler, so the `OPEN`/`GUARDED` route tables, the session check and the origin check do not
+  apply to it at all — a route added by editing those tables would be wide open while looking
+  protected. The upgrade path therefore redoes all of it by hand, and is stricter in one place: a
+  handshake is exempt from the same-origin policy and carries cookies whatever `SameSite` says, so
+  there the `Origin` check is the only lock rather than the second one, and a request that names
+  no origin is refused rather than waved through as it is elsewhere. The `?arg=` that selects the
+  topic is a browser string that reaches an exec, so it is checked against the topic store before
+  ttyd sees it and again by a pattern in the wrapper.
+
 ## [1.23.0] - 2026-09-21
 
 ### Changed

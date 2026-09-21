@@ -32,9 +32,15 @@
  */
 import { escapeHtml } from '../web-markdown.js';
 
-/** Fill in the configured title. Kept to one line so the document stays a top-level const. */
-export function renderPage(title: string): string {
-  return PAGE.replace(/__TITLE__/g, escapeHtml(title));
+/**
+ * Fill in the configured title and whether the terminal pane exists.
+ *
+ * `terminal` is baked into the document rather than announced over the event stream because it
+ * is a property of the daemon, not of a conversation: it cannot change while the page is open,
+ * and a control that appears one sync later is a control that flickers into existence.
+ */
+export function renderPage(title: string, terminal: boolean): string {
+  return PAGE.replace(/__TITLE__/g, escapeHtml(title)).replace(/__TERM__/g, terminal ? 'true' : 'false');
 }
 
 const STYLE = `
@@ -108,6 +114,14 @@ body{background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,-apple-system,
 .chat-title{font-weight:600;color:var(--fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:50ch}
 .chat-status{font-size:11.5px;color:var(--dim);text-transform:uppercase;letter-spacing:.04em}
 .chat-status.running{color:#38bdf8}
+/* The terminal takes the place of the transcript and the composer, not of the whole view: the
+   header stays, so the sidebar button, the topic name and the way back out are all still
+   where they were a moment ago. One class on #chat swaps the two. */
+#term-toggle{margin-left:auto}
+#term{display:none;flex:1;min-height:0;background:#000}
+#term iframe{display:block;width:100%;height:100%;border:0}
+#chat.term #log,#chat.term #typing,#chat.term #note,#chat.term #bar{display:none}
+#chat.term #term{display:block}
 
 #log{flex:1;overflow-y:auto;padding:20px 16px 8px;max-width:860px;width:100%;margin:0 auto}
 .m{margin:0 0 18px;max-width:100%;overflow-wrap:anywhere;animation:fade .18s ease-out}
@@ -265,7 +279,8 @@ const SCRIPT = `
       chips=$('chips'), hints=$('hints'), typing=$('typing'), note=$('note'), picker=$('picker'),
       bar=$('topics'), sidebar=$('sidebar'), collapseBtn=$('collapse-sidebar'),
       expandBtn=$('expand-sidebar'), newTopicBtn=$('new-topic'), backdrop=$('backdrop'),
-      clearBtn=$('clear-topics'), chatTitle=$('topic-title'), chatStatus=$('topic-status');
+      clearBtn=$('clear-topics'), chatTitle=$('topic-title'), chatStatus=$('topic-status'),
+      chat=$('chat'), termPane=$('term'), termBtn=$('term-toggle');
   var data={}, els={}, files=[], commands=[], stream=null, done=false;
   // Last markup written per message, so a sync that re-sends an unchanged message touches no DOM.
   var sig={};
@@ -280,6 +295,12 @@ const SCRIPT = `
   // and before the first sync the only generations known are the ones out of the cache.
   var epoch=0, synced=false;
   var topic = new URLSearchParams(location.search).get('t') || '';
+  // Whether this daemon serves a terminal at all, and whether the pane is currently asked for.
+  // "Asked for" is separate from "shown": until a topic is known there is nothing to point a
+  // terminal at, so a reload into terminal mode waits for the first sync to name one.
+  var TERM_OK = __TERM__;
+  var termWanted = TERM_OK && new URLSearchParams(location.search).get('v')==='term';
+  var termFrame = null;
   var topics = [];
   var readCounts = {};
   try { readCounts = JSON.parse(localStorage.getItem('aa_reads') || '{}'); } catch(x){}
@@ -866,13 +887,57 @@ const SCRIPT = `
     }
   }
 
+  // ── Terminal ───────────────────────────────────────────────────────────────
+  // A pane, not a page: the iframe holds ttyd's own terminal, which is why this is thirty
+  // lines instead of a terminal emulator. Nothing here speaks to the agent — the two share a
+  // topic id and nothing else.
+
+  // What the address bar should say now. The topic and the pane are both worth surviving a
+  // reload, and both are written the same way so neither can silently drop the other.
+  function urlNow(){
+    return '?t='+encodeURIComponent(topic) + (termWanted ? '&v=term' : '');
+  }
+
+  // The iframe is created on first use and destroyed on the way out, so a page that never
+  // opens the terminal never connects to ttyd, and a topic left behind is not still holding a
+  // socket open. Nothing is lost by dropping it: the session lives in tmux on the far side, so
+  // coming back is a redraw.
+  function applyTerm(){
+    if(!TERM_OK) return;
+    chat.classList.toggle('term', termWanted);
+    termBtn.textContent = termWanted ? '←' : '>_';
+    termBtn.title = termWanted ? 'Back to chat' : 'Terminal';
+    if(termWanted && topic) mountTerm(); else dropTerm();
+  }
+
+  function mountTerm(){
+    // Relative, for the same reason every fetch here is: a reverse proxy may mount the daemon
+    // under a sub-path, and an absolute "/" walks out of it.
+    var want = 'term/?arg='+encodeURIComponent(topic);
+    if(termFrame && termFrame.getAttribute('src')===want) return;
+    dropTerm();
+    termFrame = document.createElement('iframe');
+    termFrame.setAttribute('title','Terminal');
+    termFrame.setAttribute('src', want);
+    termPane.appendChild(termFrame);
+  }
+
+  function dropTerm(){
+    if(!termFrame) return;
+    termFrame.parentNode.removeChild(termFrame);
+    termFrame = null;
+  }
+
   function switchTopic(id){
     if(!id || id===topic) return;
     // The topic being left, written now rather than at the end of its window — in a moment
     // nothing on screen belongs to it any more and there is nothing left to write.
     cacheFlush();
     topic = id;
-    history.replaceState(null,'','?t='+encodeURIComponent(topic));
+    history.replaceState(null,'',urlNow());
+    // Before the transcript work below, so the terminal follows the topic in the same frame
+    // the title does rather than a repaint later.
+    applyTerm();
     for(var i=0;i<topics.length;i++){
       if(topics[i].id===id){
         readCounts[id]=topics[i].msgCount || 0;
@@ -937,7 +1002,10 @@ const SCRIPT = `
       // visit was ever going to get and left the page an empty shell.
       if(topic && ev.topic !== topic) return;
       topic = ev.topic;
-      history.replaceState(null,'','?t='+encodeURIComponent(topic));
+      history.replaceState(null,'',urlNow());
+      // The other half of "asked for is not shown": a reload straight into terminal mode, or a
+      // first visit with no ?t= at all, only learns which topic to point at here.
+      applyTerm();
       // Where the reader was, decided BEFORE the transcript moves under them. Opening a topic goes
       // to the bottom; a resync after a dropped connection must not yank someone out of the
       // history they were reading, which is only a choice at all now that the reconcile leaves
@@ -1081,6 +1149,17 @@ const SCRIPT = `
   }
 
   newTopicBtn.addEventListener('click', createTopic);
+
+  // Revealed only where there is something behind it. When the daemon serves no terminal the
+  // button stays hidden and this listener never has anything to toggle.
+  if(TERM_OK){
+    termBtn.hidden = false;
+    termBtn.addEventListener('click', function(){
+      termWanted = !termWanted;
+      history.replaceState(null,'',urlNow());
+      applyTerm();
+    });
+  }
 
   clearBtn.addEventListener('click', function(){
     if(!confirm('Delete all ' + topics.length + ' topics? This cannot be undone.')) return;
@@ -1401,6 +1480,10 @@ const SCRIPT = `
   // the sync instead.
   restore(topic);
 
+  // Reopens the pane a reload arrived in, when ?t= already named a topic. Without one this
+  // does nothing and the sync handler picks it up instead.
+  applyTerm();
+
   connect();
 })();
 `;
@@ -1455,10 +1538,14 @@ const PAGE = `<!doctype html>
       <button type="button" class="btn-icon" id="expand-sidebar" title="Show topics" hidden>☰</button>
       <span id="topic-title" class="chat-title"></span>
       <span id="topic-status" class="chat-status"></span>
+      <!-- Present in the markup but hidden unless the daemon serves a terminal, so the script
+           has one thing to reveal rather than one thing to build. -->
+      <button type="button" class="btn-icon" id="term-toggle" title="Terminal" hidden>&gt;_</button>
     </div>
     <div id="log"></div>
     <div id="typing" hidden>...</div>
     <div id="note"></div>
+    <div id="term"></div>
     <div id="bar">
       <div id="hints" hidden></div>
       <div id="chips"></div>

@@ -46,8 +46,9 @@ naming it, and they are all of them:
 | `index.ts` | The `PlatformAdapter`: capability declaration + the outbound methods |
 | `room.ts` | The conversations — per-topic message rings, subscribers, the hold queue, both directions of traffic. No HTTP. |
 | `topics.ts` | The topic list and its file. Shaped like `daemon/workdir-usage.ts`. |
-| `server.ts` | `node:http`: routes, auth gate, SSE, upload, download, shutdown |
+| `server.ts` | `node:http`: routes, auth gate, SSE, upload, download, the upgrade gate, shutdown |
 | `auth.ts` | Shared-secret login, session cookies, brute-force throttle |
+| `terminal-proxy.ts` | Byte-for-byte reverse proxy to the terminal's ttyd over a unix socket. Speaks no WebSocket. |
 | `protocol.ts` | `.strict()` zod schemas for every inbound body; the outbound event union |
 | `page.ts` | The whole page (HTML + CSS + JS) as a module-level string |
 | `manifest.ts` | The web app manifest and the icon, as strings, for the same reason `page.ts` is one |
@@ -253,6 +254,9 @@ reconnects by itself. Upstream is three ordinary POSTs. Node has no WebSocket se
 alternative meant a new dependency for one local page, and the only thing given up is
 client→server streaming, which nothing wants.
 
+One WebSocket does cross this server — the terminal's — but as bytes, not as a protocol. See
+[the terminal pane](#the-terminal-pane).
+
 Server→client events are **upsert by id**: a message the page already holds is replaced. One
 event kind rather than separate send/edit kinds, because a client that reconnects mid-turn
 receives an "edit" for an id it has never seen, and would have to treat it as an append
@@ -291,6 +295,104 @@ worded and sized as a line about the room rather than shaped like a message on p
 syncs add nothing, and a message-shaped placeholder would have promised one. `paint` keeps it
 last — anything painted while it is up, including a message typed into the gap, goes above it.
 
+## The terminal pane
+
+Off by default. Turned on, the chat header grows a `>_` button that replaces the transcript
+and composer with a real terminal — a shell in this machine, in which any coding-agent CLI can
+be run directly, TUI and all.
+
+**The daemon owns none of it.** It does not spawn a PTY and does not speak the terminal's
+protocol; it proxies, behind the session cookie, to a [`ttyd`](https://github.com/tsl0922/ttyd)
+already listening on a unix socket. The page embeds ttyd's own page in a same-origin iframe.
+
+Why it is not built here, since "a terminal in the web UI" sounds like it should be: nothing in
+this daemon has raw terminal output to offer in the first place. Both agent runtimes spawn their
+child over plain pipes and read line-delimited JSON — a line that does not parse is *dropped*,
+and the ACP handshake declares `terminal: false`. So the pane could never be a view onto the
+agent; it has to be a second, parallel thing. Building that second thing meant a native PTY
+binding (node-pty publishes no Linux prebuilds at all, so every Linux install would need a
+compiler), xterm.js, a WebSocket server, scrollback, resize, reconnect and a mobile key bar.
+ttyd is 1.3 MB of static binary that already does all of it, including CJK and IME handling this
+page would otherwise have to re-earn. The cost of the trade is one config field and the operator
+having to run ttyd; the benefit is that the feature added **no dependency to this package**.
+
+What the pane shows is whatever that ttyd was told to run. That is exactly why it works with any
+CLI — and also why nothing in it reaches the conversation: no transcript, no reverse CLI, no
+topic history. The two share a topic id and nothing else.
+
+### Wiring
+
+```yaml
+platforms:
+  web:
+    type: webui
+    token: ${WEBUI_TOKEN}
+    terminal:
+      enabled: true
+      # Defaults to webui-term-<instance>.sock beside the daemon's own state.
+      socket: /home/user/.config/agent-anywhere/webui-term-web.sock
+```
+
+and, outside this package, a ttyd on that socket:
+
+```
+ttyd -i <socket> -b /term -W -a -O -P 30 -T xterm-256color <wrapper> 
+```
+
+`-i` is a **unix socket, not a port** — nothing on the network can reach it, so the session
+check in front of the proxy is the only way in rather than one of two. `-b /term` matches the
+prefix route. `-a` lets the URL pass an argument to `<wrapper>`, which is how one ttyd serves a
+terminal per topic; the daemon passes `?arg=<topic id>`.
+
+The wrapper is expected to be `tmux new -A -s aa-<topic>` or equivalent. Without something
+holding the session, ttyd forks a fresh process per connection and SIGHUPs it on disconnect — so
+switching apps on a phone would kill whatever was running. With tmux, a drop is a redraw.
+
+### Security
+
+Three things are load-bearing and none of them are obvious.
+
+1. **An upgrade never reaches `route()`.** `createServer`'s request handler is not called for
+   one, so the `OPEN`/`GUARDED` tables, the session check and the origin check simply do not
+   apply. `upgrade()` in `server.ts` redoes all of it by hand. A WebSocket route added by
+   editing those tables would be wide open while looking protected.
+2. **For the handshake the Origin check is the only lock, not the second one.** A WebSocket
+   handshake is exempt from the same-origin policy and carries cookies whatever `SameSite`
+   says. So unlike `sameOrigin`, which lets a missing `Origin` through for curl's sake, the
+   upgrade path *requires* one — no browser omits it on a handshake, and the curl-shaped caller
+   that exemption exists for has no business here.
+3. **`?arg=` is a browser string that reaches an exec.** It is checked against the topic store
+   before ttyd sees it, and again by a pattern in the wrapper on the far side.
+
+Two costs accepted knowingly. The iframe is **same-origin, which is not a sandbox**: an XSS in
+ttyd's page would hold this session. A cross-origin frame would need `allow-same-origin` to keep
+a session at all, which undoes the sandbox, so the alternative buys nothing — the trade is
+ttyd's terminal against re-implementing it here. And turning this on moves the login token from
+guarding *conversation with an agent* to guarding *an interactive shell*. The ceiling is the
+same (the agent already has full tool access); the distance from a leaked token to arbitrary
+commands is not.
+
+### Things that bite here specifically
+
+- **A FIN arrives as `end`, not `close`.** An `http.Server` socket whose peer hangs up keeps its
+  own write side open and sits half-open indefinitely. Tearing down on `close` alone leaks a
+  socket pair per closed terminal tab and leaves `server.close()` waiting on every one of them —
+  measured, not theorised: the pair outlived a client `destroy()` by a full second and the close
+  callback never fired. `terminal-proxy.ts` listens for `end` too, and `server.test.ts` pins it.
+- **Do not re-compress the proxied response.** ttyd gzips its own 730 KB single-file page down
+  to ~190 KB and says so in `Content-Encoding`. Sending that back through `body()` hands the
+  browser a double-gzipped document.
+- **No connection pool to ttyd.** `agent: false` on both proxied requests: a pooled idle socket
+  is still a socket, so `server.close()` waits on it and ttyd holds a client it is not serving.
+- **Mounted under a sub-path, ttyd's `-b` has to agree.** The page's iframe `src` is relative
+  like every other URL here, so it follows the proxy prefix — but ttyd builds its own links from
+  `-b`, which is a fixed string it cannot discover.
+- **A blank pane with a healthy socket is usually the renderer.** ttyd defaults to xterm's WebGL
+  backend, which paints nothing under a headless Chromium with no GPU (this is how the pane was
+  first, wrongly, diagnosed as broken on mobile: the content was there, `tmux display` reported
+  a correct 46×51 window, and only the pixels were missing). `-t rendererType=dom` is the first
+  thing to try.
+
 ## Security
 
 New trust boundary, so it is spelled out. The port binds every interface by default and what
@@ -320,6 +422,8 @@ is behind it is an agent with full tool access.
    installable, which happens before anyone signs in, and a 401 there is indistinguishable
    from "not installable". They carry the configured title and a drawing; the title is already
    in the `<title>` of the equally-open page, so this widens nothing.
+8. **An upgrade is gated separately, because it has to be** — it never reaches `route()`, so
+   nothing above applies to it automatically. See [the terminal pane](#the-terminal-pane).
 
 **Not solved here:** TLS (put a reverse proxy in front), and DNS rebinding — a `Host`
 allowlist would break the reverse-proxy deployment this is expected to run behind, so the

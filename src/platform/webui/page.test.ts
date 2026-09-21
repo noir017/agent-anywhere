@@ -14,7 +14,7 @@ function scriptOf(html: string): string {
 }
 
 describe('webui page', () => {
-  const html = renderPage('Chat');
+  const html = renderPage('Chat', false);
 
   it('emits a client script that actually parses', () => {
     // `new Function` compiles the body without running it, which is exactly the check wanted:
@@ -70,7 +70,7 @@ describe('webui page', () => {
   });
 
   it('escapes the configured title', () => {
-    const evil = renderPage('</title><script>alert(1)</script>');
+    const evil = renderPage('</title><script>alert(1)</script>', false);
     expect(evil).not.toContain('<script>alert(1)</script>');
     expect(scriptOf(evil)).not.toContain('alert(1)');
   });

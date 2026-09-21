@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.23.0] - 2026-09-21
+
 ### Changed
 
 - **Enter sends again on a desktop; on a phone it still writes a newline.** 1.22.0 made Enter a

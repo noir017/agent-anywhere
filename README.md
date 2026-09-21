@@ -258,6 +258,43 @@ ttyd -i ~/.config/agent-anywhere/webui-term-web.sock -b /term -W -a -O \
 > Enabling the terminal moves that token from guarding *a conversation with an
 > agent* to guarding *a shell*. Same ceiling, much shorter path.
 
+**Single sign-on, when a token is not enough.** One shared secret has no name on
+it, never expires, and cannot be revoked for one person. If the page already sits
+behind an identity-aware proxy — Cloudflare Access, Teleport's Application
+Service — that proxy has authenticated a *person*, with SSO and MFA, and says so
+in a JWT it signed. Point `sso:` at the proxy's public keys and the daemon checks
+that signature instead of asking for a password a second time.
+
+```yaml
+platforms:
+  web:
+    type: webui
+    token: ${AA_WEB_TOKEN}
+    sso:
+      # Cloudflare Access. For Teleport: header Teleport-Jwt-Assertion,
+      # jwksUrl https://<proxy>/.well-known/jwks.json, claim username.
+      header: Cf-Access-Jwt-Assertion          # default
+      cookie: CF_Authorization                 # the WebSocket handshake's copy
+      jwksUrl: https://<team>.cloudflareaccess.com/cdn-cgi/access/certs
+      issuer: https://<team>.cloudflareaccess.com
+      audience: <the application's AUD tag>    # NOT optional: it is what stops a
+                                               # token for another app of the same
+                                               # provider from opening this one
+      claim: email                             # default
+      allow: ["you@example.com"]
+      from: ["172.24.0.0/16"]                  # the proxy, and nothing else
+      password: false                          # once sso works, close the old door
+```
+
+`from` is required, and is the reason a forged header is not interesting even if
+something above it is misconfigured: the signature makes forgery useless, and
+`from` makes a mistake in the four fields above it survivable. A refusal logs the
+address it came from, which is how you find what to put there. `agent-anywhere
+doctor` fetches the JWKS and reports how many keys it found — do that before
+setting `password: false`, because with the password door shut a provider outage
+means nobody opens the page at all.
+
+
 Two things to expect: everyone who knows the token shares the one conversation,
 and a daemon restart empties the page while the agent keeps its context — the
 transcript lives in memory, the session does not.

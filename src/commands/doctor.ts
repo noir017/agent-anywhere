@@ -9,6 +9,7 @@ import { resolveClaudeAdapterEntry } from '../daemon/agent-acp.js';
 import { AGY_COMMAND } from '../daemon/agent-agy.js';
 import { agentHome } from '../daemon/skills-scan.js';
 import { OWNER } from '../platform/webui/room.js';
+import { loadJwks } from '../platform/webui/sso.js';
 
 /** Whether a host:port can be bound right now. Binds and releases; never leaves it held. */
 async function portFree(host: string, port: number): Promise<boolean> {
@@ -341,6 +342,25 @@ export async function runDoctor(opts: { migrateConfig?: boolean } = {}): Promise
             lines.push(
               `${id}: bound to ${p.host} over plain HTTP — the login token is the only thing between the network and an agent with full tool access; put TLS in front of it`
             );
+          }
+          if (p.sso) {
+            // The one thing here that CAN be validated online, and the one most worth it: a
+            // JWKS URL with a typo in it fails closed, but it fails closed at 3am on a phone
+            // rather than here.
+            try {
+              const keys = await loadJwks(p.sso.jwksUrl);
+              lines.push(
+                `${id}: sso reads ${p.sso.header} from ${p.sso.from.join(', ')}, verified against ${keys.size} key(s) at ${p.sso.jwksUrl}`
+              );
+            } catch (e) {
+              warn = true;
+              lines.push(
+                `${id}: sso cannot read ${p.sso.jwksUrl} (${e instanceof Error ? e.message : String(e)}) — nobody gets in this way until that URL answers`
+              );
+            }
+            if (p.sso.password) {
+              lines.push(`${id}: the shared token is still a second way in; set sso.password: false once sso works`);
+            }
           }
         }
         return { ok: true, ...(warn ? { level: 'warn' as const } : {}), detail: lines.join('; ') };

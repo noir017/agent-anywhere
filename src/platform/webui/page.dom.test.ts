@@ -159,6 +159,8 @@ async function open(
     confirm?: boolean;
     /** Whether the daemon serves a terminal, which the page is told once at render time. */
     terminal?: boolean;
+    /** Whether the shared secret is still a way in, i.e. which of the two gates is served. */
+    password?: boolean;
   } = {}
 ): Promise<Harness> {
   const {
@@ -170,12 +172,13 @@ async function open(
     idb = new IDBFactory(),
     confirm = true,
     terminal = false,
+    password = true,
   } = opts;
   const streams: Stream[] = [];
   const calls: Call[] = [];
   const clipboard: string[] = [];
 
-  const dom = new JSDOM(renderPage('Chat', terminal), {
+  const dom = new JSDOM(renderPage('Chat', terminal, password), {
     url,
     runScripts: 'dangerously',
     pretendToBeVisual: true,
@@ -438,6 +441,50 @@ describe('webui page: rendering', () => {
 
     await h.emit({ t: 'typing', on: false });
     expect(h.el('typing').hidden).toBe(true);
+  });
+});
+
+describe('webui page: the gate', () => {
+  it('asks for the token and posts it, when the shared secret is still a door', async () => {
+    const h = await open();
+    const field = h.doc.getElementById('secret') as HTMLInputElement | null;
+    expect(field).not.toBeNull();
+    field!.value = 'open-sesame';
+    h.doc.getElementById('gate')!.dispatchEvent(new h.window.Event('submit', { cancelable: true, bubbles: true }));
+    await tick();
+    expect(h.calls.map((c) => c.path)).toContain('api/login');
+    expect(h.calls.find((c) => c.path === 'api/login')?.body).toEqual({ token: 'open-sesame' });
+  });
+
+  it('serves no field at all under SSO, and asks for no password it cannot check', async () => {
+    // The failure this prevents is a quiet one: with `sso.password: false` there is no token
+    // that works, so a page still showing the box answers an expired provider session with
+    // "that is not the right token" — and sends the operator looking for a secret instead of
+    // signing in again.
+    const h = await open({ password: false });
+    expect(h.doc.getElementById('secret')).toBeNull();
+    h.doc.getElementById('gate')!.dispatchEvent(new h.window.Event('submit', { cancelable: true, bubbles: true }));
+    await tick();
+    // Reloading is what re-triggers the provider, so the one thing that must NOT happen is a
+    // login POST — there is nothing on the other end of it.
+    expect(h.calls.map((c) => c.path)).not.toContain('api/login');
+  });
+
+  it('comes back when the stream is refused for good, under either gate', async () => {
+    for (const password of [true, false]) {
+      const h = await open({ password });
+      await h.emit(sync('a1b2c3d4', [message('m1', '<p>hello</p>')], ['a1b2c3d4']));
+      // The stream opened, so whichever gate was served is out of the way.
+      expect(h.el('login').hidden).toBe(true);
+      // readyState 2 is "the server refused it", not "the network blipped": the session is gone
+      // and the page has to offer the way back in — the field under a password, the reload
+      // button under SSO.
+      h.live().readyState = 2;
+      h.live().onerror?.();
+      await tick();
+      expect(h.el('login').hidden).toBe(false);
+      expect(h.el('app').hidden).toBe(true);
+    }
   });
 });
 

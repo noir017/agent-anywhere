@@ -5,6 +5,47 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Single sign-on for the web UI: the proxy in front can be the door.** The page's login was one
+  shared secret — no name on it, no expiry, and no way to revoke it for one person while leaving
+  it working for another. That is the right size of lock for a loopback bind and the wrong one for
+  a page published to the internet, which is where this one increasingly is. A new `sso:` block
+  points the daemon at an identity-aware proxy's public keys: Cloudflare Access and Teleport's
+  Application Service both authenticate a *person* — SSO, MFA, an access list maintained where the
+  operator maintains everything else — and state the result in an RS256 JWT. The daemon verifies
+  that signature and lets the named person in. One module covers both providers because they
+  differ only in a header name, a JWKS URL and which claim holds the person.
+
+  `from` is a required field and not an optional hardening step, which is the design decision
+  worth recording. The signature is already what makes a forged header useless; the CIDR
+  allowlist is what keeps a mistake in `jwksUrl`, `issuer`, `audience` or `allow` from being
+  fatal — the same belt-and-braces the IPC socket gets with both 0600 and a token. It costs one
+  line of YAML and turns "my verification must be perfect" into "and you must also be the proxy".
+  For the same reason nothing that decides *who* gets in has a default: a permissive `audience`
+  would accept a token the provider minted for some other application of the same tenant.
+
+  `sso.password: false` then closes the shared-secret door, and the page renders a gate with no
+  field in it — under SSO there is no secret that works, so a password box turns "your session
+  with the identity provider expired" into "that is not the right token" and sends the operator
+  looking for a credential instead of signing in again. `doctor` now fetches the JWKS and reports
+  how many keys it found, because a URL with a typo in it fails closed at 3am on a phone rather
+  than at the terminal where it was written.
+
+### Changed
+
+- **The web UI and the terminal pane now say who may frame them** (`frame-ancestors 'self'`, plus
+  `X-Frame-Options` on the proxied terminal responses). This was survivable while the only
+  credential was a `SameSite=Strict` cookie the daemon sets itself — a third-party frame simply
+  got the login page. Under SSO the admitting cookie belongs to the proxy in front and its
+  attributes are not this code's to choose, so a live terminal could otherwise be framed and
+  clicked on from another site.
+- **The terminal pane's handshake checks its `Origin` before its identity, and whether a topic
+  exists only after it.** Admission can now cost a key fetch, and making a cross-origin handshake
+  wait for one before being told no was a slower refusal for no reason — while answering "no such
+  topic" *before* admission would have been an existence oracle for topic ids that did not exist
+  before. The set of handshakes that succeed is unchanged.
+
 ## [1.24.0] - 2026-09-21
 
 ### Added

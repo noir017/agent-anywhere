@@ -74,6 +74,22 @@ arguments, and — given a conversation id — reads back the usage that convers
 recorded. It talks to the real CLI and the real home directory, so it is a development
 utility, not a test.
 
+## `verify-sso.mts` — drive the web UI's SSO door against a real provider
+
+```bash
+AGENT_ANYWHERE_CONFIG_DIR=$(mktemp -d) npx tsx scripts/verify-sso.mts
+```
+
+`sso.test.ts` and `server.test.ts` cover the verifier and the gate, but both inject `fetch`,
+so the one thing neither can see is the actual network hop to the JWKS endpoint. This script
+generates a keypair, serves a real JWKS on a real port, boots the real adapter through
+`createWebuiAdapter`, and checks the seven answers that matter: no assertion, a good one,
+another identity, another audience, the closed password door, a page with no token field, and
+a POST that gets through. Prints PASS/FAIL per line and exits non-zero on any failure.
+
+The config dir override matters — without it the script writes its topic list next to the
+daemon's own state.
+
 ## Adding a script
 
 Development-only utilities belong here. Anything a *user* needs is a subcommand of the

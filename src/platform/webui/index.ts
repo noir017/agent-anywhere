@@ -31,6 +31,7 @@ import { renderWebMarkdown } from '../web-markdown.js';
 import { WebAuth } from './auth.js';
 import { CHANNEL, TopicStore, WebRoom, type WebuiInstance } from './room.js';
 import { createWebServer, type WebServer } from './server.js';
+import { WebSso } from './sso.js';
 
 export { WebRoom, TopicStore, type Topic, type WebuiInstance } from './room.js';
 
@@ -107,13 +108,21 @@ export function createWebuiAdapter(instance: WebuiInstance): PlatformAdapter {
   // The page is never without a room to be in, including on a brand-new install.
   topics.current();
   const room = new WebRoom(instance, topics);
-  const server = createWebServer(room, new WebAuth({ token: instance.token }), instance, {
-    enabled: instance.terminal.enabled,
-    // Beside the topic file above, and for the same reason: this is the directory both ends
-    // of the terminal already share. The daemon's config lives here, so in a container it is
-    // the bind mount, which is where ttyd can reach it without a second volume.
-    socket: instance.terminal.socket ?? path.join(configDir(), `webui-term-${instance.id}.sock`),
-  });
+  const server = createWebServer(
+    room,
+    new WebAuth({ token: instance.token }),
+    instance,
+    {
+      enabled: instance.terminal.enabled,
+      // Beside the topic file above, and for the same reason: this is the directory both ends
+      // of the terminal already share. The daemon's config lives here, so in a container it is
+      // the bind mount, which is where ttyd can reach it without a second volume.
+      socket: instance.terminal.socket ?? path.join(configDir(), `webui-term-${instance.id}.sock`),
+    },
+    // Absent unless configured, and that absence is the whole of "SSO is off": the server has
+    // no fallback path that half-trusts a header when there is nothing to verify it against.
+    instance.sso ? new WebSso(instance.sso) : undefined
+  );
   return { ...describe(instance), ...outbound(room, instance), ...lifecycle(room, server) };
 }
 

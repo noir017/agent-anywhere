@@ -68,7 +68,17 @@ export function proxyRequest(
       agent: false,
     },
     (upRes) => {
-      res.writeHead(upRes.statusCode ?? 502, upRes.headers);
+      // ttyd has no opinion about who may frame its page, and this one is framed on purpose —
+      // by our own page, same-origin. Saying so is what keeps a third-party site from framing a
+      // live terminal and collecting clicks on it: the session cookie is `SameSite=Strict` and
+      // would not travel there, but an SSO deployment's cookie belongs to the proxy in front and
+      // may well be `SameSite=None`. Both headers, because `frame-ancestors` is the modern one
+      // and `X-Frame-Options` is what an older browser reads.
+      res.writeHead(upRes.statusCode ?? 502, {
+        ...upRes.headers,
+        'Content-Security-Policy': "frame-ancestors 'self'",
+        'X-Frame-Options': 'SAMEORIGIN',
+      });
       upRes.pipe(res);
     }
   );

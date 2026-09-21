@@ -48,6 +48,7 @@ naming it, and they are all of them:
 | `topics.ts` | The topic list and its file. Shaped like `daemon/workdir-usage.ts`. |
 | `server.ts` | `node:http`: routes, auth gate, SSE, upload, download, the upgrade gate, shutdown |
 | `auth.ts` | Shared-secret login, session cookies, brute-force throttle |
+| `sso.ts` | The other door: an RS256 assertion from the proxy in front, verified against its JWKS |
 | `terminal-proxy.ts` | Byte-for-byte reverse proxy to the terminal's ttyd over a unix socket. Speaks no WebSocket. |
 | `protocol.ts` | `.strict()` zod schemas for every inbound body; the outbound event union |
 | `page.ts` | The whole page (HTML + CSS + JS) as a module-level string |
@@ -428,6 +429,59 @@ is behind it is an agent with full tool access.
 **Not solved here:** TLS (put a reverse proxy in front), and DNS rebinding — a `Host`
 allowlist would break the reverse-proxy deployment this is expected to run behind, so the
 shared secret is what stands in its place.
+
+### The other door: `sso.ts`
+
+Point 1 above is a secret with no name on it. `sso.ts` is the alternative for a deployment
+that already runs behind an identity-aware proxy: Cloudflare Access and Teleport's Application
+Service both authenticate a *person* and state who it was in an RS256 JWT, so the daemon
+verifies that signature instead of asking for a password of its own. One module covers both —
+they differ only in a header name, a JWKS URL and which claim holds the person.
+
+`admitted()` in `server.ts` is the whole of the wiring: cookie first (a map lookup), then the
+assertion (possibly a key fetch). The `upgrade()` gate calls the same function, because an
+upgrade still reaches none of `route()`.
+
+Four things there are decisions rather than detail:
+
+- **`from` is required.** The signature is what makes a forged header useless; the CIDR
+  allowlist is what keeps a mistake in `jwksUrl`/`issuer`/`audience`/`allow` from being fatal.
+  Belt and braces, the way `ipc/server.ts` has both 0600 and a token. Refusals log the source
+  address precisely because that line is how the operator discovers what to configure.
+- **`alg` is not negotiable.** Only `RS256`, refused by name before a key is even looked up —
+  `none` and an HMAC keyed with the public key are the two classic ways a verifier is talked
+  out of verifying, and neither is reachable if the algorithm is fixed.
+- **`audience` has no default**, and neither does anything else that decides *who* gets in. A
+  permissive default would accept any token the provider ever signed, including one minted for
+  a different application of the same tenant.
+- **Keys are cached and refetched on an unknown `kid`, with a 10-second cooldown.** That
+  cooldown is also how long a real rotation is refused for, hence "short": it bounds the
+  provider at six requests a minute under a stream of junk `kid`s, and bounds a rotation at ten
+  seconds of the retries the page makes anyway. A provider that goes away does **not** drop the
+  keys already held — a blip at the IdP must not be a dead page.
+- **`jwksUrl` must be https** (loopback excepted, for a stub). Every guarantee above reduces to
+  "these keys are really the provider's", and `http://` hands that to anyone on the path.
+- **`from` prefixes are parsed strictly**, because `Number('')` is 0 and `BlockList` is happy
+  with a `/0` rule: `"10.0.0.1/"` would have been "every address on the internet" written as a
+  typo, and the startup log would still have printed it as one host. Every malformation throws.
+
+**Two boundaries this does not cross.** Admission is per *request*: an attached event stream and
+an open terminal WebSocket outlive both `exp` and a removal from `allow`, because nothing
+re-verifies a connection that is already running. And the cookie fallback is the proxy's cookie,
+whose `SameSite` this code does not set — which is why the terminal's proxied responses carry
+`frame-ancestors 'self'` and `X-Frame-Options` (`terminal-proxy.ts`) and the page's own CSP does
+too. Framing a live terminal from another site is the attack that would otherwise be left open
+by a cookie the daemon does not control.
+
+`sso.password: false` closes the shared-secret door. The page then renders a gate with no field
+in it (see `PASSWORD_GATE` / `SSO_GATE` in `page.ts`): under SSO there is no secret that works,
+so a password box answers an expired provider session with "that is not the right token" and
+sends the operator hunting for a credential instead of signing in again. `doctor` fetches the
+JWKS and says how many keys it found — worth running before closing that door, because with it
+shut an IdP outage locks everyone out.
+
+`scripts/verify-sso.mts` drives the whole path against a real socket and a real JWKS server;
+the unit tests inject `fetch`, so that script is the only thing that exercises the network hop.
 
 ## Installing it as an app
 

@@ -59,6 +59,7 @@ import {
   type WebEvent,
 } from './protocol.js';
 import type { WebRoom, WebuiInstance } from './room.js';
+import type { SsoRefusal, WebSso } from './sso.js';
 import { proxyRequest, proxyUpgrade, type UpstreamSet } from './terminal-proxy.js';
 
 export interface WebServer {
@@ -82,6 +83,10 @@ const SHUTDOWN_GRACE_MS = 2_000;
 /** Below this, gzip's own framing costs more than it saves. */
 const MIN_COMPRESS_BYTES = 512;
 
+/** How rarely an identical SSO refusal is repeated in the log, and how many are tracked. */
+const REFUSAL_QUIET_MS = 60_000;
+const MAX_WARN_KEYS = 256;
+
 /** One attached event stream, with whatever sits between it and the socket. */
 interface Stream {
   write(chunk: string): void;
@@ -92,12 +97,13 @@ export function createWebServer(
   room: WebRoom,
   auth: WebAuth,
   instance: WebuiInstance,
-  terminal: TerminalSettings
+  terminal: TerminalSettings,
+  sso?: WebSso
 ): WebServer {
   const sockets = new Set<Socket>();
   const streams = new Set<Stream>();
   const upstreams: UpstreamSet = new Set<Socket>();
-  const ctx: Ctx = { room, auth, instance, streams, terminal, upstreams };
+  const ctx: Ctx = { room, auth, instance, streams, terminal, upstreams, sso, warned: new Map() };
 
   const server = createServer((req, res) => {
     void route(req, res, ctx).catch((e: unknown) => {
@@ -155,17 +161,27 @@ function listen(server: Server, instance: WebuiInstance, room: WebRoom): Promise
  *
  * The loud version when the bind is not loopback, because that is a security posture the
  * operator chose in one line of YAML and will not otherwise be reminded of: there is no TLS
- * here, and the shared secret is the whole of the door.
+ * here, and the shared secret is the whole of the door. An `sso:` block changes what that
+ * sentence should say but not whether it is worth saying — the port is still open to whatever
+ * can reach it, and the proxy's assertion is only checked on requests that arrive from `from`.
  */
 function announce(instance: WebuiInstance, room: WebRoom): void {
   const where = `http://${instance.host}:${instance.port}`;
   console.log(
     `[webui] "${instance.id}" listening on ${where} — ${room.topics.list().length} topic(s), ${room.watchers} client(s) attached`
   );
+  if (instance.sso) {
+    console.log(
+      `[webui] "${instance.id}" accepts ${instance.sso.header} from ${instance.sso.from.join(', ')} for ` +
+        `${instance.sso.allow.length} identitie(s); password login is ` +
+        `${instance.sso.password ? 'also accepted' : 'OFF'}`
+    );
+  }
   if (instance.host !== '127.0.0.1' && instance.host !== 'localhost' && instance.host !== '::1') {
     console.warn(
-      `[webui] "${instance.id}" is reachable from the network and speaks plain HTTP: the shared ` +
-        `token is the only thing between it and an agent with full tool access. Put TLS in front ` +
+      `[webui] "${instance.id}" is reachable from the network and speaks plain HTTP: ` +
+        `${instance.sso ? 'the proxy assertion and the shared token are' : 'the shared token is'} ` +
+        `the only thing between it and an agent with full tool access. Put TLS in front ` +
         `of it before exposing it beyond a network you control, or bind host: 127.0.0.1 and tunnel.`
     );
   }
@@ -227,6 +243,10 @@ interface Ctx {
   streams: Set<Stream>;
   terminal: TerminalSettings;
   upstreams: UpstreamSet;
+  /** The second door, when an identity-aware proxy sits in front. See `sso.ts`. */
+  sso?: WebSso;
+  /** Last time each (reason, source) refusal was logged; see `noteRefusal`. */
+  warned: Map<string, number>;
 }
 
 /** One request, already parsed as far as routing needs it. */
@@ -302,12 +322,47 @@ async function route(req: IncomingMessage, res: ServerResponse, ctx: Ctx): Promi
 
   // One gate for everything else, rather than a check inside each handler, so a route added
   // later is protected by default instead of by remembering.
-  if (!ctx.auth.check(req.headers.cookie)) return send(req, res, 401, { error: 'not signed in' });
+  if (!(await admitted(req, ctx))) return send(req, res, 401, { error: 'not signed in' });
   if ((method === 'POST' || method === 'DELETE') && !sameOrigin(req)) return send(req, res, 403, { error: 'cross-origin request refused' });
 
   const guarded = match(GUARDED, method, url.pathname);
   if (guarded) return guarded.route.run({ req, res, url, rest: guarded.rest }, ctx);
   send(req, res, 404, { error: 'no such route' });
+}
+
+/**
+ * Either door: a session cookie this server minted, or an assertion from the proxy in front.
+ *
+ * The cookie is tried first because it costs a map lookup while the other may cost a key
+ * fetch — not because it is the stronger of the two. Under SSO there is usually no cookie at
+ * all: nobody signed in here, the proxy did it, and every request carries the proof.
+ */
+async function admitted(req: IncomingMessage, ctx: Ctx): Promise<boolean> {
+  if (ctx.auth.check(req.headers.cookie)) return true;
+  if (!ctx.sso) return false;
+  const result = await ctx.sso.identify(req);
+  if (!result.ok) noteRefusal(req, ctx, result.reason);
+  return result.ok;
+}
+
+/**
+ * Say why someone was turned away, at most once a minute per reason and source.
+ *
+ * Unthrottled this would be a line every few seconds: `EventSource` reconnects on its own, so
+ * one misconfigured browser is a permanent stream of identical refusals — and a log that
+ * scrolls is a log nobody reads the real line in. The source address is included deliberately:
+ * a `source` refusal means `sso.from` does not list the proxy, and this line is where the
+ * operator finds what to put there.
+ */
+function noteRefusal(req: IncomingMessage, ctx: Ctx, reason: SsoRefusal): void {
+  const from = req.socket.remoteAddress ?? 'unknown';
+  const key = `${reason}:${from}`;
+  const now = Date.now();
+  const last = ctx.warned.get(key) ?? 0;
+  if (now - last < REFUSAL_QUIET_MS) return;
+  if (ctx.warned.size >= MAX_WARN_KEYS) ctx.warned.clear();
+  ctx.warned.set(key, now);
+  console.warn(`[webui] "${ctx.instance.id}": sso refused a request from ${from} (${reason})`);
 }
 
 function logout({ req, res }: Req, ctx: Ctx): void {
@@ -321,7 +376,7 @@ function sendPage(
   instance: WebuiInstance,
   terminal: TerminalSettings
 ): void {
-  body(req, res, 200, Buffer.from(renderPage(instance.title, terminal.enabled), 'utf8'), {
+  body(req, res, 200, Buffer.from(renderPage(instance.title, terminal.enabled, passwordLogin(instance)), 'utf8'), {
     'Content-Type': 'text/html; charset=utf-8',
     // The page is the app; a stale cached copy after an upgrade is a support question.
     'Cache-Control': 'no-store',
@@ -334,7 +389,7 @@ function sendPage(
     // `allow-same-origin` to hold a session at all and that undoes the sandbox. The trade is
     // ttyd's terminal, with its IME and file transfer, against re-implementing all of it here.
     'Content-Security-Policy':
-      "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-src 'self'; manifest-src 'self'; form-action 'none'; base-uri 'none'",
+      "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-src 'self'; frame-ancestors 'self'; manifest-src 'self'; form-action 'none'; base-uri 'none'",
     'X-Content-Type-Options': 'nosniff',
     'Referrer-Policy': 'no-referrer',
   });
@@ -372,6 +427,10 @@ function sendIcon(req: IncomingMessage, res: ServerResponse, kind: 'svg' | 'png'
 }
 
 async function login({ req, res }: Req, ctx: Ctx): Promise<void> {
+  // Configured shut. Answered explicitly rather than by letting every attempt fail as a wrong
+  // password: an operator who turned this off and then cannot get in deserves to be told which
+  // of the two doors they are knocking on.
+  if (!passwordLogin(ctx.instance)) return send(req, res, 403, { error: 'password login is disabled' });
   const parsed = await readBody(req, res, LoginRequestSchema);
   if (!parsed) return;
   // The socket address, only ever as a throttling key — never logged, never authorization.
@@ -552,19 +611,40 @@ function terminalPage({ req, res, url }: Req, ctx: Ctx): void {
  */
 function upgrade(req: IncomingMessage, socket: Socket, head: Buffer, ctx: Ctx): void {
   const url = new URL(req.url ?? '/', 'http://x');
+  // `_http_server` removes its own error handler from the socket before emitting 'upgrade', so
+  // between here and `proxyUpgrade` attaching one, this socket has none — and admission may now
+  // await a key fetch. A client that resets the connection inside that window would otherwise
+  // throw ECONNRESET with nobody listening, i.e. straight to the daemon's uncaught handler.
+  socket.on('error', () => socket.destroy());
   // Nothing else here speaks WebSocket. Anything outside the terminal prefix is either a
   // probe or a future route that has not thought about this gate yet; both get nothing.
   if (!ctx.terminal.enabled || !url.pathname.startsWith('/term/')) return refuse(socket, 404, 'Not Found');
-  if (!ctx.auth.check(req.headers.cookie)) return refuse(socket, 401, 'Unauthorized');
   // A WebSocket handshake is not subject to the same-origin policy and carries cookies
   // regardless of `SameSite` — so for this one route the Origin check is not the second lock
   // it is elsewhere, it is the only one. A missing Origin is refused here for the same reason
   // it is allowed in `sameOrigin`: no browser omits it on a handshake, so nothing legitimate
   // is turned away, and the curl-shaped caller that `sameOrigin` exists to permit has no
   // business opening this socket.
+  //
+  // Checked BEFORE admission, unlike the session in `route()`, because admission may now cost a
+  // key fetch and this comparison is between two headers the caller sent anyway — it discloses
+  // nothing and waiting on the provider to say no to it would be slower for no reason.
   if (!req.headers.origin || !sameOrigin(req)) return refuse(socket, 403, 'Forbidden');
-  if (!topicArgsOk(url, ctx)) return refuse(socket, 400, 'Bad Request');
-  proxyUpgrade(req, socket, head, ctx.terminal.socket, ctx.upstreams);
+  void admitted(req, ctx).then(
+    (ok) => {
+      if (!ok) return refuse(socket, 401, 'Unauthorized');
+      // Re-checked after the await: a socket the client gave up on in the meantime must not be
+      // handed to ttyd, which would then hold a PTY open against a connection that is gone.
+      if (socket.destroyed) return;
+      // Whether a topic exists is answered only to someone already admitted. It is a weak
+      // secret — four random bytes, and not a capability anywhere — but before this gate it
+      // was no secret at all: 400 here and 401 for an id that does not exist is an oracle a
+      // stranger could walk.
+      if (!topicArgsOk(url, ctx)) return refuse(socket, 400, 'Bad Request');
+      proxyUpgrade(req, socket, head, ctx.terminal.socket, ctx.upstreams);
+    },
+    () => refuse(socket, 500, 'Internal Server Error')
+  );
 }
 
 /**
@@ -580,6 +660,11 @@ function topicArgsOk(url: URL, ctx: Ctx): boolean {
   const args = url.searchParams.getAll('arg');
   if (args.length > 1) return false;
   return args.every((arg) => ctx.room.topics.has(arg));
+}
+
+/** Whether the shared secret is still a way in. False only when SSO was told to be the only one. */
+function passwordLogin(instance: WebuiInstance): boolean {
+  return instance.sso?.password !== false;
 }
 
 /** Answer a rejected handshake and hang up. */

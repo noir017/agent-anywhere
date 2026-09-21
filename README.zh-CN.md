@@ -237,6 +237,37 @@ ttyd -i ~/.config/agent-anywhere/webui-term-web.sock -b /term -W -a -O \
 > 另外：打开终端，等于把这个密钥从「守着一条和智能体的对话」变成「守着一个 shell」。
 > 权限上限没变，但从密钥泄漏到任意命令的距离短了很多。
 
+**单点登录：一个共享密钥不够用的时候。** 共享密钥上没有名字、不会过期，也没法只
+吊销某一个人。如果这个页面前面已经有一层认证代理——Cloudflare Access、Teleport 的
+Application Service——那它已经认过「人」了（SSO + MFA），并把结论签成一个 JWT 带
+过来。把 `sso:` 指向这个代理的公钥，守护进程就去验这个签名，而不是再问一遍密码。
+
+```yaml
+platforms:
+  web:
+    type: webui
+    token: ${AA_WEB_TOKEN}
+    sso:
+      # 这里是 Cloudflare Access。Teleport 换成：header Teleport-Jwt-Assertion、
+      # jwksUrl https://<proxy>/.well-known/jwks.json、claim username。
+      header: Cf-Access-Jwt-Assertion          # 默认值
+      cookie: CF_Authorization                 # WebSocket 握手拿不到 header 时的那份
+      jwksUrl: https://<team>.cloudflareaccess.com/cdn-cgi/access/certs
+      issuer: https://<team>.cloudflareaccess.com
+      audience: <这个应用的 AUD tag>           # 不是可选项：它挡住的是「同一个 IdP
+                                               # 给另一个应用签的 token」
+      claim: email                             # 默认值
+      allow: ["you@example.com"]
+      from: ["172.24.0.0/16"]                  # 只有代理，别的都不行
+      password: false                          # SSO 跑通之后，把老门关掉
+```
+
+`from` 是必填的：签名本身已经让伪造请求头没有意义，`from` 保的是上面四个字段里写
+错一个也不至于致命。被拒的请求会把来源地址打进日志——那行就是你该往 `from` 里填
+什么的答案。`agent-anywhere doctor` 会去拉一次 JWKS 并报告拿到几把钥匙，**在设
+`password: false` 之前先跑一次**：老门关掉之后，IdP 一挂就没人打得开这个页面了。
+
+
 有两件事要有预期：知道密钥的人共用同一条会话；守护进程重启后页面是空的，但智能体
 的上下文还在——聊天记录在内存里，会话本身不在。
 

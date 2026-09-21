@@ -39,9 +39,36 @@ import { escapeHtml } from '../web-markdown.js';
  * is a property of the daemon, not of a conversation: it cannot change while the page is open,
  * and a control that appears one sync later is a control that flickers into existence.
  */
-export function renderPage(title: string, terminal: boolean): string {
-  return PAGE.replace(/__TITLE__/g, escapeHtml(title)).replace(/__TERM__/g, terminal ? 'true' : 'false');
+export function renderPage(title: string, terminal: boolean, password = true): string {
+  return PAGE.replace(/__TITLE__/g, escapeHtml(title))
+    .replace(/__TERM__/g, terminal ? 'true' : 'false')
+    .replace(/__PASSWORD__/g, password ? 'true' : 'false')
+    .replace('__GATE__', password ? PASSWORD_GATE : SSO_GATE);
 }
+
+/**
+ * The two doors, and only ever one of them in the delivered page.
+ *
+ * Both are `#gate` wrapping `#login`, so every style rule and every reference in the script
+ * below is blind to which one it got — the only code that has to know is the submit handler.
+ * Rendering both and hiding one in script was the other option, and it flashes a password box
+ * at someone who has no password on every load.
+ *
+ * The SSO one has no field on purpose. When the proxy in front is the only way in there is no
+ * secret that works, so a box asking for one turns "your session with the identity provider
+ * expired" into "wrong token" — the two states a locked-out operator most needs to tell apart.
+ * Reloading is what re-triggers the provider's sign-in, so that is the button.
+ */
+const PASSWORD_GATE = `<form id="gate" autocomplete="off"><div id="login">
+<input id="secret" type="password" placeholder="Token" autocomplete="current-password" autofocus>
+<button type="submit">Enter</button>
+<p id="err"></p>
+</div></form>`;
+
+const SSO_GATE = `<form id="gate" autocomplete="off"><div id="login">
+<p id="err">Not signed in. Your access session may have expired.</p>
+<button type="submit">Reload</button>
+</div></form>`;
 
 const STYLE = `
 :root{--bg:#131313;--fg:#dcdcdc;--dim:#7d7d7d;--line:#272727;--own:#1c222b;--own-edge:#3a5f86;--field:#1a1a1a;color-scheme:dark}
@@ -299,6 +326,9 @@ const SCRIPT = `
   // "Asked for" is separate from "shown": until a topic is known there is nothing to point a
   // terminal at, so a reload into terminal mode waits for the first sync to name one.
   var TERM_OK = __TERM__;
+  // Whether the shared secret is still a way in. False means the gate above has no field and
+  // the only thing that can sign anyone in is the proxy in front (sso.password: false).
+  var PASSWORD_LOGIN = __PASSWORD__;
   var termWanted = TERM_OK && new URLSearchParams(location.search).get('v')==='term';
   var termFrame = null;
   var topics = [];
@@ -1187,6 +1217,9 @@ const SCRIPT = `
 
   $('gate').addEventListener('submit', function(e){
     e.preventDefault();
+    // No password to send: this gate's only control is a reload, which is what sends the
+    // browser back through the identity provider.
+    if(!PASSWORD_LOGIN){ location.reload(); return; }
     err.textContent='';
     post('api/login',{token:$('secret').value},0).then(function(r){
       if(r.ok){ $('secret').value=''; connect(); return; }
@@ -1515,11 +1548,7 @@ const PAGE = `<!doctype html>
 <style>${STYLE}</style>
 </head>
 <body>
-<form id="gate" autocomplete="off"><div id="login">
-<input id="secret" type="password" placeholder="Token" autocomplete="current-password" autofocus>
-<button type="submit">Enter</button>
-<p id="err"></p>
-</div></form>
+__GATE__
 <main id="app" hidden>
   <aside id="sidebar">
     <div id="sidebar-header">

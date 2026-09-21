@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { createSign, generateKeyPairSync } from 'node:crypto';
 import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
@@ -10,6 +11,7 @@ import { WebuiConfigSchema } from '../config-schemas.js';
 import { WebAuth } from './auth.js';
 import { WebRoom, type WebuiInstance } from './room.js';
 import { createWebServer, type WebServer } from './server.js';
+import { WebSso, type SsoOptions } from './sso.js';
 import { TopicStore } from './topics.js';
 
 /**
@@ -53,7 +55,8 @@ interface Booted {
 
 async function boot(
   over: Partial<WebuiInstance> = {},
-  terminal: { enabled: boolean; socket: string } = { enabled: false, socket: '/nonexistent.sock' }
+  terminal: { enabled: boolean; socket: string } = { enabled: false, socket: '/nonexistent.sock' },
+  sso?: WebSso
 ): Promise<Booted> {
   const port = await freePort();
   const instance: WebuiInstance = {
@@ -66,7 +69,7 @@ async function boot(
   const topics = new TopicStore(path.join(dir, `${port}.json`));
   const topic = topics.current().id;
   const room = new WebRoom(instance, topics);
-  const server = createWebServer(room, new WebAuth({ token: instance.token }), instance, terminal);
+  const server = createWebServer(room, new WebAuth({ token: instance.token }), instance, terminal, sso);
   await server.start();
   running.push(server);
   return { room, server, base: `http://127.0.0.1:${port}`, port, topic, instance };
@@ -286,6 +289,161 @@ describe('webui server: the door', () => {
     });
     expect(res.status).toBe(400);
   });
+});
+
+/**
+ * A `WebSso` whose provider is in this file: one keypair, a JWKS served by an injected fetch,
+ * and tokens signed on demand. Nothing here opens a socket to the outside.
+ */
+const provider = generateKeyPairSync('rsa', { modulusLength: 2048 });
+
+function ssoFor(over: Partial<SsoOptions> = {}): { sso: WebSso; token: (claims?: Record<string, unknown>) => string } {
+  const jwks = JSON.stringify({
+    keys: [{ ...provider.publicKey.export({ format: 'jwk' }), kid: 'k1', alg: 'RS256', use: 'sig' }],
+  });
+  const sso = new WebSso({
+    header: 'Cf-Access-Jwt-Assertion',
+    cookie: 'CF_Authorization',
+    jwksUrl: 'https://idp.example/certs',
+    issuer: 'https://idp.example',
+    audience: 'aud-tag',
+    claim: 'email',
+    allow: ['operator@example.com'],
+    from: ['127.0.0.1'],
+    fetch: (async () => ({ ok: true, status: 200, headers: new Headers(), text: async () => jwks }) as Response) as unknown as typeof globalThis.fetch,
+    ...over,
+  });
+  const token = (claims: Record<string, unknown> = {}): string => {
+    const b64 = (o: unknown): string => Buffer.from(JSON.stringify(o), 'utf8').toString('base64url');
+    const head = b64({ alg: 'RS256', kid: 'k1' });
+    const body = b64({
+      iss: 'https://idp.example',
+      aud: 'aud-tag',
+      email: 'operator@example.com',
+      exp: Math.floor(Date.now() / 1000) + 3600,
+      ...claims,
+    });
+    const sig = createSign('RSA-SHA256').update(`${head}.${body}`).sign(provider.privateKey).toString('base64url');
+    return `${head}.${body}.${sig}`;
+  };
+  return { sso, token };
+}
+
+describe('webui server: the other door', () => {
+  it('admits a request carrying the proxy assertion, with no session cookie at all', async () => {
+    const { sso, token } = ssoFor();
+    const { base, topic } = await boot({}, undefined, sso);
+    const res = await fetch(`${base}/api/send`, {
+      method: 'POST',
+      headers: { ...JSON_HEADERS, 'cf-access-jwt-assertion': token() },
+      body: JSON.stringify({ text: 'hello', topic }),
+    });
+    expect(res.status).toBe(202);
+  });
+
+  it('still refuses one the proxy did not sign', async () => {
+    const { sso } = ssoFor();
+    const { base } = await boot({}, undefined, sso);
+    const res = await fetch(`${base}/api/events`, { headers: { 'cf-access-jwt-assertion': 'nope.nope.nope' } });
+    expect(res.status).toBe(401);
+  });
+
+  it('refuses one for somebody else, even correctly signed', async () => {
+    const { sso, token } = ssoFor();
+    const { base } = await boot({}, undefined, sso);
+    const res = await fetch(`${base}/api/events`, {
+      headers: { 'cf-access-jwt-assertion': token({ email: 'stranger@example.com' }) },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it('refuses it when the request did not come from the proxy `from` names', async () => {
+    // 10.0.0.0/8 cannot be this loopback connection, which is the point: the assertion is
+    // perfect and the request is still turned away.
+    const { sso, token } = ssoFor({ from: ['10.0.0.0/8'] });
+    const { base } = await boot({}, undefined, sso);
+    const res = await fetch(`${base}/api/events`, { headers: { 'cf-access-jwt-assertion': token() } });
+    expect(res.status).toBe(401);
+  });
+
+  it('admits the terminal handshake too — the gate an upgrade bypasses', async () => {
+    const socket = path.join(dir, 'sso-term.sock');
+    const ttyd = await fakeTtyd(socket);
+    const { sso, token } = ssoFor();
+    const { port, topic, base } = await boot({}, { enabled: true, socket }, sso);
+    // Through the cookie, because that is the form the assertion takes on a handshake the proxy
+    // does not add headers to.
+    const res = await handshake(port, `/term/ws?arg=${topic}`, {
+      cookie: `CF_Authorization=${token()}`,
+      origin: base,
+    });
+    expect(res.status).toBe(101);
+    await ttyd.close();
+  });
+
+  it('refuses a handshake with neither cookie nor header', async () => {
+    const socket = path.join(dir, 'sso-term-2.sock');
+    const ttyd = await fakeTtyd(socket);
+    const { sso } = ssoFor();
+    const { port, topic, base } = await boot({}, { enabled: true, socket }, sso);
+    const res = await handshake(port, `/term/ws?arg=${topic}`, { origin: base });
+    expect(res.status).not.toBe(101);
+    expect(ttyd.seen).toHaveLength(0);
+    await ttyd.close();
+  });
+
+  it('closes the password door when told to, and serves a page with no field in it', async () => {
+    const { sso: ssoConfig } = WebuiConfigSchema.parse({
+      type: 'webui',
+      token: 'open-sesame',
+      sso: {
+        jwksUrl: 'https://idp.example/certs',
+        issuer: 'https://idp.example',
+        audience: 'aud-tag',
+        allow: ['operator@example.com'],
+        from: ['127.0.0.1'],
+        password: false,
+      },
+    });
+    const { sso, token } = ssoFor();
+    const { base, topic } = await boot({ sso: ssoConfig }, undefined, sso);
+    const refused = await fetch(`${base}/api/login`, {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ token: 'open-sesame' }),
+    });
+    expect(refused.status).toBe(403);
+    expect(await (await fetch(base)).text()).not.toContain('id="secret"');
+    // And the other door still opens.
+    const ok = await fetch(`${base}/api/send`, {
+      method: 'POST',
+      headers: { ...JSON_HEADERS, 'cf-access-jwt-assertion': token() },
+      body: JSON.stringify({ text: 'hi', topic }),
+    });
+    expect(ok.status).toBe(202);
+  });
+
+  it('leaves the password door open by default when sso is configured', async () => {
+    const { sso } = ssoFor();
+    const { base } = await boot({}, undefined, sso);
+    expect(await signIn(base)).toContain('aa_webui=');
+    expect(await (await fetch(base)).text()).toContain('id="secret"');
+  });
+
+  it('answers whether a topic exists only to someone already admitted', async () => {
+    // Moving the arg check ahead of admission (it is cheap, and the gate is now async) would
+    // have turned "400 vs 401" into an existence oracle for topic ids a stranger could walk.
+    const socket = path.join(dir, 'sso-term-3.sock');
+    const ttyd = await fakeTtyd(socket);
+    const { sso } = ssoFor();
+    const { port, topic, base } = await boot({}, { enabled: true, socket }, sso);
+    const real = await handshake(port, `/term/ws?arg=${topic}`, { origin: base });
+    const fake = await handshake(port, '/term/ws?arg=00000000', { origin: base });
+    expect(real.status).toBe(fake.status);
+    expect(real.status).not.toBe(101);
+    await ttyd.close();
+  });
+
 });
 
 describe('webui server: topics', () => {

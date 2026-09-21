@@ -189,8 +189,8 @@ export const DingtalkConfigSchema = z.object({
  *
  * The only platform here with no account, no bot token and no upstream service — which is
  * the point of it. It is also the only one that opens a port for HUMANS rather than for a
- * platform's webhook, so three of its fields are security decisions rather than connection
- * details, and all three are documented where the operator will read them.
+ * platform's webhook, so four of its fields are security decisions rather than connection
+ * details, and all four are documented where the operator will read them.
  */
 export const WebuiConfigSchema = z.object({
   type: z.literal('webui'),
@@ -198,6 +198,11 @@ export const WebuiConfigSchema = z.object({
    * Shared secret for the login page. Required, and required for a reason: behind this page
    * is an agent the daemon grants full tool access, and `host` below defaults to every
    * interface. Use `${VAR}` and keep it out of the file.
+   *
+   * Still required when `sso` below is configured, and deliberately so — the wizard's prompts
+   * are generated from this shape, so an optional field is a field nobody is ever asked for,
+   * and a deployment that later removes the `sso:` block would quietly become an open port.
+   * Set `sso.password: false` to stop this secret from being a door without removing it.
    */
   token: z.string().min(1).describe('Shared login secret for the web UI'),
   /**
@@ -217,6 +222,76 @@ export const WebuiConfigSchema = z.object({
    * someone glances past and one they ask about. The default says nothing.
    */
   title: z.string().default('Chat'),
+  /**
+   * Single sign-on: let an identity-aware proxy in front decide who gets in.
+   *
+   * Absent by default, and worth setting up the moment this page is reachable from anywhere
+   * you do not control. `token` above is one secret shared by everyone who has it, with no
+   * name on it and no way to revoke it for one person; a proxy like Cloudflare Access or
+   * Teleport's Application Service has already authenticated a *person* — SSO, MFA, an access
+   * list the operator maintains where they maintain everything else — and says so in a JWT it
+   * signed. This block is what makes the daemon check that signature instead of asking for a
+   * password a second time.
+   *
+   * Every field that decides *who* is let in is required, with no default: a permissive
+   * default here would be one typo away from accepting any token the provider ever signed,
+   * including one minted for a different application. See `webui/sso.ts`.
+   */
+  sso: z
+    .object({
+      /**
+       * Where the assertion is. Defaults to Cloudflare Access's header; Teleport sets
+       * `Teleport-Jwt-Assertion`.
+       */
+      header: z.string().default('Cf-Access-Jwt-Assertion'),
+      /**
+       * Cookie to read when the header is absent — `CF_Authorization` for Cloudflare Access.
+       * Worth setting: the terminal pane's WebSocket handshake does not always carry the
+       * header, and a pane that hangs is harder to diagnose than one that refuses.
+       */
+      cookie: z.string().optional(),
+      /**
+       * Where the provider publishes its public keys. Fetched, cached, refetched on rotation.
+       *
+       * HTTPS, and enforced rather than advised: every guarantee this block makes reduces to
+       * "these keys are really the provider's", and one `http://` here hands that to anyone on
+       * the path — they substitute a key set and mint themselves an admitted identity. Loopback
+       * is the one exception, for a provider stub in a test or on the same machine.
+       */
+      jwksUrl: z
+        .string()
+        .url()
+        .refine((u) => {
+          const parsed = new URL(u);
+          return parsed.protocol === 'https:' || parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost' || parsed.hostname === '[::1]';
+        }, 'sso.jwksUrl must be https (or loopback): over plain http, anyone on the path can substitute the signing keys'),
+      /** Exact `iss` the token must carry. */
+      issuer: z.string().min(1),
+      /**
+       * The `aud` the token must carry: Cloudflare's per-application AUD tag, or the app's
+       * public address in Teleport. This is what keeps a valid token for some *other* app of
+       * the same provider from opening this one.
+       */
+      audience: z.string().min(1),
+      /** Claim naming the person: `email` under Cloudflare Access, `username` under Teleport. */
+      claim: z.string().default('email'),
+      /** Who may in, matched against that claim, case-insensitively. */
+      allow: z.array(z.string().min(1)).min(1),
+      /**
+       * CIDRs (or bare addresses) the request must arrive from — the proxy, and nothing else.
+       *
+       * Required rather than optional. The signature is what makes a forged header useless;
+       * this is what keeps a mistake in the four fields above from being fatal. A refusal logs
+       * the address it came from, which is how you find the value to put here.
+       */
+      from: z.array(z.string().min(1)).min(1),
+      /**
+       * Whether the shared secret above is still a way in. Leave it true until SSO is proven
+       * working — with `false`, a provider outage means nobody opens this page at all.
+       */
+      password: z.boolean().default(true),
+    })
+    .optional(),
   /**
    * The raw terminal pane: a real PTY in this machine, rendered in the page.
    *

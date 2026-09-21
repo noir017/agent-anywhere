@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.24.0] - 2026-09-21
+
 ### Added
 
 - **A raw terminal in the web UI, for any coding-agent CLI at all.** Turned on, the chat header

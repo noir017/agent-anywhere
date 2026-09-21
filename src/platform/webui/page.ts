@@ -130,10 +130,23 @@ body{background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,-apple-system,
    dot reads as blinking and on an 11px bar over this background reads as gone. Half opacity is
    the point where the bar still breathes and never stops being a bar. */
 @keyframes breathe{0%,100%{opacity:1}50%{opacity:.45}}
-/* Both of the above are decoration over content that is arriving anyway, which is exactly what
-   this query is for: without motion the skeleton is still a placeholder and a message still
-   appears, they just do it instantly. */
-@media(prefers-reduced-motion:reduce){.m,.sk i{animation:none}}
+/* The other half of the same wait, for a topic that came back out of the local cache. There the
+   transcript is already on screen, so there is nothing to hold a place in FRONT of — what is
+   still unknown is whether anything was said while you were elsewhere, and that lands at the
+   bottom. Sized and centred like .divider rather than like a message, for the ordinary case
+   where nothing was missed: a message-shaped placeholder would have promised one. */
+.syncing{display:flex;align-items:center;justify-content:center;gap:7px;margin:2px auto 18px;font-size:11.5px;color:var(--dim)}
+.syncing .dots{display:inline-flex;gap:3px}
+.syncing i{width:5px;height:5px;border-radius:50%;background:var(--dim);animation:blip 1.2s ease-in-out infinite}
+.syncing i:nth-child(2){animation-delay:.2s}
+.syncing i:nth-child(3){animation-delay:.4s}
+/* Never all the way out, for the reason breathe does not either: three dots that vanish in turn
+   read as a rendering fault on a 5px circle, where three that dim read as a wait. */
+@keyframes blip{0%,100%{opacity:.3}50%{opacity:1}}
+/* All three of the above are decoration over content that is arriving anyway, which is exactly
+   what this query is for: without motion the skeleton is still a placeholder, the dots still say
+   the page is waiting on something, and a message still appears — instantly. */
+@media(prefers-reduced-motion:reduce){.m,.sk i,.syncing i{animation:none}}
 /* Why an empty room is empty. A transcript lives in memory only while the topic LIST is
    persisted, so every restart leaves rows that open onto nothing — and an empty panel rendered
    faithfully is indistinguishable from a page that failed to load, which is how it was reported.
@@ -518,7 +531,10 @@ const SCRIPT = `
       // The page's own key, on the node, so the order on screen can be read back off #log —
       // which is what the cache writes and what places the history divider.
       el.setAttribute('data-k', key);
-      if(before && before.parentNode === log) log.insertBefore(el, before); else log.appendChild(el);
+      // before is where cached history goes; the waiting line, when one is up, is the last thing
+      // in the log and has to stay there, so anything painted under it goes above it instead.
+      var at = (before && before.parentNode === log) ? before : syncingEl;
+      if(at) log.insertBefore(el, at); else log.appendChild(el);
       els[key]=el;
     }
     var hist = isHistory(m);
@@ -599,6 +615,9 @@ const SCRIPT = `
    */
   function reconcile(list){
     clearSkeleton();
+    // The sync this was waiting for. Cleared before anything is painted, so the messages it
+    // carries are appended to a log whose last child is a message again.
+    clearSyncing();
     var keep={};
     for(var i=0;i<list.length;i++){
       var m=list[i];
@@ -641,10 +660,11 @@ const SCRIPT = `
     if(!skeleton) return;
     skeleton = false;
     log.innerHTML = '';
-    // Emptying #log invalidates anything held by reference into it, and these are the only two
+    // Emptying #log invalidates anything held by reference into it, and these are the only
     // things in there that are not messages.
     emptyEl = null;
     dividerEl = null;
+    syncingEl = null;
   }
 
   /**
@@ -712,6 +732,34 @@ const SCRIPT = `
   }
 
   /**
+   * That a transcript painted out of the local cache is not the whole story yet.
+   *
+   * Entering a topic with the cache warm is instantaneous — and then, a second or two later,
+   * everything said in it while you were elsewhere appears in one frame, with nothing in between
+   * having suggested more was coming. The skeleton cannot answer that: it only ever goes into an
+   * EMPTY log, and this log is full. So the wait is marked where the missing messages are going
+   * to land, at the bottom, and it says what it is waiting FOR rather than impersonating one of
+   * them — most syncs add nothing and the line just goes away again.
+   */
+  var SYNC_NOTE = 'Checking for anything said while you were away';
+  var syncingEl=null;
+
+  function showSyncing(){
+    // Not over an empty log: the skeleton is already standing in for the whole transcript there,
+    // and two answers to one wait is one too many.
+    if(syncingEl || synced || skeleton || !log.firstChild) return;
+    syncingEl=document.createElement('div');
+    syncingEl.className='syncing';
+    syncingEl.innerHTML='<span class="dots"><i></i><i></i><i></i></span><span>'+SYNC_NOTE+'</span>';
+    log.appendChild(syncingEl);
+  }
+
+  function clearSyncing(){
+    if(syncingEl && syncingEl.parentNode) syncingEl.parentNode.removeChild(syncingEl);
+    syncingEl=null;
+  }
+
+  /**
    * Re-draw whatever the cache handed us once a sync has said which generation is live.
    *
    * Before the first sync a cached message is painted as an ordinary message, because there is
@@ -768,6 +816,8 @@ const SCRIPT = `
     }
     placeDivider();
     syncEmptyNote();
+    // Last, so it is last in the log: what the sync may still add goes under what the cache had.
+    showSyncing();
     if(stick) toBottom();
   }
 
@@ -843,6 +893,7 @@ const SCRIPT = `
     stale=false;
     emptyEl=null;
     dividerEl=null;
+    syncingEl=null;
     entering=true;
     synced=false;
     // The shape of a transcript while both the cache read and the stream are outstanding. The
@@ -1294,15 +1345,28 @@ const SCRIPT = `
   }
 
   input.addEventListener('input', function(){ grow(); suggest(); });
-  // Enter writes a newline; Ctrl/Cmd-Enter and the Send button are what send.
-  //
-  // This is the inverse of the chat-app convention, and deliberately so. The composer is most
-  // often reached from a phone, where there is no Shift key to hold — Enter-to-send made a
-  // multi-line message impossible to type rather than merely awkward, and the messages worth
-  // typing here are prompts, which are multi-line more often than chat lines are. Losing a
-  // half-written prompt to a stray Enter is also the more expensive mistake of the two.
+  /**
+   * Enter sends and Shift-Enter writes a newline — except under the narrow-screen layout, where
+   * the two are the other way round.
+   *
+   * 1.22.0 made Enter a newline on every width, and the half of that which was right is the
+   * phone: held upright there is no Shift key to hold down, so Enter-to-send makes a multi-line
+   * prompt impossible to type rather than merely awkward, and a stray Enter costs a half-written
+   * one. Neither is true of a keyboard, where Shift-Enter is right there and every other chat
+   * app on that screen sends on Enter — paying the cost of the phone's problem on a desktop buys
+   * nothing. Ctrl/Cmd-Enter sends on both, so what 1.22.0 taught still works.
+   *
+   * narrow() is read per keypress rather than once: rotating a phone and dragging a window both
+   * change the answer, and it is the same breakpoint the CSS uses to decide the layout — where
+   * the phone layout applies, the phone's Enter applies.
+   */
   input.addEventListener('keydown', function(e){
-    if(e.key==='Enter' && (e.ctrlKey || e.metaKey) && !e.isComposing){ e.preventDefault(); send(); }
+    // isComposing is an IME candidate being chosen, on either shortcut. It is a keystroke the
+    // composer never sees the end of, and sending on it truncates the word being typed.
+    if(e.key!=='Enter' || e.isComposing) return;
+    if(e.ctrlKey || e.metaKey){ e.preventDefault(); send(); return; }
+    if(e.shiftKey || e.altKey || narrow()) return;
+    e.preventDefault(); send();
   });
   $('composer').addEventListener('submit', function(e){ e.preventDefault(); send(); });
 
@@ -1403,7 +1467,10 @@ const PAGE = `<!doctype html>
           <textarea id="input" rows="1" placeholder="Message" autocomplete="off"></textarea>
           <input id="picker" type="file" multiple hidden>
           <button type="button" id="attach" title="Attach a file">+</button>
-          <button type="submit" title="Send (Ctrl+Enter)">Send</button>
+          <!-- A tooltip is a pointer's affordance, so it names the pointer's shortcut: under the
+               narrow-screen layout Enter writes a newline, but nothing there can hover to read
+               this. Ctrl-Enter sends on both and is what that layout's users are left with. -->
+          <button type="submit" title="Send (Enter)">Send</button>
         </div>
       </form>
     </div>

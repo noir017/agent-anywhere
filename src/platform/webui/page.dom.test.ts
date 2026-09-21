@@ -72,6 +72,8 @@ interface Harness {
   painted: () => number;
   /** Placeholder blocks held in the transcript while a sync is in flight. */
   skeletons: () => number;
+  /** The "still waiting on the daemon" line under a transcript painted from cache. */
+  waiting: () => string | null;
   /** Topic rows currently painted in the sidebar. */
   rows: () => number;
   /** The "why is this room empty" notice, when one is on screen. */
@@ -246,6 +248,7 @@ async function open(
     },
     painted: () => doc.getElementById('log')!.querySelectorAll(':scope > .m').length,
     skeletons: () => doc.getElementById('log')!.querySelectorAll(':scope > .sk').length,
+    waiting: () => doc.querySelector('#log > .syncing')?.textContent ?? null,
     rows: () => doc.getElementById('topics')!.children.length,
     notice: () => doc.querySelector('#log > .empty')?.textContent ?? null,
     click: async (selector) => {
@@ -456,8 +459,51 @@ describe('webui page: topics', () => {
     expect(h.window.location.search).toBe('?t=a1b2c3d4');
   });
 
-  it('closes the stream it left behind when switching', async () => {
+  /**
+   * The gap this covers is the one a warm cache creates: the transcript is on screen instantly,
+   * and then a second or two later everything said while you were elsewhere arrives in one frame.
+   * Between those two moments the page has to be visibly waiting on something.
+   */
+  it('keeps saying it is waiting while a cached topic catches up', async () => {
     const h = await open();
+    await h.emit(sync('a1b2c3d4', [message('m1', '<p>in A</p>')], ['a1b2c3d4', 'b2c3d4e5']));
+    await h.click('[data-topic="b2c3d4e5"]');
+    await h.click('[data-topic="a1b2c3d4"]');
+    await until('A is painted from cache', () => h.painted() === 1);
+
+    // Not the skeleton — that is for an empty log, and this one is full.
+    expect(h.skeletons()).toBe(0);
+    expect(h.waiting()).toContain('while you were away');
+    // At the bottom, where whatever is missing is going to land.
+    expect(h.el('log').lastElementChild?.className).toBe('syncing');
+
+    // And a message typed into the gap still goes above it: the line marks the end of the
+    // transcript, not a place in it.
+    (h.el('input') as HTMLTextAreaElement).value = 'while I wait';
+    await h.click('#composer button[type="submit"]');
+    expect(h.el('log').lastElementChild?.className).toBe('syncing');
+
+    await h.emit(
+      sync('a1b2c3d4', [message('m1', '<p>in A</p>'), message('m2', '<p>said since</p>')], ['a1b2c3d4', 'b2c3d4e5'])
+    );
+    expect(h.waiting()).toBe(null);
+    expect(h.el('log').textContent).toContain('said since');
+  });
+
+  it('leaves a topic with nothing cached to the skeleton rather than stacking two waits on it', async () => {
+    const h = await open();
+    await h.emit(sync('a1b2c3d4', [message('m1', '<p>in A</p>')], ['a1b2c3d4', 'b2c3d4e5']));
+
+    await h.click('[data-topic="b2c3d4e5"]');
+    // Long enough for B's cache read to have come back empty, which is what would otherwise put
+    // the line up next to the placeholders.
+    for (let i = 0; i < 10; i++) await tick();
+
+    expect(h.skeletons()).toBeGreaterThan(0);
+    expect(h.waiting()).toBe(null);
+  });
+
+  it('closes the stream it left behind when switching', async () => {    const h = await open();
     await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4', 'b2c3d4e5']));
     const first = h.live();
 
@@ -683,49 +729,85 @@ describe('webui page: sending', () => {
    * Enter in the composer, as a browser delivers it. `win.KeyboardEvent` rather than the global
    * one: the event has to come from the same realm as the listener, or jsdom's `instanceof`
    * checks inside the dispatch path disagree about what it is.
+   *
+   * The event is handed back so a test can read `defaultPrevented`: jsdom does not insert the
+   * newline itself, so "writes a newline" is only ever observable as the default being left alone.
    */
-  const pressEnter = async (h: Harness, mods: KeyboardEventInit = {}): Promise<void> => {
+  const pressEnter = async (h: Harness, mods: KeyboardEventInit = {}): Promise<KeyboardEvent> => {
     const win = h.doc.defaultView as Window & typeof globalThis;
-    h.el('input').dispatchEvent(
-      new win.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true, ...mods }),
-    );
+    const ev = new win.KeyboardEvent('keydown', {
+      key: 'Enter',
+      bubbles: true,
+      cancelable: true,
+      ...mods,
+    });
+    h.el('input').dispatchEvent(ev);
     await tick();
+    return ev;
   };
 
-  it('leaves a plain Enter to write a newline instead of sending', async () => {
-    const h = await open();
+  /** The composer, ready to send, at whatever width the layout should be decided by. */
+  const composing = async (width: number, text: string): Promise<Harness> => {
+    const h = await open({ width });
     await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
-    const input = h.el('input') as HTMLTextAreaElement;
-    input.value = 'first line';
+    (h.el('input') as HTMLTextAreaElement).value = text;
+    return h;
+  };
 
-    await pressEnter(h);
+  it('sends on a plain Enter where there is a keyboard to hold Shift on', async () => {
+    const h = await composing(1440, 'ship it');
 
-    // Nothing sent, and the keystroke was not swallowed — jsdom does not insert the newline
-    // itself, so the default being left alone is the whole of what "writes a newline" means here.
-    expect(h.calls.filter((c) => c.path === 'api/send')).toHaveLength(0);
-    expect(input.value).toBe('first line');
+    const ev = await pressEnter(h);
+
+    expect(h.calls.find((c) => c.path === 'api/send')?.body.text).toBe('ship it');
+    expect(ev.defaultPrevented).toBe(true);
   });
 
-  it('sends on Ctrl-Enter and on Cmd-Enter', async () => {
-    for (const mods of [{ ctrlKey: true }, { metaKey: true }]) {
-      const h = await open();
-      await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
-      (h.el('input') as HTMLTextAreaElement).value = 'ship it';
+  it('leaves a plain Enter to write a newline under the narrow-screen layout', async () => {
+    // A phone held upright has no Shift key to hold, so this is the one screen where Enter-to-send
+    // makes a multi-line prompt impossible to type rather than merely awkward.
+    const h = await composing(380, 'first line');
 
-      await pressEnter(h, mods);
+    const ev = await pressEnter(h);
 
-      expect(h.calls.find((c) => c.path === 'api/send')?.body.text).toBe('ship it');
+    expect(h.calls.filter((c) => c.path === 'api/send')).toHaveLength(0);
+    expect(ev.defaultPrevented).toBe(false);
+    expect((h.el('input') as HTMLTextAreaElement).value).toBe('first line');
+  });
+
+  it('leaves Shift-Enter and Alt-Enter to write a newline on a wide screen', async () => {
+    for (const mods of [{ shiftKey: true }, { altKey: true }]) {
+      const h = await composing(1440, 'first line');
+
+      const ev = await pressEnter(h, mods);
+
+      expect(h.calls.filter((c) => c.path === 'api/send')).toHaveLength(0);
+      expect(ev.defaultPrevented).toBe(false);
+    }
+  });
+
+  it('sends on Ctrl-Enter and on Cmd-Enter, at either width', async () => {
+    for (const width of [1440, 380]) {
+      for (const mods of [{ ctrlKey: true }, { metaKey: true }]) {
+        const h = await composing(width, 'ship it');
+
+        await pressEnter(h, mods);
+
+        expect(h.calls.find((c) => c.path === 'api/send')?.body.text).toBe('ship it');
+      }
     }
   });
 
   it('ignores Enter mid-composition, which is a candidate being chosen and not a send', async () => {
-    const h = await open();
-    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
-    (h.el('input') as HTMLTextAreaElement).value = '你好';
+    // Both shortcuts, because on a wide screen the plain Enter is now a send as well — and the
+    // keystroke that closes an IME candidate list is the one that would truncate the word.
+    for (const mods of [{ isComposing: true }, { ctrlKey: true, isComposing: true }]) {
+      const h = await composing(1440, '你好');
 
-    await pressEnter(h, { ctrlKey: true, isComposing: true } as KeyboardEventInit);
+      await pressEnter(h, mods as KeyboardEventInit);
 
-    expect(h.calls.filter((c) => c.path === 'api/send')).toHaveLength(0);
+      expect(h.calls.filter((c) => c.path === 'api/send')).toHaveLength(0);
+    }
   });
 
   it('refuses to send nothing', async () => {

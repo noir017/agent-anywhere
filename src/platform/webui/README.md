@@ -282,6 +282,15 @@ While a topic's first sync is in flight the log holds message-shaped placeholder
 They are only ever shown into an EMPTY log: a topic painted from cache has real content to read,
 and a reconnect where the conversation is still on screen must not replace it with grey bars.
 
+A full log has the opposite problem, and `.syncing` answers it. With the cache warm, entering a
+topic is instantaneous — and then, a second or two later, everything said in it while you were
+elsewhere lands in one frame, with nothing in between having suggested more was coming. So
+`adopt` follows the cached transcript with a line saying what is still outstanding, at the bottom
+where the missing messages will land, and `reconcile` takes it away when the sync arrives. It is
+worded and sized as a line about the room rather than shaped like a message on purpose: most
+syncs add nothing, and a message-shaped placeholder would have promised one. `paint` keeps it
+last — anything painted while it is up, including a message typed into the gap, goes above it.
+
 ## Security
 
 New trust boundary, so it is spelled out. The port binds every interface by default and what
@@ -381,11 +390,13 @@ without it. `page.test.ts` pins the viewport tag so this does not get added by r
   to a 44px square (a `:not([hidden])` selector, because the rule sets `display` and would
   otherwise beat the UA's `[hidden]` rule while the drawer is open), and the input is not
   focused on open — the keyboard would take half the viewport before a word had been read.
-- **Enter writes a newline; Ctrl/Cmd-Enter sends.** The inverse of the chat-app convention, on
-  purpose: a phone keyboard has no Shift to hold, so Enter-to-send made a multi-line message
-  impossible to type rather than merely awkward, and what gets typed here is prompts. It is one
-  behaviour on every screen width rather than a narrow-screen special case — a send shortcut
-  that changes with the viewport is worse than either choice on its own.
+- **Enter sends; under the narrow-screen layout it writes a newline instead.** 1.22.0 made it a
+  newline at every width, and the half of that which was right is the phone: held upright there
+  is no Shift key to hold, so Enter-to-send makes a multi-line prompt impossible to type rather
+  than merely awkward, and a stray Enter costs a half-written one. Neither is true of a keyboard,
+  where Shift-Enter is right there and every other chat app on the screen sends on Enter — so
+  paying the phone's cost on a desktop bought nothing. `narrow()` is read per keypress, because
+  rotating a phone and dragging a window both change the answer. Ctrl/Cmd-Enter sends on both.
 - **A reverse proxy must not buffer.** nginx buffers SSE by default; the response carries
   `X-Accel-Buffering: no` and `Cache-Control: no-transform`, but a proxy configured to ignore
   them shows nothing until the turn ends, which reads exactly like a hung daemon. Set

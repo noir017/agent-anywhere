@@ -5,6 +5,31 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **Enter sends again on a desktop; on a phone it still writes a newline.** 1.22.0 made Enter a
+  newline at every screen width, and the half of that which was right is the phone: held upright
+  there is no Shift key to hold down, so Enter-to-send does not make a multi-line prompt awkward,
+  it makes one impossible to type. Neither half of that argument survives a keyboard, where
+  Shift-Enter is right there and every other chat app on the screen sends on Enter — so what the
+  one-behaviour-everywhere rule actually bought was the phone's problem paid for on a desktop
+  that never had it. The layout already knows which of the two it is, so the composer now asks it:
+  under the narrow-screen breakpoint Enter writes a newline, above it Enter sends and Shift-Enter
+  writes the newline. It is read per keypress, so rotating a phone or dragging a window changes it
+  with the layout. Ctrl/Cmd-Enter still sends on both.
+
+### Fixed
+
+- **Opening a topic from the local cache now says it is still waiting.** The transcript comes back
+  out of the browser's cache instantly, which is the point of it — but the daemon's own sync is
+  still a second or two away, and everything said in that topic while you were reading another one
+  arrives in one frame with nothing in between having suggested more was coming. The existing
+  placeholders could not answer this: they stand in for a transcript that is not there, and this
+  one is. So a cached transcript is now followed by a line saying what is still outstanding, at
+  the bottom where the missing messages are going to land, and it goes away when the sync arrives.
+  It is deliberately a line about the room rather than another message-shaped placeholder: most
+  syncs add nothing, and a placeholder would have promised one.
+
 ## [1.22.0] - 2026-09-20
 
 ### Added

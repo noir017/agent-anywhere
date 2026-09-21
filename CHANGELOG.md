@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.25.0] - 2026-09-21
+
 ### Added
 
 - **Single sign-on for the web UI: the proxy in front can be the door.** The page's login was one

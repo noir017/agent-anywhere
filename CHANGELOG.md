@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.26.0] - 2026-09-21
+
 ### Added
 
 - **The terminal is a window now, one per topic, and the switcher says which topics have one.**

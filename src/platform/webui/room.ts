@@ -45,6 +45,7 @@ import type { ButtonSpec } from '../adapter.js';
 import type { WebuiPlatformConfig } from '../config-schemas.js';
 import { escapeHtml, renderWebMarkdown } from '../web-markdown.js';
 import type { ClickRequest, SendRequest, WebEvent, WebMessage } from './protocol.js';
+import type { TerminalSessions } from './terminal-sessions.js';
 import { TopicStore, type Topic } from './topics.js';
 
 /** A `platforms.<id>` entry of type `webui`, plus its map key. */
@@ -163,6 +164,11 @@ export class WebRoom {
   /** Injected by the daemon; absent in a deployment (or a test) that never offered one. */
   private workdir: ((ref: ConversationRef) => string | undefined) | null = null;
   private readonly dirCache = new Map<string, { at: number; dir?: Topic['dir'] }>();
+  /**
+   * Who has a terminal pane attached. Absent when the feature is off, and in every test that
+   * does not care — which is why `topicList` reads it through `?.` rather than requiring one.
+   */
+  private terminal: Pick<TerminalSessions, 'has'> | null = null;
 
   constructor(
     private readonly instance: WebuiInstance,
@@ -234,6 +240,20 @@ export class WebRoom {
   }
 
   /**
+   * Accept the terminal's attendance register, and redraw the switcher whenever it changes.
+   *
+   * Both halves matter and they pull in opposite directions. `topicList` reads it (pull, like
+   * the workdir lookup), so a list built for any other reason is current without asking. But a
+   * pane opening is not otherwise an event in this room — nothing is said, no message arrives —
+   * so without the subscription the marker would appear only the next time something else
+   * happened to announce the list, which on an idle topic is never.
+   */
+  useTerminalSessions(sessions: Pick<TerminalSessions, 'has' | 'onChange'>): void {
+    this.terminal = sessions;
+    sessions.onChange(() => this.announceTopics());
+  }
+
+  /**
    * The directory label for one topic, memoised for `DIR_TTL_MS`.
    *
    * Swallows a failing lookup rather than letting it out: this runs inside the path that
@@ -265,6 +285,7 @@ export class WebRoom {
       return {
         ...t,
         running: Boolean(room?.typing),
+        term: Boolean(this.terminal?.has(t.id)),
         msgCount: room?.msgCount ?? 0,
         ...(dir ? { dir } : {}),
       };

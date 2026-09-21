@@ -5,6 +5,40 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **The terminal is a window now, one per topic, and the switcher says which topics have one.**
+  The pane was a mode: opening it swapped the transcript, leaving it tore the iframe down, and a
+  topic switch dragged the single pane along behind you. Every one of those is wrong once you
+  keep a terminal around for more than a minute — going back to the chat to read something meant
+  hanging up on whatever was running, and there was nowhere on the page that said a terminal
+  existed at all.
+
+  So the pane grew a title bar with two controls that mean deliberately different things.
+  **Minimize** hides the window and does nothing else: the iframe stays mounted and its
+  WebSocket stays up, so coming back is a repaint rather than a reconnect and a redraw.
+  **Close** ends the session, after a confirmation, and is a server round trip rather than a
+  teardown — because dropping an iframe only hangs up on a shell that carries on without us.
+  Windows are keyed by topic and outlive a switch, which is not a convenience: a single window
+  following whichever topic is on screen would hang up on the one being left, and that alone
+  would make the new marker meaningless, since at most one topic could ever be lit.
+
+  The marker is fed by the daemon counting the terminal WebSockets it is proxying — a thing it
+  already had in its hands, and the most it can honestly know. It says *a page is attached to
+  this topic's terminal*, which is not the same claim as *a shell is alive over there*: close
+  every tab and every marker goes out while the sessions carry on. Asking the far side the
+  stronger question would mean teaching this process what is behind the socket, which is the one
+  thing `terminal-proxy.ts` exists to avoid.
+
+- **`terminal.endCommand`, so the close button can exist at all.** A session survives a dropped
+  connection only because the operator's wrapper is `tmux new -A`; ttyd itself SIGHUPs its child.
+  Undoing that is therefore *their* arrangement to describe, so it is configuration — an argv
+  array with `{topic}` substituted, run through `execFile` with no shell, which is what makes a
+  browser-supplied id an argument rather than syntax. Where no command is configured the window
+  has no close button rather than one that cannot work, and the route answers 501 rather than
+  pretending. Hard-coding `tmux kill-session` here instead would have traded "works with any
+  backend" for "works with the one we guessed".
+
 ## [1.25.0] - 2026-09-21
 
 ### Added

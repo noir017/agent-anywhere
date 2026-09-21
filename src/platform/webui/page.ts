@@ -33,15 +33,17 @@
 import { escapeHtml } from '../web-markdown.js';
 
 /**
- * Fill in the configured title and whether the terminal pane exists.
+ * Fill in the configured title, whether the terminal pane exists, and whether a session can be
+ * ended from it.
  *
- * `terminal` is baked into the document rather than announced over the event stream because it
- * is a property of the daemon, not of a conversation: it cannot change while the page is open,
- * and a control that appears one sync later is a control that flickers into existence.
+ * All three are baked into the document rather than announced over the event stream because
+ * they are properties of the daemon, not of a conversation: none can change while the page is
+ * open, and a control that appears one sync later is a control that flickers into existence.
  */
-export function renderPage(title: string, terminal: boolean, password = true): string {
+export function renderPage(title: string, terminal: boolean, password = true, terminalEnd = false): string {
   return PAGE.replace(/__TITLE__/g, escapeHtml(title))
     .replace(/__TERM__/g, terminal ? 'true' : 'false')
+    .replace(/__TERM_END__/g, terminalEnd ? 'true' : 'false')
     .replace(/__PASSWORD__/g, password ? 'true' : 'false')
     .replace('__GATE__', password ? PASSWORD_GATE : SSO_GATE);
 }
@@ -124,6 +126,10 @@ body{background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,-apple-system,
 #topics .topic-item.idle .topic-title{color:var(--dim)}
 #topics .topic-item.on.idle .topic-title{color:#a0a0a0}
 .topic-badge{background:#2563eb;color:#fff;border-radius:9px;padding:1px 6px;font-size:11px;font-weight:600;line-height:1.3;margin-left:4px;flex-shrink:0}
+/* A terminal is attached to this topic. Deliberately not a second colour on .topic-dot: that
+   dot means an agent turn is executing, and the two are unrelated states that can both be true.
+   A prompt-shaped glyph says which of the two it is without a legend. */
+.topic-term{flex-shrink:0;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:9.5px;line-height:1;color:#4ade80;border:1px solid rgba(74,222,128,.35);border-radius:3px;padding:2px 3px;margin-left:4px}
 .topic-del{opacity:0;background:none;border:0;color:var(--dim);font:inherit;font-size:16px;line-height:1;padding:2px 5px;cursor:pointer;border-radius:3px;margin-left:auto;flex-shrink:0;transition:opacity .15s,color .15s,background .15s}
 #topics .topic-item:hover .topic-del,#topics .topic-item:focus-within .topic-del{opacity:1}
 .topic-del:hover{color:#f87171;background:rgba(248,113,113,.15)}
@@ -143,12 +149,27 @@ body{background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,-apple-system,
 .chat-status.running{color:#38bdf8}
 /* The terminal takes the place of the transcript and the composer, not of the whole view: the
    header stays, so the sidebar button, the topic name and the way back out are all still
-   where they were a moment ago. One class on #chat swaps the two. */
+   where they were a moment ago. One class on #chat swaps the two.
+
+   It is a window rather than a mode, which is what the title bar below is for. Minimizing only
+   hides it — the iframe stays mounted and its WebSocket stays up, which is both what makes
+   coming back instant and what keeps the switcher's marker lit. So visibility is a class, never
+   a teardown. */
 #term-toggle{margin-left:auto}
-#term{display:none;flex:1;min-height:0;background:#000}
-#term iframe{display:block;width:100%;height:100%;border:0}
+#term-toggle.on{color:#4ade80}
+#term{display:none;flex:1;min-height:0;background:#000;flex-direction:column}
 #chat.term #log,#chat.term #typing,#chat.term #note,#chat.term #bar{display:none}
-#chat.term #term{display:block}
+#chat.term #term{display:flex}
+#term-bar{display:flex;align-items:center;gap:4px;padding:4px 6px 4px 12px;background:#161616;border-bottom:1px solid var(--line);flex:0 0 auto}
+.term-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dim);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11.5px}
+#term-end:hover{color:#f87171;background:rgba(248,113,113,.15)}
+/* One host for every mounted terminal, of which exactly one is visible. Visibility is a class
+   rather than the hidden attribute because the rule that sizes an iframe would have to fight
+   it: display:block on the element beats hidden's user-agent display:none, and the loser of
+   that fight is not obvious from reading either rule. */
+#term-frames{flex:1;min-height:0}
+#term-frames iframe{display:none;width:100%;height:100%;border:0}
+#term-frames iframe.on{display:block}
 
 #log{flex:1;overflow-y:auto;padding:20px 16px 8px;max-width:860px;width:100%;margin:0 auto}
 .m{margin:0 0 18px;max-width:100%;overflow-wrap:anywhere;animation:fade .18s ease-out}
@@ -296,6 +317,14 @@ button:disabled{opacity:.5;cursor:default}
      back out afterwards — every tap on the composer would leave the page a little larger. */
   #input,#secret{font-size:16px}
   #input{max-height:30dvh}
+  /* The window's two controls, for a finger. Same 44px the drawer toggle gets, and for the
+     same reason — but here it also matters WHICH of the two a near miss lands on: one hides the
+     terminal and the other kills what is running in it. The gap is the separation. Setting
+     display is safe against the close button's own hidden attribute for the reason given
+     there: the global [hidden] rule at the top is !important. */
+  #term-bar{padding:2px 4px 2px 12px;gap:8px}
+  #term-min,#term-end{display:inline-flex;align-items:center;justify-content:center;
+    min-width:44px;height:44px;font-size:18px}
 }
 `;
 
@@ -307,7 +336,8 @@ const SCRIPT = `
       bar=$('topics'), sidebar=$('sidebar'), collapseBtn=$('collapse-sidebar'),
       expandBtn=$('expand-sidebar'), newTopicBtn=$('new-topic'), backdrop=$('backdrop'),
       clearBtn=$('clear-topics'), chatTitle=$('topic-title'), chatStatus=$('topic-status'),
-      chat=$('chat'), termPane=$('term'), termBtn=$('term-toggle');
+      chat=$('chat'), termBtn=$('term-toggle'), termHost=$('term-frames'),
+      termName=$('term-name'), termMinBtn=$('term-min'), termEndBtn=$('term-end');
   var data={}, els={}, files=[], commands=[], stream=null, done=false;
   // Last markup written per message, so a sync that re-sends an unchanged message touches no DOM.
   var sig={};
@@ -322,15 +352,25 @@ const SCRIPT = `
   // and before the first sync the only generations known are the ones out of the cache.
   var epoch=0, synced=false;
   var topic = new URLSearchParams(location.search).get('t') || '';
-  // Whether this daemon serves a terminal at all, and whether the pane is currently asked for.
-  // "Asked for" is separate from "shown": until a topic is known there is nothing to point a
-  // terminal at, so a reload into terminal mode waits for the first sync to name one.
+  // Whether this daemon serves a terminal at all, and whether it was given a way to END one (a
+  // configured terminal.endCommand). Without that, the window has no close button rather than a
+  // close button that cannot work.
   var TERM_OK = __TERM__;
+  var TERM_END = __TERM_END__;
   // Whether the shared secret is still a way in. False means the gate above has no field and
   // the only thing that can sign anyone in is the proxy in front (sso.password: false).
   var PASSWORD_LOGIN = __PASSWORD__;
-  var termWanted = TERM_OK && new URLSearchParams(location.search).get('v')==='term';
-  var termFrame = null;
+  // A terminal window belongs to a TOPIC, not to the page: 'open' is shown, 'min' is hidden and
+  // still connected, absent is no window at all. Keyed this way because the alternative — one
+  // window that follows whichever topic is on screen — would tear down the connection to the
+  // topic being left, which is both a surprise (the pane you minimized is gone) and the end of
+  // the switcher's marker ever meaning anything: at most one topic could ever be lit.
+  var termState = {};
+  var termFrames = {};
+  // A reload asked for the pane, before any topic is known. "Asked for" is separate from
+  // "shown": there is nothing to point a terminal at until the first sync names a topic, so
+  // this is spent there rather than here.
+  var termBoot = TERM_OK && new URLSearchParams(location.search).get('v')==='term';
   var topics = [];
   var readCounts = {};
   try { readCounts = JSON.parse(localStorage.getItem('aa_reads') || '{}'); } catch(x){}
@@ -893,6 +933,9 @@ const SCRIPT = `
       var cls='topic-item '+(isCur?'on ':'')+(isRunning?'running':'idle');
       var dotCls='topic-dot'+(isRunning?' running':'');
       var badge=unread>0?'<span class="topic-badge">'+(unread>99?'99+':unread)+'</span>':'';
+      // Not "a shell is alive over there" — the daemon only sees the connection, so this says a
+      // page has that topic's terminal open (shown or minimized). See terminal-sessions.ts.
+      var term=t.term?'<span class="topic-term" title="A terminal is attached to this topic">&gt;_</span>':'';
       // The full path on the title attribute rather than in the row: two checkouts of one
       // project have the same last segment, and the column is 240px wide.
       var dir=t.dir?'<span class="topic-dir" title="'+text(t.dir.path)+'">'+text(t.dir.name)+'</span>':'';
@@ -902,6 +945,7 @@ const SCRIPT = `
          + '<span class="topic-title">'+text(t.title || 'Untitled')+'</span>'
          + dir
          + '</span>'
+         + term
          + badge
          + '<button type="button" class="btn-icon topic-del" data-del="'+text(t.id)+'" title="Delete topic">×</button>'
          + '</div>';
@@ -915,47 +959,121 @@ const SCRIPT = `
       chatTitle.textContent='';
       chatStatus.textContent='';
     }
+    // The window's title bar names the same topic this row does, so a rename lands on both in
+    // the same frame rather than leaving the bar holding the old name until the next switch.
+    if(TERM_OK) paintFrames();
   }
 
   // ── Terminal ───────────────────────────────────────────────────────────────
-  // A pane, not a page: the iframe holds ttyd's own terminal, which is why this is thirty
-  // lines instead of a terminal emulator. Nothing here speaks to the agent — the two share a
-  // topic id and nothing else.
+  // A window over the transcript, one per topic. The iframe holds ttyd's own terminal, which is
+  // why this is a hundred lines instead of a terminal emulator. Nothing here speaks to the agent
+  // — the two share a topic id and nothing else.
 
   // What the address bar should say now. The topic and the pane are both worth surviving a
   // reload, and both are written the same way so neither can silently drop the other.
   function urlNow(){
-    return '?t='+encodeURIComponent(topic) + (termWanted ? '&v=term' : '');
+    return '?t='+encodeURIComponent(topic) + (termState[topic]==='open' ? '&v=term' : '');
   }
 
-  // The iframe is created on first use and destroyed on the way out, so a page that never
-  // opens the terminal never connects to ttyd, and a topic left behind is not still holding a
-  // socket open. Nothing is lost by dropping it: the session lives in tmux on the far side, so
-  // coming back is a redraw.
+  // Mounted on first use, so a page that never opens a terminal never connects to ttyd, and
+  // dropped only when the window is CLOSED — never when it is minimized and never when the
+  // topic changes. What survives a drop is the session itself, on the far side, which is the
+  // operator's arrangement (ttyd hangs up its child; their wrapper holds the session open) and
+  // the reason closing needs a server round trip while minimizing does not.
   function applyTerm(){
     if(!TERM_OK) return;
-    chat.classList.toggle('term', termWanted);
-    termBtn.textContent = termWanted ? '←' : '>_';
-    termBtn.title = termWanted ? 'Back to chat' : 'Terminal';
-    if(termWanted && topic) mountTerm(); else dropTerm();
+    if(termBoot && topic){
+      termBoot = false;
+      if(!termState[topic]) termState[topic]='open';
+    }
+    var state = topic ? termState[topic] : undefined;
+    var on = state === 'open';
+    chat.classList.toggle('term', on);
+    termBtn.classList.toggle('on', Boolean(state));
+    termBtn.title = on ? 'Minimize the terminal' : (state ? 'Show the terminal (still running)' : 'Terminal');
+    // Only ever rendered where a session can actually be ended; see TERM_END.
+    termEndBtn.hidden = !TERM_END;
+    if(state && topic) mountTerm(topic);
+    paintFrames();
   }
 
-  function mountTerm(){
+  function mountTerm(id){
+    if(termFrames[id]) return;
+    var frame = document.createElement('iframe');
+    frame.setAttribute('title','Terminal');
     // Relative, for the same reason every fetch here is: a reverse proxy may mount the daemon
     // under a sub-path, and an absolute "/" walks out of it.
-    var want = 'term/?arg='+encodeURIComponent(topic);
-    if(termFrame && termFrame.getAttribute('src')===want) return;
-    dropTerm();
-    termFrame = document.createElement('iframe');
-    termFrame.setAttribute('title','Terminal');
-    termFrame.setAttribute('src', want);
-    termPane.appendChild(termFrame);
+    frame.setAttribute('src','term/?arg='+encodeURIComponent(id));
+    termFrames[id] = frame;
+    termHost.appendChild(frame);
   }
 
-  function dropTerm(){
-    if(!termFrame) return;
-    termFrame.parentNode.removeChild(termFrame);
-    termFrame = null;
+  /** Exactly one mounted terminal is visible: the current topic's, and only while it is open. */
+  function paintFrames(){
+    var on = topic && termState[topic]==='open';
+    for(var id in termFrames){
+      if(!Object.prototype.hasOwnProperty.call(termFrames, id)) continue;
+      termFrames[id].classList.toggle('on', Boolean(on) && id===topic);
+    }
+    var cur = null;
+    for(var i=0;i<topics.length;i++){ if(topics[i].id===topic){ cur=topics[i]; break; } }
+    termName.textContent = cur && cur.title ? cur.title : 'Untitled';
+  }
+
+  /** Unmount one topic's terminal. Ends a connection, never a session — see endTerm. */
+  function dropTerm(id){
+    var frame = termFrames[id];
+    if(frame){
+      if(frame.parentNode) frame.parentNode.removeChild(frame);
+      delete termFrames[id];
+    }
+    delete termState[id];
+  }
+
+  function showTerm(){
+    if(!TERM_OK || !topic) return;
+    termState[topic] = 'open';
+    history.replaceState(null,'',urlNow());
+    applyTerm();
+  }
+
+  // Hidden, not unmounted: the point of minimizing is that whatever is running in there keeps
+  // running AND stays connected, so coming back is a repaint rather than a reconnect and a
+  // redraw.
+  function minTerm(){
+    if(!TERM_OK || !topic || !termState[topic]) return;
+    termState[topic] = 'min';
+    history.replaceState(null,'',urlNow());
+    applyTerm();
+  }
+
+  /**
+   * End the session, which is a different act from closing the window and is why it asks first.
+   *
+   * Dropping the iframe would only hang up on a shell that carries on without us. What actually
+   * ends it is a command the operator configured, so this is a request; the window is taken down
+   * only once the server says it worked, because a window closed over a session that is still
+   * alive is the one outcome nobody could explain from the screen.
+   */
+  function endTerm(){
+    if(!TERM_OK || !TERM_END || !topic || !termState[topic]) return;
+    var cur = null;
+    for(var i=0;i<topics.length;i++){ if(topics[i].id===topic){ cur=topics[i]; break; } }
+    var title = (cur && cur.title) ? cur.title : 'Untitled';
+    if(!confirm('End the terminal session in "'+title+'"?\\n\\nAnything still running in it is killed. Minimize instead to leave it running.')) return;
+    var id = topic;
+    // Not retried, unlike a send. A 500 here means the operator's command ran and failed, and
+    // running it again 700ms later answers the same way while spawning a second process; the
+    // retry in post() is for a link that dropped a request, which is not this.
+    post('api/terminal/end',{topic:id},0).then(function(r){
+      return r.ok ? {ok:true} : r.json().then(function(d){ return {ok:false, error:(d&&d.error)||'could not end the terminal session'}; }, function(){ return {ok:false, error:'could not end the terminal session'}; });
+    }).then(function(d){
+      if(!d.ok){ alert(d.error); return; }
+      dropTerm(id);
+      if(id===topic){ history.replaceState(null,'',urlNow()); applyTerm(); }
+    }, function(){
+      alert('could not reach the daemon to end the terminal session');
+    });
   }
 
   function switchTopic(id){
@@ -1011,6 +1129,10 @@ const SCRIPT = `
     }).then(function(d){
       if(!d) return;
       cacheDrop(delId);
+      // The row is gone, so its terminal window has nothing left to belong to. Only the window
+      // — the session on the far side outlives this exactly as it outlives a closed tab, which
+      // is why deleting a topic is not offered as a way to end one.
+      dropTerm(delId);
       delete readCounts[delId];
       saveReads();
       if(topic === delId){
@@ -1181,14 +1303,18 @@ const SCRIPT = `
   newTopicBtn.addEventListener('click', createTopic);
 
   // Revealed only where there is something behind it. When the daemon serves no terminal the
-  // button stays hidden and this listener never has anything to toggle.
+  // button stays hidden and these listeners never have anything to toggle.
   if(TERM_OK){
     termBtn.hidden = false;
+    // One button, three states: no window opens one, a shown window is minimized, a minimized
+    // one comes back. Minimizing from here as well as from the title bar because the header
+    // button is where the hand already is on a phone, and because it is what this button did
+    // before there was a window to minimize.
     termBtn.addEventListener('click', function(){
-      termWanted = !termWanted;
-      history.replaceState(null,'',urlNow());
-      applyTerm();
+      if(termState[topic]==='open') minTerm(); else showTerm();
     });
+    termMinBtn.addEventListener('click', minTerm);
+    termEndBtn.addEventListener('click', endTerm);
   }
 
   clearBtn.addEventListener('click', function(){
@@ -1201,6 +1327,12 @@ const SCRIPT = `
       cacheClear();
       readCounts={};
       saveReads();
+      // Same as deleting one, for every row at once: the windows belonged to topics that no
+      // longer exist, so they are unmounted here rather than left pointing at ids the daemon
+      // has forgotten.
+      for(var id in termFrames){
+        if(Object.prototype.hasOwnProperty.call(termFrames, id)) dropTerm(id);
+      }
       // The list is replaced with what the server just told us rather than left to the broadcast
       // that is also on its way: paintTopics re-seeds a read mark for every topic it renders, so
       // painting the OLD list once more would write the ids we are here to forget straight back
@@ -1574,7 +1706,17 @@ __GATE__
     <div id="log"></div>
     <div id="typing" hidden>...</div>
     <div id="note"></div>
-    <div id="term"></div>
+    <!-- A window, not a mode: the bar is what makes minimize and close two different things.
+         The dash hides it and leaves the session connected; the cross ends the session, and is
+         rendered only where the daemon was given a way to do that. -->
+    <div id="term">
+      <div id="term-bar">
+        <span id="term-name" class="term-name"></span>
+        <button type="button" class="btn-icon" id="term-min" title="Minimize — the terminal keeps running">&#8211;</button>
+        <button type="button" class="btn-icon" id="term-end" title="End this terminal session" hidden>&times;</button>
+      </div>
+      <div id="term-frames"></div>
+    </div>
     <div id="bar">
       <div id="hints" hidden></div>
       <div id="chips"></div>

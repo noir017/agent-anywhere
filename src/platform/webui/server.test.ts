@@ -12,6 +12,7 @@ import { WebAuth } from './auth.js';
 import { WebRoom, type WebuiInstance } from './room.js';
 import { createWebServer, type WebServer } from './server.js';
 import { WebSso, type SsoOptions } from './sso.js';
+import { TerminalSessions } from './terminal-sessions.js';
 import { TopicStore } from './topics.js';
 
 /**
@@ -51,11 +52,15 @@ interface Booted {
   port: number;
   topic: string;
   instance: WebuiInstance;
+  sessions: TerminalSessions;
 }
 
 async function boot(
   over: Partial<WebuiInstance> = {},
-  terminal: { enabled: boolean; socket: string } = { enabled: false, socket: '/nonexistent.sock' },
+  terminal: { enabled: boolean; socket: string; endCommand?: string[] } = {
+    enabled: false,
+    socket: '/nonexistent.sock',
+  },
   sso?: WebSso
 ): Promise<Booted> {
   const port = await freePort();
@@ -69,13 +74,36 @@ async function boot(
   const topics = new TopicStore(path.join(dir, `${port}.json`));
   const topic = topics.current().id;
   const room = new WebRoom(instance, topics);
-  const server = createWebServer(room, new WebAuth({ token: instance.token }), instance, terminal, sso);
+  const sessions = new TerminalSessions(terminal.endCommand);
+  room.useTerminalSessions(sessions);
+  const server = createWebServer(
+    room,
+    new WebAuth({ token: instance.token }),
+    instance,
+    { enabled: terminal.enabled, socket: terminal.socket, sessions },
+    sso
+  );
   await server.start();
   running.push(server);
-  return { room, server, base: `http://127.0.0.1:${port}`, port, topic, instance };
+  return { room, server, base: `http://127.0.0.1:${port}`, port, topic, instance, sessions };
 }
 
 const JSON_HEADERS = { 'content-type': 'application/json' };
+
+/**
+ * Spin until something becomes true, or give up loudly.
+ *
+ * For facts that land on a socket event rather than in the response: a peer's close reaches
+ * this process some turns after the client destroyed its end, and how many is `node:net`'s
+ * business. A fixed sleep here would be a test that passes until the machine is busy.
+ */
+async function until(ok: () => boolean, what = 'condition'): Promise<void> {
+  for (let i = 0; i < 200; i++) {
+    if (ok()) return;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  throw new Error(`never happened: ${what}`);
+}
 
 async function signIn(base: string, token = 'open-sesame'): Promise<string> {
   const res = await fetch(`${base}/api/login`, {
@@ -655,6 +683,7 @@ describe('webui server: lifecycle', () => {
     const clash = createWebServer(new WebRoom(instance, topics), new WebAuth({ token: 'x' }), instance, {
       enabled: false,
       socket: '/nonexistent.sock',
+      sessions: new TerminalSessions(),
     });
     await expect(clash.start()).rejects.toThrow(/cannot bind/);
   });
@@ -858,5 +887,119 @@ describe('webui server: terminal', () => {
     await server.stop();
     expect(Date.now() - started).toBeLessThan(1500);
     await ttyd.close();
+  });
+
+  it('counts a live pane against its topic, and stops counting when it goes', async () => {
+    // What the switcher's marker is made of. The count is the daemon's only knowledge of the
+    // terminal — it never asks the far side anything — so this is the whole of "running".
+    const socketPath = path.join(dir, 'ttyd.sock');
+    const ttyd = await fakeTtyd(socketPath);
+    const { base, port, topic, sessions, room } = await boot({}, { enabled: true, socket: socketPath });
+    const cookie = await signIn(base);
+    expect(sessions.has(topic)).toBe(false);
+
+    const up = await handshake(port, `/term/ws?arg=${topic}`, { cookie, origin: `http://127.0.0.1:${port}` });
+    expect(up.status).toBe(101);
+    expect(sessions.has(topic)).toBe(true);
+    expect(room.topicList().find((t) => t.id === topic)?.term).toBe(true);
+
+    // `handshake` destroys its socket after the echo, which is a closed tab. The count has to
+    // follow it down or the marker never goes out again.
+    await until(() => !sessions.has(topic));
+    expect(room.topicList().find((t) => t.id === topic)?.term).toBe(false);
+    await ttyd.close();
+  });
+
+  it('does not count a handshake it refused', async () => {
+    // A refusal is not a pane. Counting one would light a marker with nothing left to put it
+    // out, since there is no socket whose close could decrement it.
+    const socketPath = path.join(dir, 'ttyd.sock');
+    const ttyd = await fakeTtyd(socketPath);
+    const { port, sessions } = await boot({}, { enabled: true, socket: socketPath });
+    const bad = await handshake(port, '/term/ws?arg=deadbeef', { origin: `http://127.0.0.1:${port}` });
+    expect(bad.status).not.toBe(101);
+    expect(sessions.has('deadbeef')).toBe(false);
+    await ttyd.close();
+  });
+
+  it('ends a session by running the command the operator configured', async () => {
+    const stamp = path.join(dir, 'ended.txt');
+    const { base, topic } = await boot(
+      {},
+      {
+        enabled: true,
+        socket: path.join(dir, 'absent.sock'),
+        // No shell: argv[0] is the program, and `{topic}` is substituted into an argument
+        // rather than into a command line. `node -e` rather than `sh -c` so this does not
+        // depend on a shell being there.
+        endCommand: [
+          process.execPath,
+          '-e',
+          'require("fs").writeFileSync(process.argv[1], process.argv[2])',
+          stamp,
+          '{topic}',
+        ],
+      }
+    );
+    const cookie = await signIn(base);
+
+    const res = await fetch(`${base}/api/terminal/end`, {
+      method: 'POST',
+      headers: { ...JSON_HEADERS, cookie, origin: base },
+      body: JSON.stringify({ topic }),
+    });
+    expect(res.status).toBe(200);
+    expect(fs.readFileSync(stamp, 'utf8')).toBe(topic);
+  });
+
+  it('reports a command that failed instead of claiming the session is gone', async () => {
+    const { base, topic } = await boot(
+      {},
+      {
+        enabled: true,
+        socket: path.join(dir, 'absent.sock'),
+        endCommand: [process.execPath, '-e', 'process.exit(3)', '{topic}'],
+      }
+    );
+    const cookie = await signIn(base);
+    const res = await fetch(`${base}/api/terminal/end`, {
+      method: 'POST',
+      headers: { ...JSON_HEADERS, cookie, origin: base },
+      body: JSON.stringify({ topic }),
+    });
+    expect(res.status).toBe(500);
+    expect((await res.json()).error).toMatch(/could not end/);
+  });
+
+  it('refuses to end anything without a configured command, or for a topic it does not have', async () => {
+    const { base, topic } = await boot({}, { enabled: true, socket: path.join(dir, 'absent.sock') });
+    const cookie = await signIn(base);
+    const end = (body: unknown): Promise<Response> =>
+      fetch(`${base}/api/terminal/end`, {
+        method: 'POST',
+        headers: { ...JSON_HEADERS, cookie, origin: base },
+        body: JSON.stringify(body),
+      });
+
+    // Unknown topic first: it is answered before the missing command, so a page cannot learn
+    // which topics exist by reading which error it gets.
+    expect((await end({ topic: 'deadbeef' })).status).toBe(404);
+    // 501, not 404: the route is there and the request was fine — this deployment simply never
+    // said what ending a session means.
+    expect((await end({ topic })).status).toBe(501);
+    // And the shape is still a shape. `{topic}` reaches a command, so nothing else may.
+    expect((await end({ topic, extra: 1 })).status).toBe(400);
+    expect((await end({ topic: '../../etc' })).status).toBe(400);
+  });
+
+  it('will not end a session on a daemon that serves no terminal', async () => {
+    const { base, topic } = await boot({}, { enabled: false, socket: '/nonexistent.sock', endCommand: ['true', '{topic}'] });
+    const cookie = await signIn(base);
+    const res = await fetch(`${base}/api/terminal/end`, {
+      method: 'POST',
+      headers: { ...JSON_HEADERS, cookie, origin: base },
+      body: JSON.stringify({ topic }),
+    });
+    expect(res.status).toBe(404);
   });
 });

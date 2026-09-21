@@ -76,6 +76,15 @@ export const SendRequestSchema = z
 export const CreateTopicRequestSchema = z.object({ title: z.string().max(200).optional() }).strict();
 export const DeleteTopicRequestSchema = z.object({ topic: TopicId }).strict();
 /**
+ * End one topic's terminal session.
+ *
+ * Same shape as deleting a topic and deliberately a schema of its own rather than a shared
+ * one: the id here is substituted into a command the operator configured, and a schema shared
+ * between "forget a row" and "run a program" is one rename away from loosening the second to
+ * suit the first.
+ */
+export const EndTerminalRequestSchema = z.object({ topic: TopicId }).strict();
+/**
  * Clear every topic. Takes no fields, and is still a schema rather than an ignored body:
  * `.strict()` is what makes "no fields" mean it, so a request carrying one is refused instead
  * of quietly discarded by the most destructive route here.
@@ -95,6 +104,7 @@ export type SendRequest = z.infer<typeof SendRequestSchema>;
 export type ClickRequest = z.infer<typeof ClickRequestSchema>;
 export type CreateTopicRequest = z.infer<typeof CreateTopicRequestSchema>;
 export type DeleteTopicRequest = z.infer<typeof DeleteTopicRequestSchema>;
+export type EndTerminalRequest = z.infer<typeof EndTerminalRequestSchema>;
 export type ClearTopicsRequest = z.infer<typeof ClearTopicsRequestSchema>;
 
 /**

@@ -318,6 +318,34 @@ export const WebuiConfigSchema = z.object({
        * `config/load.ts` for `configDir()` would close the cycle.
        */
       socket: z.string().optional(),
+      /**
+       * How to END one topic's terminal session — the argv of a command the operator supplies.
+       *
+       * Absent by default, and its absence is a feature rather than an omission: the pane's
+       * close button only exists when this is set, so a deployment that has not answered "what
+       * does ending a session even mean here" does not get a button that pretends to.
+       *
+       * It is configuration rather than code because of the same line `terminal-proxy.ts`
+       * draws: the daemon does not own the terminal and must not learn what is behind it. A
+       * session survives a closed connection only because the operator's wrapper runs `tmux`
+       * — that is *their* arrangement, and `tmux -L aa-web kill-session -t aa-{topic}` is
+       * theirs to write. Teaching this process that name would make the pane work with one
+       * backend instead of any.
+       *
+       * An argv array, never a shell string: `{topic}` is substituted into each element and
+       * then handed to `execFile`, so there is no shell to quote for and no way for the
+       * substitution to become a second command. What it substitutes is already narrow — the
+       * page's id is matched against `^[0-9a-f]{8}$` and then against the topic store — but
+       * the reason it is safe is the missing shell, not the pattern.
+       */
+      endCommand: z
+        .array(z.string().min(1))
+        .min(1)
+        .refine(
+          (argv) => argv.slice(1).some((arg) => arg.includes('{topic}')),
+          'terminal.endCommand must use {topic} in an argument, or it would end the same session (or every session) whichever terminal the page asked to close'
+        )
+        .optional(),
     })
     .default({}),
   ...common,

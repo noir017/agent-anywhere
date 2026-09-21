@@ -67,6 +67,8 @@ interface Harness {
   cached: (topic: string) => Promise<Array<Record<string, unknown>> | null>;
   /** Everything written to `navigator.clipboard` by the page. */
   clipboard: string[];
+  /** Everything the page raised in an `alert()`. */
+  alerts: string[];
   el: (id: string) => HTMLElement;
   /** Messages currently painted in the transcript. */
   painted: () => number;
@@ -159,6 +161,8 @@ async function open(
     confirm?: boolean;
     /** Whether the daemon serves a terminal, which the page is told once at render time. */
     terminal?: boolean;
+    /** Whether the daemon was given a way to END a terminal session (terminal.endCommand). */
+    terminalEnd?: boolean;
     /** Whether the shared secret is still a way in, i.e. which of the two gates is served. */
     password?: boolean;
   } = {}
@@ -172,13 +176,15 @@ async function open(
     idb = new IDBFactory(),
     confirm = true,
     terminal = false,
+    terminalEnd = false,
     password = true,
   } = opts;
   const streams: Stream[] = [];
   const calls: Call[] = [];
   const clipboard: string[] = [];
+  const alerts: string[] = [];
 
-  const dom = new JSDOM(renderPage('Chat', terminal, password), {
+  const dom = new JSDOM(renderPage('Chat', terminal, password, terminalEnd), {
     url,
     runScripts: 'dangerously',
     pretendToBeVisual: true,
@@ -213,6 +219,11 @@ async function open(
       }
       (w as any).EventSource = FakeEventSource;
       (w as any).confirm = () => confirm;
+      // jsdom has no alert, and the page uses one to report a refused "end session". Recorded
+      // rather than ignored: "the button failed and said nothing" is the bug worth catching.
+      (w as any).alert = (s: string) => {
+        alerts.push(String(s));
+      };
       (w as any).fetch = (path: string, init: { body: string }) => {
         calls.push({ path, body: JSON.parse(init.body) });
         const code = status[path] ?? 200;
@@ -242,6 +253,7 @@ async function open(
     status,
     idb,
     clipboard,
+    alerts,
     cached: (topic) => readCache(idb, topic),
     emit: async (ev) => {
       live().onmessage?.({ data: JSON.stringify(ev) });
@@ -1317,40 +1329,44 @@ describe('webui page: the narrow-screen stylesheet', () => {
   });
 });
 
-describe('webui page: the terminal pane', () => {
-  /** The iframe, or null. Created on demand, so its absence is a fact worth asserting. */
-  const frame = (h: { doc: Document }): HTMLIFrameElement | null =>
-    h.doc.querySelector<HTMLIFrameElement>('#term iframe');
+describe('webui page: the terminal window', () => {
+  /** Every mounted terminal, whether or not it is the one on screen. */
+  const frames = (h: { doc: Document }): HTMLIFrameElement[] =>
+    [...h.doc.querySelectorAll<HTMLIFrameElement>('#term-frames iframe')];
+  /** The one currently shown. Absence is a fact worth asserting: mounted ≠ visible now. */
+  const shown = (h: { doc: Document }): HTMLIFrameElement | null =>
+    h.doc.querySelector<HTMLIFrameElement>('#term-frames iframe.on');
+  const srcOf = (h: { doc: Document }): string | null => shown(h)?.getAttribute('src') ?? null;
 
   it('offers nothing at all when the daemon serves no terminal', async () => {
     const h = await open();
     await h.emit(sync('a1b2c3d4', [message('m1', '<p>hi</p>')], ['a1b2c3d4']));
 
     expect(h.el('term-toggle').hidden).toBe(true);
-    expect(frame(h)).toBeNull();
+    expect(frames(h)).toHaveLength(0);
     // And clicking it anyway — which a curious person can do from the console — changes nothing.
     await h.click('#term-toggle');
-    expect(frame(h)).toBeNull();
+    expect(frames(h)).toHaveLength(0);
     expect(h.el('chat').className).not.toContain('term');
   });
 
-  it('connects to ttyd only once the pane is opened', async () => {
-    // The whole point of building the iframe on demand: a page that never opens the terminal
-    // must never open a socket to it, whether or not the feature is on.
+  it('connects to ttyd only once a window is opened', async () => {
+    // The whole point of mounting on demand: a page that never opens the terminal must never
+    // open a socket to it, whether or not the feature is on.
     const h = await open({ terminal: true });
     await h.emit(sync('a1b2c3d4', [message('m1', '<p>hi</p>')], ['a1b2c3d4']));
 
     expect(h.el('term-toggle').hidden).toBe(false);
-    expect(frame(h)).toBeNull();
+    expect(frames(h)).toHaveLength(0);
 
     await h.click('#term-toggle');
-    expect(frame(h)?.getAttribute('src')).toBe('term/?arg=a1b2c3d4');
+    expect(srcOf(h)).toBe('term/?arg=a1b2c3d4');
     expect(h.el('chat').className).toContain('term');
     // The transcript is still there underneath, not thrown away — going back is a class flip.
     expect(h.painted()).toBe(1);
   });
 
-  it('puts the pane in the URL, and comes back into it on reload', async () => {
+  it('puts the window in the URL, and comes back into it on reload', async () => {
     const h = await open({ terminal: true });
     await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
     await h.click('#term-toggle');
@@ -1358,43 +1374,152 @@ describe('webui page: the terminal pane', () => {
 
     const again = await open({ terminal: true, url: 'http://localhost:8787/?t=a1b2c3d4&v=term' });
     await again.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
-    expect(frame(again)?.getAttribute('src')).toBe('term/?arg=a1b2c3d4');
+    expect(srcOf(again)).toBe('term/?arg=a1b2c3d4');
     expect(again.el('chat').className).toContain('term');
   });
 
   it('waits for a topic before pointing a terminal at one', async () => {
     // A first visit has no ?t= at all — the daemon picks the room and says so in the sync. Until
-    // then there is nothing to name in the URL, so the pane is asked for but not yet built.
+    // then there is nothing to name in the URL, so the window is asked for but not yet built.
     const h = await open({ terminal: true, url: 'http://localhost:8787/?v=term' });
-    expect(frame(h)).toBeNull();
+    expect(frames(h)).toHaveLength(0);
 
     await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
-    expect(frame(h)?.getAttribute('src')).toBe('term/?arg=a1b2c3d4');
+    expect(srcOf(h)).toBe('term/?arg=a1b2c3d4');
   });
 
-  it('follows the topic switcher', async () => {
-    const h = await open({ terminal: true, replies: {} });
-    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4', 'b2c3d4e5']));
-    await h.click('#term-toggle');
-    expect(frame(h)?.getAttribute('src')).toBe('term/?arg=a1b2c3d4');
-
-    await h.click('[data-topic="b2c3d4e5"]');
-    expect(frame(h)?.getAttribute('src')).toBe('term/?arg=b2c3d4e5');
-    expect(h.window.location.search).toBe('?t=b2c3d4e5&v=term');
-  });
-
-  it('drops the iframe on the way back to the chat', async () => {
-    // Nothing is lost by dropping it: the session lives in tmux on the far side, so reopening
-    // is a redraw. Keeping it would hold a socket open for a pane nobody is looking at.
+  it('minimizes to the chat without dropping the connection', async () => {
+    // The difference between this and the old pane, and the reason the window exists: what is
+    // running in there keeps running AND stays attached, so coming back is a repaint rather
+    // than a reconnect. A dropped iframe would also put out the switcher's marker, which is
+    // fed by the connection.
     const h = await open({ terminal: true });
     await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
 
     await h.click('#term-toggle');
-    expect(frame(h)).not.toBeNull();
+    const mounted = shown(h);
+    expect(mounted).not.toBeNull();
 
-    await h.click('#term-toggle');
-    expect(frame(h)).toBeNull();
+    await h.click('#term-min');
     expect(h.el('chat').className).not.toContain('term');
     expect(h.window.location.search).toBe('?t=a1b2c3d4');
+    expect(frames(h)).toHaveLength(1);
+    expect(shown(h)).toBeNull();
+
+    // Back in, and it is the same element — not a second connection to the same session.
+    await h.click('#term-toggle');
+    expect(shown(h)).toBe(mounted);
+  });
+
+  it('keeps one window per topic, each attached across a switch', async () => {
+    // A single window following the topic would hang up on the one being left, which both
+    // surprises (the terminal you minimized is gone) and makes the switcher's marker pointless:
+    // at most one topic could ever be lit.
+    const h = await open({ terminal: true, replies: {} });
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4', 'b2c3d4e5']));
+    await h.click('#term-toggle');
+    expect(srcOf(h)).toBe('term/?arg=a1b2c3d4');
+
+    await h.click('[data-topic="b2c3d4e5"]');
+    // The other topic has no window, so switching lands in its chat rather than opening one.
+    expect(h.el('chat').className).not.toContain('term');
+    expect(h.window.location.search).toBe('?t=b2c3d4e5');
+    expect(frames(h)).toHaveLength(1);
+
+    await h.click('#term-toggle');
+    expect(srcOf(h)).toBe('term/?arg=b2c3d4e5');
+    expect(frames(h)).toHaveLength(2);
+
+    // And the first one was never unmounted, so its session is still attached.
+    await h.click('[data-topic="a1b2c3d4"]');
+    expect(srcOf(h)).toBe('term/?arg=a1b2c3d4');
+    expect(frames(h)).toHaveLength(2);
+  });
+
+  it('has no close button unless the daemon can end a session', async () => {
+    // Nothing here could end one, so the control that claims to does not exist. The alternative
+    // — a close that only hides — is the same word meaning two different things on two
+    // deployments.
+    const h = await open({ terminal: true });
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+    await h.click('#term-toggle');
+    expect(h.el('term-end').hidden).toBe(true);
+    expect(h.el('term-min').hidden).toBe(false);
+  });
+
+  it('ends the session on close, once confirmed', async () => {
+    const h = await open({ terminal: true, terminalEnd: true });
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+    await h.click('#term-toggle');
+    expect(h.el('term-end').hidden).toBe(false);
+
+    await h.click('#term-end');
+    expect(h.calls).toContainEqual({ path: 'api/terminal/end', body: { topic: 'a1b2c3d4' } });
+    // Unmounted only after the server said it worked — see below for the refusal.
+    expect(frames(h)).toHaveLength(0);
+    expect(h.el('chat').className).not.toContain('term');
+    expect(h.window.location.search).toBe('?t=a1b2c3d4');
+  });
+
+  it('asks before ending, and does nothing at all when the answer is no', async () => {
+    const h = await open({ terminal: true, terminalEnd: true, confirm: false });
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+    await h.click('#term-toggle');
+
+    await h.click('#term-end');
+    expect(h.calls.filter((c) => c.path === 'api/terminal/end')).toHaveLength(0);
+    expect(frames(h)).toHaveLength(1);
+    expect(h.el('chat').className).toContain('term');
+  });
+
+  it('keeps the window when the daemon refuses to end the session', async () => {
+    // The one outcome nobody could explain from the screen is a closed window over a session
+    // that is still alive — so a refusal says so and leaves everything where it was.
+    const h = await open({
+      terminal: true,
+      terminalEnd: true,
+      status: { 'api/terminal/end': 500 },
+      replies: { 'api/terminal/end': { error: 'could not end the terminal session: boom' } },
+    });
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+    await h.click('#term-toggle');
+
+    await h.click('#term-end');
+    await tick();
+    expect(h.alerts.join('\n')).toContain('boom');
+    expect(frames(h)).toHaveLength(1);
+    expect(h.el('chat').className).toContain('term');
+  });
+
+  it('marks the topics a terminal is attached to', async () => {
+    // Fed by the daemon's own count of live terminal connections, not by what this page has
+    // open — so a terminal opened on a phone marks the row on a laptop too.
+    const h = await open({ terminal: true });
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4', 'b2c3d4e5']));
+    expect(h.doc.querySelectorAll('.topic-term')).toHaveLength(0);
+
+    await h.emit({
+      t: 'topics',
+      topics: [
+        { id: 'a1b2c3d4', title: 'One', lastAt: 1000, running: false, msgCount: 0, term: true },
+        { id: 'b2c3d4e5', title: 'Two', lastAt: 999, running: false, msgCount: 0, term: false },
+      ],
+    });
+    const marked = [...h.doc.querySelectorAll('.topic-item')].filter((row) => row.querySelector('.topic-term'));
+    expect(marked).toHaveLength(1);
+    expect(marked[0]?.getAttribute('data-topic')).toBe('a1b2c3d4');
+  });
+
+  it('unmounts a deleted topic terminal', async () => {
+    // The row is gone, so the window has nothing left to belong to. It is only the window: the
+    // session outlives this exactly as it outlives a closed tab.
+    const h = await open({ terminal: true, replies: {} });
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4', 'b2c3d4e5']));
+    await h.click('#term-toggle');
+    expect(frames(h)).toHaveLength(1);
+
+    await h.click('[data-del="a1b2c3d4"]');
+    await tick();
+    expect(frames(h)).toHaveLength(0);
   });
 });

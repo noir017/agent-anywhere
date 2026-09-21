@@ -52,6 +52,7 @@ import {
   CreateTopicRequestSchema,
   ClearTopicsRequestSchema,
   DeleteTopicRequestSchema,
+  EndTerminalRequestSchema,
   LoginRequestSchema,
   MAX_BODY_BYTES,
   SendRequestSchema,
@@ -61,17 +62,28 @@ import {
 import type { WebRoom, WebuiInstance } from './room.js';
 import type { SsoRefusal, WebSso } from './sso.js';
 import { proxyRequest, proxyUpgrade, type UpstreamSet } from './terminal-proxy.js';
+import type { TerminalSessions } from './terminal-sessions.js';
 
 export interface WebServer {
   start(): Promise<void>;
   stop(): Promise<void>;
 }
 
-/** Where the terminal pane's ttyd is, and whether the pane exists at all. */
+/** Where the terminal pane's ttyd is, whether the pane exists, and its session bookkeeping. */
 export interface TerminalSettings {
   enabled: boolean;
   /** Resolved by `index.ts`; meaningless when `enabled` is false. */
   socket: string;
+  /**
+   * Who is attached and how a session ends — see `terminal-sessions.ts`.
+   *
+   * A live object riding along with two config values, because `index.ts` is where both ends
+   * of it meet: this server feeds it (every proxied handshake) and the room reads it (the
+   * topic list's marker). Constructing it here instead would leave the room with nothing to
+   * read, and making it a sixth parameter would separate it from the two settings it is
+   * meaningless without.
+   */
+  sessions: TerminalSessions;
 }
 
 /** Keeps proxies and NAT tables from dropping an idle stream. A comment line, not an event. */
@@ -293,6 +305,9 @@ const GUARDED: Route[] = [
   // off, so this table stays the complete answer to "what is reachable"; `terminalPage`
   // answers 404 when it is off, which is the truth about the route either way.
   { method: 'GET', path: '/term/', prefix: true, run: terminalPage },
+  // Ending a session, as opposed to closing a pane. Guarded like everything else, and refused
+  // outright when the operator configured no way to do it — see `terminal-sessions.ts`.
+  { method: 'POST', path: '/api/terminal/end', run: endTerminal },
 ];
 
 /**
@@ -376,7 +391,15 @@ function sendPage(
   instance: WebuiInstance,
   terminal: TerminalSettings
 ): void {
-  body(req, res, 200, Buffer.from(renderPage(instance.title, terminal.enabled, passwordLogin(instance)), 'utf8'), {
+  body(
+    req,
+    res,
+    200,
+    Buffer.from(
+      renderPage(instance.title, terminal.enabled, passwordLogin(instance), terminal.sessions.canEnd),
+      'utf8'
+    ),
+    {
     'Content-Type': 'text/html; charset=utf-8',
     // The page is the app; a stale cached copy after an upgrade is a support question.
     'Cache-Control': 'no-store',
@@ -601,6 +624,34 @@ function terminalPage({ req, res, url }: Req, ctx: Ctx): void {
 }
 
 /**
+ * End one topic's terminal session, by running the command the operator configured.
+ *
+ * Separate from closing the pane, which the page does by itself: dropping the iframe ends a
+ * connection, and a connection is not a session. This is the only route here that reaches
+ * outside the process, and it reaches exactly as far as `terminal.endCommand` says.
+ *
+ * The topic is checked against the store even though the command cannot be made to mean
+ * something else by an id that is merely unknown — because "which sessions may this page end"
+ * should have the same answer as "which topics does this room have", and an id from a page
+ * that has drifted out of date deserves a 404 rather than a subprocess.
+ */
+async function endTerminal({ req, res }: Req, ctx: Ctx): Promise<void> {
+  if (!ctx.terminal.enabled) return send(req, res, 404, { error: 'no such route' });
+  const parsed = await readBody(req, res, EndTerminalRequestSchema);
+  if (!parsed) return;
+  if (!ctx.room.topics.has(parsed.topic)) return send(req, res, 404, { error: 'no such topic' });
+  // 501 rather than 404: the route exists and the request was fine — this deployment simply
+  // never said what ending a session means. The page normally hides the button that gets here,
+  // so anyone seeing this is holding a page older than the config.
+  if (!ctx.terminal.sessions.canEnd) {
+    return send(req, res, 501, { error: 'this daemon has no terminal.endCommand configured' });
+  }
+  const result = await ctx.terminal.sessions.end(parsed.topic);
+  if (!result.ok) return send(req, res, 500, { error: result.error });
+  send(req, res, 200, { ok: true });
+}
+
+/**
  * The gate `route()` cannot be: an upgrade bypasses the request handler entirely.
  *
  * Everything `route()` does is redone here by hand, in the same order and for the same
@@ -641,6 +692,12 @@ function upgrade(req: IncomingMessage, socket: Socket, head: Buffer, ctx: Ctx): 
       // was no secret at all: 400 here and 401 for an id that does not exist is an oracle a
       // stranger could walk.
       if (!topicArgsOk(url, ctx)) return refuse(socket, 400, 'Bad Request');
+      // Count this pane against its topic for as long as the socket lives, so the switcher can
+      // mark which topics have a terminal attached. Only a handshake that is about to be
+      // proxied is counted — a refusal above is not a pane, and counting one would light a
+      // marker that nothing will ever put out.
+      const arg = url.searchParams.get('arg');
+      if (arg) ctx.terminal.sessions.attach(arg, socket);
       proxyUpgrade(req, socket, head, ctx.terminal.socket, ctx.upstreams);
     },
     () => refuse(socket, 500, 'Internal Server Error')

@@ -32,6 +32,7 @@ import { WebAuth } from './auth.js';
 import { CHANNEL, TopicStore, WebRoom, type WebuiInstance } from './room.js';
 import { createWebServer, type WebServer } from './server.js';
 import { WebSso } from './sso.js';
+import { TerminalSessions } from './terminal-sessions.js';
 
 export { WebRoom, TopicStore, type Topic, type WebuiInstance } from './room.js';
 
@@ -108,6 +109,12 @@ export function createWebuiAdapter(instance: WebuiInstance): PlatformAdapter {
   // The page is never without a room to be in, including on a brand-new install.
   topics.current();
   const room = new WebRoom(instance, topics);
+  // Owned here because both ends of it are wired here: the server feeds it (a pane attaches on
+  // every proxied handshake) and the room reads it (the switcher's terminal marker). Given the
+  // command up front, since whether a session can be ended at all decides whether the page
+  // renders a close button.
+  const sessions = new TerminalSessions(instance.terminal.endCommand);
+  room.useTerminalSessions(sessions);
   const server = createWebServer(
     room,
     new WebAuth({ token: instance.token }),
@@ -118,6 +125,7 @@ export function createWebuiAdapter(instance: WebuiInstance): PlatformAdapter {
       // of the terminal already share. The daemon's config lives here, so in a container it is
       // the bind mount, which is where ttyd can reach it without a second volume.
       socket: instance.terminal.socket ?? path.join(configDir(), `webui-term-${instance.id}.sock`),
+      sessions,
     },
     // Absent unless configured, and that absence is the whole of "SSO is off": the server has
     // no fallback path that half-trusts a header when there is nothing to verify it against.

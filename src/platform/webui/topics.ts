@@ -37,6 +37,14 @@ export interface Topic {
   /** Monotonic count of messages posted into this topic. */
   msgCount?: number;
   /**
+   * A terminal pane is attached to this topic right now — some page has it open, minimized or
+   * not. Derived like `running` and never persisted, and NOT the same claim as "a shell is
+   * alive over there": the daemon only ever sees the connection (see `terminal-sessions.ts`),
+   * so a session left running with every tab closed reports false here. Read it as "a page is
+   * attached", which is what the switcher's marker says.
+   */
+  term?: boolean;
+  /**
    * Where this topic's conversation is working, when the daemon gave the adapter a way to ask
    * (`PlatformAdapter.useWorkdirLookup`). Both halves are sent because they answer different
    * questions: `name` is the project you recognise at a glance in a 240px column, and `path` is

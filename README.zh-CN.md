@@ -204,9 +204,11 @@ access:
 断线重连从断点续传，而不是重新下载整个会话。一次 30 秒的流式回答，13 次更新被压成 3 次，
 字节数大约是原来的四分之一。发送带 nonce，所以页面可以放心重试。
 
-**可选的终端。** 打开之后，聊天页顶栏会多一个 `>_` 按钮，把聊天记录换成守护进程所在
-机器上的一个真终端——于是**任何** coding agent 的 CLI，连同它的 TUI，都能在同一个页面里
-直接跑。守护进程自己不实现终端：它只是把请求过同一道登录门之后，转发给你自己跑在 unix
+**可选的终端。** 打开之后，聊天页顶栏会多一个 `>_` 按钮，在聊天记录之上开出一个守护
+进程所在机器的真终端——于是**任何** coding agent 的 CLI，连同它的 TUI，都能在同一个页面里
+直接跑。它是**每个话题一个窗口**，右上角两个按钮是两件不同的事：最小化只是收起来，里面
+跑着的东西照常跑、连接也不断；关闭才是真的结束这个会话。话题列表会标出哪些话题开着终端。
+守护进程自己不实现终端：它只是把请求过同一道登录门之后，转发给你自己跑在 unix
 socket 上的 [`ttyd`](https://github.com/tsl0922/ttyd)。默认关闭，要自己打开。
 
 ```yaml
@@ -217,12 +219,16 @@ platforms:
     terminal:
       enabled: true
       socket: ~/.config/agent-anywhere/webui-term-web.sock   # 你的 ttyd 监听在哪
+      # 可选：怎么「结束一个会话」。不配的话窗口上就没有关闭按钮，只有最小化——
+      # 因为会话能在断线之后活下来是你那边的安排，不是这个守护进程的。
+      # 是 argv 数组，不是 shell 字符串。
+      endCommand: ["tmux", "-L", "aa-web", "kill-session", "-t", "aa-{topic}"]
 ```
 
 ```bash
 # 另一半不归这个包管。wrapper 里要套一层 tmux——否则关掉标签页，
 # 里面正在跑的东西会跟着被 SIGHUP 掉。
-printf '#!/bin/sh\nexec tmux new -A -s "aa-$1"\n' > /usr/local/bin/aa-terminal.sh
+printf '#!/bin/sh\nexec tmux -L aa-web new -A -s "aa-$1"\n' > /usr/local/bin/aa-terminal.sh
 chmod +x /usr/local/bin/aa-terminal.sh
 ttyd -i ~/.config/agent-anywhere/webui-term-web.sock -b /term -W -a -O \
      -T xterm-256color /usr/local/bin/aa-terminal.sh

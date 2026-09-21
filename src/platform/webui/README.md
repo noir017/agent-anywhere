@@ -50,6 +50,7 @@ naming it, and they are all of them:
 | `auth.ts` | Shared-secret login, session cookies, brute-force throttle |
 | `sso.ts` | The other door: an RS256 assertion from the proxy in front, verified against its JWKS |
 | `terminal-proxy.ts` | Byte-for-byte reverse proxy to the terminal's ttyd over a unix socket. Speaks no WebSocket. |
+| `terminal-sessions.ts` | The bookkeeping either side of those bytes: who is attached, and the operator's command for ending a session |
 | `protocol.ts` | `.strict()` zod schemas for every inbound body; the outbound event union |
 | `page.ts` | The whole page (HTML + CSS + JS) as a module-level string |
 | `manifest.ts` | The web app manifest and the icon, as strings, for the same reason `page.ts` is one |
@@ -298,9 +299,9 @@ last — anything painted while it is up, including a message typed into the gap
 
 ## The terminal pane
 
-Off by default. Turned on, the chat header grows a `>_` button that replaces the transcript
-and composer with a real terminal — a shell in this machine, in which any coding-agent CLI can
-be run directly, TUI and all.
+Off by default. Turned on, the chat header grows a `>_` button that opens a terminal **window**
+over the transcript — a shell in this machine, in which any coding-agent CLI can be run
+directly, TUI and all.
 
 **The daemon owns none of it.** It does not spawn a PTY and does not speak the terminal's
 protocol; it proxies, behind the session cookie, to a [`ttyd`](https://github.com/tsl0922/ttyd)
@@ -321,6 +322,33 @@ What the pane shows is whatever that ttyd was told to run. That is exactly why i
 CLI — and also why nothing in it reaches the conversation: no transcript, no reverse CLI, no
 topic history. The two share a topic id and nothing else.
 
+### A window per topic, and what its two buttons mean
+
+The window belongs to a topic, not to the page. Its title bar carries exactly two controls, and
+the whole design is in the difference between them:
+
+- **Minimize** hides it. The iframe stays mounted and its WebSocket stays up, so coming back is
+  a repaint rather than a reconnect — and the switcher's marker stays lit.
+- **Close** ends the session, after a confirmation. It is a server round trip, not a teardown,
+  because dropping an iframe only hangs up on a shell that carries on without us.
+
+Switching topics therefore does not move one window around: each topic keeps its own, mounted
+and attached until it is closed. The alternative — a single window following whichever topic is
+on screen — hangs up on the topic being left, which surprises (the terminal you minimized is
+gone) and makes the marker meaningless, since at most one topic could ever be lit.
+
+The marker itself is a `>_` glyph on the topic row, fed by `terminal-sessions.ts` counting the
+**live connections** this daemon is proxying. Read it as "a page is attached to this topic's
+terminal", not "a shell is alive over there" — those differ, and the difference is visible:
+close every tab and every marker goes out while the sessions carry on. Counting connections is
+the most this process can honestly know, because it is the only part of the terminal it touches.
+
+Closing has to be a configured command for the same reason. A session survives a dropped
+connection only because the operator's wrapper is `tmux new -A`; ttyd itself SIGHUPs its child.
+Only they can say how that is reversed, so `terminal.endCommand` is theirs to write — and where
+they have not written one, the window has **no close button at all** rather than one that
+cannot work.
+
 ### Wiring
 
 ```yaml
@@ -332,6 +360,9 @@ platforms:
       enabled: true
       # Defaults to webui-term-<instance>.sock beside the daemon's own state.
       socket: /home/user/.config/agent-anywhere/webui-term-web.sock
+      # Optional. Without it there is no close button — only minimize.
+      # argv, never a shell string; {topic} is substituted into each element.
+      endCommand: ["tmux", "-L", "aa-web", "kill-session", "-t", "aa-{topic}"]
 ```
 
 and, outside this package, a ttyd on that socket:
@@ -347,7 +378,8 @@ terminal per topic; the daemon passes `?arg=<topic id>`.
 
 The wrapper is expected to be `tmux new -A -s aa-<topic>` or equivalent. Without something
 holding the session, ttyd forks a fresh process per connection and SIGHUPs it on disconnect — so
-switching apps on a phone would kill whatever was running. With tmux, a drop is a redraw.
+switching apps on a phone would kill whatever was running. With tmux, a drop is a redraw — and
+`endCommand` is how the page gets to undo that on purpose.
 
 ### Security
 
@@ -364,6 +396,10 @@ Three things are load-bearing and none of them are obvious.
    that exemption exists for has no business here.
 3. **`?arg=` is a browser string that reaches an exec.** It is checked against the topic store
    before ttyd sees it, and again by a pattern in the wrapper on the far side.
+4. **`endCommand` is a second string from the browser reaching a command.** It runs through
+   `execFile` with an argv array — no shell — so a substituted id is an argument and cannot
+   become syntax however it is spelled. The `^[0-9a-f]{8}$` pattern and the topic-store check
+   are the belt; the missing shell is the braces, and it is the one doing the work.
 
 Two costs accepted knowingly. The iframe is **same-origin, which is not a sandbox**: an XSS in
 ttyd's page would hold this session. A cross-origin frame would need `allow-same-origin` to keep
@@ -393,6 +429,11 @@ commands is not.
   first, wrongly, diagnosed as broken on mobile: the content was there, `tmux display` reported
   a correct 46×51 window, and only the pixels were missing). `-t rendererType=dom` is the first
   thing to try.
+- **A minimized window is still a mounted iframe.** That is the point — the connection is what
+  keeps the session attached and the marker lit — but it means visibility has to be a class on
+  the iframe, never an unmount, and never the `hidden` attribute either: the rule that sizes an
+  iframe (`display:block`) beats the user agent's `[hidden]{display:none}`, and the loser of
+  that fight is not obvious from reading either rule.
 
 ## Security
 

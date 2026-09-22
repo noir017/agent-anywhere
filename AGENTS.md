@@ -107,7 +107,7 @@ edits are `void`-and-`catch`: a failure is logged and the turn continues.
 
 ## Testing
 
-Vitest, colocated: `foo.ts` is tested by `foo.test.ts` in the same directory. ~1845
+Vitest, colocated: `foo.ts` is tested by `foo.test.ts` in the same directory. ~1880
 tests across 95 files.
 
 ```bash

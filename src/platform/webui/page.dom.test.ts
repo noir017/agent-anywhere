@@ -456,6 +456,72 @@ describe('webui page: rendering', () => {
   });
 });
 
+describe('webui page: a picture the agent sent', () => {
+  /** A file message in the shape `index.ts` `sendFile` builds it. */
+  function fileMessage(id: string, name: string, image: boolean): Record<string, unknown> {
+    return { ...message(id, '<p>here</p>'), file: { name, url: 'f/abc123', ...(image ? { image: true } : {}) } };
+  }
+
+  it('draws an image in the bubble, and keeps the link that saves it', async () => {
+    const h = await open();
+    await h.emit(sync('a1b2c3d4', [fileMessage('m1', 'shot.png', true)], ['a1b2c3d4']));
+
+    const img = h.doc.querySelector('#log img.shot') as HTMLImageElement | null;
+    expect(img?.getAttribute('src')).toBe('f/abc123');
+    // The name, not an empty alt: a picture that fails to load still has to say what it was.
+    expect(img?.getAttribute('alt')).toBe('shot.png');
+    // The link is not replaced by the picture. It is the only route onto disk, and `download`
+    // is what overrides the `inline` disposition the server now sends for an image.
+    const link = h.doc.querySelector('#log .files a') as HTMLAnchorElement | null;
+    expect(link?.textContent).toBe('shot.png');
+    expect(link?.hasAttribute('download')).toBe(true);
+  });
+
+  it('leaves a file the server would not serve as an image as a link alone', async () => {
+    // `image` is the server's answer, not the page's guess — a .pdf drawn into an <img> would
+    // be a permanently broken frame under every document an agent ever sends.
+    const h = await open();
+    await h.emit(sync('a1b2c3d4', [fileMessage('m1', 'report.pdf', false)], ['a1b2c3d4']));
+
+    expect(h.doc.querySelector('#log img.shot')).toBeNull();
+    expect(h.doc.querySelector('#log .files a')?.textContent).toBe('report.pdf');
+  });
+
+  it('opens the picture full-screen when it is tapped, and closes on a click or Escape', async () => {
+    const h = await open();
+    await h.emit(sync('a1b2c3d4', [fileMessage('m1', 'shot.png', true)], ['a1b2c3d4']));
+    expect(h.el('lightbox').hidden).toBe(true);
+
+    await h.click('#log img.shot');
+    expect(h.el('lightbox').hidden).toBe(false);
+    // `.src` resolved against the document, which is what keeps the relative `f/<token>` working
+    // when a reverse proxy mounts this page under a sub-path.
+    expect(h.el('lightbox-img').getAttribute('src')).toBe('http://localhost:8787/f/abc123');
+
+    await h.click('#lightbox');
+    expect(h.el('lightbox').hidden).toBe(true);
+    // Dropped, not left decoded behind an invisible overlay for the life of the daemon.
+    expect(h.el('lightbox-img').hasAttribute('src')).toBe(false);
+
+    await h.click('#log img.shot');
+    expect(h.el('lightbox').hidden).toBe(false);
+    h.doc.dispatchEvent(new h.window.KeyboardEvent('keydown', { key: 'Escape' }));
+    expect(h.el('lightbox').hidden).toBe(true);
+  });
+
+  it('hides a picture whose file is gone rather than showing a broken frame', async () => {
+    // The download table holds 200 files across every topic, so scrolling back far enough finds
+    // one that 404s. The link stays — that is what every non-image shows anyway.
+    const h = await open();
+    await h.emit(sync('a1b2c3d4', [fileMessage('m1', 'shot.png', true)], ['a1b2c3d4']));
+
+    const img = h.doc.querySelector('#log img.shot') as HTMLImageElement;
+    img.dispatchEvent(new h.window.Event('error'));
+    expect(img.style.display).toBe('none');
+    expect(h.doc.querySelector('#log .files a')).not.toBeNull();
+  });
+});
+
 describe('webui page: the gate', () => {
   it('asks for the token and posts it, when the shared secret is still a door', async () => {
     const h = await open();

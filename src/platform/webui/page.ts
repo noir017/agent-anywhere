@@ -287,6 +287,15 @@ button:disabled{opacity:.5;cursor:default}
 #chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
 .chip{background:var(--field);border:1px solid var(--line);border-radius:3px;padding:1px 6px;font-size:12px;color:var(--dim)}
 .files{margin-top:6px;display:flex;flex-wrap:wrap;gap:6px}
+/* A picture the agent sent, drawn in the bubble. Capped in both directions: a screenshot of a
+   4K display would otherwise push the timestamp and everything after it off the fold, and the
+   point of showing it here is to recognise it, not to read it — that is what tapping is for. */
+.shot{display:block;margin-top:6px;max-width:100%;max-height:340px;border:1px solid var(--line);border-radius:4px;cursor:zoom-in}
+/* The tapped-open view. display:flex has to be restated under [hidden] or it beats the
+   attribute's UA display:none and the overlay is never actually hidden. */
+#lightbox{position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.88);display:flex;align-items:center;justify-content:center;padding:12px;cursor:zoom-out}
+#lightbox[hidden]{display:none}
+#lightbox img{max-width:100%;max-height:100%;object-fit:contain}
 #row{display:flex;gap:8px;align-items:flex-end}
 #input{flex:1;resize:none;max-height:40vh;max-height:40dvh;padding:8px 10px;background:var(--field);color:var(--fg);border:1px solid var(--line);border-radius:4px;font:inherit;overflow-y:auto}
 #input:focus,#login input:focus{outline:none;border-color:#3d3d3d}
@@ -352,7 +361,8 @@ const SCRIPT = `
       expandBtn=$('expand-sidebar'), newTopicBtn=$('new-topic'), backdrop=$('backdrop'),
       clearBtn=$('clear-topics'), chatTitle=$('topic-title'), chatStatus=$('topic-status'),
       chat=$('chat'), termBtn=$('term-toggle'), termHost=$('term-frames'),
-      termName=$('term-name'), termMinBtn=$('term-min'), termEndBtn=$('term-end');
+      termName=$('term-name'), termMinBtn=$('term-min'), termEndBtn=$('term-end'),
+      lightbox=$('lightbox'), lightboxImg=$('lightbox-img');
   var data={}, els={}, files=[], commands=[], stream=null, done=false;
   // Last markup written per message, so a sync that re-sends an unchanged message touches no DOM.
   var sig={};
@@ -650,7 +660,14 @@ const SCRIPT = `
     var h='';
     if(m.quote && m.quote.html) h += '<div class="q">'+m.quote.html+'</div>';
     h += '<div class="b">'+m.html+'</div>';
-    if(m.file) h += '<div class="files"><a href="'+text(m.file.url)+'" download>'+text(m.file.name)+'</a></div>';
+    if(m.file){
+      // An image is drawn, not just named — a screenshot the agent took is about to be looked
+      // at, and a round trip through the downloads folder to do that is the friction this
+      // exists to remove. The link stays underneath either way: it is still the only way to
+      // get the bytes onto disk, and it is what a picture that fails to load degrades to.
+      if(m.file.image) h += '<img class="shot" src="'+text(m.file.url)+'" alt="'+text(m.file.name)+'" loading="lazy">';
+      h += '<div class="files"><a href="'+text(m.file.url)+'" download>'+text(m.file.name)+'</a></div>';
+    }
     // Buttons are dropped from a message that came out of the cache: the process that would
     // answer them is gone, and the id they name now means a different message or nothing at
     // all. A control that cannot act is worse than no control.
@@ -1383,6 +1400,11 @@ const SCRIPT = `
   });
 
   log.addEventListener('click', function(e){
+    // A picture, filling the screen. Not a new tab: installed as an app this page has no tab
+    // bar to come back from, and leaving the app to look at a screenshot is the same friction
+    // as downloading it. Checked first — a picture carries none of the attributes below.
+    var shot = e.target.closest ? e.target.closest('img.shot') : null;
+    if(shot) return openShot(shot);
     // What a message that failed to send offers. Checked before the ordinary buttons: these are
     // answered here, locally, and never posted as a click on a message the daemon has no idea
     // about.
@@ -1402,6 +1424,35 @@ const SCRIPT = `
     post('api/click',{topic:topic,messageId:b.getAttribute('data-msg'),buttonId:b.getAttribute('data-btn')},2)
       .catch(function(){ b.disabled=false; });
   });
+
+  /**
+   * A file the download table has since evicted, or one deleted off disk, answers 404 — and an
+   * <img> says so with a broken frame that reads like a bug in the page. Hide it and the link
+   * underneath is left, which is what a non-image shows anyway.
+   *
+   * Capture phase, because 'error' on an <img> does not bubble and so never reaches #log on its
+   * own. The hiding survives a repaint for free: identical markup is not rewritten, and markup
+   * that IS rewritten builds an image that 404s again.
+   */
+  log.addEventListener('error', function(e){
+    var t = e.target;
+    if(t && t.classList && t.classList.contains('shot')) t.style.display='none';
+  }, true);
+
+  function openShot(img){
+    lightboxImg.src = img.src;
+    lightboxImg.alt = img.alt;
+    lightbox.hidden = false;
+  }
+  function closeShot(){
+    if(lightbox.hidden) return;
+    lightbox.hidden = true;
+    // Dropped rather than left behind: a full-resolution screenshot held decoded by an overlay
+    // nobody is looking at is the kind of thing a daemon running for weeks pays for.
+    lightboxImg.removeAttribute('src');
+  }
+  lightbox.addEventListener('click', closeShot);
+  document.addEventListener('keydown', function(e){ if(e.key === 'Escape') closeShot(); });
 
   // Grow to fit, and let the max-height in the stylesheet decide where to stop — it is stated
   // in dvh there, which on a phone with the keyboard up is the viewport that is actually left.
@@ -1717,6 +1768,9 @@ __GATE__
     </div>
   </aside>
   <div id="backdrop" hidden></div>
+  <!-- Filled in and revealed when a picture in the log is tapped. One node reused for every
+       image, rather than one per message: the transcript holds hundreds. -->
+  <div id="lightbox" hidden><img id="lightbox-img" alt=""></div>
   <section id="chat">
     <div id="chat-header">
       <button type="button" class="btn-icon" id="expand-sidebar" title="Show topics" hidden>☰</button>

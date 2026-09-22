@@ -477,6 +477,9 @@ is behind it is an agent with full tool access.
 5. **Downloads are opaque tokens, served `attachment` + `nosniff` as
    `application/octet-stream`** — never the file's own type, so an agent-sent `.html` cannot
    render on this origin. A path never reaches the browser and the browser can never name one.
+   The one exception is [a raster image](#showing-a-picture-instead-of-a-download), which is
+   served as itself so the page can draw it; `nosniff` is what keeps that from being a hole,
+   and SVG is deliberately not in the set.
 6. **Uploads become `data:` URLs**, the shape `adapter-telegram` already uses, so
    `daemon/attachment-io.ts` handles them through its existing branch and its SSRF guard has
    nothing to act on. A temp file and a `file://` URL would be refused by that guard outright.
@@ -491,6 +494,39 @@ is behind it is an agent with full tool access.
 **Not solved here:** TLS (put a reverse proxy in front), and DNS rebinding — a `Host`
 allowlist would break the reverse-proxy deployment this is expected to run behind, so the
 shared secret is what stands in its place.
+
+### Showing a picture instead of a download
+
+Point 5 has an exception, and it is the only place in this directory where a file leaves the
+daemon as its own type. An agent that takes a screenshot is expecting it to be *looked at*, and
+a download that has to be found in a folder and opened in another application is not that.
+
+`room.ts` `inlineImageType` is the whole of the decision — one closed list of raster formats,
+read by both ends so the tag the page writes and the headers the server sends cannot disagree
+about the same file. `server.ts` uses it to pick `Content-Type` and `inline`; `index.ts` uses it
+to set `file.image`, which is what makes the page draw an `<img>` instead of only a link.
+
+Three things hold it up:
+
+- **No SVG.** An `.svg` is XML with `<script>` in it that a browser runs as a document. It is
+  the one image format that is also code, and it stays an octet-stream attachment — as do
+  `.pdf` (a document format browsers render, with its own scripting) and everything else.
+- **`nosniff` is what makes trusting the extension safe.** A file merely *named* `.png` is
+  served as `image/png` and the browser is then forbidden from sniffing a document back out of
+  it. It renders as a broken image, which is the correct outcome; without that header the same
+  file would be stored XSS on the origin holding this session's cookie.
+- **The link stays.** The picture is drawn *above* the download link, never instead of it — the
+  link is still the only way to get the bytes onto disk, and it is what a picture whose file has
+  since been evicted from the download table degrades to (the page hides the broken frame).
+
+Tapping a picture fills the screen with it. Deliberately not a new tab: installed as an app
+this page has no tab bar to come back from, and leaving the app to look at a screenshot is the
+same friction the feature exists to remove.
+
+The operator's *own* uploads are still shown as named chips, not thumbnails. They are base64 in
+the request body and deliberately never stored — see [the local transcript
+cache](#the-local-transcript-cache) for why that is the same reason a failed message cannot be
+retried after a reload.
 
 ### The other door: `sso.ts`
 

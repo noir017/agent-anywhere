@@ -59,7 +59,7 @@ import {
   parseBody,
   type WebEvent,
 } from './protocol.js';
-import type { WebRoom, WebuiInstance } from './room.js';
+import { inlineImageType, type WebRoom, type WebuiInstance } from './room.js';
 import type { SsoRefusal, WebSso } from './sso.js';
 import { proxyRequest, proxyUpgrade, type UpstreamSet } from './terminal-proxy.js';
 import type { TerminalSessions } from './terminal-sessions.js';
@@ -589,21 +589,31 @@ async function download(req: IncomingMessage, res: ServerResponse, room: WebRoom
     () => undefined
   );
   if (size === undefined) return send(req, res, 404, { error: 'that file is no longer on disk' });
+  // Never the file's own type, and always an attachment: an agent that sent an .html or .svg
+  // would otherwise get it rendered on this origin, holding this session's cookie.
+  //
+  // The one exception is a raster image, which the page shows inline and therefore has to be
+  // served as itself. `inlineImageType` is the closed list and carries the argument for why
+  // that is safe; the rule it does not bend is `nosniff`, which is what stops a document being
+  // sniffed out of a file merely NAMED .png.
+  const image = inlineImageType(entry.name);
   res.writeHead(200, {
-    // Never the file's own type, and always an attachment: an agent that sent an .html or .svg
-    // would otherwise get it rendered on this origin, holding this session's cookie.
-    'Content-Type': 'application/octet-stream',
+    'Content-Type': image ?? 'application/octet-stream',
     'Content-Length': size,
-    'Content-Disposition': disposition(entry.name),
+    'Content-Disposition': disposition(entry.name, image !== undefined),
     'X-Content-Type-Options': 'nosniff',
+    // Belt and braces for the inline case: even a browser that ignored the two headers above
+    // and decided to treat this as a document would find a sandbox with no scripts and an
+    // opaque origin, which is nobody's session.
+    ...(image ? { 'Content-Security-Policy': "default-src 'none'; sandbox" } : {}),
   });
   createReadStream(entry.path).pipe(res);
 }
 
 /** A `Content-Disposition` a filename cannot break out of, in both the ASCII and UTF-8 forms. */
-function disposition(name: string): string {
+function disposition(name: string, inline = false): string {
   const ascii = name.replace(/[^\w.\- ]/g, '_') || 'download';
-  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
+  return `${inline ? 'inline' : 'attachment'}; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

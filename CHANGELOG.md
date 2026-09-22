@@ -5,6 +5,31 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **The web UI shows a picture the agent sent, instead of only naming it.** A screenshot arrived
+  as a link called `shot.png`, and looking at it meant downloading it, finding it in a folder and
+  opening it somewhere else — three steps to see something the agent had just produced *so that
+  you would look at it*. Images now draw in the bubble, capped so a 4K screenshot does not push
+  the rest of the transcript off the fold, and tapping one fills the screen. Not a new tab:
+  installed as an app there is no tab bar to come back from, so leaving the app would have been
+  the same friction in a different shape. The download link stays underneath — it is still the
+  only route onto disk, and it is what a picture whose file has since been evicted degrades to.
+
+  This bends the rule that every published file leaves the daemon as `application/octet-stream;
+  attachment`, which exists so an agent-sent `.html` cannot render on the origin holding the
+  session cookie. The exception is a closed list of raster formats decided in one place
+  (`inlineImageType`), read by both the page and the server so they cannot disagree about the
+  same file. SVG is deliberately not in it — it is XML with `<script>` in it that a browser runs
+  as a document, the one image format that is also code — and neither is PDF. What makes trusting
+  the extension safe is `nosniff`, which pins a file merely *named* `.png` to the type we
+  declared: it renders as a broken image rather than as a document. Inline responses also carry
+  `default-src 'none'; sandbox`, for the browser that ignores the other two headers.
+
+  Your own uploads are still shown as named chips rather than thumbnails. They are base64 in the
+  request body and never stored, which is the same reason a failed message cannot be retried
+  after a reload.
+
 ## [1.27.0] - 2026-09-22
 
 ### Changed

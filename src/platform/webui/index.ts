@@ -29,7 +29,7 @@ import type { MessageRef, SlashCommandSpec } from '../../types.js';
 import type { PlatformAdapter } from '../adapter.js';
 import { renderWebMarkdown } from '../web-markdown.js';
 import { WebAuth } from './auth.js';
-import { CHANNEL, TopicStore, WebRoom, type WebuiInstance } from './room.js';
+import { CHANNEL, inlineImageType, TopicStore, WebRoom, type WebuiInstance } from './room.js';
 import { createWebServer, type WebServer } from './server.js';
 import { WebSso } from './sso.js';
 import { TerminalSessions } from './terminal-sessions.js';
@@ -198,7 +198,15 @@ function outbound(room: WebRoom, instance: WebuiInstance): Outbound {
       const name = file.name ?? file.path.split('/').pop() ?? 'file';
       const url = room.publish(file.path, name);
       const caption = file.caption ?? '';
-      return ref(topic, room.post(topic, { own: false, html: renderWebMarkdown(caption), file: { name, url } }, caption).id);
+      // A screenshot the agent just took is worth more on screen than in the downloads folder,
+      // so an image says so and the page draws it. Everything else stays a link, including the
+      // formats that only *look* like images — see `inlineImageType` for which and why.
+      const image = inlineImageType(name) !== undefined;
+      return ref(
+        topic,
+        room.post(topic, { own: false, html: renderWebMarkdown(caption), file: { name, url, ...(image ? { image } : {}) } }, caption)
+          .id
+      );
     },
     async replyMessage(r, text) {
       // A quote of the message being answered, which is all "native reply" can mean on a page

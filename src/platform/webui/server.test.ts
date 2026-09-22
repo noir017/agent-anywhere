@@ -664,6 +664,34 @@ describe('webui server: traffic', () => {
     expect(res.headers.get('x-content-type-options')).toBe('nosniff');
   });
 
+  it('serves a raster image as itself, so the page can show it', async () => {
+    const { base, room } = await boot();
+    const cookie = await signIn(base);
+    const url = room.publish(new URL(import.meta.url).pathname, 'shot.png');
+    const res = await fetch(`${base}/${url}`, { headers: { cookie } });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe('image/png');
+    expect(res.headers.get('content-disposition')).toContain('inline');
+    // The inline exception rests entirely on this: a file merely NAMED .png is pinned to the
+    // type we declared, so a document cannot be sniffed back out of one.
+    expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(res.headers.get('content-security-policy')).toContain('sandbox');
+  });
+
+  it.each([
+    ['an .svg, which is XML a browser runs', 'diagram.svg'],
+    ['a .pdf, which browsers render and which scripts', 'report.pdf'],
+    ['an extensionless name', 'screenshot'],
+    ['a name whose extension only looks like one', 'notes.png.html'],
+  ])('keeps %s a download', async (_label, name) => {
+    const { base, room } = await boot();
+    const cookie = await signIn(base);
+    const url = room.publish(new URL(import.meta.url).pathname, name);
+    const res = await fetch(`${base}/${url}`, { headers: { cookie } });
+    expect(res.headers.get('content-type')).toBe('application/octet-stream');
+    expect(res.headers.get('content-disposition')).toContain('attachment');
+  });
+
   it.each([
     ['an unknown token', 'f/deadbeef'],
     ['a path instead of a token', 'f/..%2F..%2Fetc%2Fpasswd'],

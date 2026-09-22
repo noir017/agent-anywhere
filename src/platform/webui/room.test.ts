@@ -5,7 +5,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import { MessageNotEditableError } from '../../core/outbound-errors.js';
 import { WebuiConfigSchema } from '../config-schemas.js';
-import { CHANNEL, DIR_TTL_MS, OWNER, WebRoom, type WebuiInstance } from './room.js';
+import { CHANNEL, DIR_TTL_MS, inlineImageType, OWNER, WebRoom, type WebuiInstance } from './room.js';
 import { TopicStore } from './topics.js';
 import type { InboundMessage } from '../../types.js';
 import type { WebEvent, WebMessage } from './protocol.js';
@@ -569,6 +569,38 @@ describe('WebRoom: outbound basics', () => {
     expect(url).toMatch(/^f\/[0-9a-f]{32}$/);
     expect(url).not.toContain('tmp');
     expect(room.resolveDownload(url.slice(2))).toEqual({ path: '/tmp/report.pdf', name: 'report.pdf' });
+  });
+});
+
+describe('WebRoom: which files may be shown instead of downloaded', () => {
+  it.each([
+    ['shot.png', 'image/png'],
+    ['photo.JPG', 'image/jpeg'],
+    ['photo.jpeg', 'image/jpeg'],
+    ['anim.gif', 'image/gif'],
+    ['pic.webp', 'image/webp'],
+    ['pic.avif', 'image/avif'],
+    ['old.bmp', 'image/bmp'],
+    ['a.name.with.dots.png', 'image/png'],
+  ])('shows %s as %s', (name, mime) => {
+    expect(inlineImageType(name)).toBe(mime);
+  });
+
+  it.each([
+    // The load-bearing one. An SVG is XML a browser runs as a document, so serving it as itself
+    // would put a <script> on the origin holding this session's cookie — which is the whole
+    // reason downloads are octet-stream in the first place.
+    'diagram.svg',
+    'page.html',
+    // Rendered by browsers, and scriptable. Not worth the argument for an inline preview.
+    'report.pdf',
+    // No browser displays one, so inline would mean a broken image where a download worked.
+    'scan.tiff',
+    // The extension is the last one, not any of them: this is a download whatever it is named.
+    'notes.png.html',
+    'screenshot',
+  ])('keeps %s a download', (name) => {
+    expect(inlineImageType(name)).toBeUndefined();
   });
 });
 

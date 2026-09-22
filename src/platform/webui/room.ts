@@ -854,6 +854,48 @@ function flagsOf(topics: Topic[]): string {
   return topics.map((t) => `${t.id}${t.live ? 'L' : ''}${t.asking ? 'A' : ''}${t.running ? 'R' : ''}`).join(',');
 }
 
+/**
+ * The image types a published file may be served as itself, instead of as an opaque download.
+ *
+ * Every other file leaves this daemon as `application/octet-stream; attachment` so that an
+ * agent-sent `.html` cannot render on the origin holding this session's cookie — see
+ * `server.ts` `download()`. An image has to break that rule to be visible at all, so the set
+ * is a closed list of RASTER formats and the decision is made in exactly one place.
+ *
+ * Two things make the exception safe, and both are load-bearing:
+ *
+ * - **No SVG.** An `.svg` is XML with `<script>` in it and a browser runs it as a document.
+ *   It is the one image format that is also code, and it stays a download.
+ * - **The extension is trusted only because `nosniff` pins it.** A file *named* `.png` whose
+ *   bytes are HTML is served as `image/png`, and `X-Content-Type-Options: nosniff` forbids the
+ *   browser from sniffing a document back out of it. It renders as a broken image, which is
+ *   the correct outcome; without `nosniff` the same file would be a stored XSS.
+ *
+ * Deliberately absent: PDF (a document format with its own scripting, which browsers render),
+ * and TIFF (which no browser displays — an inline TIFF would be a broken image where a
+ * download was useful).
+ */
+export function inlineImageType(name: string): string | undefined {
+  const ext = /\.([a-z0-9]+)$/i.exec(name)?.[1]?.toLowerCase();
+  switch (ext) {
+    case 'png':
+      return 'image/png';
+    case 'jpg':
+    case 'jpeg':
+      return 'image/jpeg';
+    case 'gif':
+      return 'image/gif';
+    case 'webp':
+      return 'image/webp';
+    case 'avif':
+      return 'image/avif';
+    case 'bmp':
+      return 'image/bmp';
+    default:
+      return undefined;
+  }
+}
+
 /** A browser upload, as the attachment pipeline wants it. */
 function toAttachment(file: { name: string; mime: string; data: string }): NonNullable<InboundMessage['attachments']>[number] {
   return {

@@ -217,8 +217,15 @@ export interface WebMessage {
   reactions: string[];
   /** Set when the agent used a native reply; rendered as a quote above the body. */
   quote?: { html: string };
-  /** Set when the message IS a file the agent sent. */
-  file?: { name: string; url: string };
+  /**
+   * Set when the message IS a file the agent sent.
+   *
+   * `image` says the download URL may be pointed at an `<img>`: the server will serve that one
+   * as itself rather than as an octet-stream attachment. The page does not decide this from the
+   * name — `room.ts` `inlineImageType` is the single place that answers it, so the tag the page
+   * writes and the headers the server sends can never disagree about the same file.
+   */
+  file?: { name: string; url: string; image?: boolean };
   /**
    * The `nonce` of the send this message is the echo of. Only ever set on the operator's own.
    *

@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.27.0] - 2026-09-22
+
 ### Changed
 
 - **The web UI's topic dot says what the topic is doing, rather than whether a turn is open.**

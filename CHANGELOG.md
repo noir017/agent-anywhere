@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.28.0] - 2026-09-22
+
 ### Added
 
 - **The web UI shows a picture the agent sent, instead of only naming it.** A screenshot arrived

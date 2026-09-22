@@ -678,6 +678,10 @@ export class Daemon {
       // does not exist when the adapters are built, and best-effort because it is decoration:
       // an adapter that does not implement it simply shows nothing.
       adapter.useWorkdirLookup?.((ref) => this.registry.workdirForRef(ref));
+      // …and one that can show whether the agent behind a conversation is still up. Same seam,
+      // same best-effort reading: a turn ending is not the agent ending, and nothing else tells
+      // the topic switcher that apart from a conversation whose child was reclaimed hours ago.
+      adapter.useLivenessLookup?.((ref) => this.registry.liveForRef(ref));
       await adapter.start();
       console.log(`[daemon] platform instance "${id}" (${adapter.platformType}) started`);
     }

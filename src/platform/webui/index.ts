@@ -262,7 +262,14 @@ function lifecycle(
   server: WebServer
 ): Pick<
   PlatformAdapter,
-  'onMessage' | 'onButton' | 'onCommand' | 'useWorkdirLookup' | 'registerCommands' | 'start' | 'stop'
+  | 'onMessage'
+  | 'onButton'
+  | 'onCommand'
+  | 'useWorkdirLookup'
+  | 'useLivenessLookup'
+  | 'registerCommands'
+  | 'start'
+  | 'stop'
 > {
   return {
     onMessage: (handler) => room.onMessage(handler),
@@ -273,6 +280,12 @@ function lifecycle(
      * open on different projects are indistinguishable there.
      */
     useWorkdirLookup: (lookup) => room.useWorkdirLookup(lookup),
+    /**
+     * Likewise the only implementor: a chat app's conversation list is the platform's, and this
+     * page draws its own — so it is the only one that can show that a topic which stopped talking
+     * an hour ago still has an agent behind it.
+     */
+    useLivenessLookup: (lookup) => room.useLivenessLookup(lookup),
     /**
      * Accepted and never called.
      *

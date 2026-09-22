@@ -129,6 +129,23 @@ export interface PlatformAdapter {
    */
   useWorkdirLookup?(lookup: (ref: ConversationRef) => string | undefined): void;
 
+  /**
+   * Hand the platform a way to ask whether the conversation at one of its addresses still has an
+   * agent process behind it.
+   *
+   * Same seam and same caveats as useWorkdirLookup (optional, web-UI-only, a lookup rather than a
+   * pushed value, best-effort decoration), answering the question its topic switcher could not:
+   * a turn ending does not end the agent, so a topic that just went quiet and a topic whose child
+   * was reclaimed an hour ago are two very different things — one answers instantly with its
+   * context in memory, the other has to resume from a session id first. Rendered identically they
+   * read as the same dead row.
+   *
+   * Deliberately NOT pushed for the same reason as the directory: nothing announces a reclaim (it
+   * happens on a timer, in a conversation by definition nobody is touching) and a child can also
+   * exit on its own, so every push would have to be found and none would cover a crash.
+   */
+  useLivenessLookup?(lookup: (ref: ConversationRef) => boolean): void;
+
   /** Send a message with buttons (used by clarify). */
   sendButtons(
     address: ConversationAddress,

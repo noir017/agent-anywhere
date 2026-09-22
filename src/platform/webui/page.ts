@@ -109,8 +109,17 @@ body{background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,-apple-system,
 #topics .topic-item{display:flex;align-items:center;gap:8px;width:100%;padding:7px 9px;border:1px solid transparent;border-radius:5px;background:none;text-align:left;font:inherit;font-size:13px;cursor:pointer;transition:background .15s;position:relative}
 #topics .topic-item:hover{background:#222}
 #topics .topic-item.on{background:#252525;border-color:var(--line)}
+/* Four states, and the dot is the only thing that carries all four. Read as one sentence: the
+   colour says whether the agent is there, the pulse says whether it is busy.
+     grey     — nothing resident. History, or a topic that will have to resume from a session id.
+     dim blue — an agent child is up and idle. Same blue, not doing anything.
+     blue     — a turn is executing.
+     amber    — a question is on screen and nothing moves until it is answered. Wins over running,
+                because during an ask the turn IS still open and would otherwise paint over it. */
 .topic-dot{width:7px;height:7px;border-radius:50%;flex:0 0 7px;background:#444}
+.topic-dot.live{background:#2b6a8f}
 .topic-dot.running{background:#38bdf8;box-shadow:0 0 6px rgba(56,189,248,.8);animation:pulse 1.5s infinite}
+.topic-dot.asking{background:#fbbf24;box-shadow:0 0 6px rgba(251,191,36,.8);animation:pulse 1.5s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
 /* Two lines in one row, so the second can hold the directory. min-width:0 is what lets either
    line actually ellipsis — without it a flex item refuses to shrink below its content and a
@@ -125,9 +134,14 @@ body{background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,-apple-system,
 #topics .topic-item.on.running .topic-title{color:#fff}
 #topics .topic-item.idle .topic-title{color:var(--dim)}
 #topics .topic-item.on.idle .topic-title{color:#a0a0a0}
+/* Quiet but not finished: half a step back from a running title, half a step ahead of a topic
+   with nothing behind it. The dot says which; this is so the eye finds the right row first. */
+#topics .topic-item.idle.live .topic-title{color:#9a9a9a}
+#topics .topic-item.on.idle.live .topic-title{color:#bcbcbc}
 .topic-badge{background:#2563eb;color:#fff;border-radius:9px;padding:1px 6px;font-size:11px;font-weight:600;line-height:1.3;margin-left:4px;flex-shrink:0}
-/* A terminal is attached to this topic. Deliberately not a second colour on .topic-dot: that
-   dot means an agent turn is executing, and the two are unrelated states that can both be true.
+/* A terminal is attached to this topic. Deliberately not a fifth colour on .topic-dot: that dot
+   is about the agent — whether one is resident, busy, or waiting on an answer — and a terminal is
+   an unrelated state that can be true alongside any of them.
    A prompt-shaped glyph says which of the two it is without a legend. */
 .topic-term{flex-shrink:0;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:9.5px;line-height:1;color:#4ade80;border:1px solid rgba(74,222,128,.35);border-radius:3px;padding:2px 3px;margin-left:4px}
 .topic-del{opacity:0;background:none;border:0;color:var(--dim);font:inherit;font-size:16px;line-height:1;padding:2px 5px;cursor:pointer;border-radius:3px;margin-left:auto;flex-shrink:0;transition:opacity .15s,color .15s,background .15s}
@@ -147,6 +161,7 @@ body{background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,-apple-system,
 .chat-title{font-weight:600;color:var(--fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:50ch}
 .chat-status{font-size:11.5px;color:var(--dim);text-transform:uppercase;letter-spacing:.04em}
 .chat-status.running{color:#38bdf8}
+.chat-status.asking{color:#fbbf24}
 /* The terminal takes the place of the transcript and the composer, not of the whole view: the
    header stays, so the sidebar button, the topic name and the way back out are all still
    where they were a moment ago. One class on #chat swaps the two.
@@ -920,6 +935,11 @@ const SCRIPT = `
       var isCur=(t.id===topic);
       if(isCur) cur=t;
       var isRunning=Boolean(t.running);
+      // A question on screen holds its turn open, so t.running is true at the same time. Asked
+      // first everywhere below: "waiting for you" is the state you can act on, and the one the
+      // running blue would otherwise hide.
+      var isAsking=Boolean(t.asking);
+      var isLive=Boolean(t.live);
       var count=t.msgCount||0;
       if(isCur){
         readCounts[t.id]=count;
@@ -930,8 +950,8 @@ const SCRIPT = `
         saveReads();
       }
       var unread=isCur?0:Math.max(0, count - readCounts[t.id]);
-      var cls='topic-item '+(isCur?'on ':'')+(isRunning?'running':'idle');
-      var dotCls='topic-dot'+(isRunning?' running':'');
+      var cls='topic-item '+(isCur?'on ':'')+(isRunning?'running':'idle')+(isLive?' live':'');
+      var dotCls='topic-dot'+(isAsking?' asking':(isRunning?' running':(isLive?' live':'')));
       var badge=unread>0?'<span class="topic-badge">'+(unread>99?'99+':unread)+'</span>':'';
       // Not "a shell is alive over there" — the daemon only sees the connection, so this says a
       // page has that topic's terminal open (shown or minimized). See terminal-sessions.ts.
@@ -953,8 +973,11 @@ const SCRIPT = `
     bar.innerHTML=h;
     if(cur){
       chatTitle.textContent=cur.title || 'Untitled';
-      chatStatus.textContent=cur.running ? 'running' : '';
-      chatStatus.className='chat-status'+(cur.running ? ' running' : '');
+      // Same order as the dot, and the same reason: during an ask the turn is still open, so
+      // "running" is true and is the less useful of the two things to say.
+      var state=cur.asking?'awaiting you':(cur.running?'running':'');
+      chatStatus.textContent=state;
+      chatStatus.className='chat-status'+(cur.asking?' asking':(cur.running?' running':''));
     } else {
       chatTitle.textContent='';
       chatStatus.textContent='';

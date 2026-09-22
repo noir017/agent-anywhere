@@ -34,6 +34,26 @@ export interface Topic {
   lastAt: number;
   /** True while an agent turn is actively executing in this topic. */
   running?: boolean;
+  /**
+   * A question is on screen here and nothing will move until it is answered.
+   *
+   * Derived from the room itself — a message still carrying live buttons — rather than asked of
+   * the daemon, because that is both the same fact and the only one the page can act on: every
+   * ask, elicitation round and menu is posted as buttons and retired by stripping them. Note that
+   * `running` is usually true at the same time (the turn the question belongs to is still open,
+   * typing and all), so a renderer that wants to say "waiting for you" has to check this FIRST.
+   */
+  asking?: boolean;
+  /**
+   * An agent child process is resident for this topic's conversation, whether or not a turn is
+   * running. Derived like `running` and never persisted; absent when no daemon offered the
+   * lookup (`PlatformAdapter.useLivenessLookup`), which is every platform but this one.
+   *
+   * The distinction it exists for: a turn ending does not end the agent, so "quiet for a minute
+   * with its context in memory" and "reclaimed an hour ago, nothing left running" are the same
+   * row without it — and they answer the next message very differently.
+   */
+  live?: boolean;
   /** Monotonic count of messages posted into this topic. */
   msgCount?: number;
   /**

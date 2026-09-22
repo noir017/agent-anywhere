@@ -90,7 +90,7 @@ as a Telegram forum topic, which is also why it is the second platform after Tel
 rename one — `retitleLane` refuses any address without a lane, so a design that gave each topic
 a channel of its own would have left `renameThread` permanently inert.
 
-**One adapter method is not in the matrix, because it is not a capability.**
+**Two adapter methods are not in the matrix, because they are not capabilities.**
 `useWorkdirLookup` hands an adapter a way to *ask* the daemon which directory the conversation
 at one of its addresses works in, and only the web UI implements it: a chat platform has
 nowhere to put the answer, while the page's topic switcher has a second line per row and,
@@ -98,6 +98,12 @@ without this, nothing to put in it. Optional rather than flagged — an adapter 
 implement it is simply never asked, the same shape `fetchAttachment` uses. Pull rather than
 push because the answer moves (`/cd`, a rebind) and because a restart leaves conversations that
 have a directory and no in-memory state at all; see the doc comment on the method for the rest.
+
+`useLivenessLookup` is the same seam for a different question: is an agent child still resident
+behind this conversation? A turn ending does not end the agent, so without it a topic that went
+quiet a minute ago and one whose child was reclaimed an hour ago are the same grey row. Pull for
+one more reason on top of the directory's: nothing *announces* a reclaim — it happens on a timer,
+in a conversation by definition nobody is touching — and a child can also exit on its own.
 
 **`menuPageSize` is a declaration, not a preference.** It says how many items one page of
 a button menu (`/cd`, `/model`, `/setting`) may hold here, and the limits are nowhere near

@@ -685,6 +685,41 @@ describe('webui page: topics', () => {
     expect(h.rows()).toBe(2);
     expect(h.painted()).toBe(1);
   });
+
+  it('paints the dot by what a topic is doing, not merely by whether a turn is open', async () => {
+    // Four states, and two of them only exist because a turn is a bad proxy for the agent: a
+    // question holds its turn OPEN while waiting on the user, and a turn ending does not stop
+    // the process. The row for each must not be the row for the other.
+    const h = await open();
+    await h.emit(
+      sync('a1b2c3d4', [], ['a1b2c3d4'], {
+        topics: [
+          { id: 'a1b2c3d4', title: 'asking', lastAt: 1000, running: true, asking: true, live: true, msgCount: 0 },
+          { id: 'b2c3d4e5', title: 'working', lastAt: 999, running: true, live: true, msgCount: 0 },
+          { id: 'c3d4e5f6', title: 'resident', lastAt: 998, running: false, live: true, msgCount: 0 },
+          { id: 'd4e5f6a7', title: 'cold', lastAt: 997, running: false, live: false, msgCount: 0 },
+        ],
+      })
+    );
+
+    expect(Array.from(h.doc.querySelectorAll('.topic-dot')).map((el) => el.className)).toEqual([
+      'topic-dot asking',
+      'topic-dot running',
+      'topic-dot live',
+      'topic-dot',
+    ]);
+    // The row a reclaimed topic gets is the one that says so, and it is not the one a topic with
+    // its context still in memory gets.
+    expect(Array.from(h.doc.querySelectorAll('.topic-item')).map((el) => el.className)).toEqual([
+      'topic-item on running live',
+      'topic-item running live',
+      'topic-item idle live',
+      'topic-item idle',
+    ]);
+    // And the header says the useful half of "running AND waiting on you".
+    expect(h.el('topic-status').textContent).toBe('awaiting you');
+    expect(h.el('topic-status').className).toBe('chat-status asking');
+  });
 });
 
 describe('webui page: a topic the daemon no longer has', () => {

@@ -5,6 +5,32 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **The web UI's topic dot says what the topic is doing, rather than whether a turn is open.**
+  Two states were being painted as something they are not. A question on screen kept the running
+  blue, because the turn it belongs to *is* still open and still typing — so the one row on the
+  sidebar that needed you to look at it looked exactly like the one grinding through a build. And
+  a topic whose turn had ended went grey immediately, alongside every topic from last week, even
+  though its agent was still resident with the whole conversation in memory and would answer the
+  next message instantly.
+
+  So the dot is now about the agent rather than about the turn: grey when nothing is resident,
+  dim blue when a child is up and idle, blue and pulsing while a turn runs, amber and pulsing
+  while a question is waiting on you. The header follows the same order and says "awaiting you"
+  where it used to say "running", because during an ask both are true and only one of them is
+  worth the space.
+
+  The waiting state is derived in the page's own room rather than asked of the daemon, since it
+  already holds the fact — every ask, elicitation round and menu arrives as a message with
+  buttons and is retired by stripping them. Residency is a new lookup the daemon hands to
+  adapters that can show it (`useLivenessLookup`, the same seam as the directory label), answered
+  from the same `reclaimState` the idle sweeper consults, so the sidebar and the sweeper cannot
+  disagree about what is running. That one is polled, and it is the only polled thing in the
+  module: everything that turns it on already announces the list, and nothing announces it going
+  off — an idle reclaim fires on a timer in a conversation nobody is touching, and a child that
+  crashed is quieter still.
+
 ## [1.26.0] - 2026-09-21
 
 ### Added

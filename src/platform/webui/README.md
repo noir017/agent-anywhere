@@ -113,6 +113,27 @@ lookup instead (`PlatformAdapter.useWorkdirLookup`), and `topicList()` asks it �
 `DIR_TTL_MS`, because the list is rebuilt on every posted message and the lookup stats the
 filesystem on the other side. A deployment that never offers one shows no second line at all.
 
+**The dot on each row is about the agent, not about the turn.** Four states, and two of them
+exist because "a turn is running" turned out to be a bad proxy for both of the things a person
+actually reads that column for:
+
+| dot | means | where it comes from |
+|---|---|---|
+| grey | nothing resident — history, or a topic that will have to resume from a session id | the absence of the two below |
+| dim blue | an agent child is up and idle | `PlatformAdapter.useLivenessLookup` |
+| blue, pulsing | a turn is executing | `startTyping` / `stopTyping` |
+| amber, pulsing | a question is on screen and nothing moves until it is answered | a message in the room still carrying buttons |
+
+`asking` is derived HERE rather than asked of the daemon, because the room already holds the
+fact: every ask, elicitation round and menu arrives as a message with buttons and is retired by
+stripping them. Note that it overlaps `running` rather than replacing it — the turn a question
+belongs to is still open, typing and all — so anything rendering this checks `asking` first.
+
+`live` is the one thing in this module that is POLLED (`LIVENESS_POLL_MS`). Everything that
+turns it on already announces the list; nothing announces it going off, because an idle reclaim
+fires on a timer in a conversation nobody is touching and a crashed child is quieter still. The
+poll skips itself while no browser is attached and sends only when a flag actually changed.
+
 **`access.allowFrom` identity is `<instance id>:owner`**, the same for every topic. An existing
 config that already lists other identities will silently ignore every message typed into this
 page until that entry is added — `doctor` checks for exactly this.

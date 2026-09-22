@@ -1880,18 +1880,42 @@ ${formatTokens(left)} left before compaction — ${name}`;
    * The directory the conversation at an ADDRESS works in — the lookup handed to any platform
    * that can display it (`PlatformAdapter.useWorkdirLookup`).
    *
-   * Takes the long way round through the scope and the alias table rather than letting the
-   * caller build a key, because neither is a platform's business to know: under `per_channel`
-   * every lane shares one conversation and therefore one directory, under `shared` all of them
-   * do, and an auto-threaded lane answers under the key of the conversation that opened it. A
-   * platform that formed the key itself would be right about the default scope and quietly
-   * wrong about the rest.
-   *
    * `boundAgentFor` rather than `agentIdOf` for the reason a `/cd` typed as the opening message
    * uses it: after a restart a topic has a persisted binding and no state, and falling through
    * to `routing.default` would report the wrong agent's root for every topic on the list.
    */
   workdirForRef(ref: ConversationRef): string | undefined {
+    const id = this.idForRef(ref);
+    return this.workdirOf(id, this.boundAgentFor(id, this.config.routing.default));
+  }
+
+  /**
+   * Whether the conversation at an ADDRESS still has an agent child resident — the lookup handed
+   * to a platform that can show it (`PlatformAdapter.useLivenessLookup`).
+   *
+   * The same question the idle sweeper asks before reclaiming, which is why it is answered from
+   * the same place: `reclaimState` is each runtime's own statement about its child, and a session
+   * HANDLE outliving that child is the normal state after a reclaim (see `reclaimSession`), so
+   * `peek` alone would report every conversation this process has ever run as still alive.
+   *
+   * A runtime that does not implement `reclaimState` reports not-live rather than live: the
+   * sweeper reads that absence conservatively too, and of the two possible lies "the agent is
+   * already up" is the one that would be believed.
+   */
+  liveForRef(ref: ConversationRef): boolean {
+    const session = this.agents.peek(this.idForRef(ref));
+    return (session?.reclaimState?.() ?? 'no-child') !== 'no-child';
+  }
+
+  /**
+   * The conversation an address belongs to, taking the long way round through the scope and the
+   * alias table rather than letting the caller build a key — because neither is a platform's
+   * business to know: under `per_channel` every lane shares one conversation, under `shared` all
+   * of them do, and an auto-threaded lane answers under the key of the conversation that opened
+   * it. A platform that formed the key itself would be right about the default scope and quietly
+   * wrong about the rest.
+   */
+  private idForRef(ref: ConversationRef): ConversationId {
     const scope = resolveScope(this.config, {
       platform: ref.platform,
       channel: ref.channel,
@@ -1902,8 +1926,7 @@ ${formatTokens(left)} left before compaction — ${name}`;
       isBot: false,
     });
     const raw = conversationKey(scope, ref);
-    const id = this.threadAliases.get(raw) ?? raw;
-    return this.workdirOf(id, this.boundAgentFor(id, this.config.routing.default));
+    return this.threadAliases.get(raw) ?? raw;
   }
 
   /**

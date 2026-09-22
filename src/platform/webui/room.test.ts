@@ -45,6 +45,9 @@ function attached(over?: Partial<WebuiInstance>): {
 
 const kinds = (seen: Seen[]): string[] => seen.map((s) => s.ev.t);
 const last = (seen: Seen[]): WebEvent | undefined => seen[seen.length - 1]?.ev;
+/** The last event of one kind: an edit that carries buttons now drags a topic list along behind it. */
+const lastOf = (seen: Seen[], t: WebEvent['t']): WebEvent | undefined =>
+  [...seen].reverse().find((s) => s.ev.t === t)?.ev;
 
 describe('WebRoom: topics are separate conversations', () => {
   it('keeps two topics' + " messages and streams apart", () => {
@@ -502,7 +505,7 @@ describe('WebRoom: outbound basics', () => {
     const msg = room.post(topic, { own: false, html: '', buttons: [{ id: 'ask:r:0', label: 'Yes' }] }, '');
     seen.length = 0;
     room.revise(topic, msg.id, 'answered', []);
-    expect((last(seen) as { msg: { buttons: unknown[] } }).msg.buttons).toEqual([]);
+    expect((lastOf(seen, 'msg') as { msg: { buttons: unknown[] } }).msg.buttons).toEqual([]);
   });
 
   it('an edit carrying buttons goes out at once, unlike a text-only one', () => {
@@ -638,5 +641,98 @@ describe('WebRoom: which directory a topic is working in', () => {
     expect(() => room.post(topic, { own: false, html: '<p>hi</p>' }, 'hi')).not.toThrow();
     expect(kinds(seen)).toContain('msg');
     expect(room.topicList().find((t) => t.id === topic)?.dir).toBeUndefined();
+  });
+});
+
+describe('WebRoom: what the switcher dot is saying', () => {
+  const flagsOf = (room: WebRoom, topic: string): { asking?: boolean; live?: boolean; running?: boolean } => {
+    const t = room.topicList().find((x) => x.id === topic);
+    return { asking: t?.asking, live: t?.live, running: t?.running };
+  };
+
+  it('marks a topic as waiting on the user for as long as its question is on screen', () => {
+    vi.useFakeTimers();
+    const { room, topic, seen } = attached();
+    expect(flagsOf(room, topic).asking).toBe(false);
+
+    // Every ask, elicitation round and menu reaches this platform as a message with buttons.
+    const msg = room.post(topic, { own: false, html: '', buttons: [{ id: 'ask:r:0', label: 'Yes' }] }, '?');
+    expect(flagsOf(room, topic).asking).toBe(true);
+
+    // …and is retired by stripping them, which is what has to put the dot back.
+    seen.length = 0;
+    room.revise(topic, msg.id, 'answered: Yes', []);
+    expect(flagsOf(room, topic).asking).toBe(false);
+    expect(kinds(seen)).toContain('topics');
+  });
+
+  it('keeps saying it is waiting while a menu turns its pages', () => {
+    // A page turn is an edit carrying buttons too. It changes nothing about who is waiting on
+    // whom, so it must not cost a redraw of every client's sidebar.
+    vi.useFakeTimers();
+    const { room, topic, seen } = attached();
+    const msg = room.post(topic, { own: false, html: '', buttons: [{ id: 'cd:p:1', label: 'Next' }] }, 'pick one');
+    seen.length = 0;
+
+    room.revise(topic, msg.id, 'pick one', [{ id: 'cd:p:2', label: 'Next' }]);
+
+    expect(flagsOf(room, topic).asking).toBe(true);
+    expect(kinds(seen)).not.toContain('topics');
+  });
+
+  it('stops waiting when the question is deleted rather than answered', () => {
+    // `/new` sweeps a topic's messages; an unanswered menu leaving that way must not leave the
+    // dot blinking at a question nobody can see.
+    const { room, topic } = attached();
+    const msg = room.post(topic, { own: false, html: '', buttons: [{ id: 'ask:r:0', label: 'Yes' }] }, '?');
+    room.remove(topic, msg.id);
+    expect(flagsOf(room, topic).asking).toBe(false);
+  });
+
+  it('reports no agent behind any topic when the daemon never offered a lookup', () => {
+    const { room, topic } = attached();
+    expect(flagsOf(room, topic).live).toBe(false);
+  });
+
+  it('separates a topic whose agent is still resident from one with nothing left running', () => {
+    const { room, topic } = attached();
+    const cold = room.createTopic('cold');
+    room.useLivenessLookup((ref) => ref.thread === topic);
+
+    const listed = room.topicList();
+    expect(listed.find((t) => t.id === topic)?.live).toBe(true);
+    expect(listed.find((t) => t.id === cold.id)?.live).toBe(false);
+  });
+
+  it('redraws the switcher when an agent goes away, which nothing else announces', () => {
+    // An idle reclaim happens on a timer in a conversation nobody is touching, so there is no
+    // message, no typing change and no click to hang the redraw off. Hence the poll.
+    vi.useFakeTimers();
+    const { room, topic, seen } = attached();
+    let up = true;
+    room.useLivenessLookup(() => up);
+    seen.length = 0;
+
+    // Nothing changed: the poll stays silent rather than re-sending the list every tick.
+    vi.advanceTimersByTime(60_000);
+    expect(kinds(seen)).not.toContain('topics');
+
+    up = false;
+    vi.advanceTimersByTime(60_000);
+    expect(kinds(seen)).toContain('topics');
+    expect((lastOf(seen, 'topics') as { topics: Array<{ id: string; live?: boolean }> }).topics
+      .find((t) => t.id === topic)?.live).toBe(false);
+  });
+
+  it('keeps posting messages when the liveness lookup throws', () => {
+    // Same rule as the directory lookup: it runs inside announceTopics, which runs inside post.
+    const { room, topic, seen } = attached();
+    room.useLivenessLookup(() => {
+      throw new Error('the registry is gone');
+    });
+
+    expect(() => room.post(topic, { own: false, html: '<p>hi</p>' }, 'hi')).not.toThrow();
+    expect(kinds(seen)).toContain('msg');
+    expect(flagsOf(room, topic).live).toBe(false);
   });
 });

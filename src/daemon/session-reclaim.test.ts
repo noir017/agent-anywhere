@@ -74,19 +74,35 @@ function rig(opts: RigOptions = {}) {
 
   const disposed: string[] = [];
   const sessions = new Map<string, AgentSession>();
+  // Whether each stub currently has a "child", the way both real runtimes track theirs: a turn
+  // spawns one and dispose tears it down, and reclaimState answers from that rather than from the
+  // handle's existence. Without it the stub would report a reclaimed session as still running,
+  // which is precisely the confusion liveForRef exists to clear up.
+  const down = new Set<string>();
   const factory: AgentFactory = {
     getOrCreate(conversationId) {
       let s = sessions.get(conversationId);
       if (!s) {
         s = {
           conversationId,
-          runTurn: opts.hang ? () => new Promise<void>(() => {}) : async () => {},
+          // A turn spawns the child before it does anything else, hang or no hang — otherwise the
+          // mid-turn test would be passing on "there is nothing to reclaim" instead of on the gate
+          // it is named for.
+          runTurn: () => {
+            down.delete(conversationId);
+            return opts.hang ? new Promise<void>(() => {}) : Promise.resolve();
+          },
           abort: () => {},
-          reclaimState: () => opts.reclaimState ?? 'resumable',
+          reclaimState: () => (down.has(conversationId) ? 'no-child' : (opts.reclaimState ?? 'resumable')),
           // Note what dispose does NOT do here, mirroring both real runtimes: the handle stays in
           // the map and rebuilds its child on the next turn.
-          dispose: () => void disposed.push(conversationId),
+          dispose: () => {
+            disposed.push(conversationId);
+            down.add(conversationId);
+          },
         };
+        // A handle built for a conversation that has not run a turn yet has no child either.
+        down.add(conversationId);
         sessions.set(conversationId, s);
       }
       return s;
@@ -103,6 +119,8 @@ function rig(opts: RigOptions = {}) {
     reg,
     disposed,
     factory,
+    /** Stand in for the spawn a real turn does, when a test replaces runTurn with its own. */
+    spawn: (id: ConversationId) => void down.delete(id),
     advance: (ms: number) => {
       t += ms;
     },
@@ -256,6 +274,7 @@ describe('idle reclaim', () => {
     const h = rig();
     const session = h.factory.getOrCreate(KEY, 'cc');
     (session as unknown as { runTurn: () => Promise<void> }).runTurn = () => turnPromise;
+    h.spawn(KEY);
 
     h.reg.route(inbound('hello', 'm1'));
     await new Promise((r) => setTimeout(r, 10));
@@ -267,5 +286,41 @@ describe('idle reclaim', () => {
     await drain();
 
     expect(h.disposed).toEqual([KEY]);
+  });
+});
+
+/**
+ * The same fact reclaim is built on, asked from the other side: a platform that draws its own
+ * conversation list (the web UI's topic switcher) wants to know whether an agent is still up.
+ */
+describe('liveForRef', () => {
+  const ref = { platform: 'discord', channel: 'c1', kind: 'direct' as const, user: 'u1' };
+
+  it('separates a quiet conversation from one with nothing left running', async () => {
+    const h = rig();
+    // Never run here: there is a row for it in the list, and nothing behind it.
+    expect(h.reg.liveForRef(ref)).toBe(false);
+
+    h.reg.route(inbound('hello', 'm1'));
+    await drain();
+    // The turn is over and the child is not. This is the state that used to be indistinguishable
+    // from the line above, and it is the one where the next message is answered straight away.
+    expect(h.reg.liveForRef(ref)).toBe(true);
+
+    h.advance(IDLE_MS + 60_000);
+    h.reg.reclaimIdleSessions();
+    expect(h.reg.liveForRef(ref)).toBe(false);
+  });
+
+  it('reports a session that cannot state its own liveness as not running', async () => {
+    // Read the way the sweeper reads it: of the two possible lies, "the agent is already up" is
+    // the one that would be believed.
+    const h = rig();
+    h.reg.route(inbound('hello', 'm1'));
+    await drain();
+    const session = h.factory.peek(KEY)!;
+    delete (session as { reclaimState?: unknown }).reclaimState;
+
+    expect(h.reg.liveForRef(ref)).toBe(false);
   });
 });

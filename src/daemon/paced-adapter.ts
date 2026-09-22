@@ -59,6 +59,7 @@ const PACING = {
   // Registers a callback and writes nothing to the chat; the lookup it installs is read while
   // rendering a topic list, which is not traffic the platform meters.
   useWorkdirLookup: 'unpaced',
+  useLivenessLookup: 'unpaced',
   measureRendered: 'unpaced',
   registerCommands: 'unpaced',
   onMessage: 'unpaced',

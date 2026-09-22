@@ -115,6 +115,20 @@ const MAX_HOLD_MS = 8_000;
 /** How many recent send-nonces are remembered, so a retry on a flaky link cannot double-send. */
 const MAX_NONCES = 64;
 
+/**
+ * How often the switcher re-checks whether each topic's agent process is still up.
+ *
+ * A poll, which nothing else in this file is, because a child going away announces nothing: the
+ * idle sweeper reclaims on a timer, in a conversation that by definition nobody is touching, and
+ * a child that crashed is quieter still. Everything that turns the flag ON already announces (a
+ * turn starting sets typing, which redraws the list), so this only has to catch it going off —
+ * and being a few seconds late to say "that one is asleep now" costs nothing.
+ *
+ * Cheap enough to leave running: a map lookup per topic, skipped entirely while no browser is
+ * attached, and it sends only when a flag actually changed.
+ */
+const LIVENESS_POLL_MS = 15_000;
+
 /** One message as a topic holds it: what the page renders, plus what produced it. */
 interface Stored {
   msg: WebMessage;
@@ -142,6 +156,14 @@ interface Room {
   /** When the current hold must end regardless of further edits; 0 when nothing is held. */
   holdUntil: number;
   msgCount: number;
+  /**
+   * Message ids currently showing buttons — i.e. every question this topic is waiting on.
+   *
+   * A set rather than a scan of `stored` on demand, because the topic list is rebuilt on every
+   * message posted into any topic and scanning 500 messages × 64 topics for one boolean is work
+   * per keystroke of a streamed reply. Maintained wherever buttons appear or are stripped.
+   */
+  awaiting: Set<string>;
 }
 
 export class WebRoom {
@@ -163,6 +185,16 @@ export class WebRoom {
   private onBtn: ((ev: ButtonInteraction) => void) | null = null;
   /** Injected by the daemon; absent in a deployment (or a test) that never offered one. */
   private workdir: ((ref: ConversationRef) => string | undefined) | null = null;
+  /** Likewise, and read the same way — see `useLivenessLookup`. */
+  private liveness: ((ref: ConversationRef) => boolean) | null = null;
+  /** The poll that keeps `liveness` honest; only ever running once a lookup exists. */
+  private liveTimer: NodeJS.Timeout | null = null;
+  /**
+   * The flags of the last topic list actually sent, so the poll can stay silent when nothing
+   * moved. Not a cache of the list itself: everything else announces unconditionally, because a
+   * title, an order or an unread count changed and the poll is not what noticed.
+   */
+  private lastFlags = '';
   private readonly dirCache = new Map<string, { at: number; dir?: Topic['dir'] }>();
   /**
    * Who has a terminal pane attached. Absent when the feature is off, and in every test that
@@ -240,6 +272,31 @@ export class WebRoom {
   }
 
   /**
+   * Accept the daemon's way of asking whether a topic's agent child is still resident, and start
+   * the poll that watches it (see LIVENESS_POLL_MS for why this one is polled and the rest is not).
+   *
+   * Unreferenced: a sidebar dot going grey is never a reason for the process to stay up.
+   */
+  useLivenessLookup(lookup: (ref: ConversationRef) => boolean): void {
+    this.liveness = lookup;
+    // What the list says NOW is the poll's baseline, so installing a lookup does not itself look
+    // like a change. Nothing is lost by it: a client is handed the whole list on subscribe.
+    this.lastFlags = flagsOf(this.topicList());
+    if (this.liveTimer) return;
+    this.liveTimer = setInterval(() => this.sweepLiveness(), LIVENESS_POLL_MS);
+    this.liveTimer.unref?.();
+  }
+
+  /** Redraw the switcher if — and only if — a topic's flags changed since the last one sent. */
+  private sweepLiveness(): void {
+    if (this.clients.size === 0) return;
+    const topics = this.topicList();
+    const flags = flagsOf(topics);
+    if (flags === this.lastFlags) return;
+    this.sendTopics(topics, flags);
+  }
+
+  /**
    * Accept the terminal's attendance register, and redraw the switcher whenever it changes.
    *
    * Both halves matter and they pull in opposite directions. `topicList` reads it (pull, like
@@ -278,6 +335,22 @@ export class WebRoom {
     return dir;
   }
 
+  /**
+   * Whether one topic still has an agent child behind it, swallowing a failing lookup for the
+   * same reason `dirOf` does: this runs inside the path that announces a topic list, which runs
+   * inside the path that posts a message. Unmemoised because the daemon answers it from a map —
+   * it is the filesystem stat behind the directory that needed a TTL, not the crossing itself.
+   */
+  private liveOf(topicId: string): boolean {
+    if (!this.liveness) return false;
+    try {
+      return this.liveness(this.conversation(topicId));
+    } catch (e) {
+      console.warn('[webui] could not resolve a topic agent state:', e instanceof Error ? e.message : e);
+      return false;
+    }
+  }
+
   topicList(): Topic[] {
     return this.topics.list().map((t) => {
       const room = this.rooms.get(t.id);
@@ -285,6 +358,10 @@ export class WebRoom {
       return {
         ...t,
         running: Boolean(room?.typing),
+        // Before `running` in meaning, not just in this object: a question on screen holds the
+        // turn open, so both are true at once and only this one says what is actually happening.
+        asking: Boolean(room?.awaiting.size),
+        live: this.liveOf(t.id),
         term: Boolean(this.terminal?.has(t.id)),
         msgCount: room?.msgCount ?? 0,
         ...(dir ? { dir } : {}),
@@ -294,6 +371,12 @@ export class WebRoom {
 
   private announceTopics(): void {
     const topics = this.topicList();
+    this.sendTopics(topics, flagsOf(topics));
+  }
+
+  /** The one place a topic list reaches a client, so `lastFlags` cannot drift from what was sent. */
+  private sendTopics(topics: Topic[], flags: string): void {
+    this.lastFlags = flags;
     // The one event that crosses rooms: the switcher has to stay current without every client
     // subscribing to topics nobody is reading.
     for (const client of this.clients) this.deliver(client, { t: 'topics', topics });
@@ -489,9 +572,15 @@ export class WebRoom {
     };
     if (room.stored.size >= MAX_MESSAGES) {
       const oldest = room.stored.keys().next().value;
-      if (oldest !== undefined) room.stored.delete(oldest);
+      if (oldest !== undefined) {
+        room.stored.delete(oldest);
+        // A question that aged out of the ring is off screen, so it no longer holds the topic in
+        // "waiting for you" — the buttons went with it.
+        room.awaiting.delete(oldest);
+      }
     }
     room.stored.set(msg.id, { msg, text });
+    if (msg.buttons.length > 0) room.awaiting.add(msg.id);
     room.msgCount += 1;
     this.emit(topicId, { t: 'msg', msg });
     this.topics.touch(topicId, msg.at);
@@ -518,6 +607,19 @@ export class WebRoom {
     room.stored.set(id, rec);
     this.enqueue(room, topicId, id);
     if (buttons) this.flush(room, topicId);
+    // An edit carrying buttons is how a question is both posted and retired (an empty array is
+    // `retireAsk` stripping them), so it is also where the switcher stops or starts saying this
+    // topic is waiting on the user. Announced only when the set actually changed: a menu turning
+    // its page edits buttons too, and the sidebar has nothing to redraw for that.
+    if (buttons && this.setAwaiting(room, id, buttons.length > 0)) this.announceTopics();
+  }
+
+  /** Record whether a message is holding live buttons. Returns whether that changed. */
+  private setAwaiting(room: Room, id: string, on: boolean): boolean {
+    if (on === room.awaiting.has(id)) return false;
+    if (on) room.awaiting.add(id);
+    else room.awaiting.delete(id);
+    return true;
   }
 
   /** Remove a message. Removing one that is already gone is success, not an error. */
@@ -526,6 +628,9 @@ export class WebRoom {
     this.flush(room, topicId);
     if (!room.stored.delete(id)) return;
     this.emit(topicId, { t: 'del', id });
+    // Deleting the message deletes its buttons with it — the commonest way an unanswered menu
+    // leaves the screen (`/new` sweeping a topic), and it must not leave the dot waiting forever.
+    if (this.setAwaiting(room, id, false)) this.announceTopics();
   }
 
   /**
@@ -590,6 +695,8 @@ export class WebRoom {
   /** Send everything being held and stop every timer. Called on shutdown. */
   dispose(): void {
     for (const [topicId, room] of this.rooms) this.flush(room, topicId);
+    if (this.liveTimer) clearInterval(this.liveTimer);
+    this.liveTimer = null;
   }
 
   // ── Inbound (page → daemon) ────────────────────────────────────────────────
@@ -692,7 +799,17 @@ export class WebRoom {
   private roomOf(topicId: string): Room {
     let room = this.rooms.get(topicId);
     if (!room) {
-      room = { stored: new Map(), typing: false, seq: 0, backlog: [], queue: [], timer: null, holdUntil: 0, msgCount: 0 };
+      room = {
+        stored: new Map(),
+        typing: false,
+        seq: 0,
+        backlog: [],
+        queue: [],
+        timer: null,
+        holdUntil: 0,
+        msgCount: 0,
+        awaiting: new Set(),
+      };
       this.rooms.set(topicId, room);
     }
     return room;
@@ -725,6 +842,16 @@ export class WebRoom {
     const allow = this.instance.chat.channels;
     return allow.length === 0 || addressListed(allow, addressOf(ref));
   }
+}
+
+/**
+ * The part of a topic list the liveness poll is allowed to redraw for.
+ *
+ * Only the three derived states the switcher paints a dot from, deliberately: the poll must not
+ * notice a title, an order or an unread count, because whatever changed those already announced.
+ */
+function flagsOf(topics: Topic[]): string {
+  return topics.map((t) => `${t.id}${t.live ? 'L' : ''}${t.asking ? 'A' : ''}${t.running ? 'R' : ''}`).join(',');
 }
 
 /** A browser upload, as the attachment pipeline wants it. */

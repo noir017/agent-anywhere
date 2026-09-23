@@ -281,3 +281,21 @@ export interface ModelSelector {
   /** Selectable ids with the display names the harness gave them. May be empty. */
   options: Array<{ value: string; name: string }>;
 }
+
+/**
+ * A session's reasoning-effort selector (the ACP config option in the `thought_level` category).
+ *
+ * Its own type rather than a second use of ModelSelector, although the shape is the same, because
+ * the two are not interchangeable: the effort list belongs to the CURRENT MODEL, not to the session
+ * — opencode offers one only for a model with reasoning variants, and codex only for a model in its
+ * own catalog — so a model switch can reshape it or take it away entirely.
+ *
+ * `current` is the raw value, `default` included. The footer drops `default` because it names no
+ * level; a selector must not, because on claude and opencode it is one of the choices.
+ */
+export interface EffortSelector {
+  /** The level this session is on right now. */
+  current?: string;
+  /** Selectable levels with the display names the harness gave them. */
+  options: Array<{ value: string; name: string }>;
+}

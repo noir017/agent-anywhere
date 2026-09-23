@@ -178,6 +178,21 @@ const GENERIC_COMMANDS: Record<string, GenericCommand> = {
     // "the setting does nothing"). With it set, session/new reports `gpt-5.6-terra[high]`.
     local: ['opencode', 'claude', 'agy', 'dsh', 'codex'],
   },
+  effort: {
+    description: 'Show or change the reasoning effort',
+    // No native spelling, for the reason `/model` has none: every harness that has a level exposes
+    // it as an ACP config option, and switching that is one tap with no turn spent. Probed on
+    // 2026-09-23 — claude-agent-acp 0.81.0, codex-acp 1.13.0 and opencode 2.0.14 all file the
+    // option under category `thought_level` (ids `effort`, `reasoning_effort`, `effort`), and
+    // `session/set_config_option` switched it on all three.
+    native: {},
+    // Only where that was probed. agy has no such setting (`agy -p=/effort` answers "not
+    // adjustable") and folds it into the model name instead, so `/model` is its answer; dsh and
+    // gemini have never been seen to offer a `thought_level` option. All three get the explicit
+    // "not supported" — and on agy that also keeps `/effort` out of HARNESS_CLI_ANSWERED's path,
+    // where it would have been run as a one-shot process only to print "not adjustable".
+    local: ['claude', 'codex', 'opencode'],
+  },
   usage: {
     description: 'Show token usage and limits',
     // codex spells it `status` — "Display session configuration and token usage", a superset of

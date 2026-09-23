@@ -193,7 +193,7 @@ access:
 ```
 
 打开 `http://<host>:8787`，输入密钥，就得到和其他平台一样的会话：流式回复、工具
-气泡、`/model` `/cd` `/setting` 按钮菜单、`ask` 提问、附件上传与下载。
+气泡、`/model` `/effort` `/cd` `/setting` 按钮菜单、`ask` 提问、附件上传与下载。
 
 **话题。** 顶部一行名字用来切换并行的会话，和 Telegram 的论坛话题、飞书的话题群是同一种
 形状：每个话题有自己的 agent session、自己的上下文，并且会根据聊下来的内容被自动命名。
@@ -291,7 +291,7 @@ platforms:
 | `/title` | 给这个话题起名字；不起则自动命名，见下 |
 | `/setting` | 改 config.yaml 里的设置，见下 |
 | `/cc`、`/oc`、`/cx`、`/gm`、`/agy` | 每个已配置 harness 一个，见下 |
-| `/compact`、`/context`、`/model`、`/usage`、`/doctor`、`/mcp`、`/init`、`/review` | 通用词表，按 harness 翻译成各自的原生拼写 |
+| `/compact`、`/context`、`/model`、`/effort`、`/usage`、`/doctor`、`/mcp`、`/init`、`/review` | 通用词表，按 harness 翻译成各自的原生拼写 |
 
 **智能体命令**以 harness 命名 —— `/cc` claude、`/oc` opencode、`/cx` codex、
 `/gm` gemini、`/agy` Antigravity。只有你实际配置了的 harness 才会被注册。
@@ -320,9 +320,9 @@ platforms:
 通用命令会被改写成目标 harness 的原生拼写（`/compact` → gemini 的
 `/compress`）；没有对应命令的 harness 会直接说明，而不是浪费一轮去让它猜。
 
-其中两条，在 harness 没有对应命令时由网关自己回答 —— 因为这两件事它是通过
+其中几条，在 harness 没有对应命令时由网关自己回答 —— 因为这些能力它是通过
 协议暴露的，而不是做成斜杠命令：`/context` 打印智能体最近上报的上下文用量，
-`/model` 则用来查看和切换模型。
+`/model` 用来查看和切换模型，`/effort` 用来查看和切换推理强度（思考深度）。
 
 单独发 `/model` 会弹出一个**可翻页的按钮菜单**，直接停在当前模型所在那一页；
 ◀ ▶ 在同一条消息上原地翻页，点某个模型即为该会话切换。这需要平台既能发按钮、
@@ -330,6 +330,16 @@ platforms:
 `/model <名字的一部分>` 在所有平台都能按子串切换，匹配到多个时列出候选，而不是
 替你猜一个。opencode 和 claude 都走这条路——两者都不把 `/model` 登记成命令，
 却都在 ACP 会话里暴露了模型选择器。
+
+`/effort` 在 `claude`、`codex`、`opencode` 上用法相同：单独发会弹出档位按钮，
+● 标出当前档（不能改按钮的平台回一行文字）；`/effort high`，或任何能唯一确定的
+开头（`/effort x` 即 `xhigh`），为该会话切换档位，从下一条消息起生效。档位是
+模型给的，不是 harness 给的，所以会随 `/model` 变化，也可能一个都没有：opencode
+只对有推理变体的模型提供，codex 只对本机 codex-cli 自带模型目录里的模型提供
+（0.155.1 的目录里没有 `gpt-6-luna`，0.156.1 有）。回复会说明你属于哪种情况。
+智能体因空闲被回收后选择依然有效 —— claude 和 codex 重载会话时会回到默认档，
+网关会重新设一次 —— 直到 `/new` 或 daemon 重启为止。`agy` 没有这项设置，它的思考档位是独立的
+模型，在 `/model` 里选。
 
 ## 选智能体在哪儿干活
 

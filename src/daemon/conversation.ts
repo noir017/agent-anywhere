@@ -33,7 +33,18 @@ import type {
 } from '../types.js';
 import type { PlatformAdapter } from '../platform/adapter.js';
 import type { AgentFactory, AgentSession, AgentUsage } from './agent.js';
-import type { ModelSelector } from '../types.js';
+import type { EffortSelector, ModelSelector } from '../types.js';
+import {
+  effortAmbiguousText,
+  effortChoiceText,
+  effortMenuSurface,
+  effortNoMatchText,
+  effortNoSelectorText,
+  effortStartFailedText,
+  effortSummaryText,
+  matchEfforts,
+  type EffortChoiceResult,
+} from '../core/effort-menu.js';
 import {
   matchModels,
   modelAmbiguousText,
@@ -382,6 +393,13 @@ export class ConversationRegistry {
         agentId: string,
         msg: InboundMessage,
         selector: ModelSelector
+      ): void;
+      /** A bare `/effort` on a platform that can carry a menu. Same division as the model menu. */
+      onEffortMenuRequest?(
+        id: ConversationId,
+        agentId: string,
+        msg: InboundMessage,
+        selector: EffortSelector
       ): void;
       /**
        * A `/setting` on a platform that can carry a menu. Same division of labour as the model
@@ -1610,6 +1628,11 @@ export class ConversationRegistry {
         if (text !== undefined) reply(text);
         return;
       }
+      if (name === 'effort') {
+        const text = await this.applyEffortCommand(state, key, rest, msg);
+        if (text !== undefined) reply(text);
+        return;
+      }
       reply(`/${name} has no local handler.`); // unreachable unless GENERIC_COMMANDS gains a `local` without one
     } catch (e) {
       reply(`Could not answer /${name}: ${e instanceof Error ? e.message : String(e)}`);
@@ -1736,8 +1759,21 @@ ${formatTokens(left)} left before compaction — ${name}`;
     key: ConversationId,
     agentId: string
   ): Promise<{ session: AgentSession; selector?: ModelSelector; error?: string }> {
+    return this.warmSelector(key, agentId, (s) => s.modelSelector?.());
+  }
+
+  /**
+   * warmModelSelector's body, for any selector read off a live session — `/model` and `/effort`
+   * both need "start the session if that is what it takes to have an answer", and the second copy
+   * of that is where the two would start disagreeing about which situations deserve a warm-up.
+   */
+  private async warmSelector<T>(
+    key: ConversationId,
+    agentId: string,
+    read: (session: AgentSession) => T | undefined
+  ): Promise<{ session: AgentSession; selector?: T; error?: string }> {
     const session = this.agents.getOrCreate(key, agentId);
-    const known = session.modelSelector?.();
+    const known = read(session);
     if (known) return { session, selector: known };
     // Nothing to warm up with (a runtime that does not implement it): keep the old answer.
     if (!session.ensureSession) return { session };
@@ -1746,7 +1782,7 @@ ${formatTokens(left)} left before compaction — ${name}`;
     } catch (e) {
       return { session, error: e instanceof Error ? e.message : String(e) };
     }
-    return { session, selector: session.modelSelector?.() };
+    return { session, selector: read(session) };
   }
 
   /**
@@ -1859,6 +1895,105 @@ ${formatTokens(left)} left before compaction — ${name}`;
     if (!selector) return { kind: 'unavailable' };
     if (!selector.options.some((o) => o.value === value)) return { kind: 'missing', value };
     return this.setModelOn(warm.session, state, value);
+  }
+
+  // ───────────────────────────── reasoning effort (`/effort`) ─────────────────────────────
+
+  /**
+   * `/effort`: open the menu, show the levels, or switch to a level named in full or by prefix.
+   *
+   * `/model`'s three outcomes in `/model`'s order (see applyModelCommand), with one difference in
+   * the empty case. "No levels" is an answer about the current MODEL rather than the harness —
+   * codex and opencode both have levels for some models and none for others — so the reply names
+   * the model and says what would change it, which is why it is handed the live model name.
+   */
+  private async applyEffortCommand(
+    state: ConversationState,
+    key: ConversationId,
+    rest: string | undefined,
+    msg: InboundMessage
+  ): Promise<string | undefined> {
+    // Same reason as /model: a cold session takes a second or two to come up.
+    const typing = this.platforms.get(msg.conversation.platform);
+    void typing?.startTyping?.(addressOf(msg.conversation)).catch(() => undefined);
+    const warm = await this.warmSelector(key, state.agentId, (s) => s.effortSelector?.());
+    void typing?.stopTyping?.(addressOf(msg.conversation)).catch(() => undefined);
+    if (warm.error) return effortStartFailedText(warm.error);
+    const selector = warm.selector;
+    if (!selector) {
+      const def = findAgent(this.config, state.agentId);
+      return effortNoSelectorText(def?.harness, warm.session.modelSelector?.()?.current);
+    }
+
+    const query = rest?.trim();
+    if (!query) return this.answerBareEffort(state, key, msg, selector);
+
+    const match = matchEfforts(selector.options, query);
+    if (match.kind === 'none') return effortNoMatchText(query, selector.options);
+    if (match.kind === 'many') return effortAmbiguousText(query, match.matches);
+    return effortChoiceText(await this.setEffortOn(warm.session, match.option.value));
+  }
+
+  /** A bare `/effort`: the menu where the platform can carry one, the one-line summary elsewhere. */
+  private answerBareEffort(
+    state: ConversationState,
+    key: ConversationId,
+    msg: InboundMessage,
+    selector: EffortSelector
+  ): string | undefined {
+    const caps = this.platforms.get(msg.conversation.platform)?.capabilities;
+    if (
+      caps &&
+      effortMenuSurface(caps, selector.options.length) === 'menu' &&
+      this.hooks?.onEffortMenuRequest
+    ) {
+      this.hooks.onEffortMenuRequest(key, state.agentId, msg, selector);
+      return undefined;
+    }
+    return effortSummaryText(selector);
+  }
+
+  /**
+   * Switch a live session's effort. Shared by the typed and clicked paths, like setModelOn.
+   *
+   * Nothing is mirrored onto ConversationState, unlike the model: the footer reads the level fresh
+   * off the session's option list at the start of every turn, and setEffort has already written the
+   * harness's answer there.
+   */
+  private async setEffortOn(session: AgentSession, value: string): Promise<EffortChoiceResult> {
+    if (!session.setEffort) {
+      return { kind: 'failed', reason: 'this agent cannot switch effort at runtime' };
+    }
+    try {
+      return { kind: 'applied', effort: await session.setEffort(value) };
+    } catch (e) {
+      return { kind: 'failed', reason: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
+  /**
+   * Apply a level chosen by clicking a menu the daemon posted.
+   *
+   * Re-checks everything applyModelChoice re-checks, for its reasons. The last one bites harder
+   * here than there: a `/model` between opening the menu and tapping it can reshape or remove the
+   * whole effort list, so a stale level is a normal event rather than a rare one.
+   */
+  async applyEffortChoice(
+    id: ConversationId,
+    expectAgentId: string,
+    value: string
+  ): Promise<EffortChoiceResult> {
+    const state = this.conversations.get(id);
+    if (!state) return { kind: 'gone' };
+    if (state.agentId !== expectAgentId) {
+      const def = findAgent(this.config, state.agentId);
+      return { kind: 'rebound', agent: agentDisplayName(def, state.agentId) };
+    }
+    const warm = await this.warmSelector(id, state.agentId, (s) => s.effortSelector?.());
+    const selector = warm.selector;
+    if (!selector) return { kind: 'unavailable' };
+    if (!selector.options.some((o) => o.value === value)) return { kind: 'missing', value };
+    return this.setEffortOn(warm.session, value);
   }
 
   // ───────────────────────────── working directory (`/cd`) ─────────────────────────────

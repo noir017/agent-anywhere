@@ -11,6 +11,15 @@ import {
 } from '../core/command-translate.js';
 import { parseButtonId } from '../core/button-id.js';
 import {
+  buildEffortMenu,
+  effortChoiceText,
+  effortMenuExpiredText,
+  effortMenuSupersededText,
+  parseEffortButtonId,
+  type EffortButtonClick,
+  type EffortOption,
+} from '../core/effort-menu.js';
+import {
   buildModelMenu,
   modelChoiceText,
   modelIndexOf,
@@ -62,6 +71,7 @@ import type {
   ButtonInteraction,
   CommandInteraction,
   ConversationId,
+  EffortSelector,
   ElicitAnswer,
   ElicitQuestion,
   InboundMessage,
@@ -453,6 +463,27 @@ interface PendingModelMenu {
 }
 
 /**
+ * A posted effort menu, awaiting a click.
+ *
+ * PendingModelMenu minus the page size: the frozen snapshot, the rebind check and the value
+ * re-validated at click time are all kept for the model menu's reasons, and the effort list is one
+ * page by construction (effortMenuSurface falls back to text otherwise), so nothing is paged.
+ */
+interface PendingEffortMenu {
+  conversationId: ConversationId;
+  /** The agent that offered these levels; a rebind since then invalidates the menu. */
+  agentId: string;
+  /** Where the menu was posted (the ack and any error go back here). */
+  conversation: ConversationRef;
+  /** The levels as they stood when the menu opened. Indices in button ids point into THIS. */
+  options: EffortOption[];
+  /** The level marked ● when the menu was drawn. Display only; never used to decide a switch. */
+  current?: string;
+  /** The menu message itself, captured from the send — the ack edits it. */
+  ref?: MessageRef;
+}
+
+/**
  * A posted settings menu, awaiting clicks.
  *
  * Two levels in one message: `rows` is the list, `open` is the setting whose values are on screen
@@ -552,6 +583,8 @@ export class Daemon {
    * entry; a failed one keeps it, so a retry is one tap rather than retyping /model.
    */
   private pendingModelMenus = new Map<string, PendingModelMenu>();
+  /** Live effort menus, bounded the same way: at most one per conversation (see pendingModelMenus). */
+  private pendingEffortMenus = new Map<string, PendingEffortMenu>();
   /** Live settings menus: reqId → the conversation, row snapshot and open level it was built for. */
   private pendingSettingsMenus = new Map<string, PendingSettingsMenu>();
   /**
@@ -645,6 +678,9 @@ export class Daemon {
       // A bare `/model` on a platform that can carry (and later edit) buttons.
       onModelMenuRequest: (id, agentId, msg, selector) =>
         this.onModelMenuRequest(id, agentId, msg, selector),
+      // A bare `/effort`, same conditions.
+      onEffortMenuRequest: (id, agentId, msg, selector) =>
+        this.onEffortMenuRequest(id, agentId, msg, selector),
       // A `/setting` on a platform that can carry (and later edit) buttons.
       onSettingMenuRequest: (id, msg, menu) => this.onSettingMenuRequest(id, msg, menu),
       // A directory menu is wanted: `/cd`, a bare agent command in a conversation with no history,
@@ -739,6 +775,7 @@ export class Daemon {
     }
     this.pendingPicks.clear();
     this.pendingModelMenus.clear();
+    this.pendingEffortMenus.clear();
     this.pendingSettingsMenus.clear();
     // Clear pending asks after ipc/platform are down: no new clicks or asks can arrive now. Clear each
     // timer and resolve null ("no selection") so any caller still blocked on ask IPC gets a result
@@ -1177,13 +1214,18 @@ export class Daemon {
     return { action: 'accept', content };
   }
 
-  /** Button click: resolve the matching model menu, directory menu, settings menu, pending ask, or picker; otherwise ignore. */
+  /** Button click: resolve the matching model menu, effort menu, directory menu, settings menu, pending ask, or picker; otherwise ignore. */
   private onButton(ev: ButtonInteraction): void {
-    // Prefixes are pairwise non-prefixing (`mdl:`/`mpg:`/`wdr:`/`wdp:`/`stg:`/`stv:`/`stp:`/`stb:`/
-    // `cmd:`/`ask:`), so this order is for readability, not correctness.
+    // Prefixes are pairwise non-prefixing (`mdl:`/`mpg:`/`eff:`/`wdr:`/`wdp:`/`stg:`/`stv:`/`stp:`/
+    // `stb:`/`cmd:`/`ask:`), so this order is for readability, not correctness.
     const model = parseModelButtonId(ev.buttonId);
     if (model) {
       this.onModelClick(ev, model);
+      return;
+    }
+    const effort = parseEffortButtonId(ev.buttonId);
+    if (effort) {
+      void this.onEffortClick(ev, effort);
       return;
     }
     const workdir = parseWorkdirButtonId(ev.buttonId);
@@ -1689,6 +1731,115 @@ export class Daemon {
       .get(ev.conversation.platform)
       ?.sendMessage(addressOf(ev.conversation), text)
       .catch((e) => console.warn('[menu] failed to answer a click:', e instanceof Error ? e.message : e));
+  }
+
+  /**
+   * A bare `/effort` on a platform that can carry a menu: post the levels, ● on the current one.
+   *
+   * The model menu's shape without its paging (see PendingEffortMenu) — including "one live menu
+   * per conversation", so a second `/effort` retires the first rather than leaving two sets of live
+   * buttons that disagree about where the ● is.
+   */
+  private onEffortMenuRequest(
+    conversationId: ConversationId,
+    agentId: string,
+    msg: InboundMessage,
+    selector: EffortSelector
+  ): void {
+    const adapter = this.platforms.get(msg.conversation.platform);
+    if (!adapter) return;
+    this.retireEffortMenusFor(conversationId);
+
+    const reqId = randomUUID().slice(0, 8);
+    // Copied, not referenced: the list is the harness's, and a `/model` rebuilds it.
+    const options = [...selector.options];
+    const pending: PendingEffortMenu = {
+      conversationId,
+      agentId,
+      conversation: msg.conversation,
+      options,
+      current: selector.current,
+    };
+    this.pendingEffortMenus.set(reqId, pending);
+
+    const view = buildEffortMenu({ reqId, options, current: selector.current });
+    void adapter
+      .sendButtons(addressOf(msg.conversation), view.text, view.buttons)
+      .then((ref) => {
+        // The menu's own ref, for the reason onModelMenuRequest keeps one: the click's messageId
+        // is the callback_query id on Telegram, not the message.
+        pending.ref = ref;
+      })
+      .catch((e) => {
+        this.pendingEffortMenus.delete(reqId);
+        console.error('[effort] failed to post the menu:', e instanceof Error ? e.message : e);
+      });
+  }
+
+  /** Retire every live effort menu of one conversation, saying so on the message. */
+  private retireEffortMenusFor(conversationId: ConversationId): void {
+    for (const [reqId, menu] of this.pendingEffortMenus) {
+      if (menu.conversationId !== conversationId) continue;
+      this.pendingEffortMenus.delete(reqId);
+      this.editEffortMenu(menu, effortMenuSupersededText(menu.current), []);
+    }
+  }
+
+  /** Best-effort in-place edit of an effort menu; an empty button array retires it (see editModelMenu). */
+  private editEffortMenu(
+    menu: PendingEffortMenu,
+    text: string,
+    buttons: Array<{ id: string; label: string }>
+  ): void {
+    const adapter = this.platforms.get(menu.conversation.platform);
+    if (!adapter) return;
+    if (!menu.ref) {
+      console.warn('[effort] menu has no message ref yet; skipping the edit');
+      return;
+    }
+    void adapter
+      .editButtons(menu.ref, text, buttons)
+      .catch((e) => console.warn('[effort] menu edit failed:', e instanceof Error ? e.message : e));
+  }
+
+  /**
+   * An effort button was clicked: apply it, then say what happened on the menu itself.
+   *
+   * The clicker is re-checked against the allowlist first, as for the model menu: a menu in a shared
+   * channel can be pressed by anyone in it, and this changes how every later turn there is run.
+   */
+  private async onEffortClick(ev: ButtonInteraction, click: EffortButtonClick): Promise<void> {
+    const clicker = ev.conversation;
+    const allow = this.config.access.allowFrom;
+    if (allow.length > 0 && !allow.includes(`${clicker.platform}:${clicker.user}`)) {
+      console.log(`[access] denied effort-menu click from ${clicker.platform}:${clicker.user}`);
+      return;
+    }
+
+    const menu = this.pendingEffortMenus.get(click.reqId);
+    const option = menu?.options[click.index];
+    if (!menu || !option) {
+      // Superseded, already used, restarted — or a mangled index, which can only come from an id
+      // this menu never drew. Answered where the click happened, never silently.
+      console.log(`[effort] click on an expired menu (${click.reqId}:${click.index})`);
+      this.replyToClick(ev, effortMenuExpiredText());
+      return;
+    }
+
+    const result = await this.registry.applyEffortChoice(menu.conversationId, menu.agentId, option.value);
+    const text = effortChoiceText(result);
+    console.log(`[effort] ${menu.conversationId}: ${option.value} → ${result.kind}`);
+
+    // Only a refusal keeps the menu up, so a retry is one tap. Every other outcome either moved the
+    // ● or means the snapshot describes nothing real any more — including `unavailable`, which here
+    // is not the model menu's transient "no session yet" but "this model has no levels at all".
+    if (result.kind !== 'failed') {
+      this.pendingEffortMenus.delete(click.reqId);
+      this.editEffortMenu(menu, text, []);
+      return;
+    }
+    const view = buildEffortMenu({ reqId: click.reqId, options: menu.options, current: menu.current });
+    this.editEffortMenu(menu, `${view.text}\n\n${text}`, view.buttons);
   }
 
   /**

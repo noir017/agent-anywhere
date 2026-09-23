@@ -5,6 +5,29 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **`/effort` shows and changes how hard the agent thinks, from the chat.** On claude, codex and
+  opencode: `/effort` alone opens a menu of the levels with the current one marked (a line of text
+  on LINE, QQ and the other platforms that cannot edit buttons), and `/effort high` — or any
+  unique start of one, `/effort x` for `xhigh` — switches it for the conversation from the next
+  message on. No turn is spent: all three expose the level as the same ACP config option that the
+  footer already reads (checked against each on 2026-09-23), so the gateway sets it directly.
+
+  The levels belong to the model, not the harness, so they change with `/model` and a model can
+  have none. opencode offers them only for models with reasoning variants; codex only for models
+  in the installed codex-cli's own catalog — `gpt-6-luna` is missing from 0.155.1's and present in
+  0.156.1's. In those cases `/effort` names the model and what would change it rather than a bare
+  "not supported". A `/model` keeps your level where the new model offers it and leaves it alone
+  where it does not.
+
+  The choice survives the agent being stopped for idleness, and that took work: claude and codex
+  both come back from a reload at their default level, not the one you left them on, so the
+  gateway sets it again each time the agent restarts. It ends with `/new` or a restart of the
+  daemon itself (so, in a container, with every upgrade), like a `/model` choice.
+  agy has no such setting — its thinking variants are separate models, chosen with `/model` — and
+  now says so directly instead of starting a one-shot `agy` process to print "not adjustable".
+
 ## [1.31.2] - 2026-09-23
 
 ### Fixed

@@ -51,6 +51,7 @@ conversation, not part of its name — see [`daemon/README.md`](../daemon/README
 | `skills-catalog.ts` | `/skills`: the bound agent's own commands as text |
 | `settings.ts` | `/setting` as data: which config.yaml fields are editable, what they accept, when a change lands |
 | `model-menu.ts` | `/model` as data: paging, labels, button ids, matching, and every string it says |
+| `effort-menu.ts` | `/effort` as data: the one-page level menu, prefix matching, and the per-harness "no levels" answers |
 | `workdir-menu.ts` | `/cd` as data: the same shape, for the directory a conversation works in |
 | `paging.ts` | The platform-imposed shape of a button menu: page size, page arithmetic, label budget |
 | `frecency.ts` | How often a thing was chosen, discounted by how long ago — what orders the `/cd` list |
@@ -409,6 +410,7 @@ though the gateway could answer it outright. Four do:
 | `/context` (agy) | agy's protocol carries no token counts at all — it hands them to whatever `statusLine` command its settings name, headless runs included | the snapshot `daemon/agy-statusline.ts` records from that shim, read back at the end of each turn |
 | `/usage` (agy) | agy's own CLI answers it, and forwarding that name into the session **kills the session** | a one-shot `agy -p=/usage`, rendered as quota bars |
 | `/model` (opencode, claude, agy) | opencode and claude expose the selector as a config option; agy reads it from `agy models` and switches via kill-and-respawn with `--model` and `--conversation` | `ConversationRegistry.applyModelCommand` via `AgentSession.modelSelector()` / `setModel()` |
+| `/effort` (claude, codex, opencode) | all three expose the level as a config option in category `thought_level` (ids differ: `effort`, `reasoning_effort`); none advertises a command for it | `ConversationRegistry.applyEffortCommand` via `AgentSession.effortSelector()` / `setEffort()` |
 
 ### `HARNESS_CLI_ANSWERED` — the names that must not be forwarded
 
@@ -467,6 +469,16 @@ Two rules keep this honest:
 93 of them: far past a button menu's 25 and past what is readable as a list, but
 `/model sonnet-5` is one thumb-typed token. An ambiguous query lists the candidates
 rather than guessing — picking one silently would change which model answers.
+
+`/effort` (`effort-menu.ts`) is `/model`'s shape with two deliberate differences. Its list
+is a handful of levels, so the menu has no pages — a list longer than one page on the
+posting platform falls back to text rather than drawing past the limit. And a level is
+matched by PREFIX, not substring, because the words contain each other: `high` is inside
+`xhigh`, so a substring rule would make every non-exact query ambiguous, while a prefix
+keeps `/effort x` meaning `xhigh`. The levels belong to the current *model*, not the
+harness — opencode offers them only for models with reasoning variants, codex only for
+models in the installed codex-cli's catalog — which is why "no levels" is a per-harness
+sentence naming the model and the way out, not one line for everyone.
 
 `custom` always passes through — nothing is known about a user-supplied executable, so
 rejecting its commands would break a working setup on a guess.

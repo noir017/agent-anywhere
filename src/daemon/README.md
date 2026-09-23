@@ -537,6 +537,15 @@ ran.
 opencode, `reasoning_effort` on codex). It is re-reported with `undefined` when an update
 drops the level, so the footer never keeps showing a level the session left.
 
+`/effort` writes that same option (`setEffort`, sent to whatever id the harness gave it), and
+the choice is held beside `modelPreference` as `effortPreference`, surviving `resetHandles`.
+Unlike the model's, it is re-applied after `session/load` as well as `session/new`, and after
+a runtime `/model` — the first because it is not optional: probed 2026-09-23, claude-agent-acp
+0.81.0 and codex-acp 1.13.0 both reload at their default level, so every idle reclaim would
+otherwise undo the user's choice (opencode 2.0.14 keeps it, and then the re-apply costs
+nothing, since an unchanged level is not re-sent). The order on a fresh session is model
+first, then effort, because the levels on offer are the model's.
+
 ### `agent-agy.ts` — the Antigravity runtime
 
 Read the file header before touching this. `agy` **does not speak ACP** — it has no ACP

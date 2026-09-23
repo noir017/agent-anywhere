@@ -25,6 +25,7 @@ import type {
   AgentFactory,
   AgentSession,
   AgentStreamHandlers,
+  EffortSelector,
   FollowUpSink,
   ModelSelector,
   ReclaimState,
@@ -394,6 +395,98 @@ export function liveEffortName(options: SessionConfigOption[] | null | undefined
 /** ACP's spec-reserved category for the reasoning-effort selector (SessionConfigOptionCategory). */
 const THOUGHT_LEVEL_CATEGORY = 'thought_level';
 
+/** A config option of the `select` kind — the only kind a level can be chosen from. */
+type SelectConfigOption = Extract<SessionConfigOption, { type: 'select' }>;
+
+/**
+ * The effort option itself, found the way liveEffortName finds it — by category, because the id is
+ * the one thing the three harnesses disagree on. Its `id` is what `session/set_config_option` must
+ * be sent, so the caller never spells `effort` or `reasoning_effort` itself.
+ */
+function effortOption(options: SessionConfigOption[] | null | undefined): SelectConfigOption | undefined {
+  const opt = options?.find((o) => o.category === THOUGHT_LEVEL_CATEGORY);
+  return opt?.type === 'select' ? opt : undefined;
+}
+
+/**
+ * The session's effort levels as a selector for `/effort`, or undefined when the current model
+ * offers none.
+ *
+ * Differs from liveEffortName in the one place the two readers want different things: `default`
+ * is KEPT as `current`. The footer drops it because it names no level; a menu must show it,
+ * because on claude and opencode it is one of the choices, and a menu with no ● anywhere would
+ * leave the user unable to tell where they are.
+ *
+ * An option with no choices is reported as no selector: a menu of nothing is not a menu.
+ */
+export function effortSelectorOf(options: SessionConfigOption[] | null | undefined): EffortSelector | undefined {
+  const opt = effortOption(options);
+  if (!opt) return undefined;
+  const levels = opt.options
+    .flatMap((entry) => ('group' in entry ? entry.options : [entry]))
+    .map((o) => ({ value: o.value, name: o.name || o.value }));
+  if (levels.length === 0) return undefined;
+  return { current: opt.currentValue || undefined, options: levels };
+}
+
+/**
+ * Re-apply a conversation's `/effort` choice to a freshly started or reloaded session, returning
+ * the option list the harness reports afterwards (undefined when nothing was sent).
+ *
+ * This is not the model's belt-and-braces: without it the choice is lost on the very first idle
+ * reclaim. Probed 2026-09-23 by setting `low`, killing the child and `session/load`ing the same
+ * session into a new one — claude-agent-acp 0.81.0 and codex-acp 1.13.0 both came back at `high`
+ * (their defaults for the model), opencode 2.0.14 came back at `low`. So two of three harnesses
+ * treat the level as process state, not session state.
+ *
+ * Also run after a runtime `/model`, because the effort list belongs to the model: opencode's
+ * variants differ per model, and codex falls back to the new model's default when the old level is
+ * not among its levels.
+ *
+ * Best-effort, like applyModelPreference and for its reasons — never fails the turn. A level the
+ * current model does not offer is skipped with a log line rather than forced: the preference stays
+ * recorded, so a later switch back to a model that has it picks it up again, and the footer shows
+ * the level that is really in force meanwhile.
+ */
+export async function applyEffortPreference(
+  ctx: Pick<ClientContext, 'request'>,
+  sessionId: string,
+  def: AgentDef,
+  options: SessionConfigOption[] | undefined,
+  want: string | undefined
+): Promise<SessionConfigOption[] | undefined> {
+  if (!want) return undefined;
+  const opt = effortOption(options);
+  if (!opt) {
+    console.log(`[acp] agent "${def.id}": effort "${want}" not applied — the current model offers no effort levels`);
+    return undefined;
+  }
+  if (opt.currentValue === want) return undefined; // already there — don't spend a round trip
+  const offered = opt.options.flatMap((entry) => ('group' in entry ? entry.options : [entry]));
+  if (!offered.some((o) => o.value === want)) {
+    console.warn(
+      `[acp] agent "${def.id}": effort "${want}" is not offered by the current model; ` +
+        `staying at "${opt.currentValue}". Offered: ${offered.map((o) => o.value).join(', ')}`
+    );
+    return undefined;
+  }
+  try {
+    const res = await ctx.request('session/set_config_option', {
+      sessionId,
+      configId: opt.id,
+      value: want,
+    });
+    console.log(`[acp] agent "${def.id}": effort re-applied as "${want}"`);
+    return res?.configOptions ?? undefined;
+  } catch (err) {
+    console.warn(
+      `[acp] agent "${def.id}": could not re-apply effort "${want}" (${err instanceof Error ? err.message : err}); ` +
+        `staying at "${opt.currentValue}"`
+    );
+    return undefined;
+  }
+}
+
 /** ACP's well-known id for the model selector among a session's config options. */
 const MODEL_CONFIG_ID = 'model';
 
@@ -438,8 +531,14 @@ export function dshModelDisplayValue(value: string): string {
 }
 
 /**
- * Enforce `agents[].model` on a freshly created session, returning the resulting live model name
- * (undefined when nothing was applied, so the caller keeps what session/new reported).
+ * Enforce `agents[].model` on a freshly created session, returning the option list the harness
+ * reports afterwards (undefined when nothing was applied, so the caller keeps what session/new
+ * reported).
+ *
+ * The whole list rather than just the resulting model name, because the model is not the only
+ * thing a model switch changes: the effort levels belong to the model too, and the caller re-applies
+ * `/effort` against the list this returns — reading it off session/new instead would validate the
+ * level against the model the session was just switched AWAY from.
  *
  * Why this exists: session/new carries the model only as a `_meta.model` hint, which the spec lets
  * an agent ignore — and opencode does. Verified against the deployed harness: with
@@ -458,7 +557,7 @@ async function applyModelPreference(
   def: AgentDef,
   /** Runtime choice for this conversation (`/model`); outranks the configured model when set. */
   override?: string
-): Promise<string | undefined> {
+): Promise<SessionConfigOption[] | undefined> {
   const want = override ?? def.model;
   if (!want) return undefined;
   // DSH's selector values are JSON.stringify([provider, model]) (see dshModelSelectorValue), so
@@ -492,9 +591,8 @@ async function applyModelPreference(
       configId: MODEL_CONFIG_ID,
       value: wireWant,
     });
-    const applied = liveModelName(res?.configOptions);
     console.log(`[acp] agent "${def.id}": model set to "${want}"`);
-    return applied;
+    return res?.configOptions ?? undefined;
   } catch (err) {
     console.warn(
       `[acp] agent "${def.id}": could not set model "${want}" (${err instanceof Error ? err.message : err}); ` +
@@ -722,6 +820,13 @@ function createAcpSession(
    * untouched), while a new conversation starts its own closure from the configured default.
    */
   let modelPreference: string | undefined;
+  /**
+   * Reasoning effort chosen at runtime for THIS conversation (`/effort`). Same lifetime as
+   * modelPreference and kept for the same reason — resetHandles leaves it alone — but re-applied on
+   * session/load too, where the model's is not: two of three harnesses reload at their default level
+   * (see applyEffortPreference).
+   */
+  let effortPreference: string | undefined;
 
   /**
    * Reset the three connection handles to undefined (without killing the process). Shared by the child
@@ -800,6 +905,33 @@ function createAcpSession(
     if (child) killChildProcess(child);
     resetHandles();
     hintInjected = false;
+  }
+
+  /**
+   * Put the conversation's `/effort` choice back on a session, folding the harness's answer into
+   * liveConfigOptions. The one call behind all three places that need it — session/load, session/new
+   * and a runtime `/model` — so none of them can forget the write-back.
+   */
+  async function reapplyEffort(ctx: Pick<ClientContext, 'request'>, sessionId: string): Promise<void> {
+    const after = await applyEffortPreference(ctx, sessionId, def, liveConfigOptions, effortPreference);
+    if (after) liveConfigOptions = after;
+  }
+
+  /**
+   * A freshly created session's runtime choices, in the only order that works: the model first,
+   * then the effort, because the levels on offer are the model's (see applyEffortPreference) and
+   * must be checked against the list the model switch produced, not the one it replaced.
+   */
+  async function reapplyPreferences(ctx: ClientContext, session: ActiveSession): Promise<void> {
+    // _meta.model is a hint some harnesses ignore (verified: opencode reports its own default
+    // regardless), so enforce the choice through the protocol's own setter. A runtime /model
+    // choice outranks config, so a rebuilt child keeps answering as the user asked.
+    const afterModel = await applyModelPreference(ctx, session, def, modelPreference);
+    if (afterModel) {
+      liveConfigOptions = afterModel;
+      liveModel = liveModelName(afterModel) ?? liveModel;
+    }
+    await reapplyEffort(ctx, session.sessionId);
   }
 
   /**
@@ -932,6 +1064,10 @@ function createAcpSession(
           // sends them before it answers `session/load`, and one JSON-RPC stream is ordered.
           armReplayFence();
           console.log(`[acp] resumed persisted session for "${def.id}" (${persistedId})`);
+          // claude-agent-acp and codex-acp reload at their DEFAULT level, not the one this session
+          // was left on — so a `/effort` choice made before an idle reclaim is put back here or lost.
+          // Cannot throw (best-effort by design), so it cannot send a good load down the catch below.
+          await reapplyEffort(ctx, persistedId);
         } catch (err) {
           // Stored id no longer loadable (history pruned, cwd moved, harness downgraded): start fresh.
           resumed.dispose();
@@ -966,10 +1102,9 @@ function createAcpSession(
         active = session; // active set = "ready": assigned last so a half-ready session isn't reused
         liveConfigOptions = session.newSessionResponse?.configOptions ?? undefined;
         liveModel = liveModelName(liveConfigOptions);
-        // _meta.model above is a hint some harnesses ignore (verified: opencode reports its own
-        // default regardless), so enforce the choice through the protocol's own setter. A runtime
-        // /model choice outranks config, so a rebuilt child keeps answering as the user asked.
-        liveModel = (await applyModelPreference(ctx, session, def, modelPreference)) ?? liveModel;
+        // _meta.model above is a hint some harnesses ignore; reapplyPreferences enforces it, and
+        // puts back a `/effort` choice after it.
+        await reapplyPreferences(ctx, session);
         store?.setAgentSession(conversationId, def.id, session.sessionId); // for post-restart session/load resume
       } catch (err) {
         // session/new returning auth_required (un-logged-in harness) surfaces as an opaque reject. Build
@@ -1582,17 +1717,51 @@ function createAcpSession(
         console.log(`[acp] agent "${def.id}": model "${value}" deferred — no live child, applies on next turn`);
         return value;
       }
-      const res = await conn.agent.request('session/set_config_option', {
-        sessionId: active.sessionId,
+      // Captured before the await: `conn` and `active` are reassigned by a child dying under us, and
+      // the effort re-apply below must address the session this switch was made on.
+      const agentCtx = conn.agent;
+      const sessionId = active.sessionId;
+      const res = await agentCtx.request('session/set_config_option', {
+        sessionId,
         configId: MODEL_CONFIG_ID,
         value: wire,
       });
       // Remember BEFORE trusting the echo: the choice must outlive this child either way.
       modelPreference = value;
       liveConfigOptions = res?.configOptions ?? liveConfigOptions;
+      // The new model brings its own effort levels, and may have reset the level to its default.
+      // Put the conversation's `/effort` choice back where the new model still offers it.
+      await reapplyEffort(agentCtx, sessionId);
       liveModel = liveModelName(liveConfigOptions) ?? value;
       console.log(`[acp] agent "${def.id}": model switched to "${value}" at runtime`);
       return liveModel;
+    },
+
+    effortSelector(): EffortSelector | undefined {
+      return effortSelectorOf(liveConfigOptions);
+    },
+
+    async setEffort(value: string): Promise<string> {
+      // No live child: record it, exactly as setModel does. Both startup paths re-apply it — the
+      // session/load one being the one that matters, since that is how a reclaimed conversation
+      // comes back. The caller has already checked the value against the (kept) option list.
+      if (!conn || !active) {
+        effortPreference = value;
+        console.log(`[acp] agent "${def.id}": effort "${value}" deferred — no live child, applies on next turn`);
+        return value;
+      }
+      const opt = effortOption(liveConfigOptions);
+      if (!opt) throw new Error('the current model offers no effort levels');
+      const res = await conn.agent.request('session/set_config_option', {
+        sessionId: active.sessionId,
+        // The harness's own id for it (`effort` / `reasoning_effort`), never spelled here.
+        configId: opt.id,
+        value,
+      });
+      effortPreference = value;
+      liveConfigOptions = res?.configOptions ?? liveConfigOptions;
+      console.log(`[acp] agent "${def.id}": effort switched to "${value}" at runtime`);
+      return effortOption(liveConfigOptions)?.currentValue || value;
     },
 
     reclaimState(): ReclaimState {

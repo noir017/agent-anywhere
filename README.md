@@ -205,8 +205,8 @@ access:
 ```
 
 Open `http://<host>:8787`, enter the token, and you have the same conversation
-every other platform gets: streaming replies, tool bubbles, the `/model`, `/cd`
-and `/setting` button menus, `ask` questions, file upload and download.
+every other platform gets: streaming replies, tool bubbles, the `/model`, `/effort`,
+`/cd` and `/setting` button menus, `ask` questions, file upload and download.
 
 **Topics.** A row of names across the top switches between parallel conversations,
 the same way a Telegram forum topic or a Feishu 话题 does: each has its own agent
@@ -320,7 +320,7 @@ Discord, Slack), and equally usable as plain text everywhere else.
 | `/title` | name this topic; it is named automatically otherwise — see below |
 | `/setting` | change a saved setting in config.yaml — see below |
 | `/cc`, `/oc`, `/cx`, `/gm`, `/agy` | one per configured harness — see below |
-| `/compact`, `/context`, `/model`, `/usage`, `/doctor`, `/mcp`, `/init`, `/review` | a generic vocabulary, translated to each harness's own spelling |
+| `/compact`, `/context`, `/model`, `/effort`, `/usage`, `/doctor`, `/mcp`, `/init`, `/review` | a generic vocabulary, translated to each harness's own spelling |
 
 An **agent command** is named after its harness — `/cc` claude, `/oc` opencode,
 `/cx` codex, `/gm` gemini, `/agy` Antigravity. Only the harnesses you configure
@@ -354,10 +354,10 @@ Generic commands are rewritten to the target harness's native spelling
 (`/compact` → gemini's `/compress`), and a harness with no equivalent says so
 instead of spending a turn on a prompt it will misread.
 
-Two of them the gateway answers itself where the harness has no command for it,
+Some of them the gateway answers itself where the harness has no command for it,
 because the capability is there over the protocol rather than as a slash:
-`/context` prints the last usage the agent reported, and `/model` shows and
-switches the model.
+`/context` prints the last usage the agent reported, `/model` shows and switches
+the model, and `/effort` shows and switches the reasoning effort.
 
 `/model` alone opens a **paginated button menu** of the models the agent offers,
 starting on the page holding the current one; ◀ ▶ turn the page on the same
@@ -367,6 +367,19 @@ elsewhere it prints the same summary line as before. `/model <part of a name>`
 switches by substring on every platform, listing the candidates when the query is
 ambiguous rather than guessing. Both work on `opencode` and `claude`; neither
 advertises a `/model` command, and both expose the selector over ACP.
+
+`/effort` works the same way on `claude`, `codex` and `opencode`: alone it opens a
+menu of the levels with the current one marked (a line of text where buttons
+cannot be edited), and `/effort high` — or any unique start of a level, `/effort x`
+for `xhigh` — switches it for the conversation from the next message on. The
+levels come from the model, not the harness, so they change with `/model`, and a
+model can have none: opencode offers them only for models with reasoning variants,
+and codex only for models in the installed codex-cli's own catalog (on 0.155.1,
+`gpt-6-luna` is not one; 0.156.1 knows it). The reply says which case you are in.
+The choice survives the agent being stopped for idleness — the gateway re-applies
+it, since claude and codex come back at their default level — and ends with `/new`
+or a daemon restart.
+`agy` has no such setting; its thinking variants are separate models, under `/model`.
 
 ## Choosing where the agent works
 

@@ -3,6 +3,7 @@ import type { CreateElicitationRequest, SessionConfigOption, SessionUpdate } fro
 import {
   dshModelDisplayValue,
   dshModelSelectorValue,
+  effortSelectorOf,
   liveEffortName,
   liveModelName,
   isResultUsage,
@@ -453,6 +454,49 @@ describe('liveEffortName (effort from ACP session config options)', () => {
     // e.g. opencode switched to a model without reasoning variants: the option vanished.
     feed(st, { sessionUpdate: 'config_option_update', configOptions: [] });
     expect(efforts).toEqual(['max', undefined, undefined]);
+  });
+});
+
+/**
+ * The same option read for `/effort` instead of the footer. The one deliberate difference from
+ * liveEffortName is `default`: the footer drops it, a selector must keep it, because on claude and
+ * opencode it is a choice and a menu with no ● would leave the user unable to tell where they are.
+ */
+describe('effortSelectorOf (the /effort menu’s view of the same option)', () => {
+  const opts = (o: unknown): SessionConfigOption[] => o as SessionConfigOption[];
+  const effort = (id: string, currentValue: unknown, values: string[]) => ({
+    id,
+    name: 'Effort',
+    category: 'thought_level',
+    type: 'select',
+    currentValue,
+    options: values.map((v) => ({ value: v, name: v === 'xhigh' ? 'Xhigh' : '' })),
+  });
+
+  it('keeps `default` as the current level, where the footer would drop it', () => {
+    const o = opts([effort('effort', 'default', ['default', 'low', 'high'])]);
+    expect(liveEffortName(o)).toBeUndefined();
+    expect(effortSelectorOf(o)?.current).toBe('default');
+  });
+
+  it('finds codex’s differently named option, and falls back to the value for a blank name', () => {
+    const sel = effortSelectorOf(opts([effort('reasoning_effort', 'high', ['low', 'high', 'xhigh'])]));
+    expect(sel).toEqual({
+      current: 'high',
+      options: [
+        { value: 'low', name: 'low' },
+        { value: 'high', name: 'high' },
+        { value: 'xhigh', name: 'Xhigh' },
+      ],
+    });
+  });
+
+  it('is undefined for no option, a non-select option, or an empty list', () => {
+    expect(effortSelectorOf(undefined)).toBeUndefined();
+    expect(
+      effortSelectorOf(opts([{ id: 'effort', category: 'thought_level', type: 'boolean', name: 'E', currentValue: true }])),
+    ).toBeUndefined();
+    expect(effortSelectorOf(opts([effort('effort', 'high', [])]))).toBeUndefined();
   });
 });
 

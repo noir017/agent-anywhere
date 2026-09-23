@@ -1,6 +1,7 @@
 import type {
   AgentCommand,
   AgentElicitation,
+  EffortSelector,
   ElicitAnswer,
   ModelSelector,
   ToolEvent,
@@ -9,7 +10,8 @@ import type {
 
 // ModelSelector lives in types.ts rather than here: core/model-menu.ts renders it into a paginated
 // button menu, and core may not import daemon/. Re-exported so the runtimes keep one import site.
-export type { ModelSelector };
+// EffortSelector likewise, for core/effort-menu.ts.
+export type { EffortSelector, ModelSelector };
 
 /**
  * Thin wrapper over the agent runtime (ACP implementation in agent-acp.ts). One AgentSession per session
@@ -206,6 +208,24 @@ export interface AgentSession {
    * Rejects when there is no session, no selector, or the harness refuses the value.
    */
   setModel?(value: string): Promise<string>;
+  /**
+   * The live session's reasoning-effort selector, or undefined when its current model offers none.
+   *
+   * Non-spawning, like modelSelector — `ensureSession` first for a conversation that has not run.
+   * Undefined is a per-MODEL answer, not a per-harness one: opencode and codex both offer levels
+   * for some models and not others, so it can change with a `/model`.
+   */
+  effortSelector?(): EffortSelector | undefined;
+  /**
+   * Switch the live session's reasoning effort, returning the level the harness reports afterwards.
+   *
+   * Remembered like setModel's choice, and re-applied on every rebuilt child — which, unlike the
+   * model, is not optional: probed 2026-09-23, claude-agent-acp 0.81.0 and codex-acp 1.13.0 both
+   * answer `session/load` at their DEFAULT level, not the one the session was left on (opencode
+   * 2.0.14 keeps it). So an idle reclaim would otherwise quietly undo the user's choice.
+   * Rejects when the live session offers no levels or the harness refuses the value.
+   */
+  setEffort?(value: string): Promise<string>;
   /**
    * Whether this session's resident child could be shut down right now without losing anything.
    *

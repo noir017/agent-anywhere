@@ -5,6 +5,23 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **`/kill` ends the agent's process and keeps the conversation.** `/stop` asks the agent to stop,
+  and an agent stuck inside a tool call never answers — until now the only command that could
+  still end it was `/new`, which also threw away everything you were trying to keep. `/kill`
+  ends the process the way the idle timeout already does: the next message starts a fresh one
+  that reloads the session and carries on. Mid-turn it stops the turn first and drops anything
+  queued behind it, so the queue cannot start the agent straight back up. An agent that cannot
+  reload its session (its harness does not offer `session/load`, or no session id has been
+  recorded for it yet) is left running and says so, rather than quietly turning `/kill` into
+  `/new`.
+- **The web UI has buttons for both.** Beside the topic's title, a power button — shown while an
+  agent process is up, the same moment the sidebar dot is lit — sends `/kill`; beside Send, a
+  **Stop** button — shown while a reply is running — sends `/stop`. They send the command exactly
+  as typing it would, so it appears in the transcript with its answer, and a half-written message
+  in the composer stays where it is.
+
 ## [1.32.0] - 2026-09-23
 
 ### Added

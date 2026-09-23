@@ -1091,6 +1091,104 @@ describe('webui page: sending', () => {
   });
 });
 
+/**
+ * Stop (beside Send) and the power button (beside the title) — `/stop` and `/kill` on a tap.
+ *
+ * Both are the typed command and nothing more, so the daemon's side is tested where the commands
+ * are (`kill-command.test.ts`, `session-control.test.ts`). What can only go wrong HERE is the page:
+ * a control shown when its command has nothing to act on, one that never appears, and a press that
+ * throws away the draft in the composer — which is what reusing `send()` as-is would have done.
+ */
+describe('webui page: stopping the agent', () => {
+  /** One topic in the state a test wants, delivered the way the daemon's liveness poll does. */
+  const state = (flags: Record<string, boolean>): Record<string, unknown> => ({
+    t: 'topics',
+    topics: [{ id: 'a1b2c3d4', title: 'Topic a1b2c3d4', lastAt: 1000, msgCount: 0, ...flags }],
+  });
+
+  it('offers neither control for a topic with no process and no turn', async () => {
+    const h = await open();
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+
+    expect(h.el('kill-agent').hidden).toBe(true);
+    expect(h.el('stop-turn').hidden).toBe(true);
+  });
+
+  it('shows each control only while its command has something to act on', async () => {
+    const h = await open();
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+
+    // Resident but quiet: a process to end, no turn to stop.
+    await h.emit(state({ running: false, live: true }));
+    expect(h.el('kill-agent').hidden).toBe(false);
+    expect(h.el('stop-turn').hidden).toBe(true);
+
+    // A turn opening arrives as `typing`, not as a topic list — Stop has to follow that too.
+    await h.emit({ t: 'typing', on: true });
+    expect(h.el('stop-turn').hidden).toBe(false);
+    await h.emit({ t: 'typing', on: false });
+    expect(h.el('stop-turn').hidden).toBe(true);
+
+    // A question holds its turn open, and /stop is how it is called off.
+    await h.emit(state({ running: true, asking: true, live: true }));
+    expect(h.el('stop-turn').hidden).toBe(false);
+
+    // Reclaimed, or ended by /kill: the power button goes with the process.
+    await h.emit(state({ running: false, live: false }));
+    expect(h.el('kill-agent').hidden).toBe(true);
+    expect(h.el('stop-turn').hidden).toBe(true);
+  });
+
+  it('follows the topic on screen, not whichever topic is busy', async () => {
+    const h = await open({ url: 'http://localhost:8787/?t=a1b2c3d4' });
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4', 'b2c3d4e5']));
+    await h.emit({
+      t: 'topics',
+      topics: [
+        { id: 'a1b2c3d4', title: 'here', lastAt: 1000, running: false, live: false, msgCount: 0 },
+        { id: 'b2c3d4e5', title: 'elsewhere', lastAt: 999, running: true, live: true, msgCount: 0 },
+      ],
+    });
+
+    expect(h.el('kill-agent').hidden).toBe(true);
+    expect(h.el('stop-turn').hidden).toBe(true);
+  });
+
+  it('Stop sends /stop for this topic and leaves the draft in the composer', async () => {
+    const h = await open();
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+    await h.emit(state({ running: true, live: true }));
+    const input = h.el('input') as HTMLTextAreaElement;
+    input.value = 'actually, do it the other way';
+
+    await h.click('#stop-turn');
+
+    const sent = h.calls.filter((c) => c.path === 'api/send');
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.body.text).toBe('/stop');
+    expect(sent[0]?.body.topic).toBe('a1b2c3d4');
+    // The same retry-safe post a typed message makes.
+    expect(typeof sent[0]?.body.nonce).toBe('string');
+    expect(input.value).toBe('actually, do it the other way');
+    // And the same bubble — the transcript records the command like any other.
+    expect(h.el('log').textContent).toContain('/stop');
+  });
+
+  it('the power button sends /kill, and nothing else', async () => {
+    const h = await open();
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+    await h.emit(state({ running: false, live: true }));
+    (h.el('input') as HTMLTextAreaElement).value = 'draft';
+
+    await h.click('#kill-agent');
+
+    const sent = h.calls.filter((c) => c.path === 'api/send');
+    expect(sent.map((c) => c.body.text)).toEqual(['/kill']);
+    expect(sent[0]?.body.files).toBeUndefined();
+    expect((h.el('input') as HTMLTextAreaElement).value).toBe('draft');
+  });
+});
+
 describe('webui page: the local transcript cache', () => {
   it('paints a topic from the last visit before the daemon has said anything', async () => {
     const h = await open({ url: 'http://localhost:8787/?t=a1b2c3d4' });
@@ -1417,6 +1515,14 @@ describe('webui page: the narrow-screen stylesheet', () => {
     expect(css).toMatch(/#expand-sidebar\{[^}]*height:44px/);
     // The rule sets `display`, which is only safe because of the page-wide `!important` guard.
     expect(renderPage('Chat', false)).toContain('[hidden]{display:none!important}');
+  });
+
+  it('gives the power button the same finger-sized target', () => {
+    // It sets `display` too (inline-flex, to centre the glyph), under the same `!important` guard
+    // the drawer toggle relies on — without it the button would show for a topic with no process.
+    const css = narrowBlock();
+    expect(css).toMatch(/#kill-agent\{[^}]*min-width:44px/);
+    expect(css).toMatch(/#kill-agent\{[^}]*height:44px/);
   });
 
   it('scopes all of that to the narrow screen and nothing else', () => {

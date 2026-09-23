@@ -38,7 +38,7 @@ streams its answer into a single, live-edited message.
 - **Chat actions** — the agent sends files, reacts, replies, opens threads, reads history, asks button questions.
 - **Attachments** — inbound images and files are downloaded and handed to the agent.
 - **Topics are first-class** — a Telegram topic, Feishu topic (话题), Slack thread or Discord thread is its own conversation, with its own agent; sticky per conversation, `/oc` to switch.
-- **Persistent conversations** — survive restarts; reset via `/new`, interrupt a turn with `/stop`; scoped per thread, channel, user, or globally. Idle ones release their agent process and resume from it on the next message.
+- **Persistent conversations** — survive restarts; reset via `/new`, interrupt a turn with `/stop`, end a stuck agent's process with `/kill`; scoped per thread, channel, user, or globally. Idle ones release their agent process and resume from it on the next message.
 - **Small config** — five sections, typed credentials, `${VAR}` and `.env` expansion; `/setting` edits the handful of fields worth changing from chat.
 
 ## Quick start
@@ -214,6 +214,12 @@ session and its own context, and each gets named automatically from what it turn
 out to be about. `+` opens one; the agent can open one itself with
 `agent-anywhere create-thread`, and write into one with `--channel main/<topic id>`.
 
+**Stopping it.** While a reply is streaming, **Stop** beside Send ends the turn
+(`/stop`). While an agent process is up behind the topic, the power button beside
+its title ends the process (`/kill`) — the conversation is kept, and the next
+message picks up where it left off. Both simply send the command, so a draft in
+the composer is left where it is.
+
 **Built for a bad connection.** Replies are sent when they settle rather than on
 every keystroke of the stream, everything on the wire is compressed, and a dropped
 connection resumes from where it left off instead of re-downloading the
@@ -316,6 +322,7 @@ Discord, Slack), and equally usable as plain text everywhere else.
 | `/help` | everything below, for the agent currently answering |
 | `/new`, `/clear` | start a fresh conversation (clears context) |
 | `/stop` | stop the current turn, keeping the conversation |
+| `/kill` | end the agent process, keeping the conversation — the next message resumes it |
 | `/cd` | choose the directory this conversation works in — see below |
 | `/title` | name this topic; it is named automatically otherwise — see below |
 | `/setting` | change a saved setting in config.yaml — see below |

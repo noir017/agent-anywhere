@@ -48,6 +48,7 @@ ConversationRegistry.route
    ├─ response gate      core/inbound-gate shouldRespond
    ├─ /new · /clear      reset the conversation, drop every agent's id, ack. Never forwarded.
    ├─ /stop              cancel the running turn and the queued backlog, ack. Never forwarded.
+   ├─ /kill              /stop, then end the agent child; the session id is kept. Never forwarded.
    ├─ /help              the registered vocabulary, from core/command-translate. Never forwarded.
    ├─ unconfigured agent `/agy` with no agy agent → say so, run no turn. Never forwarded.
    ├─ bind or rebind     new conversation → bind; explicit `/oc` → rebind; else keep the bound agent
@@ -74,7 +75,8 @@ Several orderings in `route()` are load-bearing and commented in place:
   will not be answered gets no acknowledgement of any kind.
 - **`/new` is intercepted before the merger**, so it works mid-turn (dispose aborts the
   in-flight turn). `/stop` sits beside it for the same reason: a stop command that only
-  worked between turns would be useless exactly when it is wanted.
+  worked between turns would be useless exactly when it is wanted. `/kill` too, and more so —
+  the turn it is for is one `/stop` could not end.
 - **The unconfigured-harness check runs before binding**, and only on a name `resolveAgent`
   declined — so a `when.command` rule or a configured harness always wins, and a name nobody
   claimed never binds a conversation on its way to being refused.
@@ -172,6 +174,17 @@ context, the session ids, the binding and the child process exactly as they were
 deliberately does not reach the agent through `agents.getOrCreate` — building a session
 for a conversation that has none, in order to stop it, is backwards; the abort travels via
 the merger, which only fires it in the `running` phase where a session must exist.
+
+`/kill` sits between the two. It ends the agent child and keeps everything else — the idle
+sweeper's reclaim, asked for by name, and the only way out of a harness wedged in a tool call,
+since `/stop`'s `session/cancel` is cooperative and a wedged harness never answers it.
+`killConversation` is order-sensitive: it asks the session's `reclaimState` first and refuses
+outright on `unresumable` (ending that child would restart the conversation, which is `/new`);
+then it calls off pending asks, interrupts the merger, and only then disposes the session — never
+the factory's handle, so the runtime `/model` choice survives. Disposing without the interrupt
+would let the merger mark the dead turn ✅ and start the queued backlog, respawning the child a
+moment after the ack said it was gone. Unlike `reclaimAfterAskTimeout` it does not wait for the
+turn to unwind; a turn that never unwinds is the case it exists for.
 
 `/new` is the single context-destroying path in the system, and it clears **every**
 agent's id for that conversation: the topic *is* the conversation, so a reset that let

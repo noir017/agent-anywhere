@@ -134,6 +134,16 @@ turns it on already announces the list; nothing announces it going off, because 
 fires on a timer in a conversation nobody is touching and a crashed child is quieter still. The
 poll skips itself while no browser is attached and sends only when a flag actually changed.
 
+**The two stop controls read the same flags as the dot.** The power button beside the title is
+shown while `live` and sends `/kill` (end the process, keep the conversation); Stop beside Send is
+shown while `running` — `asking` implies it — and sends `/stop` (end the turn). Both post the
+typed command through `api/send` with the same nonce, bubble and echo as typing it, so the daemon
+has one way to be told, the transcript records the command like any other, and this module gains
+no route. They leave the composer alone: a half-written prompt is exactly what someone reaching
+for Stop mid-reply has in there. The power button does not wait out the poll to disappear — the
+daemon ends the child synchronously before it sends the ack (`answerDaemonCommand`), and the ack
+is a posted message, which announces the list.
+
 **`access.allowFrom` identity is `<instance id>:owner`**, the same for every topic. An existing
 config that already lists other identities will silently ignore every message typed into this
 page until that entry is added — `doctor` checks for exactly this.

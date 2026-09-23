@@ -375,9 +375,11 @@ the `claude` agent.
 
 The fix, three layers, all fixed at startup from config alone:
 
-1. `DAEMON_COMMANDS` (`/new`, `/clear`, `/stop`, `/setting`, `/help`) — intercepted before any
+1. `DAEMON_COMMANDS` (`/new`, `/clear`, `/stop`, `/kill`, `/setting`, `/help`) — intercepted before any
    agent. `/new` and `/stop` are separate because they answer separate asks: both end the running
-   turn, only `/new` also ends the conversation. `/setting` is the odd one out — it is the only
+   turn, only `/new` also ends the conversation. `/kill` is the rung between them — it ends the
+   agent's process and keeps the conversation, for the harness `/stop`'s cooperative cancel cannot
+   reach. `/setting` is the odd one out — it is the only
    command whose effect outlives the conversation, because it writes config.yaml (see
    [`settings.ts`](#settingsts)).
 2. `GENERIC_COMMANDS` — a small fixed vocabulary meaning the same thing everywhere,

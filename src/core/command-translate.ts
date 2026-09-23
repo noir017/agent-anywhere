@@ -49,6 +49,15 @@ export type Harness = AgentDef['harness'];
  * `inbound.interruptOnNewMessage` — which fires as a side effect of sending another message, not
  * because anybody asked for it.
  *
+ * `/kill` is the third rung, between those two: it ends the agent's PROCESS and keeps the
+ * conversation, the manual form of what the idle sweeper does on its own. `/stop` cannot be that
+ * command, because its cancel is cooperative — it asks the harness to stop (ACP `session/cancel`),
+ * and a harness wedged inside a tool call never answers. The only thing that still works then is
+ * ending the child, and before `/kill` the commands that did so (`/new`, `/cd`) also threw away the
+ * context the user was trying to save. Kept apart from `/stop` rather than folded into
+ * it because the price differs: the next message after `/kill` pays a respawn and a session
+ * reload, and "stop that reply" should not cost that every time.
+ *
  * `/setting` is the only command in this list that writes to disk, and the only one whose effect
  * outlives the conversation it was typed in: it edits config.yaml (see core/settings.ts for what it
  * will and will not touch). Registered alongside the rest because the alternative — reaching the
@@ -65,6 +74,7 @@ export const DAEMON_COMMANDS: SlashCommandSpec[] = [
   { name: 'new', description: 'Start a fresh conversation (clears context)' },
   { name: 'clear', description: 'Alias of /new: start a fresh conversation' },
   { name: 'stop', description: 'Stop the current turn (keeps the conversation)' },
+  { name: 'kill', description: 'End the agent process (keeps the conversation; the next message resumes it)' },
   { name: 'cd', description: 'Choose the working directory (starts a fresh session there)' },
   { name: 'setting', description: 'Change a saved setting (default agent, model, session)' },
   { name: 'title', description: 'Name this topic (it is named automatically otherwise)' },

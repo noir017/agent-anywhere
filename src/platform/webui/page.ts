@@ -162,6 +162,12 @@ body{background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,-apple-system,
 .chat-status{font-size:11.5px;color:var(--dim);text-transform:uppercase;letter-spacing:.04em}
 .chat-status.running{color:#38bdf8}
 .chat-status.asking{color:#fbbf24}
+/* The process behind this topic, ended on a tap (/kill). Red only under the pointer, as #term-end
+   is: at rest it is one of the header's quiet controls, and one that is red all the time reads as
+   an alarm rather than as an option. flex-shrink:0 because the title beside it is the thing that
+   gives way to a narrow header; the control must not be what gets squeezed out. */
+#kill-agent{flex-shrink:0;display:inline-flex;align-items:center;justify-content:center;padding:4px 6px}
+#kill-agent:hover{color:#f87171;background:rgba(248,113,113,.15)}
 /* The terminal takes the place of the transcript and the composer, not of the whole view: the
    header stays, so the sidebar button, the topic name and the way back out are all still
    where they were a moment ago. One class on #chat swaps the two.
@@ -297,6 +303,10 @@ button:disabled{opacity:.5;cursor:default}
 #lightbox[hidden]{display:none}
 #lightbox img{max-width:100%;max-height:100%;object-fit:contain}
 #row{display:flex;gap:8px;align-items:flex-end}
+/* Red at rest, unlike #kill-agent: it only exists while a reply is streaming in, and in that
+   moment it is the control being looked for. */
+#stop-turn{color:#f87171;border-color:rgba(248,113,113,.4)}
+#stop-turn:hover{border-color:#f87171}
 #input{flex:1;resize:none;max-height:40vh;max-height:40dvh;padding:8px 10px;background:var(--field);color:var(--fg);border:1px solid var(--line);border-radius:4px;font:inherit;overflow-y:auto}
 #input:focus,#login input:focus{outline:none;border-color:#3d3d3d}
 #note{color:var(--dim);font-size:12px;padding:0 16px 8px;max-width:860px;width:100%;margin:0 auto}
@@ -332,6 +342,10 @@ button:disabled{opacity:.5;cursor:default}
   #chat-header{padding:2px 12px}
   #expand-sidebar{display:inline-flex;align-items:center;justify-content:center;
     min-width:44px;height:44px;margin-left:-10px;font-size:20px;color:var(--fg)}
+  /* The same 44px, for the same finger. The glyph grows with the box, or a 14px icon floats in
+     a target three times its size and reads as a stray mark rather than a control. */
+  #kill-agent{min-width:44px;height:44px}
+  #kill-agent svg{width:18px;height:18px}
   .chat-title{max-width:none}
   #log{padding:14px 12px 6px}
   #typing,#note{padding-left:12px;padding-right:12px}
@@ -362,7 +376,8 @@ const SCRIPT = `
       clearBtn=$('clear-topics'), chatTitle=$('topic-title'), chatStatus=$('topic-status'),
       chat=$('chat'), termBtn=$('term-toggle'), termHost=$('term-frames'),
       termName=$('term-name'), termMinBtn=$('term-min'), termEndBtn=$('term-end'),
-      lightbox=$('lightbox'), lightboxImg=$('lightbox-img');
+      lightbox=$('lightbox'), lightboxImg=$('lightbox-img'),
+      killBtn=$('kill-agent'), stopBtn=$('stop-turn');
   var data={}, els={}, files=[], commands=[], stream=null, done=false;
   // Last markup written per message, so a sync that re-sends an unchanged message touches no DOM.
   var sig={};
@@ -999,6 +1014,12 @@ const SCRIPT = `
       chatTitle.textContent='';
       chatStatus.textContent='';
     }
+    // Each control exists only while its command has something to act on, read off the same flags
+    // as the dot: Stop while a turn is open (a question holds one open, so asking implies it), and
+    // the power button while a process is resident. Hiding beats disabling — a greyed-out control
+    // asks to be explained, and "nothing is running" is already what an unlit dot says.
+    killBtn.hidden = !(cur && cur.live);
+    stopBtn.hidden = !(cur && (cur.running || cur.asking));
     // The window's title bar names the same topic this row does, so a rename lands on both in
     // the same frame rather than leaving the bar holding the old name until the next switch.
     if(TERM_OK) paintFrames();
@@ -1574,12 +1595,29 @@ const SCRIPT = `
   function send(){
     var typed = input.value;
     if(!typed.trim() && !files.length) return;
+    var attached = files;
+    input.value=''; files=[]; renderChips(); suggest(); grow();
+    dispatch(typed, attached);
+  }
+
+  /**
+   * Send a command on behalf of a control (Stop, the power button): exactly what typing it would
+   * post — same bubble, same nonce, same echo — so the daemon has one way to be told and the
+   * transcript records the command like any other.
+   *
+   * The composer is left alone on purpose. A half-written prompt is what someone reaching for Stop
+   * mid-reply is most likely to have in there, and pressing it must not cost them that.
+   */
+  function command(text){
+    if(topic) dispatch(text, []);
+  }
+
+  function dispatch(typed, attached){
     var nonce = Math.random().toString(36).slice(2)+Date.now().toString(36);
     var body = {topic:topic, text:typed, nonce:nonce};
     var names = [];
-    for(var i=0;i<files.length;i++) names.push(files[i].name);
-    if(files.length) body.files = files;
-    input.value=''; files=[]; renderChips(); suggest(); grow();
+    for(var i=0;i<attached.length;i++) names.push(attached[i].name);
+    if(attached.length) body.files = attached;
     outbox[nonce] = body;
     data['p:'+nonce] = { id:'p:'+nonce, _local:1, _nonce:nonce, _state:'sending', _text:typed,
       own:true, html:localBody(typed, names), at:Date.now(), buttons:[], reactions:[] };
@@ -1687,6 +1725,8 @@ const SCRIPT = `
     e.preventDefault(); send();
   });
   $('composer').addEventListener('submit', function(e){ e.preventDefault(); send(); });
+  killBtn.addEventListener('click', function(){ command('/kill'); });
+  stopBtn.addEventListener('click', function(){ command('/stop'); });
 
   /**
    * Retire the local bubble this message is the echo of.
@@ -1775,6 +1815,16 @@ __GATE__
     <div id="chat-header">
       <button type="button" class="btn-icon" id="expand-sidebar" title="Show topics" hidden>☰</button>
       <span id="topic-title" class="chat-title"></span>
+      <!-- /kill, one tap away. Beside the title rather than beside Send because it is about the
+           topic — the process behind it — and not about the message being written; shown only
+           while there is a process to end, which is the same fact the sidebar dot is lit by.
+           An SVG rather than U+23FB: that glyph only arrived in Unicode 9, not every system font
+           carries it, and where it is missing it renders as an empty box — which nobody presses. -->
+      <button type="button" class="btn-icon" id="kill-agent" hidden
+        title="End the agent process — the conversation is kept, and the next message resumes it (/kill)"
+        aria-label="End the agent process"><svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+        stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M12 3v8"/><path
+        d="M6.3 6.8a8 8 0 1 0 11.4 0"/></svg></button>
       <span id="topic-status" class="chat-status"></span>
       <!-- Present in the markup but hidden unless the daemon serves a terminal, so the script
            has one thing to reveal rather than one thing to build. -->
@@ -1802,6 +1852,11 @@ __GATE__
           <textarea id="input" rows="1" placeholder="Message" autocomplete="off"></textarea>
           <input id="picker" type="file" multiple hidden>
           <button type="button" id="attach" title="Attach a file">+</button>
+          <!-- /stop, while there is a turn to stop. Beside Send because that is where the eye
+               already is while a reply streams in, and separate from it because the composer
+               still sends mid-turn (queued behind the running turn, or interrupting it under
+               inbound.interruptOnNewMessage) — neither of which is "stop". -->
+          <button type="button" id="stop-turn" title="Stop the current turn — the conversation is kept (/stop)" hidden>Stop</button>
           <!-- A tooltip is a pointer's affordance, so it names the pointer's shortcut: under the
                narrow-screen layout Enter writes a newline, but nothing there can hover to read
                this. Ctrl-Enter sends on both and is what that layout's users are left with. -->

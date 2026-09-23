@@ -52,10 +52,11 @@ describe('buildRegisteredSpecs', () => {
   it('registers daemon commands, the generic vocabulary, and one agent command per harness', () => {
     const names = buildRegisteredSpecs(cfg(agent('cc', 'claude'), agent('oc', 'opencode'))).map((s) => s.name);
     // Daemon commands lead (intercepted before any agent).
-    expect(names.slice(0, 8)).toEqual([
+    expect(names.slice(0, 9)).toEqual([
       'new',
       'clear',
       'stop',
+      'kill',
       'cd',
       'setting',
       'title',

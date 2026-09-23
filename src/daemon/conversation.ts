@@ -104,6 +104,9 @@ const HELP_RE = /^\/help(@\S+)?$/;
 /** `/stop` — end the running turn without ending the conversation (the counterpart to `/new`). */
 const STOP_RE = /^\/stop(@\S+)?$/;
 
+/** `/kill` — end the agent's process without ending the conversation (see DAEMON_COMMANDS). */
+const KILL_RE = /^\/kill(@\S+)?$/;
+
 /**
  * Spellings of the settings command the gateway answers.
  *
@@ -197,6 +200,27 @@ const STOP_ACK: Record<StopOutcome, string> = {
  * are read off the merger, which knows nothing about a question posted outside a turn.
  */
 const STOP_ACK_QUESTION = '⏹ Called off the question above. Nothing else was running.';
+
+/**
+ * What `/kill` found. The first three are StopOutcome — the process was ended, and this is what
+ * else was going on at the time; the last two are the cases where nothing was ended at all.
+ */
+type KillOutcome = StopOutcome | 'no-child' | 'unresumable';
+
+/**
+ * What `/kill` answers, per outcome. Every "ended" sentence says the conversation survives, because
+ * that is the one thing separating this command from `/new` and the one a user about to lose a long
+ * session needs to read before they believe it.
+ */
+const KILL_ACK: Record<KillOutcome, string> = {
+  running: '🔌 Stopped the turn and ended the agent process. The conversation is kept — the next message starts a new process that picks up where this one left off.',
+  collecting: '🔌 Dropped the message that was about to start a turn, and ended the agent process. The conversation is kept — the next message resumes it.',
+  idle: '🔌 Ended the agent process. The conversation is kept — the next message starts a new one that picks up where it left off.',
+  'no-child': 'No agent process is running here — nothing to end.',
+  unresumable:
+    'Not ended: this agent cannot resume a stored session, so ending its process would lose the conversation. ' +
+    '`/stop` ends the turn; `/new` ends the process and starts fresh.',
+};
 
 /**
  * How often the idle sweeper looks for conversations to reclaim.
@@ -1236,6 +1260,14 @@ export class ConversationRegistry {
       return true;
     }
 
+    // /kill ends the agent's PROCESS and keeps the conversation — the manual form of idle reclaim,
+    // for the harness that /stop's cooperative cancel cannot reach. Intercepted here for the same
+    // reason as /stop: it has to work mid-turn, which is exactly when a wedged agent is noticed.
+    if (KILL_RE.test(text)) {
+      ack('/kill', this.killAndReport(key, conv));
+      return true;
+    }
+
     // `/help` lists what THIS gateway understands, which is the vocabulary a chat user has no other
     // way to discover — the platform menu shows names without saying who answers them, and the
     // harness's own /help knows nothing about /new, /oc or the generic translation.
@@ -1302,6 +1334,13 @@ export class ConversationRegistry {
     const outcome = this.stopConversation(key);
     console.log(`[conversation] ${key} /stop by ${conv.platform}:${conv.user} → ${outcome}`);
     return outcome === 'idle' && calledOff > 0 ? STOP_ACK_QUESTION : STOP_ACK[outcome];
+  }
+
+  /** `/kill`: end the agent process here and say what that did (see killConversation). */
+  private killAndReport(key: ConversationId, conv: ConversationRef): string {
+    const outcome = this.killConversation(key);
+    console.log(`[conversation] ${key} /kill by ${conv.platform}:${conv.user} → ${outcome}`);
+    return KILL_ACK[outcome];
   }
 
   /**
@@ -2428,6 +2467,41 @@ ${formatTokens(left)} left before compaction — ${name}`;
     const state = this.conversations.get(id);
     if (!state) return 'idle';
     return state.merger.interrupt();
+  }
+
+  /**
+   * End a conversation's agent process (`/kill`), keeping everything that identifies the
+   * conversation — the idle sweeper's reclaim, asked for by name and applied mid-turn if need be.
+   *
+   * The order is the point:
+   *
+   *  1. The child is examined FIRST, and a refusal touches nothing. A runtime that cannot resume a
+   *     stored session keeps its child, for the reason reclaimSession gives — ending it would
+   *     silently restart the conversation, which is `/new`, and the user asked for the other one.
+   *     Stopping the turn on the way to that refusal would do half of what was asked and say none.
+   *  2. Questions still on screen are called off: they belong to the process being ended, and one
+   *     left live would pin the conversation (hasPendingWork) and read the next message as its answer.
+   *  3. The merger is interrupted BEFORE the child goes. Disposing alone would end the turn too — the
+   *     runtime's own abort flag makes the dead prompt resolve quietly — but the merger would not
+   *     know it was stopped, so it would mark the turn ✅ and then start the queued backlog, which
+   *     spawns a fresh child and undoes the kill a moment after acking it.
+   *  4. dispose() on the SESSION, not on the factory, exactly as reclaim does: the handle survives,
+   *     and with it the runtime `/model` choice. It does not wait for the turn to unwind, unlike
+   *     reclaimAfterAskTimeout's reclaimOnIdle — a turn that never unwinds is the case this exists for.
+   *
+   * No session means nothing ever ran here; answered without agents.getOrCreate for the reason
+   * stopConversation gives.
+   */
+  killConversation(id: ConversationId): KillOutcome {
+    const session = this.agents.peek(id);
+    const reclaim = session?.reclaimState?.() ?? 'no-child';
+    if (!session || reclaim === 'no-child') return 'no-child';
+    if (reclaim === 'unresumable') return 'unresumable';
+    this.hooks?.cancelPendingAsks?.(id, 'agent process ended');
+    const outcome = this.stopConversation(id);
+    session.dispose();
+    console.log(`[reclaim] ${id} ended by /kill — agent child stopped; the next message resumes it`);
+    return outcome;
   }
 
   /** Shutdown: stop the sweeper, release all mergers and agent sessions. */

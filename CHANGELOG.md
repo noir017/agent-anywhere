@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.31.2] - 2026-09-23
+
 ### Fixed
 
 - **Claude turns work when the daemon uses the global Claude Code binary.** The daemon strips

@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.33.1] - 2026-09-23
+
 ### Fixed
 
 - **An agy conversation left on agy's default model names that model in the footer again.** The

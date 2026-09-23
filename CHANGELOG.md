@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.31.0] - 2026-09-23
+
 ### Fixed
 
 - **The web UI no longer asks for the password after every update.** Sessions lived only in the

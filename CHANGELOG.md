@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.32.0] - 2026-09-23
+
 ### Added
 
 - **`/effort` shows and changes how hard the agent thinks, from the chat.** On claude, codex and

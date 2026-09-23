@@ -29,7 +29,7 @@
     "prepublishOnly": "npm run typecheck && npm test && npm run build"
   },
   "dependencies": {
-    "@agentclientprotocol/claude-agent-acp": "^0.58.1",
+    "@agentclientprotocol/claude-agent-acp": "^0.81.0",
     "@agentclientprotocol/sdk": "0.29.0",
     "@cordisjs/plugin-http": "^0.6.0",
     "@inquirer/prompts": "^7.0.0",
@@ -63,7 +63,7 @@
     "vitest": "^2.1.0"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "publishConfig": {
     "registry": "https://registry.npmjs.org"

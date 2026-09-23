@@ -5,6 +5,12 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Claude model requests use a current Claude Code runtime.** The Claude ACP adapter bundles its
+  own Claude Code binary; upgrading the global `claude` command does not update that runtime. The
+  adapter now bundles Claude Code 2.1.280, required by current models.
+
 ## [1.28.0] - 2026-09-22
 
 ### Added

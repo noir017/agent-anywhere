@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.30.0] - 2026-09-23
+
 ### Added
 
 - **The footer shows the reasoning effort beside the model.** `cc · 18k / 1M (2%) · opus-5-5 ·

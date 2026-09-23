@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.29.0] - 2026-09-23
+
 ### Fixed
 
 - **Claude model requests use a current Claude Code runtime.** The Claude ACP adapter bundles its

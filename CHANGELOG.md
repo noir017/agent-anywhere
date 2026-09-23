@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.31.1] - 2026-09-23
+
 ### Fixed
 
 - **A web UI topic stops showing amber once you have written into it.** `/cc` offers a

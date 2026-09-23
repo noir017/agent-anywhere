@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.33.0] - 2026-09-23
+
 ### Added
 
 - **`/kill` ends the agent's process and keeps the conversation.** `/stop` asks the agent to stop,

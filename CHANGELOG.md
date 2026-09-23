@@ -5,6 +5,13 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Claude turns work when the daemon uses the global Claude Code binary.** The daemon strips
+  inherited Claude session markers before starting an agent, but that also removed
+  `CLAUDE_CODE_EXECUTABLE`, the path needed after the SDK's bundled binary was removed. Keep
+  that one variable while continuing to strip the markers that trigger nested-session rejection.
+
 ## [1.31.1] - 2026-09-23
 
 ### Fixed

@@ -148,7 +148,9 @@ export function buildHarnessEnv(def: AgentDef): Record<string, string | undefine
   // inside a Claude Code session, the child inherits CLAUDECODE/CLAUDE_CODE_* and the underlying Claude
   // CLI refuses with "Claude Code cannot be launched inside another Claude Code session".
   delete env.CLAUDECODE;
-  for (const k of Object.keys(env)) if (k.startsWith('CLAUDE_CODE')) delete env[k];
+  for (const k of Object.keys(env)) {
+    if (k.startsWith('CLAUDE_CODE') && k !== 'CLAUDE_CODE_EXECUTABLE') delete env[k];
+  }
   for (const [k, v] of Object.entries(def.env)) env[k] = expandEnv(v);
   return env;
 }

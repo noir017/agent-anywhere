@@ -59,7 +59,7 @@ Pushing is opt-in on purpose: the tag push is the irreversible step.
 ## `verify-agy.ts` — re-probe the Antigravity harness against a real `agy`
 
 ```bash
-npx tsx scripts/verify-agy.ts [<agy conversation id>]
+npx tsx scripts/verify-agy.ts
 ```
 
 Everything the agy runtime does rests on behaviour measured from the CLI, version by
@@ -70,9 +70,12 @@ any of it still true on the agy currently installed?*
 
 It installs the status-line shim, lists the skill directories and what was found in them,
 runs three of agy's own CLI commands through `runAgyCliCommand`, prints the launch
-arguments, and — given a conversation id — reads back the usage that conversation
-recorded. It talks to the real CLI and the real home directory, so it is a development
-utility, not a test.
+arguments, and starts one stream-json agy with the daemon's fd 3 to count the status-line
+frames that reach it — the one undocumented behaviour the footer rests on, checked without
+sending a prompt. It talks to the real CLI and the real home directory, so it is a
+development utility, not a test; on a machine whose daemon runs another version, isolate
+`HOME` and `AGENT_ANYWHERE_CONFIG_DIR` first (the script's header says how), or step one
+replaces that daemon's shim.
 
 ## `verify-sso.mts` — drive the web UI's SSO door against a real provider
 

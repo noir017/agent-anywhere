@@ -141,8 +141,9 @@ access:
   **skills**——照常进入会话并正常展开。
 - **上下文占用来自 agy 的状态栏。** agy 的协议不上报 token 数，但它会把上下文快照
   交给 `~/.gemini/antigravity-cli/settings.json` 里配置的 `statusLine` 命令。守护进程
-  启动时会先备份该文件一次，再把这项指向自己的 shim：既把数字记录下来供页脚使用，
-  也照样为你的终端画出状态栏。设 `AGENT_ANYWHERE_NO_AGY_STATUSLINE=1` 可以不动这项
+  启动时会先备份该文件一次，再把这项指向自己的 shim：既通过一条管道把数字——以及
+  其他途径都拿不到的 agy 默认模型名——直接交回守护进程供页脚使用，也照样为你的终端
+  画出状态栏。设 `AGENT_ANYWHERE_NO_AGY_STATUSLINE=1` 可以不动这项
   配置（代价是没有这些数字）。
 - **skills** 从 `<cwd>/.agents/skills`、`~/.agents/skills`、
   `~/.gemini/antigravity-cli/skills`、`~/.gemini/skills`、`~/.gemini/config/skills`

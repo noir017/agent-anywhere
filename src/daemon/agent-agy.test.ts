@@ -1,5 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi, afterEach } from 'vitest';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
+import { spawn } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import {
+  agyModelId,
   buildAgyArgs,
   consumeNdJsonLines,
   createAgyAgentFactory,
@@ -12,7 +17,21 @@ import {
   type AgyTurnState,
 } from './agent-agy.js';
 import { buildInputPreview } from './agent-common.js';
+import { AGY_STATUS_FD, AGY_STATUS_FD_ENV, ensureAgyStatusLine } from './agy-statusline.js';
 import { AgentDefSchema, type Config } from '../config/schema.js';
+import type { AgentStreamHandlers } from './agent.js';
+
+// Pass-throughs by default, so every test that never spawns is untouched; the session tests at the
+// bottom swap in a scripted child. The status-line install is stubbed so no test can reach the
+// operator's agy settings, and so a test can claim it was wired.
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  return { ...actual, spawn: vi.fn(actual.spawn) };
+});
+vi.mock('./agy-statusline.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./agy-statusline.js')>();
+  return { ...actual, ensureAgyStatusLine: vi.fn(() => 'skipped' as const) };
+});
 
 /**
  * Every event fixture here is a verbatim shape captured from a real `agy 1.1.22` run
@@ -477,5 +496,220 @@ describe('formatAgyCliOutput', () => {
     const out = formatAgyCliOutput('usage', 'Gemini Models\tWeekly\t50%\t2026-09-24T06:12:21Z');
     expect(out).toContain('Quota:');
     expect(out).not.toContain('```');
+  });
+});
+
+describe('agyModelId', () => {
+  const MODELS = [
+    { value: 'gemini-3.8-flash-high', name: 'Gemini 3.8 Flash (High)' },
+    { value: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6 (Thinking)' },
+  ];
+
+  it('respells a display name as the id `agy models` lists, and leaves an id alone', () => {
+    expect(agyModelId('Claude Sonnet 4.6 (Thinking)', MODELS)).toBe('claude-sonnet-4-6');
+    expect(agyModelId('gemini-3.8-flash-high', MODELS)).toBe('gemini-3.8-flash-high');
+  });
+
+  it('passes an unknown name through — a display name beats no model at all', () => {
+    expect(agyModelId('Some Future Model', MODELS)).toBe('Some Future Model');
+    expect(agyModelId('Claude Sonnet 4.6 (Thinking)')).toBe('Claude Sonnet 4.6 (Thinking)');
+  });
+});
+
+/**
+ * The session driven end to end against a scripted child: `init`, then per turn whatever the status
+ * line reports on fd 3, then `result`. `init` shapes are verbatim from agy 1.2.9 (2026-09-23): with
+ * no `--model=` it names no model at all, which is the bug these tests were written for — a footer
+ * with context numbers and no model, on every conversation left on agy's default.
+ */
+describe('agy session — what the status pipe tells the footer', () => {
+  const MODELS = [
+    { value: 'gemini-3.8-flash-high', name: 'Gemini 3.8 Flash (High)' },
+    { value: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6 (Thinking)' },
+  ];
+  const INIT_DEFAULT = { conversation_id: '2a7e949d-7849-4d00-b565-fc062f30e515', init: { cwd: '/tmp', permission_mode: 'always-proceed' } };
+
+  afterEach(() => {
+    vi.mocked(spawn).mockReset();
+    vi.mocked(ensureAgyStatusLine).mockReturnValue('skipped');
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * A scripted child, in the order agy 1.2.9 was measured to write things: `boot` frames on fd 3
+   * from the moment it starts (before `init`, before any prompt), `init`, and per prompt `during`
+   * frames, `result`, then `after` frames — the post-turn refresh that carries the turn's tokens.
+   */
+  function scriptSpawn(
+    init: Record<string, unknown>,
+    frames: { boot?: string[]; during?: string[]; after?: string[] } = {}
+  ): void {
+    vi.mocked(spawn).mockImplementation(() => {
+      const statusPipe = new PassThrough();
+      const child = Object.assign(new EventEmitter(), {
+        stdin: new PassThrough(),
+        stdout: new PassThrough(),
+        stderr: new PassThrough(),
+        exitCode: null,
+        signalCode: null,
+        kill: vi.fn(() => true),
+      });
+      Object.assign(child, { stdio: [child.stdin, child.stdout, child.stderr, statusPipe] });
+      const report = (lines: string[] = []) => {
+        for (const line of lines) statusPipe.write(`${line}\n`);
+      };
+      report(frames.boot);
+      setImmediate(() => child.stdout.write(`${JSON.stringify({ event: 'init', ...init })}\n`));
+      child.stdin.on('data', () => {
+        report(frames.during);
+        setTimeout(() => {
+          child.stdout.write(`${JSON.stringify({ event: 'result', result: { status: 'SUCCESS' } })}\n`);
+          setTimeout(() => report(frames.after), 30);
+        }, 10);
+      });
+      return child as unknown as ReturnType<typeof spawn>;
+    });
+  }
+
+  function recordingHandlers() {
+    const seen: { models: string[]; usage: unknown[] } = { models: [], usage: [] };
+    const handlers: AgentStreamHandlers = {
+      onText: () => {},
+      onToolStart: () => {},
+      onToolFinish: () => {},
+      onSegmentBreak: () => {},
+      onModel: (m) => seen.models.push(m),
+      onUsage: (u) => seen.usage.push(u),
+    };
+    return { seen, handlers };
+  }
+
+  function makeFactory(over: Record<string, unknown> = {}) {
+    const cfg = { agents: [def({ id: 'ag', cwd: tmpdir(), ...over })] } as unknown as Config;
+    return createAgyAgentFactory(cfg, '/tmp/test.sock', undefined, async () => MODELS);
+  }
+
+  it('names agy’s default model from the status line when `init` names none', async () => {
+    // Verbatim from 1.2.9: the id slot carries the display name when agy is on its default.
+    const named = { size: 250000, model: 'Claude Sonnet 4.6 (Thinking)' };
+    scriptSpawn(INIT_DEFAULT, {
+      boot: [JSON.stringify({ ...named, used: 0 })],
+      after: [JSON.stringify({ ...named, used: 22087 })],
+    });
+    const factory = makeFactory();
+    const session = factory.getOrCreate('conv-1', 'ag');
+    await session.ensureSession?.('sess_x');
+    const { seen, handlers } = recordingHandlers();
+
+    await session.runTurn({ prompt: 'hi', sessionToken: 'sess_x' }, handlers);
+
+    // Respelled as the id, so it reads the same as a model someone picked from /model.
+    expect(seen.models.at(-1)).toBe('claude-sonnet-4-6');
+    expect(seen.usage.at(-1)).toEqual({ used: 22087, size: 250000 });
+    // And the /model menu can mark it, which it could not while nobody knew the default.
+    expect(session.modelSelector?.()?.current).toBe('claude-sonnet-4-6');
+
+    // The pipe is what the shim writes to: fd 3 opened, and named in the environment.
+    const opts = vi.mocked(spawn).mock.calls[0]?.[2] as { stdio: unknown[]; env: Record<string, string> };
+    expect(opts.stdio).toHaveLength(AGY_STATUS_FD + 1);
+    expect(opts.env[AGY_STATUS_FD_ENV]).toBe(String(AGY_STATUS_FD));
+    factory.dispose('conv-1');
+  });
+
+  it('prefers the model `init` resolved, when there is one', async () => {
+    // With --model= passed, `init` names it (agy 1.2.9), and that is the authoritative spelling.
+    scriptSpawn(
+      { ...INIT_DEFAULT, init: { ...INIT_DEFAULT.init, model: 'gemini-3.8-flash-high' } },
+      { after: [JSON.stringify({ used: 1000, size: 1048576, model: 'Something Else' })] }
+    );
+    const factory = makeFactory({ model: 'gemini-3.8-flash-high' });
+    const session = factory.getOrCreate('conv-1', 'ag');
+    const { seen, handlers } = recordingHandlers();
+
+    await session.runTurn({ prompt: 'hi', sessionToken: 'sess_x' }, handlers);
+
+    expect(new Set(seen.models)).toEqual(new Set(['gemini-3.8-flash-high']));
+    factory.dispose('conv-1');
+  });
+
+  it('waits for the frame agy sends after `result` — the one that carries the turn’s tokens', async () => {
+    // Measured on 1.2.9: every frame during a turn still read the pre-turn count (0 on a first
+    // turn) and the real number arrived ~260ms after `result`. Read at `result`, the footer lagged
+    // a turn behind; this is the order that exposed it.
+    const stale = JSON.stringify({ used: 0, size: 1048576, model: 'Gemini 3.8 Flash (High)' });
+    const fresh = JSON.stringify({ used: 16926, size: 1048576, model: 'Gemini 3.8 Flash (High)' });
+    scriptSpawn(INIT_DEFAULT, { boot: [stale], during: [stale], after: [fresh] });
+    const factory = makeFactory();
+    const session = factory.getOrCreate('conv-1', 'ag');
+    const { seen, handlers } = recordingHandlers();
+
+    await session.runTurn({ prompt: 'hi', sessionToken: 'sess_x' }, handlers);
+
+    expect(seen.usage).toEqual([{ used: 16926, size: 1048576 }]);
+    expect(seen.models.at(-1)).toBe('gemini-3.8-flash-high');
+    factory.dispose('conv-1');
+  });
+
+  it('gives up waiting after a bound when no fresher frame comes, and reports what it has', async () => {
+    const stale = JSON.stringify({ used: 0, size: 1048576 });
+    scriptSpawn(INIT_DEFAULT, { boot: [stale] });
+    const factory = makeFactory();
+    const session = factory.getOrCreate('conv-1', 'ag');
+    const { seen, handlers } = recordingHandlers();
+
+    const started = Date.now();
+    await session.runTurn({ prompt: 'hi', sessionToken: 'sess_x' }, handlers);
+
+    expect(seen.usage).toEqual([{ used: 0, size: 1048576 }]);
+    expect(Date.now() - started).toBeLessThan(3_000);
+    factory.dispose('conv-1');
+  });
+
+  it('shrugs off lines on the pipe that are not frames — anything agy started can write there', async () => {
+    scriptSpawn(INIT_DEFAULT, {
+      boot: [JSON.stringify({ used: 0, size: 100 })],
+      during: ['garbage from a tool', '[]'],
+      after: [JSON.stringify({ used: 5, size: 100 })],
+    });
+    const factory = makeFactory();
+    const session = factory.getOrCreate('conv-1', 'ag');
+    const { seen, handlers } = recordingHandlers();
+
+    await session.runTurn({ prompt: 'hi', sessionToken: 'sess_x' }, handlers);
+
+    expect(seen.usage.at(-1)).toEqual({ used: 5, size: 100 });
+    factory.dispose('conv-1');
+  });
+
+  it('says so in the log, once, when a turn passes with nothing on the pipe', async () => {
+    // What a future agy that closes inherited descriptors would look like: the footer loses its
+    // numbers, and the operator is told why instead of finding out by noticing.
+    vi.mocked(ensureAgyStatusLine).mockReturnValue('unchanged');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    scriptSpawn(INIT_DEFAULT);
+    const factory = makeFactory();
+    const session = factory.getOrCreate('conv-1', 'ag');
+    const { seen, handlers } = recordingHandlers();
+
+    await session.runTurn({ prompt: 'one', sessionToken: 'sess_x' }, handlers);
+    await session.runTurn({ prompt: 'two', sessionToken: 'sess_x' }, handlers);
+
+    const silence = warn.mock.calls.filter((c) => String(c[0]).includes(`fd ${AGY_STATUS_FD}`));
+    expect(silence).toHaveLength(1);
+    expect(seen.models).toEqual([]);
+    factory.dispose('conv-1');
+  });
+
+  it('stays quiet about silence when the daemon never wired the status line', async () => {
+    // Opted out, or no agy config on this machine: nothing on the pipe is the expected answer.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    scriptSpawn(INIT_DEFAULT);
+    const factory = makeFactory();
+    const session = factory.getOrCreate('conv-1', 'ag');
+
+    await session.runTurn({ prompt: 'one', sessionToken: 'sess_x' }, recordingHandlers().handlers);
+
+    expect(warn.mock.calls.filter((c) => String(c[0]).includes(`fd ${AGY_STATUS_FD}`))).toEqual([]);
+    factory.dispose('conv-1');
   });
 });

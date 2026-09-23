@@ -149,8 +149,10 @@ other than its session:
 - **Context usage comes from agy's status line.** agy reports no token counts over
   its protocol, but it does hand a context snapshot to the `statusLine` command in
   `~/.gemini/antigravity-cli/settings.json`. On startup the daemon backs that file
-  up once and points the setting at its own shim, which records the numbers for the
-  footer and still draws a status line for your terminal. Set
+  up once and points the setting at its own shim, which passes the numbers — and
+  the name of agy's default model, which nothing else reports — straight back to
+  the daemon over a pipe for the footer, and still draws a status line for your
+  terminal. Set
   `AGENT_ANYWHERE_NO_AGY_STATUSLINE=1` to leave the setting alone and go without
   the numbers.
 - **Skills** are read from `<cwd>/.agents/skills`, `~/.agents/skills`,

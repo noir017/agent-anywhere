@@ -26,6 +26,28 @@ import type { AgentUsage } from './agent.js';
  * `total_input_tokens` against `context_window_size` is exactly the `{used, size}` pair the ACP
  * runtimes report, so it reaches the footer through the same `onUsage` path and renders identically.
  *
+ * The same snapshot is also the one place agy names its DEFAULT model. `init` stopped doing that:
+ * probed on agy 1.2.9 (2026-09-23), `init` carries `model` only when the daemon passed `--model=`,
+ * and with nothing configured it carries none — while the status line keeps reporting
+ * `"model": {"id": "Claude Sonnet 4.6 (Thinking)", "display_name": …}` throughout. So the model
+ * rides along with the numbers, and the runtime prefers `init`'s whenever there is one.
+ *
+ * ── Why the snapshot comes back over an inherited descriptor ─────────────────
+ * The shim is agy's child, not the daemon's, so its own stdio is spoken for: agy reads its stdout
+ * as the text to draw, and captures its stderr too (probed on agy 1.2.9: a marker written there
+ * never reached agy's stderr, which the daemon does read). What does reach it is a fourth stdio
+ * pipe: the runtime spawns agy with fd 3 open, agy leaves it open across the exec of its status
+ * line command, and a marker the shim wrote to fd 3 arrived at the daemon. One pipe per child, so a
+ * frame belongs to the child whose pipe carried it and needs no conversation id, no token and no
+ * file. It replaced a directory of per-conversation JSON files that nothing ever cleaned up.
+ *
+ * Hyrum's Law applies: nothing in agy's documentation promises fd 3 survives to the status line
+ * command. It holds on 1.2.9 because agy closes nothing it inherited, and the day an agy release
+ * starts sanitizing descriptors the frames stop arriving. The runtime says so in the log rather
+ * than letting the footer quietly lose its numbers (see agent-agy.ts, `statusSilence`).
+ * `AGY_STATUS_FD_ENV` is what arms the shim: the same script also runs under the operator's own
+ * interactive agy, where fd 3 is not ours to write to.
+ *
  * ── Why this writes to another product's config ───────────────────────────────
  * There is no per-invocation override: no flag, no environment variable, nothing in `agy --help`.
  * The status line is configured in `~/.gemini/antigravity-cli/settings.json` and that is the only
@@ -43,8 +65,68 @@ import type { AgentUsage } from './agent.js';
  * line, and agy-statusline.test.ts runs the installed artifact itself.
  */
 
-/** Where a conversation's last reported usage is parked, one small JSON file per agy conversation. */
-export function agyUsageDir(): string {
+/**
+ * The descriptor the runtime opens as agy's fourth stdio pipe, and the variable that tells the shim
+ * which descriptor to write to. Named in the environment rather than assumed, because the shim is
+ * also what the operator's own agy runs, and there fd 3 is whatever their shell left open.
+ */
+export const AGY_STATUS_FD = 3;
+export const AGY_STATUS_FD_ENV = 'AGENT_ANYWHERE_AGY_STATUS_FD';
+
+/** What one status-line frame told the daemon. Either half may be missing from any given frame. */
+export interface AgyStatus {
+  usage?: AgentUsage;
+  /** The model agy is serving, in whichever spelling its status line used (id or display name). */
+  model?: string;
+}
+
+/**
+ * Longest model name accepted. The pipe is open in every process agy spawns, the agent's own
+ * commands included, so a frame is parsed as untrusted input — and a name is printed on every reply.
+ */
+const MAX_MODEL_CHARS = 120;
+
+/**
+ * Parse one line the shim wrote to the status pipe. Undefined for anything that is not a frame.
+ *
+ * Usage has to be whole or absent: a window of 0 is the snapshot agy sends while it is still
+ * authenticating, and "0 / 0" in a footer would be a lie with a progress bar. The shim already
+ * drops those; this refuses them again because the pipe has other writers.
+ */
+export function parseAgyStatusFrame(line: string): AgyStatus | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+  const { used, size, model } = parsed as { used?: unknown; size?: unknown; model?: unknown };
+
+  const status: AgyStatus = {};
+  if (
+    typeof used === 'number' &&
+    typeof size === 'number' &&
+    Number.isFinite(used) &&
+    Number.isFinite(size) &&
+    used >= 0 &&
+    size > 0
+  ) {
+    status.usage = { used, size };
+  }
+  if (typeof model === 'string') {
+    const name = model.trim();
+    if (name && name.length <= MAX_MODEL_CHARS) status.model = name;
+  }
+  return status.usage || status.model ? status : undefined;
+}
+
+/**
+ * Where the shim used to park usage, one file per conversation, before the pipe replaced it. Kept
+ * only so the install can remove what earlier versions left behind (39 files on the machine that
+ * prompted the change, and nothing ever deleted one).
+ */
+function legacyUsageDir(): string {
   return path.join(configDir(), 'agy-usage');
 }
 
@@ -98,10 +180,10 @@ export function installStatusLine(home: string): 'installed' | 'unchanged' | 'sk
 function writeShim(): string {
   const dir = path.join(configDir(), 'bin');
   fs.mkdirSync(dir, { recursive: true });
-  fs.mkdirSync(agyUsageDir(), { recursive: true });
+  removeLegacyUsageDir();
 
   const script = path.join(dir, 'agy-statusline.mjs');
-  writeIfChanged(script, statusLineScript(agyUsageDir()), 0o644);
+  writeIfChanged(script, statusLineScript(), 0o644);
 
   // `node` is resolved at RUN time, not baked: the daemon may be running inside a container while
   // the operator's own `agy` runs on the host, sharing only the home directory. The interpreter
@@ -151,29 +233,15 @@ function pointSettingsAt(file: string, command: string): 'installed' | 'unchange
 }
 
 /**
- * The last usage this conversation's status line reported, or undefined.
- *
- * Undefined is the normal answer before a turn has produced any numbers, and it must stay
- * distinguishable from zero: a window reported as 0 is the snapshot agy emits while it is still
- * authenticating, and showing "0 / 0" as a context reading would be a lie with a progress bar.
+ * Delete the per-conversation usage files earlier versions wrote. Only ever this daemon's own
+ * state, under its own config dir; the shim rewritten beside it no longer writes there, so nothing
+ * would ever remove them otherwise. Best-effort, like the rest of the install.
  */
-export function readAgyUsage(conversationId: string | undefined): AgentUsage | undefined {
-  if (!conversationId) return undefined;
-  try {
-    const raw = fs.readFileSync(path.join(agyUsageDir(), `${safeName(conversationId)}.json`), 'utf8');
-    const parsed: unknown = JSON.parse(raw);
-    const { used, size } = (parsed ?? {}) as { used?: unknown; size?: unknown };
-    if (typeof used !== 'number' || typeof size !== 'number' || size <= 0) return undefined;
-    return { used, size };
-  } catch {
-    // Absent is the common case (no turn yet, or no status line installed) and not worth a line.
-    return undefined;
-  }
-}
-
-/** agy conversation ids are UUIDs; anything else is kept out of the path rather than trusted. */
-function safeName(id: string): string {
-  return id.replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 64);
+function removeLegacyUsageDir(): void {
+  const dir = legacyUsageDir();
+  if (!fs.existsSync(dir)) return;
+  fs.rmSync(dir, { recursive: true, force: true });
+  console.log(`[agy] removed ${dir} — usage now arrives over a pipe, not through files`);
 }
 
 function writeIfChanged(file: string, content: string, mode: number): void {
@@ -189,7 +257,7 @@ function shellQuote(s: string): string {
 }
 
 /**
- * The installed script: record the numbers for the daemon, then draw the status line.
+ * The installed script: report the snapshot to the daemon, then draw the status line.
  *
  * Plain JS with one import, because it is spawned on every render tick and startup time is the
  * whole cost. It must never fail loudly — a status line that prints a stack trace on every tick
@@ -200,12 +268,14 @@ function shellQuote(s: string): string {
  * not a licence to change what it shows. The quota shape is agy's: a map of pool id
  * (`gemini-weekly`, `3p-5h`, …) to `{remaining_fraction, reset_in_seconds}`.
  */
-function statusLineScript(usageDir: string): string {
+function statusLineScript(): string {
   return `#!/usr/bin/env node
 // Generated by agent-anywhere (daemon/agy-statusline.ts). Edits here are overwritten on restart.
 import fs from 'node:fs';
 
-const USAGE_DIR = ${JSON.stringify(usageDir)};
+// Set only by the daemon, on the agy it spawned; under an agy the operator started it is absent and
+// the frame is drawn, never reported.
+const STATUS_FD = Number(process.env[${JSON.stringify(AGY_STATUS_FD_ENV)}]);
 const ESC = '\\u001b[';
 const RESET = ESC + '0m', BOLD = ESC + '1m', DIM = ESC + '2m';
 const RED = ESC + '31m', GREEN = ESC + '32m', YELLOW = ESC + '33m';
@@ -220,24 +290,28 @@ process.stdin.on('end', () => {
   // Anything that is not a frame gets no line at all. Rendering the defaults instead would draw a
   // confident "0.0% [░░░░░░░░]" out of nothing, which is worse than an empty status line.
   if (!data || typeof data !== 'object' || Array.isArray(data)) return;
-  try { record(data); } catch {}
+  try { report(data); } catch {}
   try { process.stdout.write(render(data) + '\\n'); } catch {}
 });
 
-// One file per agy conversation, overwritten in place: the daemon reads the last snapshot at the
-// end of a turn, so history is not wanted and a growing file would be.
-function record(d) {
-  const id = d && d.conversation_id;
-  const ctx = (d && d.context_window) || {};
-  if (!id || typeof id !== 'string') return;
+// One short JSON line per tick, in a single write. Lines this small arrive whole in practice, and a
+// line that did not would fail to parse daemon-side and be dropped — the next tick replaces it.
+function report(d) {
+  if (!Number.isInteger(STATUS_FD) || STATUS_FD < 3) return;
+  const frame = {};
+  const ctx = d.context_window || {};
   const size = Number(ctx.context_window_size) || 0;
-  const used = Number(ctx.total_input_tokens) || 0;
-  if (size <= 0) return;
-  const name = id.replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 64);
-  fs.mkdirSync(USAGE_DIR, { recursive: true });
-  const tmp = USAGE_DIR + '/' + name + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify({ used, size, at: Date.now() }));
-  fs.renameSync(tmp, USAGE_DIR + '/' + name + '.json');
+  // A window of 0 is agy still authenticating; those numbers are not a reading.
+  if (size > 0) {
+    frame.used = Number(ctx.total_input_tokens) || 0;
+    frame.size = size;
+  }
+  // The id when agy has a real one, else its display name; the daemon maps a name back to an id.
+  const m = d.model;
+  const model = m && typeof m === 'object' ? (m.id || m.display_name) : m;
+  if (typeof model === 'string' && model) frame.model = model;
+  if (frame.size === undefined && frame.model === undefined) return;
+  fs.writeSync(STATUS_FD, JSON.stringify(frame) + '\\n');
 }
 
 function render(d) {

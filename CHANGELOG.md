@@ -5,6 +5,35 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **An agy conversation left on agy's default model names that model in the footer again.** The
+  footer took agy's model from the `init` event agy opens every session with, and until agy 1.2
+  that event named the model even when nobody had chosen one. On agy 1.2.9 it names one only when
+  `--model=` asked for it — so every conversation on agy's default showed its context numbers and
+  no model, and the `/model` menu could not mark which one was current. agy still reports its
+  default to the status line, so the model now comes from there, respelled as the id `agy models`
+  lists (`Claude Sonnet 4.6 (Thinking)` becomes `claude-sonnet-4-6`) so it reads the same as a
+  model picked from the menu.
+- **agy's context numbers describe the turn they are printed under.** agy refreshes the snapshot
+  it hands its status line only after a reply is done — measured at ~260ms after the turn ended —
+  and the footer read it the moment the turn ended, so it always showed the count from one step
+  earlier: `0` on a conversation's first turn. The runtime now waits for that refresh, for at most
+  1.5 seconds.
+
+### Changed
+
+- **agy's status line reports straight to the daemon, over a pipe, instead of through files.** The
+  shim the daemon installs as agy's `statusLine` used to write one JSON file per conversation for
+  the daemon to read back, and none was ever deleted (39 had piled up on the machine that prompted
+  this). It now writes each snapshot to a fourth descriptor the daemon opens when it starts agy,
+  which agy passes on to the shim. Each snapshot therefore reaches exactly the agy process it came
+  from, and the daemon can wait for the next one — which is what the fix above needed. The old
+  directory is removed on startup. agy does not document that it passes the descriptor on (1.2.9
+  does), so if a later release stops, the daemon says so in its log once rather than letting the
+  footer quietly lose its numbers. Under an agy you start yourself, the shim only draws the status
+  line, as before.
+
 ## [1.33.0] - 2026-09-23
 
 ### Added

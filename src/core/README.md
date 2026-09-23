@@ -409,7 +409,7 @@ though the gateway could answer it outright. Four do:
 | command | why there is no native name to translate to | what answers it |
 |---|---|---|
 | `/context` (opencode, dsh) | opencode's `/compact`-family commands are TUI-only; ACP mode never sees them | the last `usage_update {used, size}` the agent sent, the same numbers the footer prints |
-| `/context` (agy) | agy's protocol carries no token counts at all — it hands them to whatever `statusLine` command its settings name, headless runs included | the snapshot `daemon/agy-statusline.ts` records from that shim, read back at the end of each turn |
+| `/context` (agy) | agy's protocol carries no token counts at all — it hands them to whatever `statusLine` command its settings name, headless runs included | the snapshot the shim from `daemon/agy-statusline.ts` pushes to the daemon over a pipe, as of the end of the last turn |
 | `/usage` (agy) | agy's own CLI answers it, and forwarding that name into the session **kills the session** | a one-shot `agy -p=/usage`, rendered as quota bars |
 | `/model` (opencode, claude, agy) | opencode and claude expose the selector as a config option; agy reads it from `agy models` and switches via kill-and-respawn with `--model` and `--conversation` | `ConversationRegistry.applyModelCommand` via `AgentSession.modelSelector()` / `setModel()` |
 | `/effort` (claude, codex, opencode) | all three expose the level as a config option in category `thought_level` (ids differ: `effort`, `reasoning_effort`); none advertises a command for it | `ConversationRegistry.applyEffortCommand` via `AgentSession.effortSelector()` / `setEffort()` |

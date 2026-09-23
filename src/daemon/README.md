@@ -22,7 +22,7 @@ session id, agy's conversation id). One conversation holds one session *per agen
 | `agent-factory.ts` | Dispatch: which runtime serves which agent |
 | `agent-acp.ts` | ACP runtime (claude, codex, opencode, gemini, custom) |
 | `agent-agy.ts` | Antigravity CLI runtime — its own stream-json protocol |
-| `agy-statusline.ts` | The only channel agy reports context usage on: a shim installed into its `statusLine` setting |
+| `agy-statusline.ts` | The only channel agy reports context usage — and its default model — on: a shim installed into its `statusLine` setting, reporting back over fd 3 |
 | `agent-common.ts` | Protocol-agnostic helpers shared by both runtimes |
 | `conversation-store.ts` | Persisted per conversation: the bound agent, each agent's own session id, and the directory it works in |
 | `workdir-scan.ts` | The `/cd` option list: an agent's configured root plus the projects one level inside it |
@@ -593,7 +593,9 @@ which is what agy's own error message recommends. So agy's skills work here, whi
 still pushes no command list over the wire: `/agy` switches the conversation and its bare
 form acks the binding rather than posting an empty menu.
 
-Models: agy names the one it is serving in `init` (`onModel` is replayed each turn, because the
+Models: agy names the one it is serving in `init` — but on agy 1.2.9 only when `--model=` asked
+for it; a conversation left on agy's default is named by the status line instead, and the display
+name it reports is respelled as the `agy models` id (`onModel` is replayed each turn, because the
 footer reads a per-turn record). While `agy` has no in-process protocol switch, `agy models` lists
 available choices, and `setModel` switches via a kill-and-respawn strategy: `teardown()` stops the
 child, and the next turn respawns with `--model=<value>` while `--conversation=<id>` restores
@@ -601,10 +603,12 @@ conversation context intact from local disk. `modelSelector()` reports the parse
 bringing the `/model` menu and command to the agy harness.
 
 Context usage: agy reports none over its protocol, so `agy-statusline.ts` installs a shim into
-agy's `statusLine` setting and `runTurn` reads the recorded snapshot back at the end of each turn,
-feeding the same `onUsage` the ACP runtimes call. Read that file's header before touching it — it
-writes to another product's config, and it carries `isCliEntry` for the reason the reverse-CLI shim
-does.
+agy's `statusLine` setting, and the shim writes each snapshot to a fourth stdio pipe (fd 3) the
+runtime opens when it spawns agy — agy passes the descriptor on to its status-line command, which
+is undocumented and carries a Hyrum's Law warning. At the end of a turn `runTurn` waits (bounded)
+for the post-turn frame, because agy refreshes the count only after `result`, then feeds the same
+`onUsage` the ACP runtimes call. Read that file's header before touching it — it writes to another
+product's config, and it carries `isCliEntry` for the reason the reverse-CLI shim does.
 
 ### `agent-common.ts`
 

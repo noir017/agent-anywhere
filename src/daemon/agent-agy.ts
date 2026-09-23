@@ -1,8 +1,17 @@
 import { promisify } from 'node:util';
 import { execFile as execFileCb, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { Readable } from 'node:stream';
 import type { AgentDef, Config } from '../config/schema.js';
 import { findAgent } from '../config/schema.js';
-import type { AgentFactory, AgentSession, AgentStreamHandlers, ModelSelector, ReclaimState, RunTurnInput } from './agent.js';
+import type {
+  AgentFactory,
+  AgentSession,
+  AgentStreamHandlers,
+  AgentUsage,
+  ModelSelector,
+  ReclaimState,
+  RunTurnInput,
+} from './agent.js';
 import type { ConversationStore } from './conversation-store.js';
 import {
   buildAgentEnv,
@@ -12,7 +21,7 @@ import {
   resolveConversationCwd,
   truncateToolName,
 } from './agent-common.js';
-import { ensureAgyStatusLine, readAgyUsage } from './agy-statusline.js';
+import { AGY_STATUS_FD, AGY_STATUS_FD_ENV, ensureAgyStatusLine, parseAgyStatusFrame } from './agy-statusline.js';
 import { agentHome } from './skills-scan.js';
 
 const execFile = promisify(execFileCb);
@@ -40,6 +49,7 @@ const execFile = promisify(execFileCb);
  *   event:"result"                 ↔ turn end (status SUCCESS, else an error for the upper layer)
  *   init.conversation_id           ↔ SessionStore entry, replayed via --conversation after a restart
  *   init.model                     ↔ onModel (stored at spawn, replayed at the start of every turn)
+ *   status line, over fd 3         ↔ onUsage, and onModel when `init` named none (agy-statusline.ts)
  *   SIGINT                         ↔ abort (agy has no in-band cancel message)
  *
  * agy pushes no command list over the wire, so onAvailableCommands is never called and no native
@@ -146,6 +156,20 @@ export function parseAgyModelsOutput(stdout: string): Array<{ value: string; nam
 }
 
 export type AgyModelFetcher = () => Promise<Array<{ value: string; name: string }>>;
+
+/**
+ * A model as the status line named it, respelled as the id `agy models` lists for it.
+ *
+ * The status line's `model.id` is not reliably an id: with `--model=` passed it was one
+ * (`gemini-3.8-flash-high`, agy 1.2.0), and with agy left on its default it is the display name
+ * (`Claude Sonnet 4.6 (Thinking)`, agy 1.2.9). `init` spells the model as an id, and so does the
+ * `/model` menu, so a display name is looked up and replaced — otherwise the same model would be
+ * printed two ways depending on whether anyone had picked it. Unknown names pass through as-is:
+ * a display name in the footer is still better than no model at all.
+ */
+export function agyModelId(name: string, options: ReadonlyArray<{ value: string; name: string }> = []): string {
+  return (options.find((o) => o.value === name) ?? options.find((o) => o.name === name))?.value ?? name;
+}
 
 export async function defaultFetchAgyModels(): Promise<Array<{ value: string; name: string }>> {
   try {
@@ -329,8 +353,27 @@ export function createAgyAgentFactory(
 
   // Point agy's status line at this daemon's shim, once per distinct home among the agy agents —
   // it is the only channel through which agy reports context usage (see agy-statusline.ts).
+  const wiredHomes = new Set<string>();
   for (const home of new Set(cfg.agents.filter((a) => a.harness === 'agy').map((a) => agentHome(a)))) {
-    ensureAgyStatusLine(home);
+    if (ensureAgyStatusLine(home) !== 'skipped') wiredHomes.add(home);
+  }
+
+  /**
+   * Said once per daemon, not once per turn: when it fires it fires on every turn of every agy
+   * conversation, and the second time adds nothing. Only armed for a home whose status line this
+   * daemon wired — with the opt-out set, or no agy config, silence on fd 3 is the expected answer.
+   */
+  let warnedSilence = false;
+  function statusSilence(): void {
+    if (warnedSilence) return;
+    warnedSilence = true;
+    console.warn(
+      `[agy] a whole turn finished without a single status-line frame on fd ${AGY_STATUS_FD}, so the footer ` +
+        'has no context numbers and, with no model configured, no model name. On agy 1.2.9 the status-line ' +
+        'command inherited that descriptor from the daemon; if agy was upgraded since, it may have stopped ' +
+        'passing inherited descriptors on (see daemon/agy-statusline.ts). Also check that `statusLine` in ' +
+        '~/.gemini/antigravity-cli/settings.json still names agy-statusline.'
+    );
   }
 
   return {
@@ -348,7 +391,8 @@ export function createAgyAgentFactory(
             ensureModels();
             return cachedModels;
           },
-          awaitModels
+          awaitModels,
+          wiredHomes.has(agentHome(def)) ? statusSilence : undefined
         );
         sessions.set(sessionId, s);
       }
@@ -369,6 +413,16 @@ export function createAgyAgentFactory(
 /** Max wait for the child's `init` event after spawn; on timeout treat the spawn as failed (ENOENT etc.). */
 const START_TIMEOUT_MS = 30_000;
 
+/** Longest unterminated line kept from the status pipe. A real frame is well under 200 characters. */
+const MAX_STATUS_LINE_CHARS = 64 * 1024;
+
+/**
+ * How long a finished turn waits for the status line's post-turn frame (see settleUsage). It came
+ * ~260ms after `result` when measured, on a ~300ms tick; this is several ticks of headroom, and
+ * the footer is the only thing waiting.
+ */
+const USAGE_SETTLE_MS = 1_500;
+
 function createAgySession(
   def: AgentDef,
   socketPath: string,
@@ -382,7 +436,12 @@ function createAgySession(
    * a `/model` in the first moments after a daemon start would otherwise read `undefined` and be
    * told the harness has no model selector, which is simply untrue.
    */
-  awaitModels?: () => Promise<void>
+  awaitModels?: () => Promise<void>,
+  /**
+   * Called when a turn succeeded without this child's status line reporting once. Undefined when
+   * no frames are expected (see the factory), which is what keeps a deliberate opt-out quiet.
+   */
+  onStatusSilence?: () => void
 ): AgentSession {
   /**
    * The directory this session's child runs in — and, through `--add-dir`, the one it is allowed to
@@ -409,8 +468,27 @@ function createAgySession(
    * arrives inside ensureStarted, before the turn's sink exists, and the footer reads the model off
    * a PER-TURN record (TurnRunner's TurnRef) — so a single emit at spawn would name the model on
    * the first turn's footer and on no other. Stored here, replayed at the top of every turn.
+   *
+   * Often absent: agy 1.2.9 puts `model` in `init` only when `--model=` asked for one, so a
+   * conversation left on agy's default is named by the status line instead (`statusModel`).
    */
   let lastSeenModel: string | undefined;
+  /**
+   * What this child's status line last reported (agy-statusline.ts), off the fd-3 pipe.
+   *
+   * The model is per CHILD, cleared on respawn with lastSeenModel: a respawn is how the model
+   * changes, and the old child's name must not outlive it. Usage is per CONVERSATION and survives
+   * a respawn, because `--conversation=` resumes the same window — so a turn that dies before the
+   * new child's first tick still reports the last real reading rather than none.
+   */
+  let statusModel: string | undefined;
+  let statusUsage: AgentUsage | undefined;
+  /** Frames this child's status line delivered; zero after a whole turn is the "channel broke" signal. */
+  let statusFrames = 0;
+  /** A settle wait on this child already ran its full bound without a frame; don't pay it every turn. */
+  let settledInVain = false;
+  /** Woken by every status frame (and by teardown), for settleUsage. */
+  const statusWaiters: Array<() => void> = [];
   /**
    * Per-conversation model preference set via setModel() (/model command or menu).
    * Kept in the session closure across child respawns (same pattern as ACP runtime's modelPreference).
@@ -431,6 +509,99 @@ function createAgySession(
     proc = undefined;
     ready = false;
     lastSeenModel = undefined;
+    statusModel = undefined;
+    statusFrames = 0;
+    settledInVain = false;
+  }
+
+  /**
+   * The model to name for this child: `init`'s when agy gave one (it is what `--model=` resolved
+   * to), else the status line's, respelled as an id. Undefined only before the child has said
+   * either — the caller falls back to what was configured or picked.
+   */
+  function servingModel(): string | undefined {
+    return lastSeenModel ?? (statusModel ? agyModelId(statusModel, getModels?.()) : undefined);
+  }
+
+  /**
+   * Stop reading a child's status pipe. Needed explicitly because agy leaves fd 3 open in every
+   * process it starts, the agent's own commands included: a dev server the agent backgrounded keeps
+   * the write end alive after agy itself is gone, so the read end would otherwise never see EOF and
+   * its handle would sit open for as long as that process lives.
+   */
+  function closeStatusPipe(child: ChildProcessWithoutNullStreams): void {
+    child.stdio[AGY_STATUS_FD]?.destroy();
+  }
+
+  /** One line off a child's status pipe. Frames from a superseded child are dropped like its stdout. */
+  function handleStatusLine(line: string, from: ChildProcessWithoutNullStreams): void {
+    if (proc !== from) return;
+    const status = parseAgyStatusFrame(line);
+    if (!status) {
+      console.debug('[agy] ignoring a status-pipe line that is not a frame:', line.slice(0, 120));
+      return;
+    }
+    statusFrames++;
+    if (status.usage) statusUsage = status.usage;
+    if (status.model) statusModel = status.model;
+    wakeStatusWaiters();
+  }
+
+  function wakeStatusWaiters(): void {
+    for (const wake of statusWaiters.splice(0)) wake();
+  }
+
+  /**
+   * Wait for the status line to report the turn that just ended.
+   *
+   * agy refreshes the snapshot after each model step, and the last step's refresh lands after the
+   * turn is over. Measured on 1.2.9 (2026-09-23), twice: the frame carrying a turn's final count
+   * arrived ~260-270ms AFTER `result`, and every frame before it still read the count as of the
+   * previous step (`0` on a conversation's first turn, the pre-tool count in a turn that ran a
+   * tool). Read at `result`, the footer was always one step stale. The file-based channel this
+   * replaced had the same lag and no cheap way to wait for a write; a pipe can wait for the line.
+   *
+   * `atResult` is the reading when `result` arrived, and the wait ends on the first frame that
+   * moves it — not on the first frame, because a tick already in flight at `result` carries the
+   * stale count. Bounded by USAGE_SETTLE_MS, because agy only ticks on change: if the refresh beat
+   * `result` here, nothing further comes, and the footer must not wait on it forever.
+   *
+   * Not waited at all when nothing can come: a child that has never reported, on a home whose
+   * status line this daemon did not wire (`onStatusSilence` unset), or that already sat out a full
+   * bound in vain — once is the diagnosis (onStatusSilence), every turn would be a tax.
+   */
+  async function settleUsage(atResult: AgentUsage | undefined): Promise<void> {
+    if (statusFrames === 0 && (!onStatusSilence || settledInVain)) return;
+    const deadline = Date.now() + USAGE_SETTLE_MS;
+    while (!aborting && proc && statusUsage?.used === atResult?.used) {
+      const left = deadline - Date.now();
+      if (left <= 0) return;
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, left);
+        statusWaiters.push(() => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+    }
+  }
+
+  /** Attach the line reader to a freshly spawned child's status pipe. */
+  function readStatusPipe(child: ChildProcessWithoutNullStreams): void {
+    const pipe = child.stdio[AGY_STATUS_FD];
+    // A socket whenever the spawn asked for a fourth 'pipe'. Checked rather than cast, so a change in
+    // how it is opened costs the footer its numbers (and says so, via onStatusSilence) — not the spawn.
+    if (!(pipe instanceof Readable)) return;
+    pipe.setEncoding('utf8');
+    let buf = '';
+    pipe.on('data', (chunk: string) => {
+      buf = consumeNdJsonLines(buf + chunk, (line) => handleStatusLine(line, child));
+      // Anything agy started can write here, so a line that never ends must not grow without bound.
+      if (buf.length > MAX_STATUS_LINE_CHARS) buf = '';
+    });
+    // Required, not tidiness: an 'error' with no listener is thrown, and this one would take the
+    // whole daemon down over a footer.
+    pipe.on('error', (e) => console.debug(`[agy] status pipe error (${def.id}):`, e.message));
   }
 
   /**
@@ -451,7 +622,11 @@ function createAgySession(
     resetHandles();
     currentTurn = undefined;
     hintInjected = false; // a fresh child won't know the reverse-CLI usage
-    if (child) interruptChild(child);
+    wakeStatusWaiters(); // a settle wait on this child has nothing left to wait for
+    if (child) {
+      closeStatusPipe(child);
+      interruptChild(child);
+    }
     pending?.fail(new Error(reason));
   }
 
@@ -467,14 +642,19 @@ function createAgySession(
     // runtime's session/load equivalent). agy owns the history on its own disk; we only remember which.
     // Keyed by (conversation, agent) so agy resumes ITS conversation here, not one belonging to
     // another agent that also answered in this topic.
+    //
+    // The fourth pipe is the status line's way back (agy-statusline.ts). The cast only restores what
+    // the three-`pipe` overload would have inferred: @types/node types a longer stdio array as a
+    // bare ChildProcess with nullable streams, and fds 0-2 here are pipes all the same.
     const child = spawn(
       AGY_COMMAND,
       buildAgyArgs(def, cwd, store?.agentSession(conversationId, def.id), modelPreference),
       {
         cwd,
-        env: buildAgentEnv(def, sessionToken, socketPath),
+        env: { ...buildAgentEnv(def, sessionToken, socketPath), [AGY_STATUS_FD_ENV]: String(AGY_STATUS_FD) },
+        stdio: ['pipe', 'pipe', 'pipe', 'pipe'],
       }
-    );
+    ) as ChildProcessWithoutNullStreams;
     // Record immediately so the 'exit' callback and start-failure rollback can match by reference.
     proc = child;
     // agy sends diagnostics (auth notices, permission notes, conversation warnings) to stderr.
@@ -488,6 +668,7 @@ function createAgySession(
     child.stdout.on('data', (chunk: string) => {
       buf = consumeNdJsonLines(buf + chunk, (line) => handleLine(line, child));
     });
+    readStatusPipe(child);
     child.on('exit', (code, signal) => onChildExit(child, code, signal));
 
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -519,6 +700,7 @@ function createAgySession(
   function onChildExit(child: ChildProcessWithoutNullStreams, code: number | null, signal: string | null): void {
     if (proc !== child) return;
     console.debug(`[agy] child process exited (${def.id}): code=${code} signal=${signal}; will respawn on the next turn`);
+    closeStatusPipe(child);
     const pending = currentTurn;
     currentTurn = undefined;
     resetHandles();
@@ -553,8 +735,10 @@ function createAgySession(
 
     if (msg.event === 'init') {
       rememberConversation(msg.init?.conversation_id ?? msg.conversation_id);
-      // Kept even when `--model=` asked for it: agy answers with its own resolved id, and with
-      // nothing configured this is the only place its default model is ever named.
+      // agy's own resolved id, when it gives one. It used to give one always — on 1.1.22 this was
+      // the only place an unconfigured default was ever named — but on 1.2.9 (2026-09-23) `init`
+      // carries `model` only when `--model=` was passed, and the default is named by the status
+      // line alone (see servingModel).
       if (msg.init?.model) lastSeenModel = msg.init.model;
       ready = true;
       for (const w of initWaiters) w.res();
@@ -598,7 +782,8 @@ function createAgySession(
       }
       await ensureStarted(input.sessionToken);
       // Nothing renders from this; it only records which model to name in this turn's footer.
-      if (lastSeenModel) handlers.onModel?.(lastSeenModel);
+      const known = servingModel();
+      if (known) handlers.onModel?.(known);
 
       // Reverse-command hint: injected once per child, prepended to the first turn's text. Unlike the
       // ACP runtime there is no slash-command carve-out — slash expansion is disabled for this
@@ -634,16 +819,27 @@ function createAgySession(
 
       try {
         await done;
+        await settleUsage(statusUsage);
+        // Asked only after a successful turn and its settle wait: by then the status line has had
+        // every chance to tick — it does from the moment agy starts, before any prompt — so silence
+        // is a finding, where after a turn that failed fast it would only be a race.
+        if (statusFrames === 0) {
+          settledInVain = true;
+          onStatusSilence?.();
+        }
       } catch (err) {
         if (aborting) return; // intentional abort/dispose is not an error
         throw err;
       } finally {
-        // Context numbers, read at the end of the turn they describe. agy publishes them only
-        // through its status line (see agy-statusline.ts), so they arrive out of band and the turn
-        // has to go and fetch them — in `finally`, because a turn that failed still consumed the
-        // window, and the footer of the message reporting the failure should say so.
-        const usage = readAgyUsage(lastSeenConversationId);
-        if (usage) handlers.onUsage?.(usage);
+        // Context numbers and — when `init` named none — the model, read at the end of the turn
+        // they describe (on success, once settleUsage has seen the post-turn frame). agy publishes
+        // both only through its status line (see agy-statusline.ts), so they arrive out of band on
+        // the fd-3 pipe; the footer is built after this returns. In `finally`, because a turn that
+        // failed still consumed the window, and the footer of the message reporting the failure
+        // should say so.
+        if (statusUsage) handlers.onUsage?.(statusUsage);
+        const model = servingModel();
+        if (model) handlers.onModel?.(model);
       }
     },
 
@@ -665,7 +861,7 @@ function createAgySession(
       const options = getModels?.();
       if (!options || options.length === 0) return undefined;
       return {
-        current: lastSeenModel ?? modelPreference ?? def.model,
+        current: servingModel() ?? modelPreference ?? def.model,
         options,
       };
     },

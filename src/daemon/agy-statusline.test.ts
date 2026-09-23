@@ -1,14 +1,21 @@
 import { describe, expect, it, afterEach } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ensureAgyStatusLine, installStatusLine, readAgyUsage, agyUsageDir } from './agy-statusline.js';
+import {
+  AGY_STATUS_FD,
+  AGY_STATUS_FD_ENV,
+  ensureAgyStatusLine,
+  installStatusLine,
+  parseAgyStatusFrame,
+} from './agy-statusline.js';
 
 /**
  * The status line is the only channel through which agy reports context usage, so what is tested
  * here is the INSTALLED ARTIFACT, not a copy of its logic: the shim is provisioned into a temp
- * config dir, run as agy runs it (JSON on stdin), and then read back the way the runtime reads it.
+ * config dir, run as agy runs it (JSON on stdin, the daemon's pipe on fd 3), and what it wrote to
+ * that pipe is parsed the way the runtime parses it.
  *
  * The frame below is verbatim from `agy 1.2.0` (2026-09-17), captured by pointing settings.json at
  * a recording script and running one two-turn stream-json session. It is the last frame of that
@@ -58,12 +65,33 @@ function rig(settings?: Record<string, unknown>): { home: string; settingsFile: 
   return { home, settingsFile };
 }
 
-/** Run the shim exactly as agy does: the frame on stdin, one status line on stdout. */
-function runShim(frame: unknown): string {
-  return execFileSync(join(process.env.AGENT_ANYWHERE_CONFIG_DIR!, 'bin', 'agy-statusline'), {
-    input: JSON.stringify(frame),
+/**
+ * Run the shim exactly as agy does: `input` on stdin, one status line on stdout. `pipe` opens fd 3
+ * the way the runtime's spawn does, and `armed` sets the variable naming it — separately, because
+ * "fd 3 is open but nobody asked" is what the operator's own agy looks like.
+ */
+function runShim(input: string, opts: { pipe?: boolean; armed?: boolean } = {}) {
+  const pipe = opts.pipe ?? true;
+  const armed = opts.armed ?? pipe;
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  if (armed) env[AGY_STATUS_FD_ENV] = String(AGY_STATUS_FD);
+  else delete env[AGY_STATUS_FD_ENV];
+  const r = spawnSync(join(process.env.AGENT_ANYWHERE_CONFIG_DIR!, 'bin', 'agy-statusline'), {
+    input,
+    env,
     encoding: 'utf8',
+    stdio: pipe ? ['pipe', 'pipe', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe'],
   });
+  const reported = pipe ? String(r.output[AGY_STATUS_FD] ?? '') : '';
+  return { status: r.status, stdout: r.stdout, stderr: r.stderr, reported };
+}
+
+/** Every frame the shim reported, parsed the way the runtime parses them. */
+function reportedFrames(reported: string) {
+  return reported
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => parseAgyStatusFrame(l));
 }
 
 describe('ensureAgyStatusLine', () => {
@@ -127,21 +155,47 @@ describe('ensureAgyStatusLine', () => {
     expect(ensureAgyStatusLine(home)).toBe('skipped');
     expect(JSON.parse(readFileSync(settingsFile, 'utf8'))).toMatchObject({ statusLine: { command: '/theirs.sh' } });
   });
+
+  it('removes the per-conversation usage files earlier versions left behind', () => {
+    // Nothing reads them any more and nothing else would ever delete them — the machine that
+    // prompted the pipe had accumulated 39.
+    const { home } = rig({});
+    const legacy = join(process.env.AGENT_ANYWHERE_CONFIG_DIR!, 'agy-usage');
+    mkdirSync(legacy, { recursive: true });
+    writeFileSync(join(legacy, 'some-conversation.json'), JSON.stringify({ used: 1, size: 2 }));
+    installStatusLine(home);
+    expect(existsSync(legacy)).toBe(false);
+  });
 });
 
 describe('the installed shim', () => {
-  it('records the window so the footer can read it back', () => {
+  it('reports the window and the model to the daemon over fd 3', () => {
     const { home } = rig({});
     installStatusLine(home);
-    runShim(FRAME);
-    expect(readAgyUsage(FRAME.conversation_id)).toEqual({ used: 22087, size: 1048576 });
+    const { reported } = runShim(JSON.stringify(FRAME));
+    expect(reportedFrames(reported)).toEqual([
+      { usage: { used: 22087, size: 1048576 }, model: 'gemini-3.8-flash-high' },
+    ]);
+  });
+
+  it('names agy’s default model, which on 1.2.9 arrives as a display name in the id slot', () => {
+    // Verbatim `model` from agy 1.2.9 (2026-09-23) with no --model= passed: the status line is the
+    // only place that default is named at all (`init` carries no model then). The runtime maps the
+    // name back to an id; the shim passes on what it was given.
+    const { home } = rig({});
+    installStatusLine(home);
+    const frame = {
+      ...FRAME,
+      model: { id: 'Claude Sonnet 4.6 (Thinking)', display_name: 'Claude Sonnet 4.6 (Thinking)' },
+    };
+    expect(reportedFrames(runShim(JSON.stringify(frame)).reported)[0]?.model).toBe('Claude Sonnet 4.6 (Thinking)');
   });
 
   it('still draws the two lines the operator had — model, context, quota pools', () => {
     const { home } = rig({});
     installStatusLine(home);
     // Taking a setting over is not a licence to change what it shows.
-    const out = runShim(FRAME).split('\n');
+    const out = runShim(JSON.stringify(FRAME)).stdout.split('\n');
     expect(out[0]).toContain('Gemini 3.8 Flash (High)');
     expect(out[0]).toContain('2.1%');
     expect(out[0]).toContain('(22.1k/1.0M)');
@@ -151,45 +205,79 @@ describe('the installed shim', () => {
     expect(out[1]).toContain('6d'); // 603831s until the weekly pool resets
   });
 
-  it('records nothing from the startup frames, so "0 / 0" never reaches a footer', () => {
+  it('reports no numbers from the startup frames, so "0 / 0" never reaches a footer', () => {
     // Verbatim early frame: agy emits several of these before it has authenticated.
     const { home } = rig({});
     installStatusLine(home);
-    runShim({
+    const boot = {
       conversation_id: 'boot-frame',
       model: null,
       context_window: { total_input_tokens: 0, total_output_tokens: 0, context_window_size: 0, used_percentage: 0 },
       agent_state: 'authenticating',
-    });
-    expect(readAgyUsage('boot-frame')).toBeUndefined();
+    };
+    expect(runShim(JSON.stringify(boot)).reported).toBe('');
+    // The model can be known before the window is: that half is still worth reporting alone.
+    const named = { ...boot, model: { id: 'gemini-3.8-flash-high' } };
+    expect(reportedFrames(runShim(JSON.stringify(named)).reported)).toEqual([{ model: 'gemini-3.8-flash-high' }]);
+  });
+
+  it('writes nothing to fd 3 unless the daemon named it — under the operator’s own agy it only draws', () => {
+    // The same shim runs for an agy started by hand, where fd 3 is whatever the shell left open.
+    const { home } = rig({});
+    installStatusLine(home);
+    const r = runShim(JSON.stringify(FRAME), { pipe: true, armed: false });
+    expect(r.reported).toBe('');
+    expect(r.stdout).toContain('Gemini 3.8 Flash (High)');
+  });
+
+  it('draws and exits cleanly when told to report to a descriptor that is not open', () => {
+    // What a future agy that closes inherited descriptors looks like from inside the shim: the
+    // status line must keep working, and the failure is the runtime's to report, not a stack trace
+    // on every render tick.
+    const { home } = rig({});
+    installStatusLine(home);
+    const r = runShim(JSON.stringify(FRAME), { pipe: false, armed: true });
+    expect(r.status).toBe(0);
+    expect(r.stderr).toBe('');
+    expect(r.stdout).toContain('Gemini 3.8 Flash (High)');
   });
 
   it('prints nothing and fails nothing when handed something that is not a frame', () => {
     // It runs on every render tick; a stack trace per tick would make the TUI unusable.
     const { home } = rig({});
     installStatusLine(home);
-    expect(runShim('not-a-frame-object')).toBe('');
-    expect(
-      execFileSync(join(process.env.AGENT_ANYWHERE_CONFIG_DIR!, 'bin', 'agy-statusline'), {
-        input: 'definitely not json',
-        encoding: 'utf8',
-      })
-    ).toBe('');
+    for (const input of [JSON.stringify('not-a-frame-object'), 'definitely not json']) {
+      const r = runShim(input);
+      expect(r).toMatchObject({ status: 0, stdout: '', stderr: '', reported: '' });
+    }
   });
 });
 
-describe('readAgyUsage', () => {
-  it('has no answer before any turn, which is not the same as zero', () => {
-    process.env.AGENT_ANYWHERE_CONFIG_DIR = mkdtempSync(join(tmpdir(), 'aa-cfg-'));
-    expect(readAgyUsage('never-seen')).toBeUndefined();
-    expect(readAgyUsage(undefined)).toBeUndefined();
+describe('parseAgyStatusFrame', () => {
+  it('reads both halves, or either one alone', () => {
+    expect(parseAgyStatusFrame('{"used":22087,"size":1048576,"model":"gemini-3.8-flash-high"}')).toEqual({
+      usage: { used: 22087, size: 1048576 },
+      model: 'gemini-3.8-flash-high',
+    });
+    expect(parseAgyStatusFrame('{"used":0,"size":200000}')).toEqual({ usage: { used: 0, size: 200000 } });
+    expect(parseAgyStatusFrame('{"model":"Claude Sonnet 4.6 (Thinking)"}')).toEqual({
+      model: 'Claude Sonnet 4.6 (Thinking)',
+    });
   });
 
-  it('refuses a conversation id that would climb out of the usage directory', () => {
-    process.env.AGENT_ANYWHERE_CONFIG_DIR = mkdtempSync(join(tmpdir(), 'aa-cfg-'));
-    mkdirSync(agyUsageDir(), { recursive: true });
-    writeFileSync(join(agyUsageDir(), '.._.._etc_passwd.json'), JSON.stringify({ used: 1, size: 2 }));
-    // The traversal attempt lands on the sanitized name, not on anything above the directory.
-    expect(readAgyUsage('../../etc/passwd')).toEqual({ used: 1, size: 2 });
+  it('takes no usage from a window that is not a reading', () => {
+    // Zero is agy still authenticating; the others are what a stray writer could put on the pipe.
+    for (const bad of ['{"used":5,"size":0}', '{"used":-1,"size":10}', '{"used":"5","size":10}', '{"size":10}']) {
+      expect(parseAgyStatusFrame(bad)).toBeUndefined();
+    }
+  });
+
+  it('treats the pipe as untrusted — anything agy started can write to it', () => {
+    for (const bad of ['not json', '[]', 'null', '"a string"', '{}', '{"model":"   "}', '{"model":42}']) {
+      expect(parseAgyStatusFrame(bad)).toBeUndefined();
+    }
+    // A name is printed on every reply, so an absurd one is refused rather than truncated.
+    expect(parseAgyStatusFrame(JSON.stringify({ model: 'x'.repeat(500) }))).toBeUndefined();
+    expect(parseAgyStatusFrame('{"model":"  gemini-3.8-flash-high  "}')).toEqual({ model: 'gemini-3.8-flash-high' });
   });
 });

@@ -271,6 +271,21 @@ describe('webui server: the door', () => {
     expect(cookie).not.toContain('Secure');
   });
 
+  it('re-issues a live session cookie on page load, and nothing to a stranger', async () => {
+    const { base } = await boot();
+    const cookie = await signIn(base);
+    const page = await fetch(`${base}/`, { headers: { cookie } });
+    expect(page.status).toBe(200);
+    // Same session, fresh Max-Age: the browser otherwise drops it a week after login however
+    // often it is used.
+    expect((page.headers.get('set-cookie') ?? '').split(';')[0]).toBe(cookie);
+    expect(page.headers.get('set-cookie')).toContain('Max-Age=');
+
+    const stranger = await fetch(`${base}/`, { headers: { cookie: 'aa_webui=forged' } });
+    expect(stranger.status).toBe(200);
+    expect(stranger.headers.get('set-cookie')).toBeNull();
+  });
+
   it('throttles a run of guesses with a 429 and a Retry-After', async () => {
     const { base } = await boot();
     let last = new Response();

@@ -1,6 +1,9 @@
-import { describe, it, expect } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, beforeEach, describe, it, expect } from 'vitest';
 
-import { WebAuth, readCookie, sessionCookie, SESSION_COOKIE } from './auth.js';
+import { WebAuth, fileSessionStore, readCookie, sessionCookie, SESSION_COOKIE, type SessionStore } from './auth.js';
 
 /** A WebAuth on a clock the test drives, so expiry and throttling need no real waiting. */
 function makeAuth(token = 'correct-horse'): { auth: WebAuth; advance: (ms: number) => void } {
@@ -76,6 +79,110 @@ describe('WebAuth: session lifetime', () => {
     if (!first.ok) throw new Error('login failed');
     for (let i = 0; i < 64; i += 1) auth.login('correct-horse', 'x');
     expect(auth.check(cookieOf(first.sessionId))).toBe(false);
+  });
+});
+
+/** A store that is just an object, plus a count of writes so the write rate can be pinned. */
+function memoryStore(initial: Record<string, number> = {}): SessionStore & { data: Record<string, number>; writes: number } {
+  const s = {
+    data: { ...initial },
+    writes: 0,
+    load: () => ({ ...s.data }),
+    save: (next: Record<string, number>) => {
+      s.data = { ...next };
+      s.writes += 1;
+    },
+  };
+  return s;
+}
+
+describe('WebAuth: sessions outlive a restart', () => {
+  const HOUR = 60 * 60 * 1000;
+
+  it('honours a session issued before the restart', () => {
+    const store = memoryStore();
+    const before = new WebAuth({ token: 'correct-horse', store });
+    const res = before.login('correct-horse', 'x');
+    if (!res.ok) throw new Error('login failed');
+    const after = new WebAuth({ token: 'correct-horse', store });
+    expect(after.check(cookieOf(res.sessionId))).toBe(true);
+  });
+
+  it('never writes the cookie value itself to the store', () => {
+    const store = memoryStore();
+    const res = new WebAuth({ token: 'correct-horse', store }).login('correct-horse', 'x');
+    if (!res.ok) throw new Error('login failed');
+    expect(JSON.stringify(store.data)).not.toContain(res.sessionId);
+  });
+
+  it('forgets every remembered session once the token is rotated', () => {
+    const store = memoryStore();
+    const res = new WebAuth({ token: 'correct-horse', store }).login('correct-horse', 'x');
+    if (!res.ok) throw new Error('login failed');
+    expect(new WebAuth({ token: 'battery-staple', store }).check(cookieOf(res.sessionId))).toBe(false);
+  });
+
+  it('keeps a logout across the restart', () => {
+    const store = memoryStore();
+    const before = new WebAuth({ token: 'correct-horse', store });
+    const res = before.login('correct-horse', 'x');
+    if (!res.ok) throw new Error('login failed');
+    before.revoke(cookieOf(res.sessionId));
+    expect(new WebAuth({ token: 'correct-horse', store }).check(cookieOf(res.sessionId))).toBe(false);
+  });
+
+  it('drops expired and malformed entries on load', () => {
+    const now = 1_000_000;
+    const store = memoryStore({ ['a'.repeat(64)]: now - 1, 'not-a-digest': now + HOUR, ['b'.repeat(64)]: now + HOUR });
+    const auth = new WebAuth({ token: 't', store, now: () => now });
+    // Force a write so the in-memory set becomes visible.
+    auth.login('t', 'x');
+    expect(Object.keys(store.data)).not.toContain('a'.repeat(64));
+    expect(Object.keys(store.data)).not.toContain('not-a-digest');
+    expect(Object.keys(store.data)).toContain('b'.repeat(64));
+  });
+
+  it('does not rewrite the store on every request, only once the expiry has slid by an hour', () => {
+    let now = 1_000_000;
+    const store = memoryStore();
+    const auth = new WebAuth({ token: 't', store, now: () => now });
+    const res = auth.login('t', 'x');
+    if (!res.ok) throw new Error('login failed');
+    const afterLogin = store.writes;
+    for (let i = 0; i < 50; i += 1) {
+      now += 60_000;
+      expect(auth.check(cookieOf(res.sessionId))).toBe(true);
+    }
+    // 50 minutes of traffic: nothing written.
+    expect(store.writes).toBe(afterLogin);
+    now += 11 * 60_000;
+    auth.check(cookieOf(res.sessionId));
+    expect(store.writes).toBe(afterLogin + 1);
+  });
+});
+
+describe('fileSessionStore', () => {
+  let dir = '';
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'webui-auth-'));
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('round-trips through a 0600 file', () => {
+    const file = path.join(dir, 's.json');
+    const store = fileSessionStore(file);
+    expect(store.load()).toEqual({});
+    store.save({ ['c'.repeat(64)]: 42 });
+    expect(fileSessionStore(file).load()).toEqual({ ['c'.repeat(64)]: 42 });
+    expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+  });
+
+  it('treats a corrupt file as no sessions rather than throwing', () => {
+    const file = path.join(dir, 's.json');
+    fs.writeFileSync(file, '{not json');
+    expect(fileSessionStore(file).load()).toEqual({});
   });
 });
 

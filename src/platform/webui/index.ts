@@ -28,7 +28,7 @@ import type { ConversationAddress } from '../../core/conversation.js';
 import type { MessageRef, SlashCommandSpec } from '../../types.js';
 import type { PlatformAdapter } from '../adapter.js';
 import { renderWebMarkdown } from '../web-markdown.js';
-import { WebAuth } from './auth.js';
+import { WebAuth, fileSessionStore } from './auth.js';
 import { CHANNEL, inlineImageType, TopicStore, WebRoom, type WebuiInstance } from './room.js';
 import { createWebServer, type WebServer } from './server.js';
 import { WebSso } from './sso.js';
@@ -117,7 +117,12 @@ export function createWebuiAdapter(instance: WebuiInstance): PlatformAdapter {
   room.useTerminalSessions(sessions);
   const server = createWebServer(
     room,
-    new WebAuth({ token: instance.token }),
+    // Beside the topic file, per instance for the same reason. Persisted so that an upgrade —
+    // which in a container is a restart — does not ask for the secret again; see `auth.ts`.
+    new WebAuth({
+      token: instance.token,
+      store: fileSessionStore(path.join(configDir(), `webui-sessions-${instance.id}.json`)),
+    }),
     instance,
     {
       enabled: instance.terminal.enabled,

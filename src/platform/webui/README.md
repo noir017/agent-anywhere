@@ -462,9 +462,13 @@ New trust boundary, so it is spelled out. The port binds every interface by defa
 is behind it is an agent with full tool access.
 
 1. **One shared secret**, compared with `timingSafeEqual`, exchanged for a `randomUUID`
-   session in an `HttpOnly; SameSite=Strict` cookie. Sessions are in memory, bounded, and
-   expire after a week of disuse; a restart logs everyone out. This is not per-person
-   identity — everyone holding the secret is the same operator, and shares the conversation.
+   session in an `HttpOnly; SameSite=Strict` cookie. Sessions are bounded and expire after a
+   week of disuse; the page load re-issues the cookie so the browser's copy slides too. They
+   survive a restart in `webui-sessions-<id>.json` (`0600`), which holds only an HMAC of each
+   id keyed by the secret — so the file is not a list of usable cookies, and **rotating
+   `token` is what logs everyone out** now that a restart no longer does. This is not
+   per-person identity — everyone holding the secret is the same operator, and shares the
+   conversation.
 2. **Five guesses a minute per source**, then a lockout, so the secret cannot be ground down
    online.
 3. **Two locks on CSRF**: `SameSite=Strict`, plus a required `application/json` content type

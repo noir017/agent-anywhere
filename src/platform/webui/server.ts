@@ -44,7 +44,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { Socket } from 'node:net';
 import { constants as zlibConstants, createGzip, gzipSync } from 'node:zlib';
 
-import { sessionCookie, type WebAuth } from './auth.js';
+import { SESSION_COOKIE, readCookie, sessionCookie, type WebAuth } from './auth.js';
 import { ICON_PNG, ICON_SVG, renderManifest } from './manifest.js';
 import { renderPage } from './page.js';
 import {
@@ -279,7 +279,7 @@ interface Route {
 
 /** Reachable without a session: the page itself, and the exchange that gets you one. */
 const OPEN: Route[] = [
-  { method: 'GET', path: '/', run: ({ req, res }, ctx) => sendPage(req, res, ctx.instance, ctx.terminal) },
+  { method: 'GET', path: '/', run: ({ req, res }, ctx) => { renewCookie(req, res, ctx); sendPage(req, res, ctx.instance, ctx.terminal); } },
   { method: 'POST', path: '/api/login', run: login },
   // Open on purpose. The browser fetches these while deciding whether the site can be
   // installed, which is before anyone has signed in, and a 401 there is indistinguishable from
@@ -383,6 +383,19 @@ function noteRefusal(req: IncomingMessage, ctx: Ctx, reason: SsoRefusal): void {
 function logout({ req, res }: Req, ctx: Ctx): void {
   ctx.auth.revoke(req.headers.cookie);
   send(req, res, 200, { ok: true });
+}
+
+/**
+ * Re-issue a still-valid session cookie with a fresh `Max-Age`.
+ *
+ * The server slides a session's expiry on every use, but the browser drops the cookie at the
+ * `Max-Age` it was given at login — so without this, a tab used daily still hit the password
+ * gate exactly a week after signing in. Done on the page load only: it is the one request every
+ * visit makes, and a `Set-Cookie` on each API call would be the same effect many times over.
+ */
+function renewCookie(req: IncomingMessage, res: ServerResponse, ctx: Ctx): void {
+  const id = readCookie(req.headers.cookie, SESSION_COOKIE);
+  if (id && ctx.auth.check(req.headers.cookie)) res.setHeader('Set-Cookie', sessionCookie(id, isSecure(req)));
 }
 
 function sendPage(

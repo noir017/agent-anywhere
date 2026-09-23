@@ -13,10 +13,11 @@
  * people sharing the secret share the conversation, by design — the alternative is an
  * account system, which is a different product.
  *
- * Pure except for `randomUUID` and the injected clock, so the throttle and the expiry are
- * testable without waiting real seconds.
+ * Pure except for `randomUUID`, the injected clock and the injected store, so the throttle
+ * and the expiry are testable without waiting real seconds or touching a disk.
  */
-import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
+import fs from 'node:fs';
 
 /** Cookie the session id travels in. Prefixed so it cannot collide on a shared origin. */
 export const SESSION_COOKIE = 'aa_webui';
@@ -25,11 +26,24 @@ export const SESSION_COOKIE = 'aa_webui';
  * How long a session survives without being used.
  *
  * Refreshed on every authenticated request, so an open tab never logs itself out; a week is
- * the window in which a stolen cookie is still worth something. Sessions live in memory
- * only, so a daemon restart logs everyone out regardless — which is the right default for a
- * credential nobody can revoke individually.
+ * the window in which a stolen cookie is still worth something.
+ *
+ * Sessions used to live in memory only, on the theory that a restart logging everyone out was
+ * the safe default. In practice every release is a restart (the image is rebuilt and the
+ * container replaced), so the operator retyped the secret after every update — and a door
+ * people are made to open that often ends up with its key on a sticky note. They now persist
+ * (see `SessionStore`); what a restart no longer does, rotating the token still does.
  */
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * How stale a session's recorded expiry may get before a check rewrites it.
+ *
+ * `check` runs on every request — each send, each `EventSource` reconnect — and writing the
+ * store on each would turn reading a chat into a stream of disk writes. Refreshing only once
+ * the expiry has slid by an hour costs at most an hour off a week-long lifetime.
+ */
+const REFRESH_SLACK_MS = 60 * 60 * 1000;
 
 /** Bound on concurrent sessions; the oldest is evicted past it. One operator, a few tabs. */
 const MAX_SESSIONS = 64;
@@ -47,11 +61,24 @@ export type LoginResult =
   | { ok: false; reason: 'bad-token' }
   | { ok: false; reason: 'throttled'; retryAfterSec: number };
 
+/**
+ * Where sessions outlive the process. Keyed by `digest` (below), never by the id itself.
+ *
+ * An interface rather than a path so this module stays testable without a filesystem; the
+ * adapter wires `fileSessionStore`.
+ */
+export interface SessionStore {
+  load(): Record<string, number>;
+  save(sessions: Record<string, number>): void;
+}
+
 export interface AuthOptions {
   /** The shared secret, as configured (already `${VAR}`-expanded by `loadConfig`). */
   token: string;
   /** Injected for tests; defaults to the wall clock. */
   now?: () => number;
+  /** Absent means memory only: a restart logs everyone out. */
+  store?: SessionStore;
 }
 
 interface Attempts {
@@ -64,12 +91,16 @@ interface Attempts {
 export class WebAuth {
   private readonly secret: Buffer;
   private readonly now: () => number;
+  private readonly store: SessionStore | undefined;
+  /** `digest(id)` → expiry. Insertion order is recency order; see `check`. */
   private readonly sessions = new Map<string, number>();
   private readonly attempts = new Map<string, Attempts>();
 
   constructor(opts: AuthOptions) {
     this.secret = Buffer.from(opts.token, 'utf8');
     this.now = opts.now ?? Date.now;
+    this.store = opts.store;
+    this.restore();
   }
 
   /**
@@ -101,24 +132,57 @@ export class WebAuth {
   check(cookieHeader: string | undefined): boolean {
     const id = readCookie(cookieHeader, SESSION_COOKIE);
     if (!id) return false;
-    const expires = this.sessions.get(id);
+    const key = this.digest(id);
+    const expires = this.sessions.get(key);
     if (expires === undefined) return false;
     const now = this.now();
     if (expires <= now) {
-      this.sessions.delete(id);
+      this.sessions.delete(key);
+      this.persist();
       return false;
     }
+    const next = now + SESSION_TTL_MS;
+    if (next - expires < REFRESH_SLACK_MS) return true;
     // Re-insert rather than assign: Map preserves insertion order, and eviction below leans
     // on that to drop the least recently used session instead of an arbitrary one.
-    this.sessions.delete(id);
-    this.sessions.set(id, now + SESSION_TTL_MS);
+    this.sessions.delete(key);
+    this.sessions.set(key, next);
+    this.persist();
     return true;
   }
 
   /** Drop a session (the page's logout). No-op on an unknown or absent cookie. */
   revoke(cookieHeader: string | undefined): void {
     const id = readCookie(cookieHeader, SESSION_COOKIE);
-    if (id) this.sessions.delete(id);
+    if (id && this.sessions.delete(this.digest(id))) this.persist();
+  }
+
+  /**
+   * What a session is remembered by: an HMAC of its id under the shared secret.
+   *
+   * Two properties, both deliberate. The store never holds a usable cookie, so reading the file
+   * is not the same as being signed in. And the key is the secret, so changing `token` makes
+   * every remembered session unmatchable at once — the "log everyone out" a restart used to do
+   * implicitly is now the explicit act of rotating the credential, which is when it is wanted.
+   */
+  private digest(id: string): string {
+    return createHmac('sha256', this.secret).update(id).digest('hex');
+  }
+
+  /** Load what the store remembers, dropping anything malformed or already expired. */
+  private restore(): void {
+    if (!this.store) return;
+    const now = this.now();
+    const live = Object.entries(this.store.load())
+      .filter(([k, v]) => /^[0-9a-f]{64}$/.test(k) && typeof v === 'number' && v > now)
+      // Oldest expiry first, so Map order means recency again and the cap trims the stalest.
+      .sort((a, b) => a[1] - b[1])
+      .slice(-MAX_SESSIONS);
+    for (const [k, v] of live) this.sessions.set(k, v);
+  }
+
+  private persist(): void {
+    this.store?.save(Object.fromEntries(this.sessions));
   }
 
   /**
@@ -140,7 +204,8 @@ export class WebAuth {
       if (oldest !== undefined) this.sessions.delete(oldest);
     }
     const id = randomUUID();
-    this.sessions.set(id, this.now() + SESSION_TTL_MS);
+    this.sessions.set(this.digest(id), this.now() + SESSION_TTL_MS);
+    this.persist();
     return id;
   }
 
@@ -211,4 +276,46 @@ export function sessionCookie(sessionId: string, secure: boolean): string {
   ];
   if (secure) parts.push('Secure');
   return parts.join('; ');
+}
+
+/**
+ * A `SessionStore` on one JSON file.
+ *
+ * `0600` and written through a temp file + rename: the contents are not cookies (see
+ * `WebAuth.digest`), but they are still the list of who is signed in, and a torn write read back
+ * as garbage would log everyone out — the thing this file exists to prevent. Both failure
+ * directions degrade to "memory only" with a warning rather than throwing: a login must not fail
+ * because a disk is full, and a daemon must not refuse to start over an unreadable file.
+ */
+export function fileSessionStore(file: string): SessionStore {
+  return {
+    load() {
+      let raw: string;
+      try {
+        raw = fs.readFileSync(file, 'utf8');
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
+          console.warn('[webui] could not read saved sessions:', e instanceof Error ? e.message : e);
+        }
+        return {};
+      }
+      try {
+        const parsed: unknown = JSON.parse(raw);
+        // Entries are validated one by one in `WebAuth.restore`; this only rules out a non-object.
+        return typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, number>) : {};
+      } catch {
+        console.warn('[webui] saved sessions are not valid JSON; starting with none');
+        return {};
+      }
+    },
+    save(sessions) {
+      const tmp = `${file}.tmp`;
+      try {
+        fs.writeFileSync(tmp, JSON.stringify(sessions), { mode: 0o600 });
+        fs.renameSync(tmp, file);
+      } catch (e) {
+        console.warn('[webui] could not save sessions:', e instanceof Error ? e.message : e);
+      }
+    },
+  };
 }

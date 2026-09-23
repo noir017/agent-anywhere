@@ -5,6 +5,17 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **The web UI no longer asks for the password after every update.** Sessions lived only in the
+  daemon's memory, and in a container every release is a restart, so each upgrade signed
+  everyone out. They now persist beside the topic list in `webui-sessions-<id>.json` (`0600`).
+  The file holds an HMAC of each session id keyed by the configured `token`, not the ids
+  themselves, so reading it does not sign anyone in — and changing `token` is now the way to
+  log every browser out. Separately, the cookie's own one-week `Max-Age` is renewed whenever
+  the page loads: the server already slid the session on every use, but the browser still
+  dropped the cookie a week after login however often the tab was used.
+
 ## [1.30.0] - 2026-09-23
 
 ### Added

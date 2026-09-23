@@ -122,7 +122,7 @@ actually reads that column for:
 | grey | nothing resident — history, or a topic that will have to resume from a session id | the absence of the two below |
 | dim blue | an agent child is up and idle | `PlatformAdapter.useLivenessLookup` |
 | blue, pulsing | a turn is executing | `startTyping` / `stopTyping` |
-| amber, pulsing | a question is on screen and nothing moves until it is answered | a message in the room still carrying buttons |
+| amber, pulsing | a question is on screen and nothing moves until it is answered | a message in the room still carrying buttons, posted or re-armed since the operator last wrote |
 
 `asking` is derived HERE rather than asked of the daemon, because the room already holds the
 fact: every ask, elicitation round and menu arrives as a message with buttons and is retired by

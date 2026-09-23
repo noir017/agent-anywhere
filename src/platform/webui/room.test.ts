@@ -721,6 +721,36 @@ describe('WebRoom: what the switcher dot is saying', () => {
     expect(flagsOf(room, topic).asking).toBe(false);
   });
 
+  it('stops waiting once the operator writes into the topic instead of tapping', () => {
+    // The reported bug: `/cc` posts the workdir menu, the user types `hello` rather than picking
+    // a directory, gets an answer — and the topic stayed amber, because the ignored menu still
+    // carries its buttons and nothing ever retires it.
+    vi.useFakeTimers();
+    const { room, topic } = attached();
+    room.post(topic, { own: false, html: '', buttons: [{ id: 'cd:0', label: 'workspace' }] }, 'pick one');
+    expect(flagsOf(room, topic).asking).toBe(true);
+
+    room.submit({ topic, text: 'hello' });
+    expect(flagsOf(room, topic).asking).toBe(false);
+
+    // A question arriving after the message still marks it — that one IS waiting on the user.
+    room.post(topic, { own: false, html: '', buttons: [{ id: 'ask:r:0', label: 'Yes' }] }, '?');
+    expect(flagsOf(room, topic).asking).toBe(true);
+  });
+
+  it('marks the topic again when an ask that was answered by text moves on to its next question', () => {
+    // A multi-question ask edits the same message to show the next question's buttons; the
+    // clear on submit must not have made that message unable to mark the topic again.
+    vi.useFakeTimers();
+    const { room, topic } = attached();
+    const ask = room.post(topic, { own: false, html: '', buttons: [{ id: 'ask:r:0', label: 'A' }] }, 'Q1');
+    room.submit({ topic, text: 'my own answer' });
+    expect(flagsOf(room, topic).asking).toBe(false);
+
+    room.revise(topic, ask.id, 'Q2', [{ id: 'ask:r:1', label: 'B' }]);
+    expect(flagsOf(room, topic).asking).toBe(true);
+  });
+
   it('reports no agent behind any topic when the daemon never offered a lookup', () => {
     const { room, topic } = attached();
     expect(flagsOf(room, topic).live).toBe(false);

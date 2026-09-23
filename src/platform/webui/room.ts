@@ -580,6 +580,18 @@ export class WebRoom {
       }
     }
     room.stored.set(msg.id, { msg, text });
+    // The operator writing into the topic ends every wait that was on screen. Buttons alone could
+    // not say that: a `/cd` or `/model` menu is never retired when it is ignored — the user types
+    // `hello` instead of tapping, gets an answer, and the menu keeps its buttons (still clickable,
+    // correctly) while the dot went on pulsing amber over a topic that was waiting on nobody. A
+    // real question is not lost by this: text sent while an ask is pending IS its answer
+    // (ConversationRegistry.route → answersPendingQuestion), so that ask is retired anyway, and a
+    // follow-up question arrives as a new post or a button edit after this one, which marks the
+    // topic again. The one gap is a daemon command typed mid-question (`/context`), which route
+    // answers before the ask gets its turn: the question stays up with the dot back to running
+    // blue. Accepted — the question is still on screen above the reply, and `/stop` / `/new`, the
+    // commands a user actually reaches for there, end the ask themselves.
+    if (msg.own) room.awaiting.clear();
     if (msg.buttons.length > 0) room.awaiting.add(msg.id);
     room.msgCount += 1;
     this.emit(topicId, { t: 'msg', msg });

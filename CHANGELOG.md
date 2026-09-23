@@ -5,6 +5,16 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **A web UI topic stops showing amber once you have written into it.** `/cc` offers a
+  directory menu; typing `hello` instead of tapping one got an answer, yet the topic kept pulsing
+  "awaiting you" indefinitely. Amber meant "a message here still carries buttons", and an ignored
+  menu is never retired — its buttons stay, and stay clickable, which is right; the dot claiming
+  the topic was blocked on you was not. Your own message now ends every wait that was on screen.
+  A real question loses nothing by this: text sent while one is pending is taken as its answer,
+  and a question asked after your message marks the topic again.
+
 ## [1.31.0] - 2026-09-23
 
 ### Fixed

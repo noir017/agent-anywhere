@@ -363,6 +363,37 @@ function nameKeepsQualifiers(name: string, id: string): boolean {
   );
 }
 
+/**
+ * The session's reasoning effort, read out of its ACP `configOptions` for the footer.
+ *
+ * Found by `category`, not by `id`, because the harnesses disagree on the id and agree on the
+ * category — probed 2026-09-23: claude-agent-acp 0.81.0 and opencode 2.0.14 both call it `effort`,
+ * codex-acp (codex-cli 0.155.1) calls it `reasoning_effort`, and all three tag it
+ * `category: "thought_level"`, which is the ACP spec's own name for this selector. The spec calls
+ * category "UX only", and UX is exactly what this is: nothing but the footer reads the answer.
+ *
+ * Returns undefined — segment omitted — in three situations, each of them deliberate:
+ * - no such option. opencode offers one only while the current model has reasoning variants (none
+ *   on `opencode/mimo-v2.6-flash-free`; switching to `anthropic/claude-opus-4-8` adds it), and dsh
+ *   and gemini have none at all;
+ * - `default`, which is where claude and opencode start. It means "whatever the model defaults to"
+ *   and names no level, so printing it would look like a level while telling the reader nothing;
+ * - a non-string currentValue (a boolean option filed under the category by some future harness).
+ *
+ * The raw value is returned rather than the option's display name: the values are already the
+ * words (`high`, `xhigh`, `max`), and on codex the name is a sentence.
+ */
+export function liveEffortName(options: SessionConfigOption[] | null | undefined): string | undefined {
+  const opt = options?.find((o) => o.category === THOUGHT_LEVEL_CATEGORY);
+  if (!opt) return undefined;
+  const current = opt.currentValue;
+  if (typeof current !== 'string' || current.length === 0 || current === 'default') return undefined;
+  return current;
+}
+
+/** ACP's spec-reserved category for the reasoning-effort selector (SessionConfigOptionCategory). */
+const THOUGHT_LEVEL_CATEGORY = 'thought_level';
+
 /** ACP's well-known id for the model selector among a session's config options. */
 const MODEL_CONFIG_ID = 'model';
 
@@ -1371,6 +1402,10 @@ function createAcpSession(
       // session started on an earlier turn would otherwise never report its model to a later one.
       // config_option_update supersedes this if the model changes mid-session.
       if (liveModel) handlers.onModel?.(liveModel);
+      // Effort rides along from the same option list, read fresh rather than cached: it has no
+      // preference to fall back on, so the list is the whole of what is known about it.
+      const effort = liveEffortName(liveConfigOptions);
+      if (effort) handlers.onEffort?.(effort);
 
       // Silence watchdog: one timer, re-armed by the pump on every update it hands to this turn, so
       // it bounds SILENCE rather than turn length. A hung agent — alive but never sending `stop` nor
@@ -1750,6 +1785,10 @@ function reportConfigOptions(u: Extract<SessionUpdate, { sessionUpdate: 'config_
   st.onConfigOptions?.(u.configOptions);
   const model = liveModelName(u.configOptions);
   if (model) st.handlers.onModel?.(model);
+  // Reported even when undefined, unlike the model: the update is the full option list, so an effort
+  // missing from it is news — `/effort default`, or an opencode switch to a model without variants —
+  // and a footer still showing the old level would be stating something no longer true.
+  st.handlers.onEffort?.(liveEffortName(u.configOptions));
 }
 
 export function translateUpdate(u: SessionUpdate, st: TurnState): void {
@@ -1800,8 +1839,8 @@ export function translateUpdate(u: SessionUpdate, st: TurnState): void {
       break;
     }
 
-    // The agent's session config changed (model / mode / effort picker). Only the model interests
-    // us: re-read it so a mid-session model switch is reflected in the footer.
+    // The agent's session config changed (model / mode / effort picker). The model and the effort
+    // interest us: re-read both so a mid-session switch of either is reflected in the footer.
     case 'config_option_update':
       reportConfigOptions(u, st);
       break;

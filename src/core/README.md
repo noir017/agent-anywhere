@@ -653,6 +653,8 @@ directory is **passed in**, not read — that is the module's purity rule in min
 
 The context fields require the harness to report ACP `usage_update`. A harness that
 does not renders no context segment rather than a guessed number.
+The `effort` field is the same bargain: it prints only a level the harness reported, and
+nothing for a harness with no level or one sitting at `default`.
 
 ## Tests
 

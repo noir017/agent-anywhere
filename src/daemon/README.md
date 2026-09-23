@@ -379,7 +379,7 @@ back into `AgentStreamHandlers`:
 | `tool_call` / `tool_call_update` | `onToolStart` / `onToolFinish` |
 | `available_commands_update` | `onAvailableCommands` |
 | `usage_update` | `onUsage` (feeds the footer's context segment) |
-| `config_option_update` | `onModel` |
+| `config_option_update` | `onModel`, `onEffort` |
 | `session_info_update` | `onTitle` (renames the chat lane — see below) |
 | `session/request_permission` | **auto-approved** — see below |
 
@@ -531,6 +531,11 @@ no `dispose` can reach while it still holds the harness's session.
 accurate than the config: the `claude` harness takes its model from `ANTHROPIC_MODEL` and
 resolves aliases like `opus[1m]` internally. Header = what was asked for; footer = what
 ran.
+
+`onEffort` is the same idea for reasoning effort, read from the option in ACP's
+`thought_level` category rather than by id, because the ids differ (`effort` on claude and
+opencode, `reasoning_effort` on codex). It is re-reported with `undefined` when an update
+drops the level, so the footer never keeps showing a level the session left.
 
 ### `agent-agy.ts` — the Antigravity runtime
 

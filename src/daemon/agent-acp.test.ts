@@ -3,6 +3,7 @@ import type { CreateElicitationRequest, SessionConfigOption, SessionUpdate } fro
 import {
   dshModelDisplayValue,
   dshModelSelectorValue,
+  liveEffortName,
   liveModelName,
   isResultUsage,
   parseFormElicitation,
@@ -20,12 +21,14 @@ function recorder(): {
   commands: unknown[];
   usage: AgentUsage[];
   models: string[];
+  efforts: Array<string | undefined>;
   configOptions: Array<SessionConfigOption[] | null | undefined>;
 } {
   const events: string[] = [];
   const commands: unknown[] = [];
   const usage: AgentUsage[] = [];
   const models: string[] = [];
+  const efforts: Array<string | undefined> = [];
   const configOptions: Array<SessionConfigOption[] | null | undefined> = [];
   const st: TurnState = {
     handlers: {
@@ -36,13 +39,14 @@ function recorder(): {
       onAvailableCommands: (c) => commands.push(c),
       onUsage: (u) => usage.push(u),
       onModel: (m) => models.push(m),
+      onEffort: (e) => efforts.push(e),
     },
     lastSegment: 'none',
     toolLedger: new Map(),
     toolIndexSeq: 0,
     onConfigOptions: (o) => configOptions.push(o),
   };
-  return { st, events, commands, usage, models, configOptions };
+  return { st, events, commands, usage, models, efforts, configOptions };
 }
 
 const feed = (st: TurnState, u: unknown) => translateUpdate(u as SessionUpdate, st);
@@ -396,6 +400,59 @@ describe('translateUpdate config_option_update (mid-session model switch)', () =
       configOptions: [{ id: 'effort', type: 'select', name: 'Effort', currentValue: 'high', options: [] }],
     });
     expect(models).toEqual([]);
+  });
+});
+
+/**
+ * Reasoning effort for the footer. The option shapes are the real ones probed on 2026-09-23 — the
+ * point being that the ids differ per harness (`effort` / `reasoning_effort`) while the category
+ * agrees, so the lookup has to go by category.
+ */
+describe('liveEffortName (effort from ACP session config options)', () => {
+  const opts = (o: unknown): SessionConfigOption[] => o as SessionConfigOption[];
+  const effort = (id: string, currentValue: unknown) => ({
+    id,
+    name: 'Effort',
+    category: 'thought_level',
+    type: 'select',
+    currentValue,
+    options: [{ value: 'low', name: 'Low' }, { value: 'high', name: 'High' }],
+  });
+
+  it('finds the level by category, whatever the harness calls the option', () => {
+    // claude-agent-acp / opencode
+    expect(liveEffortName(opts([effort('effort', 'xhigh')]))).toBe('xhigh');
+    // codex-acp
+    expect(liveEffortName(opts([effort('reasoning_effort', 'high')]))).toBe('high');
+  });
+
+  it('ignores an `effort` id that is not in the thought_level category', () => {
+    expect(
+      liveEffortName(opts([{ id: 'effort', type: 'select', name: 'Effort', currentValue: 'high', options: [] }])),
+    ).toBeUndefined();
+  });
+
+  it('omits `default`, which names no level', () => {
+    expect(liveEffortName(opts([effort('effort', 'default')]))).toBeUndefined();
+  });
+
+  it('is undefined with no such option (opencode on a model without variants, agy, dsh)', () => {
+    expect(
+      liveEffortName(opts([{ id: 'mode', category: 'mode', type: 'select', name: 'Mode', currentValue: 'build', options: [] }])),
+    ).toBeUndefined();
+    expect(liveEffortName(undefined)).toBeUndefined();
+    expect(liveEffortName(null)).toBeUndefined();
+    expect(liveEffortName(opts([effort('effort', true)]))).toBeUndefined();
+  });
+
+  it('config_option_update reports the new level, and clears it when the level goes away', () => {
+    const { st, efforts } = recorder();
+    feed(st, { sessionUpdate: 'config_option_update', configOptions: [effort('effort', 'max')] });
+    // e.g. `/effort default`: the option is still there but names no level any more.
+    feed(st, { sessionUpdate: 'config_option_update', configOptions: [effort('effort', 'default')] });
+    // e.g. opencode switched to a model without reasoning variants: the option vanished.
+    feed(st, { sessionUpdate: 'config_option_update', configOptions: [] });
+    expect(efforts).toEqual(['max', undefined, undefined]);
   });
 });
 

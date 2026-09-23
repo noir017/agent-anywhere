@@ -453,7 +453,13 @@ export const ConfigSchema = z
             /**
              * Fields and order. `agent` = the agent id that answered (`cc`/`oc`), `model` = short
              * model name, `context` = `18k / 1M (2%)`, `contextPct` = just the percentage,
-             * `cwd` = working dir.
+             * `effort` = reasoning effort, `cwd` = working dir.
+             *
+             * `effort` is read from the harness's ACP config option in the `thought_level`
+             * category (claude and opencode call it `effort`, codex `reasoning_effort`). opencode
+             * offers one only for a model with reasoning variants; agy has none (`agy -p=/effort`
+             * answers "not adjustable") and folds it into the model name instead. A harness at
+             * "default" names no level, so the segment is omitted rather than printing `default`.
              *
              * The context fields need the harness to report ACP `usage_update` (claude and
              * opencode both do — opencode only for a model whose context window it knows, so a
@@ -461,8 +467,8 @@ export const ConfigSchema = z
              * renders no context segment rather than a guessed number.
              */
             fields: z
-              .array(z.enum(['agent', 'model', 'context', 'contextPct', 'cwd']))
-              .default(['agent', 'context', 'model']),
+              .array(z.enum(['agent', 'model', 'context', 'contextPct', 'effort', 'cwd']))
+              .default(['agent', 'context', 'model', 'effort']),
           })
           .default({}),
         /**

@@ -39,6 +39,14 @@ describe('formatRuntimeFooter', () => {
     expect(out).toBe('claude-opus-4-8');
   });
 
+  it('effort renders bare beside the model, and is skipped when absent', () => {
+    const fields: FooterField[] = ['agent', 'model', 'effort'];
+    expect(formatRuntimeFooter({ agent: 'cc', model: 'opus-5-5', effort: 'high' }, fields)).toBe(
+      'cc · opus-5-5 · high',
+    );
+    expect(formatRuntimeFooter({ agent: 'cc', model: 'opus-5-5' }, fields)).toBe('cc · opus-5-5');
+  });
+
   it('model without `/` uses the value as-is', () => {
     const out = formatRuntimeFooter({ model: 'gpt-4-turbo' }, ['model']);
     expect(out).toBe('gpt-4-turbo');

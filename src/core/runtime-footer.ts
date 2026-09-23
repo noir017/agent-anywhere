@@ -12,9 +12,12 @@
  * - `model`   = short model name.
  * - `context` = `18k / 1M (2%)`, tokens in context over the window size.
  * - `contextPct` = just `2%`, for a terser line.
+ * - `effort`  = reasoning effort the harness reports (`high`, `xhigh`, ...), printed bare: it sits
+ *   beside the model, and the levels are words no other field produces, so a label would only
+ *   lengthen a line appended to every reply.
  * - `cwd`     = working dir.
  */
-export type FooterField = 'agent' | 'model' | 'context' | 'contextPct' | 'cwd';
+export type FooterField = 'agent' | 'model' | 'context' | 'contextPct' | 'effort' | 'cwd';
 
 export interface FooterInput {
   /** Agent id as configured (`agents[].id`), e.g. `cc` / `oc`. */
@@ -25,6 +28,11 @@ export interface FooterInput {
   contextTokens?: number;
   /** Context window size, for the percentage. */
   contextLength?: number;
+  /**
+   * Reasoning effort as the harness reports it (ACP `thought_level` config option). Absent when the
+   * harness has no such option, or reports only "use the model's default" — which names no level.
+   */
+  effort?: string;
   /** Absolute current working directory. */
   cwd?: string;
   /** User home dir; used to replace the home prefix of cwd with `~`. */
@@ -114,6 +122,11 @@ export function formatRuntimeFooter(input: FooterInput, fields: FooterField[]): 
       case 'contextPct': {
         // Requires contextLength>0 and contextTokens>=0; round(tokens/length*100), clamped to [0,100].
         if (hasContext(input)) parts.push(`${contextPercent(input)}%`);
+        break;
+      }
+
+      case 'effort': {
+        if (input.effort) parts.push(input.effort);
         break;
       }
 

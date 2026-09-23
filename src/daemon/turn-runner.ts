@@ -183,6 +183,8 @@ interface TurnRef {
    * has no `model` in config at all, and an alias like `opus[1m]` only the harness can resolve.
    */
   model?: string;
+  /** Reasoning effort the harness reports for this turn (see AgentStreamHandlers.onEffort). */
+  effort?: string;
 }
 
 /**
@@ -411,6 +413,9 @@ export class TurnRunner {
       // Same for the live model name (see TurnRef.model for why it beats the configured value).
       onModel: (model) => {
         ref.model = model;
+      },
+      onEffort: (effort) => {
+        ref.effort = effort;
       },
       /**
        * An aside about this turn — the harness logged an error and is retrying.
@@ -684,6 +689,10 @@ export class TurnRunner {
         const live = peek();
         if (live) live.ref.model = model;
       },
+      onEffort: (effort) => {
+        const live = peek();
+        if (live) live.ref.effort = effort;
+      },
     };
   }
 
@@ -870,6 +879,7 @@ export class TurnRunner {
         model: ref.model ?? this.deps.getModelOverride(conversationId) ?? def?.model,
         contextTokens: ref.usage?.used,
         contextLength: ref.usage?.size,
+        effort: ref.effort,
         // The conversation's own directory, not `agents[].cwd`: after a `/cd` the two differ, and
         // the footer reports what is actually serving this turn.
         cwd: this.deps.getWorkdir?.(conversationId) ?? def?.cwd,

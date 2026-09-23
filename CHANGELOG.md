@@ -5,6 +5,23 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **The footer shows the reasoning effort beside the model.** `cc · 18k / 1M (2%) · opus-5-5 ·
+  high`. Effort changes what a reply costs and how long it takes as much as the model does, and
+  until now the only way to learn which level a session was on was to ask it. The level is the
+  one the harness reports, not one the config claims, so a `/effort` mid-session shows up on the
+  next reply. It is on by default as a new `effort` entry in `display.footer.fields`; a config
+  that lists its fields explicitly keeps exactly the line it had, and gets it by adding `effort`.
+
+  Claude, Codex and OpenCode all report it (checked against each on 2026-09-23). They name the
+  option differently (`effort`, `reasoning_effort`) but file it under the same ACP category,
+  `thought_level`, which is what the footer reads. The segment is left out rather than guessed in
+  three cases: OpenCode on a model without reasoning variants, which offers no level at all; a
+  harness sitting at `default`, which names no level and would only look like one; and agy, which
+  has no such setting (`agy -p=/effort` answers "not adjustable") and puts it in the model name
+  instead, e.g. `Claude Sonnet 4.6 (Thinking)`.
+
 ## [1.29.0] - 2026-09-23
 
 ### Fixed

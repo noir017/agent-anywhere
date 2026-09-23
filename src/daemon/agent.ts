@@ -50,6 +50,12 @@ export interface AgentStreamHandlers {
    */
   onModel?(model: string): void;
   /**
+   * The session's reasoning effort (ACP config option in the `thought_level` category), for the
+   * footer. Fired at turn start when there is one, and on every `config_option_update` — with
+   * undefined when the update no longer carries a level, so a stale one is cleared, not kept.
+   */
+  onEffort?(effort: string | undefined): void;
+  /**
    * The agent stopped mid-turn to ask the user something (ACP `elicitation/create`), and is
    * blocked on the answer. Resolve with the user's choice, `decline`, or `cancel`.
    *

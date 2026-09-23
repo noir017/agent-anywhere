@@ -48,7 +48,7 @@ describe('display config survives the experience merge', () => {
     expect(cfg.display.header.enabled).toBe(false);
     expect(cfg.display.footer.enabled).toBe(false);
     // Fields still have a usable default, so enabling the footer alone is sufficient.
-    expect(cfg.display.footer.fields).toEqual(['agent', 'context', 'model']);
+    expect(cfg.display.footer.fields).toEqual(['agent', 'context', 'model', 'effort']);
   });
 
   it('an explicitly disabled toggle stays disabled', () => {

@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.33.2] - 2026-09-24
+
 ### Fixed
 
 - **An agent reporting back on background work shows as running, and `/stop` stops it.** Claude

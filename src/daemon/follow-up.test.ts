@@ -32,7 +32,25 @@ function inbound(content: string, messageId: string): InboundMessage {
 /** Let the 1 ms merge window elapse, the turn run, and the render chain drain. */
 const drain = (): Promise<void> => new Promise((r) => setTimeout(r, 30));
 
-function rig() {
+/** What a scripted turn can reach: the sinks, and the log it shares with the platform. */
+interface TurnControl {
+  /** The sink installed for THIS turn — where output arriving as it ends would go. */
+  current(): FollowUpSink;
+  /**
+   * The sink whose burst is still open, if any, taken so it is closed exactly once. The ACP
+   * runtime keeps the same pairing (followUpState) because TurnRunner installs a fresh sink every
+   * turn, and closing through the new one would leave the old burst open.
+   */
+  takeBurst(): FollowUpSink | undefined;
+  events: string[];
+}
+
+function rig(
+  opts: {
+    footer?: boolean;
+    runTurn?: (handlers: AgentStreamHandlers, ctl: TurnControl) => Promise<void>;
+  } = {}
+) {
   const parsed = parseConfig({
     platforms: { discord: { type: 'discord', token: 't' } },
     // opencode rather than claude only so `/context` is answered locally by the gateway (on claude
@@ -40,7 +58,7 @@ function rig() {
     // one observable place an out-of-turn usage snapshot shows up.
     agents: [{ id: 'oc', harness: 'opencode' }],
     routing: { default: 'oc', pipeline: [] },
-    display: { header: { enabled: false }, footer: { enabled: false } },
+    display: { header: { enabled: false }, footer: { enabled: opts.footer ?? false } },
   });
   const cfg: Config = {
     ...parsed,
@@ -57,32 +75,62 @@ function rig() {
 
   /** Every message body the platform was asked to send, in order. */
   const sent: string[] = [];
+  /** The latest text of every message, edits included — where a footer ends up. */
+  const bodies = new Map<string, string>();
+  /** Typing switched on and off, interleaved with whatever a scripted turn logs. */
+  const events: string[] = [];
   let seq = 0;
   const platform = {
     capabilities: { thread: false, editMessage: true, maxMessageLength: 2000 },
     measureRendered: (s: string) => s.length,
     sendMessage: async (address: { channel: string }, text: string) => {
       sent.push(text);
-      return { address, messageId: `m${++seq}` };
+      const messageId = `m${++seq}`;
+      bodies.set(messageId, text);
+      return { address, messageId };
     },
-    editMessage: async () => {},
+    editMessage: async (ref: { messageId: string }, text: string) => {
+      bodies.set(ref.messageId, text);
+    },
     addReaction: async () => {},
-    startTyping: async () => {},
-    stopTyping: async () => {},
+    startTyping: async () => void events.push('typing on'),
+    stopTyping: async () => void events.push('typing off'),
   } as unknown as PlatformAdapter;
 
   /** The sink TurnRunner installed on the session — the seam the ACP pump feeds. */
   let sink: FollowUpSink | undefined;
+  /** The sink a burst was opened through, until something closes it (see TurnControl.takeBurst). */
+  let burst: FollowUpSink | undefined;
+  const ctl: TurnControl = {
+    current: () => {
+      if (!sink) throw new Error('no follow-up sink was installed');
+      return sink;
+    },
+    takeBurst: () => {
+      const b = burst;
+      burst = undefined;
+      return b;
+    },
+    events,
+  };
   const factory: AgentFactory = {
     getOrCreate(conversationId): AgentSession {
       return {
         conversationId,
         runTurn: async (_input, handlers: AgentStreamHandlers) => {
+          if (opts.runTurn) return opts.runTurn(handlers, ctl);
           handlers.onText('starting it in the background');
         },
         abort: () => {},
         setFollowUpSink: (s) => {
-          sink = s;
+          // Remembers which sink opened a burst, the way the runtime's followUpState does.
+          sink = {
+            handlers: () => {
+              burst = s;
+              return s.handlers();
+            },
+            close: () => s.close(),
+          };
         },
         dispose: () => {},
       };
@@ -96,11 +144,10 @@ function rig() {
   return {
     reg,
     sent,
+    bodies,
+    events,
     /** The installed sink, once a turn has run. */
-    sink: () => {
-      if (!sink) throw new Error('no follow-up sink was installed');
-      return sink;
-    },
+    sink: ctl.current,
   };
 }
 
@@ -192,6 +239,91 @@ describe('follow-up rendering (background work reporting after the turn)', () =>
     expect(h.sent.filter((t) => t.includes('background update'))).toHaveLength(2);
     expect(h.sent).toContain('job one done');
     expect(h.sent).toContain('job two done');
+  });
+});
+
+/**
+ * A background report is the agent working, and has to read as such. Every surface that says
+ * "running" reads the typing indicator — on the web UI the topic's pulsing dot, the "running"
+ * label and the Stop button — and a burst used to hold none of it: reported 2026-09-24, a
+ * conversation ran minutes of deploy commands under a topic marked idle, with no way to stop it.
+ */
+describe('a conversation reads as running while background output renders', () => {
+  it('holds typing from the first output until the burst is sealed', async () => {
+    const h = rig();
+    h.reg.route(inbound('run the long script', 'm1'));
+    await drain();
+    h.events.length = 0;
+
+    const handlers = h.sink().handlers();
+    handlers.onUsage?.({ used: 1000, size: 200_000 });
+    // Metadata is not work: the post-turn reports every conversation receives must not light it.
+    expect(h.events).toEqual([]);
+
+    handlers.onText('the script finished');
+    expect(h.events).toEqual(['typing on']);
+
+    await h.sink().close();
+    await drain();
+    expect(h.events).toEqual(['typing on', 'typing off']);
+  });
+
+  // The handover the counting exists for. The runtime seals the previous burst from INSIDE the next
+  // turn, after that turn has already switched typing on — so a burst that simply switched it off
+  // on close would do it to a turn that had just begun.
+  it('does not switch typing off under a turn that takes over from an open burst', async () => {
+    const h = rig({
+      runTurn: async (handlers, ctl) => {
+        await ctl.takeBurst()?.close(); // what runTurn in the ACP runtime does first, awaited
+        ctl.events.push('turn working');
+        handlers.onText('answer');
+      },
+    });
+    h.reg.route(inbound('start the job', 'm1'));
+    await drain();
+
+    h.sink().handlers().onText('the job reported in');
+    h.events.length = 0;
+    h.reg.route(inbound('and now this', 'm2'));
+    await drain();
+
+    expect(h.events).toEqual(['typing on', 'turn working', 'typing off']);
+  });
+
+  // The reverse gap: a turn's cleanup runs after the runtime stopped routing to it, so background
+  // output can open a burst in between — and the turn's cleanup must not switch that one off.
+  it('does not let a finishing turn switch typing off under a burst that just opened', async () => {
+    const h = rig({
+      runTurn: async (handlers, ctl) => {
+        handlers.onText('started it');
+        ctl.current().handlers().onText('and it already reported back');
+      },
+    });
+    h.reg.route(inbound('start the job', 'm1'));
+    await drain();
+    expect(h.events).toEqual(['typing on', 'typing on']);
+
+    await h.sink().close();
+    await drain();
+    expect(h.events).toEqual(['typing on', 'typing on', 'typing off']);
+  });
+
+  it('names the model and effort it was told before its first text', async () => {
+    const h = rig({ footer: true });
+    h.reg.route(inbound('hello', 'm1'));
+    await drain();
+
+    // The runtime reports both the moment a burst begins; the message opens on the first text.
+    const handlers = h.sink().handlers();
+    handlers.onModel?.('opus-5-5');
+    handlers.onEffort?.('high');
+    handlers.onText('deployed');
+    await h.sink().close();
+    await drain();
+
+    const report = [...h.bodies.values()].find((b) => b.includes('deployed'));
+    expect(report).toContain('opus-5-5');
+    expect(report).toContain('high');
   });
 });
 

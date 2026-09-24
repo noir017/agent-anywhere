@@ -47,7 +47,8 @@ ConversationRegistry.route
    ├─ resolveAgent       routing.pipeline, then HARNESS_COMMANDS → { agentId, explicit }
    ├─ response gate      core/inbound-gate shouldRespond
    ├─ /new · /clear      reset the conversation, drop every agent's id, ack. Never forwarded.
-   ├─ /stop              cancel the running turn and the queued backlog, ack. Never forwarded.
+   ├─ /stop              cancel the running turn and the queued backlog — or, with no turn, a burst
+   │                     of background output (AgentSession.stopBackground) — ack. Never forwarded.
    ├─ /kill              /stop, then end the agent child; the session id is kept. Never forwarded.
    ├─ /help              the registered vocabulary, from core/command-translate. Never forwarded.
    ├─ unconfigured agent `/agy` with no agy agent → say so, run no turn. Never forwarded.
@@ -174,6 +175,12 @@ context, the session ids, the binding and the child process exactly as they were
 deliberately does not reach the agent through `agents.getOrCreate` — building a session
 for a conversation that has none, in order to stop it, is backwards; the abort travels via
 the merger, which only fires it in the `running` phase where a session must exist.
+
+When the merger is idle, `/stop` asks the existing session (`agents.peek`, same reason) to
+`stopBackground()`: the harness may be reporting on background work with no turn open, which
+the merger cannot see — see [Out-of-turn output](#out-of-turn-output-becomes-a-follow-up-message).
+That answers `⏹ Stopped the background work`; only when neither has anything is it
+"Nothing is running here."
 
 `/kill` sits between the two. It ends the agent child and keeps everything else — the idle
 sweeper's reclaim, asked for by name, and the only way out of a harness wedged in a tool call,
@@ -506,6 +513,22 @@ that posts a new one.
   which matters because `interruptOnNewMessage` (the default) starts the next turn within
   milliseconds, so the wreckage would otherwise be rendered into *its* reply. That is the case the
   deleted drain described verbatim.
+- **A rendering burst reads as running.** Opening the message takes a typing hold
+  (`TurnRunner.holdTyping`), released after the seal's flush — every surface that says "running"
+  reads typing, and on the web UI that is the topic's dot, its "running" label and the Stop button.
+  Holds are counted per conversation because a turn and a burst overlap at both ends: `runTurn`
+  switches typing on before the runtime seals the previous burst from inside it, and a finishing
+  turn's cleanup can run after a new burst opened. Whoever lets go last switches it off.
+- **`/stop` reaches a burst, and only a rendering one.** `stopBackground()` sends `session/cancel`
+  with no prompt in flight — claude-agent-acp's `cancel()` interrupts the SDK query regardless
+  (verified live against 0.81.0: no further output, and the next turn answers normally). It marks
+  the burst's open tools ✗ and seals it at once, and records their ids as wreckage *without*
+  setting `aborting`, which would stand until the next turn and drop every later background
+  report's tool bubbles. It answers false for a burst that only ever carried metadata and between
+  bursts, where no model cycle is running and claiming a stop would be untrue.
+- **A burst is told the model and effort when it begins**, the same up-front report `runTurn`
+  makes. Both arrive with `session/new` and are never re-sent unless they change, so without it a
+  background report's footer fell back to config — which for the `claude` harness names no model.
 
 Where the message goes comes from `ConversationState.lane`: the lane the last turn ran in, recorded
 by `setLane` and never cleared. It used to be an *active* address wiped at turn end, which is why

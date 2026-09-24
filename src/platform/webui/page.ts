@@ -113,7 +113,7 @@ body{background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,-apple-system,
    colour says whether the agent is there, the pulse says whether it is busy.
      grey     — nothing resident. History, or a topic that will have to resume from a session id.
      dim blue — an agent child is up and idle. Same blue, not doing anything.
-     blue     — a turn is executing.
+     blue     — the agent is working: a turn, or background work reporting in after one.
      amber    — a question is on screen and nothing moves until it is answered. Wins over running,
                 because during an ask the turn IS still open and would otherwise paint over it. */
 .topic-dot{width:7px;height:7px;border-radius:50%;flex:0 0 7px;background:#444}
@@ -1856,7 +1856,7 @@ __GATE__
                already is while a reply streams in, and separate from it because the composer
                still sends mid-turn (queued behind the running turn, or interrupting it under
                inbound.interruptOnNewMessage) — neither of which is "stop". -->
-          <button type="button" id="stop-turn" title="Stop the current turn — the conversation is kept (/stop)" hidden>Stop</button>
+          <button type="button" id="stop-turn" title="Stop what the agent is doing — the conversation is kept (/stop)" hidden>Stop</button>
           <!-- A tooltip is a pointer's affordance, so it names the pointer's shortcut: under the
                narrow-screen layout Enter writes a newline, but nothing there can hover to read
                this. Ctrl-Enter sends on both and is what that layout's users are left with. -->

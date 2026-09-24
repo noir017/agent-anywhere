@@ -656,8 +656,14 @@ function createAcpSession(
   let followUpState: { state: TurnState; sink: FollowUpSink } | undefined;
   /** Cancels the follow-up quiet backstop (see FOLLOW_UP_QUIET_MS). */
   let cancelFollowUpQuiet: (() => void) | undefined;
-  /** Whether the current burst has already said so in the log (see followUp). */
-  let burstAnnounced = false;
+  /**
+   * Whether the current burst has put output on screen — the difference between a burst that is
+   * background work reporting in and one that only ever carried metadata (see followUp). Read for
+   * two decisions: whether to say so in the log, and whether `/stop` has anything to stop
+   * (see stopBackground). `followUpState` alone cannot answer either, because the post-turn
+   * `session_info_update` opens one on every conversation after every turn.
+   */
+  let burstRendering = false;
   /**
    * Startup currently in flight, shared by concurrent callers so only one child is ever spawned
    * per session (see ensureStarted). Undefined whenever no startup is running.
@@ -1184,15 +1190,26 @@ function createAcpSession(
    */
   function followUp(renderable: boolean): TurnState | undefined {
     if (!followUpSink) return undefined;
-    followUpState ??= { state: newTranslationState(followUpSink.handlers()), sink: followUpSink };
+    if (!followUpState) {
+      const handlers = followUpSink.handlers();
+      followUpState = { state: newTranslationState(handlers), sink: followUpSink };
+      // The same up-front report runTurn makes, for the same reason: the model and effort are
+      // known from session/new and are never re-sent unless they change, so a burst that is not
+      // told them has no way to learn them. Its footer then fell back to config, which for the
+      // `claude` harness names no model at all — the background report read `cc · 429k / 1M`
+      // directly under a reply that said `cc · 429k / 1M · opus-5-5 · high`.
+      if (liveModel) handlers.onModel?.(liveModel);
+      const effort = liveEffortName(liveConfigOptions);
+      if (effort) handlers.onEffort?.(effort);
+    }
     // Only OUTPUT starts a burst. Metadata gets the same translation state (it has to go
     // somewhere) but neither announces itself nor arms a timer, because claude-agent-acp sends a
     // `session_info_update` after every single turn: logging "rendering a follow-up" there would
     // make the one line that tells an operator background work is happening indistinguishable
     // from per-turn noise, and would leave every idle conversation holding a 3-minute timer.
     if (!renderable) return followUpState.state;
-    if (!burstAnnounced) {
-      burstAnnounced = true;
+    if (!burstRendering) {
+      burstRendering = true;
       console.log(`[acp] ${conversationId}: output arrived outside a turn; rendering it as a follow-up`);
     }
     // Re-armed on every update, so the backstop measures SILENCE rather than burst length: a
@@ -1263,7 +1280,7 @@ function createAcpSession(
     cancelFollowUpQuiet = undefined;
     const burst = followUpState;
     followUpState = undefined;
-    burstAnnounced = false;
+    burstRendering = false;
     if (!burst) return;
     flushPendingTools(burst.state);
     try {
@@ -1676,6 +1693,25 @@ function createAcpSession(
       // tool_call — the `aborting` half of isWreckage covers that window.
       cancelledTools = new Set(turnState?.toolLedger.keys() ?? []);
       if (conn && active) void conn.agent.notify('session/cancel', { sessionId: active.sessionId });
+    },
+
+    stopBackground(): boolean {
+      if (turnState || !burstRendering || !followUpState || !conn || !active) return false;
+      // The burst's open tools are this cancel's wreckage, exactly as a turn's are abort()'s. NOT
+      // `aborting`: that flag stands until the next turn clears it, and a conversation stopped
+      // out of turn may not see another turn for hours — every tool bubble of every later
+      // background report would be dropped as wreckage in the meantime.
+      cancelledTools = new Set(followUpState.state.toolLedger.keys());
+      console.log(`[acp] ${conversationId}: stopping background output on request`);
+      void conn.agent.notify('session/cancel', { sessionId: active.sessionId });
+      // Marked failed before the seal would mark them done: a deploy the user just stopped must
+      // not be left on screen with a ✓ — observed live against claude-agent-acp 0.81.0, where the
+      // harness's own "failed" update arrives after this and is (rightly) dropped as wreckage.
+      flushPendingTools(followUpState.state, false);
+      // Sealed now rather than left to the quiet timer: the user has just been told it stopped,
+      // and a message still streaming (or, in `once` mode, not yet sent at all) says otherwise.
+      void closeFollowUp();
+      return true;
     },
 
     async ensureSession(sessionToken: string): Promise<void> {
@@ -2107,11 +2143,18 @@ function hasOpenToolCall(st: TurnState): boolean {
   return false;
 }
 
-/** Turn end: started-but-unfinished close as success; has-params-but-not-started get start+finish; pure pending shells (never ran) skipped. */
-function flushPendingTools(st: TurnState): void {
+/**
+ * Turn end: started-but-unfinished close as success; has-params-but-not-started get start+finish;
+ * pure pending shells (never ran) skipped.
+ *
+ * `ok` is false only when the tools were STOPPED rather than left open by a harness that did not
+ * report their end — see stopBackground, where the harness's own "failed" update is about to be
+ * dropped as wreckage, so this is the only word the bubble will ever get.
+ */
+function flushPendingTools(st: TurnState, ok = true): void {
   for (const [id, rec] of st.toolLedger) {
     if (rec.finished) continue;
-    if (rec.started || isNonEmptyObject(rec.rawInput)) finishTool(st, id, true);
+    if (rec.started || isNonEmptyObject(rec.rawInput)) finishTool(st, id, ok);
   }
   st.toolLedger.clear();
 }

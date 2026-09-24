@@ -394,7 +394,7 @@ describe('ConversationRegistry /stop', () => {
   };
   const drain = (): Promise<void> => new Promise((r) => setTimeout(r, 20));
 
-  function stopRig() {
+  function stopRig(opts: { turnsSettle?: boolean } = {}) {
     const parsed = parseConfig({
       platforms: { discord: { type: 'discord', token: 't' } },
       agents: [{ id: 'cc', harness: 'claude' }],
@@ -418,8 +418,11 @@ describe('ConversationRegistry /stop', () => {
 
     const created: string[] = [];
     const aborts: string[] = [];
+    /** Whether the session is producing background output; a stop clears it, as the runtime's does. */
+    const background = { running: false, stops: 0 };
     const sessions = new Map<string, AgentSession>();
-    // Turns never settle on their own: the point is to observe one being stopped mid-flight.
+    // Turns never settle on their own unless asked to: the point is usually to observe one being
+    // stopped mid-flight.
     const factory: AgentFactory = {
       getOrCreate(conversationId) {
         created.push(conversationId);
@@ -427,8 +430,14 @@ describe('ConversationRegistry /stop', () => {
         if (!s) {
           s = {
             conversationId,
-            runTurn: () => new Promise<void>(() => {}),
+            runTurn: () => (opts.turnsSettle ? Promise.resolve() : new Promise<void>(() => {})),
             abort: () => void aborts.push(conversationId),
+            stopBackground: () => {
+              if (!background.running) return false;
+              background.running = false;
+              background.stops++;
+              return true;
+            },
             dispose: () => {},
           };
           sessions.set(conversationId, s);
@@ -440,7 +449,7 @@ describe('ConversationRegistry /stop', () => {
     };
 
     const reg = new ConversationRegistry(cfg, new Map([['discord', platform]]), factory, realClock);
-    return { reg, sent, created, aborts };
+    return { reg, sent, created, aborts, background };
   }
 
   it('mid-turn: aborts the agent and says what it stopped', async () => {
@@ -475,5 +484,36 @@ describe('ConversationRegistry /stop', () => {
     // session (and, in the real runtime, eventually a child process) for a conversation whose
     // whole problem is that it has none.
     expect(created).toEqual([]);
+  });
+
+  // Reported 2026-09-24: the turn had ended and the harness had re-invoked itself for a finished
+  // background task, so the merger was idle — and `/stop` answered "Nothing is running here" under
+  // tool bubbles that were still appearing.
+  it('background work reporting in: stops that, and says so', async () => {
+    const { reg, sent, aborts, background } = stopRig({ turnsSettle: true });
+    reg.route(inbound('run it in the background', 'm1'));
+    await drain();
+    background.running = true;
+    sent.length = 0;
+
+    reg.route(inbound('/stop', 'm2'));
+    await drain();
+
+    expect(background.stops).toBe(1);
+    expect(aborts).toEqual([]); // there was no turn, so nothing for abort() to do
+    expect(sent.some((t) => t.startsWith('⏹ Stopped the background work.'))).toBe(true);
+  });
+
+  it('after the background work is done: back to nothing running', async () => {
+    const { reg, sent, background } = stopRig({ turnsSettle: true });
+    reg.route(inbound('hello', 'm1'));
+    await drain();
+    sent.length = 0;
+
+    reg.route(inbound('/stop', 'm2'));
+    await drain();
+
+    expect(background.stops).toBe(0);
+    expect(sent).toEqual(['Nothing is running here.']);
   });
 });

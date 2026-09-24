@@ -5,6 +5,26 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **An agent reporting back on background work shows as running, and `/stop` stops it.** Claude
+  Code ends its turn once it has put a long job in the background, and when the job finishes it
+  picks up again on its own — that is the `⏱ background update` message. None of it held the typing
+  indicator, which is what every "running" signal is read from, so on the web UI a conversation
+  running minutes of deploy commands showed a topic marked idle, no "running" label and no Stop
+  button. `/stop` typed by hand answered "Nothing is running here" under tool bubbles that were
+  still appearing, because from the daemon's side no turn was open. A background update now holds
+  the indicator from its first output until it is sealed. `/stop` sends the harness a cancel even
+  with no turn open (claude-agent-acp interrupts that work too; checked against a live session,
+  which answered the next message normally), marks the tool it was running ✗, and answers
+  `⏹ Stopped the background work`. While the agent is only waiting on a background process, the
+  topic stays idle and `/stop` still says nothing is running: no model call is in progress, so there
+  is nothing for a stop to reach, and the background job is not touched.
+- **A background update's footer names the model and effort again.** It read `cc · 429k / 1M (43%)`
+  directly under a reply footed `cc · 429k / 1M (43%) · opus-5-5 · high`. The harness reports both
+  once, when the session starts, and only a turn was being told them — so a background update fell
+  back to config, which for the `claude` harness names no model at all.
+
 ## [1.33.1] - 2026-09-23
 
 ### Fixed

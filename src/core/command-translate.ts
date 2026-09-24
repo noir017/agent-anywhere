@@ -73,7 +73,7 @@ export type Harness = AgentDef['harness'];
 export const DAEMON_COMMANDS: SlashCommandSpec[] = [
   { name: 'new', description: 'Start a fresh conversation (clears context)' },
   { name: 'clear', description: 'Alias of /new: start a fresh conversation' },
-  { name: 'stop', description: 'Stop the current turn (keeps the conversation)' },
+  { name: 'stop', description: 'Stop the current turn or background work (keeps the conversation)' },
   { name: 'kill', description: 'End the agent process (keeps the conversation; the next message resumes it)' },
   { name: 'cd', description: 'Choose the working directory (starts a fresh session there)' },
   { name: 'setting', description: 'Change a saved setting (default agent, model, session)' },

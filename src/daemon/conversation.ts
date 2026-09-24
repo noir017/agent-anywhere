@@ -181,8 +181,12 @@ export function formatLaneTitle(agentId: string, raw: string): string {
   return `[${agentId}] ${subject}`.trim();
 }
 
-/** What the merger was doing when `/stop` arrived. */
-type StopOutcome = 'running' | 'collecting' | 'idle';
+/**
+ * What was running when `/stop` arrived. The first three are read off the merger; `background` is
+ * what the merger cannot see — the harness re-invoked itself after a background task finished and
+ * is producing output with no turn open (see AgentSession.stopBackground).
+ */
+type StopOutcome = 'running' | 'collecting' | 'background' | 'idle';
 
 /**
  * What `/stop` answers, per outcome. Three sentences rather than one ack, because the same words
@@ -192,6 +196,8 @@ type StopOutcome = 'running' | 'collecting' | 'idle';
 const STOP_ACK: Record<StopOutcome, string> = {
   running: '⏹ Stopped. The reply above is as far as it got — the conversation is kept, so just send the next message.',
   collecting: '⏹ Dropped the message that was about to start a turn. Nothing reached the agent.',
+  background:
+    '⏹ Stopped the background work. The update above is as far as it got — the conversation is kept, so just send the next message.',
   idle: 'Nothing is running here.',
 };
 
@@ -215,6 +221,8 @@ type KillOutcome = StopOutcome | 'no-child' | 'unresumable';
 const KILL_ACK: Record<KillOutcome, string> = {
   running: '🔌 Stopped the turn and ended the agent process. The conversation is kept — the next message starts a new process that picks up where this one left off.',
   collecting: '🔌 Dropped the message that was about to start a turn, and ended the agent process. The conversation is kept — the next message resumes it.',
+  background:
+    '🔌 Stopped the background work and ended the agent process. The conversation is kept — the next message starts a new process that picks up where this one left off.',
   idle: '🔌 Ended the agent process. The conversation is kept — the next message starts a new one that picks up where it left off.',
   'no-child': 'No agent process is running here — nothing to end.',
   unresumable:
@@ -2462,11 +2470,17 @@ ${formatTokens(left)} left before compaction — ${name}`;
    * through agents.getOrCreate: building a session handle for a conversation that has none, in the
    * name of stopping it, is exactly backwards. The abort reaches the agent through the merger,
    * which only fires it in the `running` phase — where a session necessarily exists.
+   *
+   * Only when the merger has nothing does the session get asked about background output, and
+   * through `peek` for the same reason. Not the other way round: while a turn runs the harness's
+   * output belongs to the turn, so there is no burst to stop and asking would only race the abort.
    */
   stopConversation(id: ConversationId): StopOutcome {
     const state = this.conversations.get(id);
     if (!state) return 'idle';
-    return state.merger.interrupt();
+    const outcome = state.merger.interrupt();
+    if (outcome !== 'idle') return outcome;
+    return this.agents.peek(id)?.stopBackground?.() ? 'background' : 'idle';
   }
 
   /**

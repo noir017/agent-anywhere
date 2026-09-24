@@ -217,10 +217,11 @@ out to be about. `+` opens one; the agent can open one itself with
 `agent-anywhere create-thread`, and write into one with `--channel main/<topic id>`.
 
 **Stopping it.** While a reply is streaming, **Stop** beside Send ends the turn
-(`/stop`). While an agent process is up behind the topic, the power button beside
-its title ends the process (`/kill`) — the conversation is kept, and the next
-message picks up where it left off. Both simply send the command, so a draft in
-the composer is left where it is.
+(`/stop`) — and the same goes for an agent reporting back on background work after
+its turn ended, which the topic shows as running too. While an agent process is up
+behind the topic, the power button beside its title ends the process (`/kill`) — the
+conversation is kept, and the next message picks up where it left off. Both simply
+send the command, so a draft in the composer is left where it is.
 
 **Built for a bad connection.** Replies are sent when they settle rather than on
 every keystroke of the stream, everything on the wire is compressed, and a dropped
@@ -323,7 +324,7 @@ Discord, Slack), and equally usable as plain text everywhere else.
 |---|---|
 | `/help` | everything below, for the agent currently answering |
 | `/new`, `/clear` | start a fresh conversation (clears context) |
-| `/stop` | stop the current turn, keeping the conversation |
+| `/stop` | stop the current turn — or background work reporting in after one — keeping the conversation |
 | `/kill` | end the agent process, keeping the conversation — the next message resumes it |
 | `/cd` | choose the directory this conversation works in — see below |
 | `/title` | name this topic; it is named automatically otherwise — see below |

@@ -32,7 +32,10 @@ export interface Topic {
   title: string;
   /** Epoch ms of the last message either way; the switcher orders by it. */
   lastAt: number;
-  /** True while an agent turn is actively executing in this topic. */
+  /**
+   * True while the agent is working in this topic: a turn, or background work reporting in after
+   * one. Both hold the typing indicator, which is what this is read from (see daemon TurnRunner).
+   */
   running?: boolean;
   /**
    * A question is on screen here and nothing will move until it is answered.

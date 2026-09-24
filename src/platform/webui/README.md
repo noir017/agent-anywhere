@@ -121,7 +121,7 @@ actually reads that column for:
 |---|---|---|
 | grey | nothing resident — history, or a topic that will have to resume from a session id | the absence of the two below |
 | dim blue | an agent child is up and idle | `PlatformAdapter.useLivenessLookup` |
-| blue, pulsing | a turn is executing | `startTyping` / `stopTyping` |
+| blue, pulsing | the agent is working — a turn, or background work reporting in after one | `startTyping` / `stopTyping` (the daemon holds typing for both) |
 | amber, pulsing | a question is on screen and nothing moves until it is answered | a message in the room still carrying buttons, posted or re-armed since the operator last wrote |
 
 `asking` is derived HERE rather than asked of the daemon, because the room already holds the
@@ -136,7 +136,8 @@ poll skips itself while no browser is attached and sends only when a flag actual
 
 **The two stop controls read the same flags as the dot.** The power button beside the title is
 shown while `live` and sends `/kill` (end the process, keep the conversation); Stop beside Send is
-shown while `running` — `asking` implies it — and sends `/stop` (end the turn). Both post the
+shown while `running` — `asking` implies it — and sends `/stop` (end the turn, or the background
+work reporting in after one). Both post the
 typed command through `api/send` with the same nonce, bubble and echo as typing it, so the daemon
 has one way to be told, the transcript records the command like any other, and this module gains
 no route. They leave the composer alone: a half-written prompt is exactly what someone reaching

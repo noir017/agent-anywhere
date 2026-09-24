@@ -188,6 +188,12 @@ interface TurnRef {
 }
 
 /**
+ * The part of a TurnRef a burst of background output learns before it has a message: the runtime
+ * reports the model and effort when the burst begins, and the message opens on the first text.
+ */
+type BurstFacts = Pick<TurnRef, 'model' | 'effort'>;
+
+/**
  * Single-turn orchestrator: all timing logic for running one turn — register the TurnContext
  * (channel/token), wire StreamBuffer / ToolRenderer, drive the agent turn, and preserve observable
  * behaviors: serial effects chain ("text → tool boundary → tool bubble → trailing text"), footer only
@@ -197,6 +203,26 @@ interface TurnRef {
  * SessionRegistry; TurnRunner borrows its capabilities via TurnRunnerDeps and holds no reference to it.
  */
 export class TurnRunner {
+  /**
+   * How many things are holding each conversation's typing indicator on right now: a turn, a
+   * burst of background output, or — for the moment one hands over to the other — both.
+   *
+   * Counted because the two overlap and the indicator is a single switch. runTurn switches typing
+   * on first, and only then does the runtime seal the previous burst, from inside the turn (see
+   * FollowUpSink.close) — so a burst that simply switched typing off on close would do it to the
+   * turn that had just begun. The reverse happens too: a turn's `finally` runs after the runtime
+   * has stopped routing to it, so background output can open a burst in that gap, and the turn
+   * would switch it off. On the web UI either one is the topic dot going quiet, the "running"
+   * label vanishing and the Stop button hiding while the agent is visibly still working.
+   *
+   * Keyed by conversation, not address. The two differ only under autoThread, where a new turn
+   * opens a new thread while the burst it seals still names the old one; skipping that stop costs
+   * nothing, because every chat platform expires typing on its own (satori's stopTyping is a
+   * no-op) and the web UI — the one adapter where stopping is real — never auto-threads (that path
+   * needs a group channel, and every web UI topic is a direct lane).
+   */
+  private readonly typingHolds = new Map<ConversationId, number>();
+
   constructor(
     private readonly config: Config,
     /** Platform adapters keyed by instance id; each turn resolves its adapter from the batch's platform. */
@@ -280,8 +306,9 @@ export class TurnRunner {
     if (!isCommandTurn) this.deps.nameConversation?.(conversationId, this.buildTitleSeed(batch));
 
     // Typing keep-alive: Discord's typing indicator self-expires ~10s, so re-fire every typingIntervalMs
-    // (fire-and-forget, never gates the turn). Cancelled + stopTyping in finally.
-    const stopTypingLoop = this.startTypingLoop(platform, address);
+    // (fire-and-forget, never gates the turn). Released in finally — held rather than simply
+    // stopped there, because a burst of background output may be holding it too (see typingHolds).
+    const releaseTyping = this.holdTyping(conversationId, platform, address);
 
     // Everything that turns agent events into messages in this lane. Shared with the follow-up
     // path (see followUpSink) so out-of-turn output renders exactly like in-turn output.
@@ -339,8 +366,7 @@ export class TurnRunner {
         .catch((e) => console.error('[turn] failed to send error notice:', e instanceof Error ? e.message : e));
       throw err;
     } finally {
-      stopTypingLoop();
-      await platform.stopTyping(address);
+      await releaseTyping();
     }
   }
 
@@ -585,6 +611,10 @@ export class TurnRunner {
     let render: Render | undefined;
     /** Whether opening was already TRIED — a failed open must not be retried per chunk. */
     let tried = false;
+    /** Lets go of the typing indicator the open message is holding (see typingHolds). */
+    let releaseTyping: (() => Promise<void>) | undefined;
+    /** What this burst was told about the session before it had a message to put it on. */
+    let facts: BurstFacts = {};
 
     const open = (): Render | undefined => {
       if (tried) return render;
@@ -602,6 +632,10 @@ export class TurnRunner {
         return undefined;
       }
       render = this.beginRender(conversationId, platform, target.address);
+      // The runtime reports the model and effort when the burst begins, which is before its first
+      // text — so before this message existed to record them on.
+      if (facts.model) render.ref.model = facts.model;
+      if (facts.effort) render.ref.effort = facts.effort;
       // Queued onto the render's own chain rather than sent directly, so the marker cannot land
       // after the first chunk of the text it is introducing.
       render.enqueue(() =>
@@ -610,27 +644,45 @@ export class TurnRunner {
           .then(() => undefined)
           .catch((e) => console.warn('[follow-up] failed to send the marker:', e instanceof Error ? e.message : e))
       );
+      // The agent is working, and every surface that says so reads the typing indicator — on the
+      // web UI that is the topic's dot, the "running" label and the Stop button. A burst used to
+      // hold none of it, so minutes of tool calls ran under a topic marked idle.
+      releaseTyping = this.holdTyping(conversationId, platform, target.address);
       console.log(`[follow-up] ${conversationId}: rendering background output as a new message`);
       return render;
     };
 
+    /** Let go of typing, absorbing failure: a stuck indicator must not fail whoever closed the burst. */
+    const letGo = (release: (() => Promise<void>) | undefined): Promise<void> | undefined =>
+      release?.().catch((e) => console.warn('[follow-up] failed to stop typing:', e instanceof Error ? e.message : e));
+
     return {
       handlers: () => {
+        // A backstop, not a path: the runtime closes every burst it opens. But a hold that
+        // outlived its burst would mark the conversation running for the life of the process,
+        // so a new burst starting over an unclosed one lets go of it.
+        void letGo(releaseTyping);
+        releaseTyping = undefined;
         render = undefined;
         tried = false;
-        return this.buildFollowUpHandlers(conversationId, open, () => render);
+        facts = {};
+        return this.buildFollowUpHandlers(conversationId, open, () => render, facts);
       },
       close: () => {
         const done = render;
+        const release = releaseTyping;
         render = undefined;
+        releaseTyping = undefined;
         tried = false;
         if (!done) return;
         // Returned rather than voided: the runtime awaits it before letting a new turn write into
         // the same lane (see FollowUpSink.close). Failures are absorbed — a background report that
-        // could not be flushed must not fail the turn that happened to seal it.
+        // could not be flushed must not fail the turn that happened to seal it. Typing goes AFTER
+        // the flush, because in `once` mode the flush is when the whole message is sent.
         return done
           .finalize(this.buildFooter(conversationId, done.ref))
-          .catch((e) => console.error('[follow-up] failed to finalize:', describeOutboundError(e)));
+          .catch((e) => console.error('[follow-up] failed to finalize:', describeOutboundError(e)))
+          .then(() => letGo(release));
       },
     };
   }
@@ -651,7 +703,9 @@ export class TurnRunner {
     conversationId: ConversationId,
     open: () => Render | undefined,
     /** The open render, WITHOUT opening one — for events that must not cause a message. */
-    peek: () => Render | undefined
+    peek: () => Render | undefined,
+    /** Written on every model/effort report, so a message opened later still starts with them. */
+    facts: BurstFacts
   ): AgentStreamHandlers {
     const touch = (): void => this.deps.touch?.(conversationId);
     return {
@@ -686,10 +740,12 @@ export class TurnRunner {
         if (live) live.ref.usage = usage;
       },
       onModel: (model) => {
+        facts.model = model;
         const live = peek();
         if (live) live.ref.model = model;
       },
       onEffort: (effort) => {
+        facts.effort = effort;
         const live = peek();
         if (live) live.ref.effort = effort;
       },
@@ -851,6 +907,34 @@ export class TurnRunner {
       stopped = true;
       cancel?.();
       cancel = null;
+    };
+  }
+
+  /**
+   * Hold a conversation's typing indicator on — keep-alive included — until the returned release
+   * is called. Release always stops this holder's keep-alive, but switches the indicator off only
+   * when nothing else is still holding it (see typingHolds). Idempotent, so a double release can
+   * never take the count below another holder's share.
+   */
+  private holdTyping(
+    id: ConversationId,
+    platform: PlatformAdapter,
+    address: ConversationAddress
+  ): () => Promise<void> {
+    this.typingHolds.set(id, (this.typingHolds.get(id) ?? 0) + 1);
+    const stopLoop = this.startTypingLoop(platform, address);
+    let released = false;
+    return async () => {
+      if (released) return;
+      released = true;
+      stopLoop();
+      const left = (this.typingHolds.get(id) ?? 1) - 1;
+      if (left > 0) {
+        this.typingHolds.set(id, left);
+        return;
+      }
+      this.typingHolds.delete(id);
+      await platform.stopTyping(address);
     };
   }
 

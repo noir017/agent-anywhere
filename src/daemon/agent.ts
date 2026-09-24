@@ -170,6 +170,25 @@ export interface AgentSession {
    */
   setFollowUpSink?(sink: FollowUpSink): void;
   /**
+   * Cancel background work that is producing output right now — a follow-up burst (see
+   * FollowUpSink) — and report whether there was any.
+   *
+   * `abort()` cannot do this, because it is scoped to a turn and a burst has none: the harness
+   * re-invoked itself when a background task finished, so from the gateway's side the merger is
+   * idle and `/stop` used to answer "Nothing is running here" while tool bubbles were still
+   * appearing above it. The cancel itself does reach that work — claude-agent-acp's `cancel()`
+   * interrupts the SDK query whether or not a prompt is in flight (verified in 0.81.0,
+   * acp-agent.js `cancel`, 2026-09-24).
+   *
+   * False whenever no burst is rendering, including the stretch BETWEEN bursts where the agent is
+   * waiting on a background process: no model cycle is running then, so there is nothing a cancel
+   * could interrupt and saying otherwise would be untrue. Also false while a turn is running —
+   * that is `abort()`'s job, and the merger already routes `/stop` there.
+   *
+   * Optional so a runtime with no out-of-turn output simply omits it; `/stop` then reports idle.
+   */
+  stopBackground?(): boolean;
+  /**
    * The live session's model selector, or undefined when the harness exposes none.
    *
    * Non-spawning: reports what is already known and never starts a child. A caller that wants an

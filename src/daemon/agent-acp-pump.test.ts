@@ -31,6 +31,8 @@ const notify = (sessionId, update) =>
 
 const text = (sessionId, t) =>
   notify(sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: t } });
+// The tool a cancel lands on, whether a turn or a background burst opened it.
+let openTool = 'doomed-1';
 // The usage snapshot the harness ties to a completed result: 'cost' is what marks it (see
 // isResultUsage), and it is how the gateway knows a burst of background output has finished.
 const resultUsage = (sessionId, used) =>
@@ -49,7 +51,22 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     return;
   }
   if (msg.method === 'session/new') {
-    reply(msg.id, { sessionId: 's1' });
+    // A model and an effort, reported here and never again unless they change — which is exactly
+    // why the runtime has to hand them on to every stream itself, a background burst included.
+    reply(msg.id, {
+      sessionId: 's1',
+      configOptions: [
+        { id: 'model', type: 'select', name: 'Model', currentValue: 'opus', options: [{ value: 'opus', name: 'Opus' }] },
+        {
+          id: 'effort',
+          type: 'select',
+          name: 'Effort',
+          category: 'thought_level',
+          currentValue: 'high',
+          options: [{ value: 'high', name: 'High' }],
+        },
+      ],
+    });
     return;
   }
   if (msg.method === 'session/load') {
@@ -75,16 +92,34 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     return;
   }
   if (msg.method === 'session/cancel') {
-    // A cancelled tool still reports in, and it lands after the prompt has settled.
+    // A cancelled tool still reports in, and it lands after the prompt has settled — or, when
+    // what was cancelled was background output, after the gateway has already sealed it.
     const sessionId = msg.params.sessionId;
+    const doomed = openTool;
     reply(msg.id, {});
     setTimeout(() => {
       notify(sessionId, {
         sessionUpdate: 'tool_call_update',
-        toolCallId: 'doomed-1',
+        toolCallId: doomed,
         status: 'failed',
       });
     }, 40);
+    if (doomed === 'bg-1') {
+      // A DIFFERENT background task finishing later. Stopping one burst must not blind the
+      // gateway to the next: this one's tool has to render as usual.
+      setTimeout(() => {
+        notify(sessionId, {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'bg-2',
+          title: 'a later check',
+          kind: 'execute',
+          status: 'in_progress',
+          rawInput: { command: './later.sh' },
+        });
+        text(sessionId, 'the other job finished too');
+        resultUsage(sessionId, 1800);
+      }, 120);
+    }
     return;
   }
   if (msg.method === 'session/prompt') {
@@ -103,10 +138,40 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
       });
       return;
     }
+    if (asked.includes('META_ONLY')) {
+      // A turn followed by nothing but the post-turn title report — what every conversation looks
+      // like between bursts. Metadata opens a follow-up state; it is not background work.
+      text(sessionId, 'done');
+      resultUsage(sessionId, 1000);
+      reply(msg.id, { stopReason: 'end_turn' });
+      setTimeout(() => notify(sessionId, { sessionUpdate: 'session_info_update', title: 'Done' }), 20);
+      return;
+    }
+    if (asked.includes('BG_TOOL')) {
+      // The shape of the reported bug: the turn ends promptly, and the background report that
+      // follows is still busy — text, then a tool left running — when the user asks it to stop.
+      text(sessionId, 'waiting on the release in the background');
+      resultUsage(sessionId, 1000);
+      reply(msg.id, { stopReason: 'end_turn' });
+      setTimeout(() => {
+        openTool = 'bg-1';
+        text(sessionId, 'the release is out; deploying');
+        notify(sessionId, {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'bg-1',
+          title: 'deploy',
+          kind: 'execute',
+          status: 'in_progress',
+          rawInput: { command: './deploy.sh' },
+        });
+      }, 60);
+      return;
+    }
     // Every block, not just the first: the runtime prepends a reverse-CLI hint block on a
     // session's first turn, so prompt[0] is not the user's text.
     if (JSON.stringify(msg.params.prompt ?? '').includes('SLOW')) {
       // A turn that opens a tool and then waits to be cancelled.
+      openTool = 'doomed-1';
       notify(sessionId, {
         sessionUpdate: 'tool_call',
         toolCallId: 'doomed-1',
@@ -198,22 +263,32 @@ function sinkSpy(): {
   install(session: AgentSession): void;
   text: string[];
   tools: string[];
+  /** Model and effort names each burst was told, in order. */
+  facts: string[];
+  /** How each tool bubble ended: true for ✓, false for ✗. */
+  finishes: boolean[];
   closes: () => number;
 } {
   const text: string[] = [];
   const tools: string[] = [];
+  const facts: string[] = [];
+  const finishes: boolean[] = [];
   let closes = 0;
   return {
     text,
     tools,
+    facts,
+    finishes,
     closes: () => closes,
     install: (session) =>
       session.setFollowUpSink?.({
         handlers: () => ({
           onText: (d) => void text.push(d),
           onToolStart: (e) => void tools.push(e.name),
-          onToolFinish: () => {},
+          onToolFinish: (e) => void finishes.push(e.ok),
           onSegmentBreak: () => {},
+          onModel: (m) => void facts.push(`model:${m}`),
+          onEffort: (e) => void facts.push(`effort:${e}`),
         }),
         close: () => void closes++,
       }),
@@ -359,6 +434,83 @@ describe('what must NOT be rendered as background output', () => {
     // it would have posted a "background update" about the tool the user just stopped.
     expect(sink.tools).toEqual([]);
     expect(sink.closes()).toBe(0);
+  });
+});
+
+/**
+ * `/stop` while background work is reporting in. The merger sees no turn, so the runtime answers
+ * this itself — and it has to do two things a turn's abort never had to: stop output that has no
+ * prompt to cancel, and leave the conversation able to hear the NEXT background report.
+ */
+describe('stopping background output', () => {
+  /** Poll for a condition rather than guessing how long the child takes to get there. */
+  const until = async (cond: () => boolean): Promise<void> => {
+    for (let i = 0; i < 300 && !cond(); i++) await new Promise((r) => setTimeout(r, 10));
+  };
+
+  it('cancels a burst that is still running, seals it, and still hears the next one', async () => {
+    const { session } = rig();
+    const sink = sinkSpy();
+    sink.install(session);
+
+    await session.runTurn({ prompt: 'BG_TOOL: wait for the release', sessionToken: 'tok' }, collector().handlers);
+    await until(() => sink.tools.length > 0);
+    expect(sink.tools).toEqual(['Bash']);
+    expect(sink.closes()).toBe(0);
+
+    expect(session.stopBackground?.()).toBe(true);
+    // Sealed at once rather than when the quiet timer gets round to it: the user has just been
+    // told it stopped, and in `once` mode an unsealed burst has not even been sent.
+    expect(sink.closes()).toBe(1);
+    // And the deploy it was running ends as ✗, not as the ✓ an ordinary seal would give it: the
+    // harness's own "failed" update for it is about to be dropped, so this is the last word.
+    expect(sink.finishes).toEqual([false]);
+
+    await settle();
+    // Exactly one more bubble, and it is the LATER job's. The deploy's trailing update was dropped
+    // as wreckage rather than opening a burst of its own; the unrelated report that followed was
+    // not — which is what reusing the turn's `aborting` flag would have got wrong, and kept wrong
+    // until the next turn.
+    expect(sink.tools).toEqual(['Bash', 'Bash']);
+    expect(sink.text.join('')).toContain('the other job finished too');
+  });
+
+  it('claims nothing between bursts, where only metadata has arrived', async () => {
+    const { session } = rig();
+    const sink = sinkSpy();
+    sink.install(session);
+    expect(session.stopBackground?.()).toBe(false); // nothing has ever run
+
+    await session.runTurn({ prompt: 'META_ONLY', sessionToken: 'tok' }, collector().handlers);
+    await settle();
+    // The post-turn title report opened a follow-up state — it does on every conversation after
+    // every turn — but nothing is working, so "stopped the background work" would be untrue.
+    expect(session.stopBackground?.()).toBe(false);
+    expect(sink.closes()).toBe(0);
+  });
+
+  it('leaves a running turn to abort()', async () => {
+    const { session } = rig();
+    sinkSpy().install(session);
+    const turn = collector();
+    const running = session.runTurn({ prompt: 'SLOW: run the long script', sessionToken: 'tok' }, turn.handlers);
+    await until(() => turn.tools.length > 0);
+    expect(session.stopBackground?.()).toBe(false);
+    await running;
+  });
+
+  it('tells a burst the model and effort it is running on', async () => {
+    const { session } = rig();
+    const sink = sinkSpy();
+    sink.install(session);
+
+    await session.runTurn({ prompt: 'run the long script', sessionToken: 'tok' }, collector().handlers);
+    await settle();
+
+    expect(sink.text.join('')).toBe('the script finished: all green');
+    // Reported by session/new and never again: without the runtime handing them on, the burst's
+    // footer fell back to config — which for the `claude` harness names no model at all.
+    expect(sink.facts).toEqual(['model:Opus', 'effort:high']);
   });
 });
 

@@ -5,6 +5,22 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **A long reply is cut between blocks, not wherever the message ran out.** A reply longer than
+  the platform's limit went out as several messages, cut at the last line break that fit — so a
+  4,632-character Telegram reply split its closing list of four questions into 1–2 at the bottom of
+  one message and 3–4 at the top of the next. The section heading and half the list scrolled out of
+  sight, and it read as if part of the reply had gone missing; the agent, asked about it, then
+  guessed "truncated", although every character had been delivered. A cut now prefers a blank line
+  or the line before a heading, as long as the message stays at least three quarters full, and
+  never leaves a heading or a bold-only title line as a message's last line. Replaying that reply,
+  the second message now starts at the heading with all four questions under it, in the same number
+  of messages. Over the 308 long replies on the operator's machine, cuts inside a list fell from 110
+  to 67 at QQ's 1000-char limit, and titles stranded at the bottom from 29 to 6, for 0.6 % more
+  messages; at Telegram's limit the count did not change. A continuation also no longer opens with
+  the newline it was cut at.
+
 ## [1.34.0] - 2026-09-25
 
 ### Added

@@ -149,6 +149,49 @@ describe('splitIntoChunks', () => {
   });
 });
 
+// Where a cut lands. The shape that motivated this: a reply of 4632 chars went to Telegram (4096)
+// as two messages cut at the last newline that fit, which split "questions for you" 1–2 | 3–4 and
+// read as if part of the reply had gone missing.
+describe('splitIntoChunks: cut placement', () => {
+  const intro = (n: number): string => 'i'.repeat(n);
+  const list = ['1. alpha', '2. bravo', '3. charlie', '4. delta'].join('\n');
+
+  it('keeps a list whole by cutting at the paragraph break before it', () => {
+    // The window (100) ends inside the list; the blank line at 80 still leaves the message 4/5 full.
+    const text = `${intro(80)}\n\n${list}`;
+    expect(splitIntoChunks(text, 100)).toEqual([intro(80), list]);
+  });
+
+  it('never leaves a heading as the last line of a message', () => {
+    // The last newline that fits is right after the heading — which is where the cut used to land.
+    const section = `### Questions\n\n${list}`;
+    expect(splitIntoChunks(`${intro(76)}\n\n${section}`, 100)).toEqual([intro(76), section]);
+  });
+
+  it('treats a line that is only a bold span as a heading too', () => {
+    // No blank line anywhere: the last newline that fits follows the bold title, so the cut has to
+    // move one line up — to the break before the title, which counts as a block boundary.
+    const section = '**Option C**\n- the agent is read-only, every write asks first';
+    const before = `${intro(60)}\n${'x'.repeat(20)}`;
+    expect(splitIntoChunks(`${before}\n${section}`, 100)).toEqual([before, section]);
+  });
+
+  it('takes the last line break when the only block boundary would leave the message under 3/4 full', () => {
+    // A blank line at 40 of 100 is too early to be worth a message that much emptier.
+    const items = Array.from({ length: 10 }, (_, i) => `item ${String(i).padStart(2, '0')} xxxxx`);
+    const text = `${intro(40)}\n\n${items.join('\n')}`;
+    const [first, second] = splitIntoChunks(text, 100);
+    expect(first!.length).toBeGreaterThan(75);
+    expect(first!.endsWith('xxxxx')).toBe(true); // a whole item, not a torn one
+    expect(second!.startsWith('item ')).toBe(true);
+  });
+
+  it('a continuation never opens with the blank lines it was cut at, nor does a message end with them', () => {
+    const text = `${'a'.repeat(80)}\n\n\n${'b'.repeat(30)}`;
+    expect(splitIntoChunks(text, 100)).toEqual(['a'.repeat(80), 'b'.repeat(30)]);
+  });
+});
+
 interface FakeSink extends StreamSink {
   sends: string[];
   edits: Array<{ ref: MessageRef; text: string }>;
@@ -380,9 +423,11 @@ describe('StreamBuffer dual-trigger and delivery', () => {
     await buf.complete({ footer: 'oc · 12k / 1M' });
     for (let i = 0; i < 6; i++) await Promise.resolve();
 
-    expect(visibleMessages(sink).join('')).toBe(
-      'part one. and the whole conclusion nobody ever saw.\n\noc · 12k / 1M'
-    );
+    // The footer had to move into a message of its own. The blank line that separated it from the
+    // body is now the seam between two messages, so it is consumed rather than opening that message.
+    const shown = visibleMessages(sink);
+    expect(shown.slice(0, -1).join('')).toBe('part one. and the whole conclusion nobody ever saw.');
+    expect(shown.at(-1)).toBe('oc · 12k / 1M');
   });
 
   it('the final flush routes around a transient failure too, rather than truncating the reply', async () => {
@@ -414,6 +459,22 @@ describe('StreamBuffer dual-trigger and delivery', () => {
     expect(visibleMessages(sink).join('')).toBe('aaaaaaaaaabbbbcc');
     // The sealed first message was never touched again.
     expect(sink.edits.every((e) => e.ref.messageId !== 'm1')).toBe(true);
+  });
+
+  it('the seam newlines between two live messages are consumed, not sent, and nothing else is lost', async () => {
+    const sink = makeSink();
+    const buf = new StreamBuffer(makeOpts({ charThreshold: 4, maxMessageLength: 20 }), sink);
+
+    await pushAndSettle(buf, sink, 'a'.repeat(18) + '\n\n'); // fits: the blank line is still in m1
+    await pushAndSettle(buf, sink, 'next para');            // overflow → cut at the paragraph
+    await pushAndSettle(buf, sink, ' goes on');             // edits m2, which never saw the seam
+    await buf.complete();
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+
+    // The cut moves to the paragraph break, so m1 loses its trailing blank line (one edit, as the old
+    // cut also cost) and m2 starts at the text — the seam is in neither message.
+    const shown = visibleMessages(sink);
+    expect(shown).toEqual(['a'.repeat(18), 'next para goes on']);
   });
 
   it('abort() then complete(): performs no further writes', async () => {
@@ -784,6 +845,20 @@ describe("StreamBuffer 'once' mode", () => {
     for (const s of sink.sends) expect(s.length).toBeLessThanOrEqual(500);
     // Joined back with the separators the chunker consumed at cut points.
     expect(sink.sends.join('\n').replace(/\n+/g, '\n')).toBe(body.replace(/\n+/g, '\n'));
+  });
+
+  it('a message cut at a paragraph keeps the list whole, and the next one does not open with a blank line', async () => {
+    const sink = makeSink();
+    const buf = new StreamBuffer(makeOpts({ mode: 'once', maxMessageLength: 100 }), sink);
+    const intro = 'i'.repeat(80);
+    const list = ['1. alpha', '2. bravo', '3. charlie', '4. delta'].join('\n');
+
+    buf.push(`${intro}\n\n${list}`);
+    await buf.complete({ footer: 'oc' });
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+
+    // Before: the second message was "\n3. charlie\n4. delta\n\noc" — a list starting at 3.
+    expect(sink.sends).toEqual([intro, `${list}\n\noc`]);
   });
 
   it('each completed segment is its own message, so a turn using tools still reports as it goes', async () => {

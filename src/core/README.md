@@ -196,6 +196,13 @@ saw a reply truncated mid-sentence with a ✅ on it.
   `measureLength` (wired to `PlatformAdapter.measureRendered`) reports the post-render
   length of a raw substring. A Telegram table→bullets rewrite expands ~1.4×; WeCom
   counts UTF-8 bytes, not chars. Without this a chunk overflows after rendering.
+- **Where a cut lands** is a reading decision, not just a fitting one. A cut prefers a
+  block boundary (a blank line or a title follows) as long as the message stays at least
+  ¾ full, then the last line break; it never leaves a title — an ATX heading or a
+  bold-only line — as a message's last line. The ¾ floor bounds the cost at a third more
+  messages, which matters where each one spends quota (QQ, LINE). The newlines at a seam
+  are consumed, not sent, so no continuation opens with a blank line — in both modes and
+  whatever sealed the previous message.
 - **`[SILENT]`** as the entire reply suppresses all output.
 
 ## `outbound-errors.ts`

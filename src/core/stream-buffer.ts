@@ -36,8 +36,9 @@ import { MessageNotEditableError, retryAfterMsOf } from './outbound-errors.js';
  *   - **not editable**: the platform said so mid-stream (`MessageNotEditableError`).
  *
  * Sealing is never a failure. The sealed text counts as delivered and delivery continues into a
- * fresh message, so `sealedText + open.text` is always EXACTLY what the user can see: nothing is
- * re-sent, nothing is lost. In `'once'` mode only the first reason can occur, which is why that
+ * fresh message, so `sealedText + open.text` is always EXACTLY what the user can see (plus the
+ * newlines at each seam, which separate messages rather than open one): nothing is re-sent, nothing
+ * is lost. In `'once'` mode only the first reason can occur, which is why that
  * mode cannot lose the tail of a reply at all.
  *
  * Folding the edit budget into the same concept as the length limit is what makes that invariant
@@ -125,7 +126,10 @@ interface OpenMessage {
 
 export class StreamBuffer {
   private acc = '';                 // full accumulated text
-  /** Text already delivered in sealed messages: immutable, never re-sent. */
+  /**
+   * Text already delivered in sealed messages: immutable, never re-sent. Includes the newlines at
+   * each seam between two messages, which were consumed rather than sent (see doFlush).
+   */
   private sealedText = '';
   private open: OpenMessage | null = null;
   private lastWriteAt = 0;
@@ -272,7 +276,7 @@ export class StreamBuffer {
 
     for (;;) {
       if (this.aborted) return;
-      const tail = rendered.slice(this.sealedText.length);
+      const tail = this.consumeSeam(rendered.slice(this.sealedText.length));
       if (tail === '') return;              // sealed messages already carry the whole render
       if (this.open?.text === tail) return; // unchanged → skip the API call entirely
 
@@ -307,6 +311,22 @@ export class StreamBuffer {
   private budgetSpent(open: OpenMessage): boolean {
     const max = this.opts.maxEditsPerMessage;
     return max !== undefined && open.edits >= max;
+  }
+
+  /**
+   * Drop the newlines a continuation would open with, counting them as delivered.
+   *
+   * A continuation begins where the previous message was cut, and cuts sit on line breaks
+   * (findTextBreak), so the undelivered tail opens with the separator — one newline, or a blank line
+   * when the cut is at a paragraph. That is the seam between two messages, not content, so it is
+   * never sent (packChunks drops it the same way). Only when nothing is open and something is sealed:
+   * a leading newline of the very first message, or inside an open one, is the reply's own.
+   */
+  private consumeSeam(tail: string): string {
+    if (this.open || this.sealedText === '') return tail;
+    const seam = /^\n+/.exec(tail)?.[0] ?? '';
+    this.sealedText += seam;
+    return tail.slice(seam.length);
   }
 
   /** Send (nothing open yet) or edit the open message in place. */
@@ -433,13 +453,65 @@ function labelWidth(total: number): number {
 }
 
 /**
+ * How full a message must be for a cut to move back to a block boundary rather than take the last
+ * line break. Three quarters: every message but the last is then at least 3/4 full, so a reply
+ * costs at most a third more messages than the tightest packing — which matters where each message
+ * spends quota (QQ passive replies, LINE push). The last quarter of a message is also where a
+ * paragraph break almost always is (about 1000 chars on Telegram's 4096).
+ */
+const BLOCK_BREAK_MIN_FILL = 0.75;
+
+/**
+ * A line that titles what follows it: an ATX heading, or a line that is nothing but one bold span
+ * (`**Option A: smallest change**`), which agents use as a heading just as often.
+ */
+function isTitleLine(line: string): boolean {
+  return /^ {0,3}#{1,6}\s/.test(line) || /^\*\*[^*\n]+\*\*[:：]?$/.test(line.trim());
+}
+
+/** The line that ends at the newline `nl`, without it. */
+function lineEndingAt(s: string, nl: number): string {
+  return s.slice(s.lastIndexOf('\n', nl - 1) + 1, nl);
+}
+
+/** The line that starts at `from`, without its newline. */
+function lineStartingAt(s: string, from: number): string {
+  const end = s.indexOf('\n', from);
+  return s.slice(from, end < 0 ? s.length : end);
+}
+
+/**
  * Find a natural break point for a text segment within [0, max].
  * Returns the cut index (cuts off [0, idx)), with 1 <= idx <= max.
- * Priority: newline > space > hard cut.
+ * Priority: block boundary > line break > any newline > space > hard cut.
+ *
+ * The last newline that fits used to win outright, which made the cut land wherever the budget
+ * ran out: a four-item list went out as items 1–2 in one message and 3–4 in the next, and the
+ * reader of the second message saw a list start at "3." with its heading out of sight. Now:
+ *
+ *   - A **block boundary** — a blank line or a title follows — is taken if it keeps the message
+ *     at least BLOCK_BREAK_MIN_FILL full, so a list, a paragraph or a titled section stays whole
+ *     when there is room to keep it so.
+ *   - Otherwise the last **line break**.
+ *   - Neither ever leaves a title as a message's last line, nor cuts inside a run of blank lines
+ *     (the cut goes at the run's start, and the continuation drops the blank lines).
+ *   - Only when every newline in the window breaks those rules does any newline do.
  */
 function findTextBreak(s: string, max: number): number {
   if (s.length <= max) return s.length;
   const window = s.slice(0, max);
+  const floor = Math.floor(max * BLOCK_BREAK_MIN_FILL);
+  let lineBreak = -1;
+  for (let at = window.lastIndexOf('\n'); at > 0; at = window.lastIndexOf('\n', at - 1)) {
+    const before = lineEndingAt(s, at);
+    if (before.trim() === '' || isTitleLine(before)) continue;
+    const after = lineStartingAt(s, at + 1);
+    if (at >= floor && (after.trim() === '' || isTitleLine(after))) return at;
+    if (lineBreak < 0) lineBreak = at;
+    // Below the floor no block boundary can qualify, and the latest line break is already found.
+    if (at < floor) break;
+  }
+  if (lineBreak > 0) return lineBreak;
   const nl = window.lastIndexOf('\n');
   if (nl > 0) return nl;
   const sp = Math.max(window.lastIndexOf(' '), window.lastIndexOf('\t'));
@@ -575,9 +647,11 @@ function packChunks(text: string, limit: number, reserve: number): string[] {
           const head = rest.slice(0, brk);
           cur = cur.length ? cur + '\n' + head : head;
           pushCur();
-          // Skip the single separator at the cut point to avoid leading whitespace.
+          // Skip the separator at the cut point to avoid leading whitespace: the whole run of newlines
+          // when the cut is at a block boundary (it can sit before blank lines), else one space.
           rest = rest.slice(brk);
-          if (rest[0] === '\n' || rest[0] === ' ' || rest[0] === '\t') rest = rest.slice(1);
+          if (rest[0] === '\n') rest = rest.replace(/^\n+/, '');
+          else if (rest[0] === ' ' || rest[0] === '\t') rest = rest.slice(1);
         }
       }
     } else {

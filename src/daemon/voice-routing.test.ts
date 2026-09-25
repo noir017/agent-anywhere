@@ -25,6 +25,20 @@ const OGG_B64 = Buffer.from('OggS\x00\x02 pretend opus', 'binary').toString('bas
 
 const drain = (): Promise<void> => new Promise((r) => setTimeout(r, 40));
 
+/**
+ * Wait for something the voice path produces, rather than for a fixed time. A voice note is
+ * several real hops (a data: URL decoded, a file written, the transcriber stub, the card), and
+ * two of them are serialized by design — a fixed 80 ms was enough here and not on a CI runner,
+ * where the second card had not been posted yet (v1.34.0's release build).
+ */
+async function until(what: string, ok: () => boolean): Promise<void> {
+  for (let i = 0; i < 200; i++) {
+    if (ok()) return;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  throw new Error(`never happened: ${what}`);
+}
+
 let dir: string;
 beforeEach(() => {
   dir = mkdtempSync(path.join(tmpdir(), 'aa-voice-route-'));
@@ -133,9 +147,10 @@ describe('a voice message through the real inbound path', () => {
   it('reaches the agent only after Send, as exactly the words — nothing about audio', async () => {
     const r = rig();
     await r.voice();
-    expect(r.cards).toHaveLength(1);
+    await until('the card is posted', () => r.cards.length === 1);
     expect(r.prompts).toEqual([]); // no turn ran on the unconfirmed recording
     await r.tap(0, 0);
+    await until('the turn runs', () => r.prompts.length === 1);
     expect(r.prompts).toEqual(['帮我看下 CI 为什么挂了']);
   });
 
@@ -143,17 +158,20 @@ describe('a voice message through the real inbound path', () => {
     const r = rig();
     await r.voice();
     await r.voice();
-    expect(r.cards).toHaveLength(2);
+    await until('both cards are posted', () => r.cards.length === 2);
     await r.tap(0, 0);
+    await until('the first turn runs', () => r.prompts.length === 1);
     await r.tap(1, 0);
-    expect(r.prompts).toHaveLength(2);
+    await until('the second turn runs', () => r.prompts.length === 2);
     expect(r.prompts.join('\n')).toContain('第二句');
   });
 
   it('typing instead replaces the waiting transcript: only the typed words reach the agent', async () => {
     const r = rig();
     await r.voice();
+    await until('the card is posted', () => r.cards.length === 1);
     await r.type('帮我看下 CD 为什么挂了');
+    await until('the typed turn runs', () => r.prompts.length === 1);
     expect(r.prompts).toEqual(['帮我看下 CD 为什么挂了']);
     expect(r.edits.at(-1)).toMatch(/Replaced by the message you typed/);
     await r.tap(0, 0);
@@ -163,7 +181,9 @@ describe('a voice message through the real inbound path', () => {
   it('/stop calls the transcript off and says that is what it stopped', async () => {
     const r = rig();
     await r.voice();
+    await until('the card is posted', () => r.cards.length === 1);
     await r.type('/stop');
+    await until('/stop answers', () => r.sent.some((t) => /Called off the voice transcript/.test(t)));
     expect(r.sent.at(-1)).toMatch(/Called off the voice transcript/);
     expect(r.edits.at(-1)).toMatch(/Called off \(stopped\)/);
     expect(r.prompts).toEqual([]);
@@ -172,8 +192,8 @@ describe('a voice message through the real inbound path', () => {
   it('without a voice: block, a voice note is an attachment as before — and no base64 in the prompt', async () => {
     const r = rig({ voice: false });
     await r.voice();
+    await until('the turn runs', () => r.prompts.length === 1);
     expect(r.cards).toEqual([]);
-    expect(r.prompts).toHaveLength(1);
     expect(r.prompts[0]).toMatch(/Attachments:\n\[Attachment file\.opus saved to /);
     expect(r.prompts[0]).not.toContain(OGG_B64);
   });

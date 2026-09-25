@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.34.1] - 2026-09-26
+
 ### Fixed
 
 - **A long reply is cut between blocks, not wherever the message ran out.** A reply longer than

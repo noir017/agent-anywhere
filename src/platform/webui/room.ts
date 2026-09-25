@@ -911,7 +911,9 @@ export function inlineImageType(name: string): string | undefined {
 /** A browser upload, as the attachment pipeline wants it. */
 function toAttachment(file: { name: string; mime: string; data: string }): NonNullable<InboundMessage['attachments']>[number] {
   return {
-    type: file.mime.startsWith('image/') ? 'image' : 'file',
+    // `audio` for the page's own voice recordings (and any uploaded audio file): it is what makes a
+    // recording sent on its own a voice message the daemon transcribes (see core/voice.ts).
+    type: file.mime.startsWith('image/') ? 'image' : file.mime.startsWith('audio/') ? 'audio' : 'file',
     // A `data:` URL, the shape `adapter-telegram` already hands over for every inbound photo —
     // so `daemon/attachment-io.ts` has a branch for it, and the SSRF guard it would otherwise
     // apply has nothing to act on (no host to resolve, no request to make). Writing the bytes

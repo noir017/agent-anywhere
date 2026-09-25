@@ -52,6 +52,15 @@ session:
   futureKnob: 45
 `;
 
+/** A voice block as an operator writes one: a comment, and the key as a template. */
+const VOICE_BLOCK = `voice:
+  # transcripts through newapi's google-ai-studio channel
+  transcriber:
+    baseUrl: http://newapi:3000/v1beta
+    apiKey: \${NEWAPI_API_KEY}
+    model: gemini-3-flash
+`;
+
 let dir: string;
 let file: string;
 const savedEnv: Record<string, string | undefined> = {};
@@ -61,8 +70,10 @@ beforeEach(() => {
   file = path.join(dir, 'config.yaml');
   savedEnv.AGENT_ANYWHERE_CONFIG_FILE = process.env.AGENT_ANYWHERE_CONFIG_FILE;
   savedEnv.TG_TOKEN = process.env.TG_TOKEN;
+  savedEnv.NEWAPI_API_KEY = process.env.NEWAPI_API_KEY;
   process.env.AGENT_ANYWHERE_CONFIG_FILE = file;
   process.env.TG_TOKEN = 'tok-from-env';
+  process.env.NEWAPI_API_KEY = 'key-from-env';
   fs.writeFileSync(file, YAML_FILE);
 });
 
@@ -98,6 +109,8 @@ interface RigOptions {
   caps?: { buttons?: boolean; editButtons?: boolean };
   /** Start with reclaim disabled, to prove `/setting idle` arms a sweeper that was never armed. */
   idleTimeoutMs?: number;
+  /** Configure voice transcription (the file must carry the same block — see VOICE_BLOCK). */
+  voice?: boolean;
 }
 
 function rig(opts: RigOptions = {}) {
@@ -182,6 +195,9 @@ function rig(opts: RigOptions = {}) {
     routing: { default: 'oc' },
     session: { idleTimeoutMs: opts.idleTimeoutMs ?? 3_600_000 },
     ...(opts.access ? { access: { allowFrom: opts.access } } : {}),
+    ...(opts.voice
+      ? { voice: { transcriber: { baseUrl: 'http://newapi:3000/v1beta', apiKey: 'k', model: 'gemini-3-flash' } } }
+      : {}),
   });
   const cfg: Config = { ...parsed, inbound: { ...parsed.inbound, mergeWindowMs: 1, maxMergeWindowMs: 1 } };
 
@@ -629,5 +645,28 @@ describe('access control', () => {
     await r.click(r.ids('stg:')[0]!, 'u1');
     await r.click(r.ids('stv:')[1]!, 'u1');
     expect(onDisk()['routing']).toEqual({ default: 'cc' });
+  });
+});
+
+describe('the voice-confirmation switch', () => {
+  it('writes voice.confirm, applies it live, and leaves the transcriber block as written', async () => {
+    fs.appendFileSync(file, VOICE_BLOCK);
+    const r = textRig({ voice: true });
+    await r.send('/setting voice off');
+    expect(r.replies().at(-1)).toContain('in effect now');
+    expect(r.cfg.voice?.confirm).toBe(false);
+    const after = text();
+    expect(after).toContain("# transcripts through newapi's google-ai-studio channel");
+    expect(after).toContain('${NEWAPI_API_KEY}'); // the key is never expanded on the way to disk
+    expect((onDisk()['voice'] as { confirm?: unknown }).confirm).toBe(false);
+    expect(loadConfig().voice?.confirm).toBe(false);
+  });
+
+  it('is refused by name where there is no voice: block, and writes nothing', async () => {
+    const r = textRig();
+    const before = text();
+    await r.send('/setting voice off');
+    expect(r.replies().at(-1)).toContain('not editable from chat');
+    expect(text()).toBe(before);
   });
 });

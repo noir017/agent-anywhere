@@ -37,6 +37,7 @@ Code、Codex、OpenCode，以及 Google 的 Antigravity CLI。给机器人发消
 - **原生流式体验** —— 消息原地编辑、工具调用气泡、生命周期回应表情、新消息打断。
 - **在聊天中行动** —— 智能体可发文件、加回应、引用回复、开子区、读历史、发按钮提问。
 - **附件处理** —— 收到的图片和文件自动下载并交给智能体。
+- **语音消息** —— 语音自动转成文字（Gemini），先标明「语音识别结果」给你看，点 ✅ 后才作为你的消息发给智能体；关掉确认后则直接发送。
 - **话题是一等公民** —— Telegram 话题、飞书话题、Slack 线程、Discord 子区各自是独立会话，各自绑定智能体；绑定粘在会话上，用 `/oc` 切换。
 - **持久会话** —— 重启不丢上下文；`/new` 重置，`/stop` 打断当前轮，`/kill` 结束卡住的智能体进程；作用域可按子区、频道、用户或全局。闲置会话会释放智能体进程，下一条消息再从原处恢复。
 - **精简配置** —— 五个部分，凭据按平台校验，支持 `${VAR}` 与 `.env` 展开；值得在聊天里改的那几项用 `/setting` 直接改。
@@ -416,6 +417,41 @@ flash 档模型一两秒出结果，每个会话约 60 token —— 一个话题
 界面里改的名字这边看不见。它不会被覆盖（已经有名字的话题不会再被改名），但 `/title`
 报的是它自己设过的那个，不是你看到的那个。
 
+## 语音消息
+
+发一条语音（或者不带说明文字的音频文件，或在网页端点 🎤 录音），网关会先把它转成文字，
+在交给智能体之前给你看识别结果：
+
+```
+🎙️ Voice transcript · gemini-3-flash · 2.7s
+
+帮我看下昨天那个 PR 的 CI 为什么挂了
+
+Send this to the agent? Tap ✅ Send — or type a corrected version instead, and this one is dropped.
+[✅ Send] [✖ Cancel]
+```
+
+点 ✅ Send 后，这段文字就像你亲手打的一样交给智能体——智能体不会被告知这是语音。
+直接打字会替换掉这条识别结果；`/stop`、`/new` 会撤销它；30 分钟没人点就过期。
+卡片处理完后 🎙️ 标记一直保留，往回翻就能看出哪些消息来自语音、有没有发出去。
+
+```yaml
+voice:
+  confirm: true                           # false = 识别完直接发给智能体
+  transcriber:                            # Gemini 的 generateContent 格式
+    baseUrl: https://generativelanguage.googleapis.com/v1beta   # 或 new-api 网关：http://newapi:3000/v1beta
+    apiKey: ${GEMINI_API_KEY}
+    model: gemini-3-flash
+```
+
+- 识别质量信得过以后，在聊天里 `/setting voice off` 即可关掉确认，立即生效。
+- **带**说明文字的音频不转写：「帮我剪一下」加一个 mp3 是针对文件的指令，文件照旧交给智能体。
+- 支持 Ogg、WebM、MP4/M4A、MP3、WAV、AAC、FLAC。QQ 和企业微信的语音编码（SILK、AMR）不支持，会明确告诉你。
+- 每次转写都记录在 `~/.config/agent-anywhere/voice-log.jsonl`，附带保存的音频文件；
+  智能体觉得某句话像是听错了时，可以用 `agent-anywhere voice-log` 查本会话的转写记录。
+- 不能显示按钮的平台（QQ、LINE、企业微信、钉钉）会自动发送，卡片上会写明原因。
+- 不配 `voice:` 时，语音就是普通附件，和以前一样。
+
 ## 在聊天里改配置
 
 `/setting` 改的是 **config.yaml 本身**，所以一次改动既跨会话也跨重启 —— 这正是
@@ -429,6 +465,7 @@ flash 档模型一两秒出结果，每个会话约 60 token —— 一个话题
 | 空闲回收窗口 | `session.idleTimeoutMs` | `off`、`15m`、`4h` …… | 立即 |
 | 会话粒度 | `session.scope` | `per_thread`、`per_channel`、`per_user`、`shared` | 重启后 |
 | 流式输出 | `stream.enabled` | `on`、`off`（默认 `off`） | 立即 —— 下一条回复生效 |
+| 确认语音识别结果 | `voice.confirm` | `on`、`off`（默认 `on`；仅在配了 `voice:` 时出现） | 立即 —— 下一条语音生效 |
 
 ```
 /setting                       →  整个设置面板，能放按钮的平台就是按钮

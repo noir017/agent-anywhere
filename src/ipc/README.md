@@ -48,7 +48,7 @@ hint follow automatically, and a missing `handleReverse` arm **fails to compile*
 add a command by hand-registering it in `cli.ts`.
 
 The catalog: `send-message`, `reply`, `edit-message`, `send-file`, `react`, `delete`,
-`fetch-messages`, `create-thread`, `ask`.
+`fetch-messages`, `create-thread`, `ask`, `voice-log`.
 
 ## Only `send-file` is injected everywhere
 
@@ -70,6 +70,7 @@ Most of it was redundant anyway:
 | `send-message`, `reply` | The agent's plain text already streams into the chat. A command to send text is a slower way to do what happens by itself. |
 | `edit-message` | The daemon already live-edits the turn's message. |
 | `react`, `delete`, `create-thread`, `fetch-messages` | Chat-client chrome, not the work the agent was asked to do. |
+| `voice-log` | A confirmed voice transcript reaches the agent as the user's own typed words — the user read and approved them — so telling every session that some messages were spoken would only invite second-guessing text that was already checked. It exists for the rare turn where a message reads like a mishearing. |
 
 `send-file` stays because it is the one act the text channel cannot perform: a file has to
 be uploaded, not described.

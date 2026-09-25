@@ -181,6 +181,12 @@ function applyToConfig(cfg: Config, row: SettingRow, value: string | number | bo
       // uses the new setting — no restart, and a turn already in flight finishes as it started.
       cfg.stream.enabled = Boolean(value);
       return;
+    case 'voice':
+      // Live: daemon/voice.ts reads `confirm` when each transcript is ready, so the very next voice
+      // message follows it — including one already being transcribed when the switch was flipped.
+      // The row exists only where `voice` does (settingsRows), so the block is there to write into.
+      if (cfg.voice) cfg.voice.confirm = Boolean(value);
+      return;
     default: {
       const _exhaustive: never = row.id;
       throw new Error(`no config location for setting ${String(_exhaustive)}`);

@@ -10,7 +10,8 @@
  */
 
 export interface AttachmentInput {
-  type: 'image' | 'file';
+  /** `audio` is handled exactly as `file` here; only the voice path (core/voice.ts) tells them apart. */
+  type: 'image' | 'audio' | 'file';
   url: string;
   name?: string;
   mime?: string;

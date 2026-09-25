@@ -102,6 +102,9 @@ const IpcActionSchema = z.discriminatedUnion('kind', [
       timeoutMs: z.number().int().positive().optional(),
     })
     .strict(),
+  // Reads the calling conversation's own transcripts only — there is no channel override, because
+  // the log is keyed by conversation, and another conversation's voice notes are not this agent's.
+  z.object({ kind: z.literal('voice-log'), limit: z.number().int().positive().optional() }).strict(),
 ]);
 
 const IpcRequestSchema = z
@@ -134,7 +137,8 @@ export type IpcAction =
   | { kind: 'delete'; messageId: string; channelId?: string }
   | { kind: 'fetch-messages'; channelId?: string; limit?: number; before?: string; fields?: string[] }
   | { kind: 'create-thread'; messageId: string; name: string; channelId?: string }
-  | { kind: 'ask'; prompt: string; options: string[]; channelId?: string; timeoutMs?: number };
+  | { kind: 'ask'; prompt: string; options: string[]; channelId?: string; timeoutMs?: number }
+  | { kind: 'voice-log'; limit?: number };
 
 // Compile-time alignment: the zod-inferred type must equal the hand-written union;
 // if either side drifts, this type errors.
@@ -167,4 +171,24 @@ export interface CreateThreadResult {
 /** Response body for ask (blocking clarify): chosen = selected label; null = timeout/unselected. */
 export interface AskResult {
   chosen: string | null;
+}
+
+/**
+ * Response body for voice-log: the calling conversation's recent voice transcripts, newest last.
+ * Shaped like core/voice.ts VoiceHistoryItem, restated here because ipc/ imports nothing but types.ts.
+ */
+export interface VoiceLogResult {
+  /** False when voice transcription is not configured on this daemon at all. */
+  enabled: boolean;
+  entries: Array<{
+    id: string;
+    at: string;
+    status: string;
+    text: string;
+    model: string;
+    latencyMs?: number;
+    messageId: string;
+    audio: string;
+    reason?: string;
+  }>;
 }

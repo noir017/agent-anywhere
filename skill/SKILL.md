@@ -85,6 +85,30 @@ messages[2]{messageId,userId,content}:
 - Page further back with `--before <the oldest messageId in the previous page>`.
 - `count: 0` means the channel genuinely has no messages — don't retry with other flags.
 
+### Checking a voice message
+
+```bash
+agent-anywhere voice-log [--limit 10]
+```
+
+Some user messages were spoken, not typed: the gateway transcribes voice messages, shows the
+user the transcript, and passes it on as their message once they approve it — nothing in the
+message itself says so. When a message reads like a mishearing (a word that makes no sense
+there, a name spelled oddly), this lists the conversation's recent transcripts:
+
+```
+count: 1
+transcripts[1]{at,status,text,model,latencyMs,messageId,audio,reason}:
+  "2026-09-25T05:18:00.121Z",sent,帮我看下 CI 为什么挂了,gemini-3-flash,2712,"12345",/home/user/.config/agent-anywhere/attachments/1e938d4c-voice.ogg,""
+```
+
+- `status` `sent` / `auto` = that text reached you as the user's message. `cancelled`,
+  `superseded` (they typed a correction instead), `expired`, `called-off` = it did not.
+  `failed` / `no-speech` = there was no transcript.
+- `audio` is the saved recording, if you need to check it yourself.
+- The user approved the text, so treat it as what they said; ask them if it still reads wrong.
+- Reads only this conversation's transcripts; `--channel` does not apply.
+
 ### Threads
 
 ```bash

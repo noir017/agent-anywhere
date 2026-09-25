@@ -207,6 +207,9 @@ const STOP_ACK: Record<StopOutcome, string> = {
  */
 const STOP_ACK_QUESTION = '⏹ Called off the question above. Nothing else was running.';
 
+/** `/stop` when the only thing here was a voice transcript waiting to be confirmed. */
+const STOP_ACK_VOICE = '⏹ Called off the voice transcript — nothing was sent. Nothing else was running.';
+
 /**
  * What `/kill` found. The first three are StopOutcome — the process was ended, and this is what
  * else was going on at the time; the last two are the cases where nothing was ended at all.
@@ -493,6 +496,16 @@ export class ConversationRegistry {
        * to someone who just called off a question.
        */
       cancelPendingAsks?(id: ConversationId, reason: string): number;
+      /**
+       * A voice message: take it for transcription (true), in which case route() does nothing more
+       * with it — the transcript comes back later through route() itself, as text, once the user
+       * has confirmed it. See daemon/voice.ts for why the placement in route() is what it is.
+       */
+      takeVoice?(id: ConversationId, msg: InboundMessage): boolean;
+      /** A typed message is about to reach the agent here: drop any transcript still waiting. */
+      supersedeVoice?(id: ConversationId): number;
+      /** `/stop` / `/new`: call off every transcript here, returning how many there were. */
+      cancelPendingVoice?(id: ConversationId, reason: string): number;
     },
     /** Persistent conversation state (agent binding + each agent's own session id). */
     private readonly store?: ConversationStore,
@@ -752,7 +765,16 @@ export class ConversationRegistry {
   }
 
   /** Inbound entry (daemon wires platform.onMessage here). */
-  route(msg: InboundMessage): void {
+  route(
+    msg: InboundMessage,
+    /**
+     * `transcript`: this is a confirmed voice transcript re-entering (daemon/voice.ts). It is
+     * answered as a typed message in every respect but two — it is not offered for transcription
+     * again, and it does not supersede the OTHER transcripts still waiting here (confirming one of
+     * two voice notes must not drop the second).
+     */
+    opts?: { transcript?: boolean }
+  ): void {
     const conv = msg.conversation;
     const address = addressOf(conv);
     // Access control (decoupled from routing): when allowFrom is non-empty, ignore identities
@@ -862,6 +884,13 @@ export class ConversationRegistry {
       return;
     }
 
+    // A voice message is transcribed and shown to the user before anything else happens to it. Past
+    // the gate and the daemon commands (a stranger must not spend transcription quota, and `/stop`
+    // stays `/stop`), past the binding (so the conversation exists when the transcript returns), and
+    // before the merger — which would interrupt the running turn on behalf of words nobody has
+    // approved yet. The transcript re-enters through route() once confirmed.
+    if (this.takesVoice(key, msg, opts)) return;
+
     // Generic-command translation. Must sit here: it is the first point that knows WHICH agent
     // will answer, and the last point at which the message can still be refused. Returns the
     // message to forward, or undefined when the command was rejected (already answered).
@@ -873,8 +902,28 @@ export class ConversationRegistry {
     // every gate above so it can't become a probe: a message that isn't going to be answered gets no
     // acknowledgement of any kind.
     this.sendHeader(state, msg);
+    // Typing is how a transcript is corrected (its card says so): a typed message reaching the agent
+    // drops whatever transcript is still waiting here, rather than leaving it to be sent as well.
+    this.supersedeTranscripts(key, opts);
     state.reclaimOnIdle = false;
     void state.merger.ingest(msg);
+  }
+
+  /** Offer a message for transcription (see the call in route()); never a transcript itself. */
+  private takesVoice(key: ConversationId, msg: InboundMessage, opts?: { transcript?: boolean }): boolean {
+    if (opts?.transcript) return false;
+    return this.hooks?.takeVoice?.(key, msg) ?? false;
+  }
+
+  /** A typed message is going to the agent: drop transcripts still waiting (see the call in route()). */
+  private supersedeTranscripts(key: ConversationId, opts?: { transcript?: boolean }): void {
+    if (!opts?.transcript) this.hooks?.supersedeVoice?.(key);
+  }
+
+  /** Call off everything waiting on the user here — questions and voice transcripts alike. */
+  private callOffPending(key: ConversationId, reason: string): void {
+    this.hooks?.cancelPendingAsks?.(key, reason);
+    this.hooks?.cancelPendingVoice?.(key, reason);
   }
 
   /**
@@ -1247,8 +1296,9 @@ export class ConversationRegistry {
     if (CONTEXT_CLEAR_RE.test(text)) {
       const agentId = this.boundAgentFor(key, fallbackAgent);
       // Before the reset: a question still waiting on this conversation belongs to the context
-      // being discarded, and its caller is blocked until somebody answers it.
-      this.hooks?.cancelPendingAsks?.(key, 'context cleared');
+      // being discarded, and its caller is blocked until somebody answers it. A transcript waiting
+      // for its tap belongs to it too.
+      this.callOffPending(key, 'context cleared');
       this.resetConversation(key);
       console.log(`[conversation] ${key} context cleared by ${conv.platform}:${conv.user}`);
       ack('context clear', 'Context cleared — the next message starts a fresh conversation.');
@@ -1339,9 +1389,13 @@ export class ConversationRegistry {
    */
   private stopAndReport(key: ConversationId, conv: ConversationRef): string {
     const calledOff = this.hooks?.cancelPendingAsks?.(key, 'stopped') ?? 0;
+    // A transcript waiting for its tap is queued input like any other, and /stop drops the queue.
+    const transcripts = this.hooks?.cancelPendingVoice?.(key, 'stopped') ?? 0;
     const outcome = this.stopConversation(key);
     console.log(`[conversation] ${key} /stop by ${conv.platform}:${conv.user} → ${outcome}`);
-    return outcome === 'idle' && calledOff > 0 ? STOP_ACK_QUESTION : STOP_ACK[outcome];
+    if (outcome === 'idle' && calledOff > 0) return STOP_ACK_QUESTION;
+    if (outcome === 'idle' && transcripts > 0) return STOP_ACK_VOICE;
+    return STOP_ACK[outcome];
   }
 
   /** `/kill`: end the agent process here and say what that did (see killConversation). */

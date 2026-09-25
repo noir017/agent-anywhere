@@ -4,7 +4,7 @@ import { encode } from '@toon-format/toon';
 import { loadConfig, resolveSocketPath } from '../config/load.js';
 import { callDaemon } from '../ipc/client.js';
 import { DEFAULT_FETCH_FIELDS } from '../ipc/commands.js';
-import type { IpcAction } from '../ipc/protocol.js';
+import type { IpcAction, VoiceLogResult } from '../ipc/protocol.js';
 import { ASK_CLIENT_TIMEOUT_MARGIN_MS, DEFAULT_ASK_TIMEOUT_MS } from '../ipc/protocol.js';
 import type { InboundMessage } from '../types.js';
 
@@ -103,6 +103,9 @@ function printResult(action: IpcAction, data: unknown): void {
     }
     case 'fetch-messages':
       printFetchMessages(action, data);
+      return;
+    case 'voice-log':
+      printVoiceLog(data);
       return;
     case 'create-thread': {
       const threadId = (data as { threadId?: string } | undefined)?.threadId;
@@ -207,6 +210,42 @@ function printFetchMessages(
   }
   if (help.length) out.help = help;
   emit(out);
+}
+
+/**
+ * Shape voice-log into a TOON table (AXI §1/§5/§9): one row per transcript, oldest first, with
+ * the text in full — the reason to run this is to read exactly what was heard, so clipping it
+ * would defeat the command. A definitive empty state, and a different one when the feature is
+ * off, so the agent does not go looking for transcripts that were never made.
+ */
+function printVoiceLog(data: unknown): void {
+  const result = (data as VoiceLogResult | undefined) ?? { enabled: false, entries: [] };
+  if (!result.enabled) {
+    emit({ count: 0, note: 'voice transcription is not configured on this gateway (no voice: block in config.yaml)' });
+    return;
+  }
+  if (result.entries.length === 0) {
+    emit({ count: 0, note: 'no voice messages have been transcribed in this conversation' });
+    return;
+  }
+  const rows = result.entries.map((e) => ({
+    at: e.at,
+    status: e.status,
+    text: e.text,
+    model: e.model,
+    latencyMs: e.latencyMs ?? '',
+    messageId: e.messageId,
+    audio: e.audio,
+    reason: e.reason ?? '',
+  }));
+  emit({
+    count: rows.length,
+    transcripts: rows,
+    help: [
+      'status: sent/auto = the text reached you as the user message; cancelled/superseded/expired/called-off = it did not; failed/no-speech = there was no transcript.',
+      'audio is the saved recording; you can re-listen or re-transcribe it if a transcript looks misheard.',
+    ],
+  });
 }
 
 /**

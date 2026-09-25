@@ -229,3 +229,57 @@ describe('chat.channels allowlist', () => {
     expect(await inboundFrom({ channels: ['oc_chat/omt_1'] })).toBe(0);
   });
 });
+
+/**
+ * A message that is only an attachment.
+ *
+ * Adapters build `session.content` by serializing the elements (adapter-telegram 4.5.11:
+ * `message.content = segments.join("")`), so for a voice note it is the whole recording as a
+ * `<audio src="data:audio/opus;base64,…"/>` string. The old `text || session.content` fallback made
+ * THAT the prompt — a 25 KB voice note reached the agent as 34,000 characters of base64.
+ */
+describe('an attachment-only message', () => {
+  async function inbound(session: Record<string, unknown>) {
+    const { adapter, ctx } = await build({ profileSendFile: true });
+    const got: Array<Parameters<Parameters<typeof adapter.onMessage>[0]>[0]> = [];
+    adapter.onMessage((m) => void got.push(m));
+    ctx.emit('message', {
+      platform: 'stub',
+      selfId: 'self',
+      userId: 'u1',
+      channelId: 'c1',
+      messageId: 'm1',
+      timestamp: 1,
+      ...session,
+    } as unknown as Session);
+    return got[0]!;
+  }
+
+  const VOICE = 'data:audio/opus;base64,T2dnUwACAAAAAAAAAAA=';
+
+  it('has empty content, not the serialized element markup', async () => {
+    const audio = h('audio', { src: VOICE });
+    const msg = await inbound({ elements: [audio], content: [audio].join('') });
+    expect(msg.content).toBe('');
+    expect(msg.attachments).toHaveLength(1);
+  });
+
+  it('keeps an audio element typed as audio (the one clue a Feishu voice note carries)', async () => {
+    const msg = await inbound({ elements: [h('audio', { src: VOICE })], content: '' });
+    expect(msg.attachments?.[0]?.type).toBe('audio');
+    const file = await inbound({ elements: [h('file', { src: 'https://x/y.pdf' })], content: '' });
+    expect(file.attachments?.[0]?.type).toBe('file');
+    const video = await inbound({ elements: [h('video', { src: 'https://x/y.mp4' })], content: '' });
+    expect(video.attachments?.[0]?.type).toBe('file');
+  });
+
+  it('still falls back to content when the walk finds nothing at all', async () => {
+    const msg = await inbound({ elements: [], content: 'plain text the elements did not carry' });
+    expect(msg.content).toBe('plain text the elements did not carry');
+  });
+
+  it('keeps a caption as the content', async () => {
+    const msg = await inbound({ elements: [h.text('trim this'), h('audio', { src: VOICE })], content: 'x' });
+    expect(msg.content).toBe('trim this');
+  });
+});

@@ -596,6 +596,30 @@ shut an IdP outage locks everyone out.
 `scripts/verify-sso.mts` drives the whole path against a real socket and a real JWKS server;
 the unit tests inject `fetch`, so that script is the only thing that exercises the network hop.
 
+## Recording a voice message
+
+The 🎤 button beside `+` records with `MediaRecorder` and sends the recording **the moment it
+stops, as a message of its own**, leaving whatever is in the composer where it was. Both halves
+matter: the daemon transcribes a message that is audio and nothing else (see
+[`core/voice.ts`](../../core/README.md)), so a recording sent together with a half-typed draft would
+be read as a file with a caption and handed to the agent untranscribed — and the draft is the
+user's, so recording must not cost it.
+
+- **Hidden where recording is impossible**: no `MediaRecorder`, or no `navigator.mediaDevices` —
+  which is what a browser gives a page on plain `http://` anywhere but localhost. Behind the
+  cloudflared/SSO entrance the page is https and the button is there.
+- **The browser picks the format**, first supported of Ogg/Opus (Firefox), WebM/Opus (Chromium),
+  MP4 (Safari). Chromium's WebM and MP4 were both transcribed correctly through newapi's
+  google-ai-studio channel on 2026-09-25; the daemon identifies the container from the bytes
+  either way, so the declared type is only a hint.
+- **Esc throws a recording away.** Ten minutes stops and sends it, rather than discarding what
+  was said.
+- **A refused microphone says so** in the status line under the transcript, instead of the
+  button simply not starting.
+- The file goes up as an ordinary upload (`voice-<n>.webm`), typed `audio` by `toAttachment`
+  in `room.ts`. With no `voice:` block in the daemon's config it is simply an audio attachment,
+  saved and handed to the agent as a path.
+
 ## Installing it as an app
 
 `manifest.ts` is what makes a phone offer "install" rather than "bookmark", and the page's

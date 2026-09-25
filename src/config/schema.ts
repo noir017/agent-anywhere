@@ -526,6 +526,66 @@ export const ConfigSchema = z
           .optional(),
       })
       .default({}),
+
+    /**
+     * Voice messages → text. Absent = off: a voice note is handled like any other attachment (saved,
+     * its path handed to the agent), which is what it always was.
+     *
+     * With it, a message that is ONLY audio (a voice note, or an audio file sent without a caption)
+     * is transcribed, the transcript is shown in the chat labelled as one, and — once confirmed — it
+     * goes to the agent as if the user had typed it. The agent is not told the words were spoken;
+     * every transcription is logged to `<configDir>/voice-log.jsonl` with its audio file, and the
+     * agent can read its conversation's entries with `agent-anywhere voice-log`. See core/voice.ts.
+     */
+    voice: z
+      .object({
+        /**
+         * Show each transcript with ✅ Send / ✖ Cancel buttons and wait for a tap (the default), or
+         * send it on at once (`false`) — the card is still posted, marked as sent automatically, so
+         * the chat always shows what the agent was given.
+         *
+         * On by default because a transcript is a guess: until the recognition has earned trust on
+         * this deployment's voices and vocabulary, the person who spoke is the only one who can tell
+         * a misheard command from a real one. Editable from chat (`/setting voice`), live.
+         *
+         * A platform that cannot post buttons (QQ, LINE, WeCom, DingTalk) sends on automatically
+         * either way, and the card says why — a confirmation the user has no way to give would
+         * leave every voice message stranded.
+         */
+        confirm: z.boolean().default(true),
+        /**
+         * The model that does the transcribing, spoken to in Gemini's own `generateContent` format.
+         *
+         * Gemini-native rather than OpenAI-compatible on purpose: audio goes over as `inline_data`
+         * with its real mime type (Ogg, WebM, MP4…) instead of through a proxy's `input_audio`
+         * format enum, and the response reports the audio's own token count. Any endpoint that
+         * speaks that format works: Google's API directly, or a new-api / one-api gateway in front
+         * of it (verified 2026-09-25 against newapi's google-ai-studio channels).
+         */
+        transcriber: z.object({
+          /**
+           * Base URL up to and including the version segment: `http://newapi:3000/v1beta`, or
+           * `https://generativelanguage.googleapis.com/v1beta`. The request goes to
+           * `<baseUrl>/models/<model>:generateContent`.
+           */
+          baseUrl: z.string().min(1),
+          /** Sent as `x-goog-api-key`, which both Google and new-api accept for this format. */
+          apiKey: z.string().min(1),
+          /** e.g. `gemini-3-flash`. A flash-tier model is the right size: this is recognition, not reasoning. */
+          model: z.string().min(1),
+          /**
+           * Deadline for one transcription, retries included.
+           *
+           * Not tight, because someone is waiting on the card but nothing else is. The upstream's
+           * latency is erratic rather than slow — the same six-second note took 1.3 s on one call
+           * and 65 s on another (2026-09-25) — so each attempt has its own shorter deadline and is
+           * retried when it stalls (see daemon/voice.ts); this bounds the whole of it. Raise it for
+           * long recordings, which take longer to transcribe.
+           */
+          timeoutMs: z.number().int().positive().default(90_000),
+        }),
+      })
+      .optional(),
   })
   // Referential-integrity + cross-field checks (fail-fast at load). Otherwise a typo
   // would surface only when that agent/platform is used, as an obscure runtime error.

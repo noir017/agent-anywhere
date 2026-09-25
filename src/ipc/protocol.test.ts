@@ -25,6 +25,8 @@ describe('parseIpcRequest — valid requests round-trip', () => {
     { kind: 'create-thread', messageId: 'm1', name: 'topic' },
     { kind: 'ask', prompt: 'pick', options: ['a', 'b'] },
     { kind: 'ask', prompt: 'pick', options: [], timeoutMs: 5000 },
+    { kind: 'voice-log' },
+    { kind: 'voice-log', limit: 5 },
   ];
   it.each(valid)('accepts %j', (action) => {
     const r = parseIpcRequest({ token: TOKEN, action });
@@ -48,6 +50,9 @@ describe('parseIpcRequest — rejects malformed / hostile input', () => {
     ['null', null],
     ['missing action', { token: TOKEN }],
     ['fetch-messages negative limit', { token: TOKEN, action: { kind: 'fetch-messages', limit: -1 } }],
+    // voice-log reads the caller's own conversation only: there is no channel to point it at.
+    ['voice-log with a channel', { token: TOKEN, action: { kind: 'voice-log', channelId: 'c2' } }],
+    ['voice-log zero limit', { token: TOKEN, action: { kind: 'voice-log', limit: 0 } }],
   ];
   it.each(bad)('rejects %s', (_label, raw) => {
     const r = parseIpcRequest(raw);

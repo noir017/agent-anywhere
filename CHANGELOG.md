@@ -5,6 +5,37 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Voice messages.** A voice note — or an audio file sent without a caption, or a recording from
+  the web UI's new 🎤 button — is transcribed and shown in the chat as a `🎙️ Voice transcript` card
+  with ✅ Send / ✖ Cancel before anything reaches the agent. Send hands the words on as if they had
+  been typed; the agent is not told they were spoken, because the person who spoke has just read
+  and approved them. Typing instead of tapping replaces the transcript, `/stop` and `/new` call it
+  off, and an untouched card expires after 30 minutes — each of which the card then says, so
+  scrolling back always shows which messages came from a voice and whether they were sent.
+  `voice.confirm: false` (or `/setting voice off`, live) sends each transcript on at once, still
+  posting the labelled card first; that is meant for once recognition has earned trust, which is
+  why confirmation is the default. Audio with a caption is left alone — "trim this" plus an mp3 is
+  an instruction about a file — and without a `voice:` block nothing changes. The transcriber is any
+  Gemini `generateContent` endpoint; verified against newapi's google-ai-studio channels with real
+  Telegram, Chromium WebM and Chromium MP4 recordings. Its latency there is erratic rather than slow
+  (the same six-second note took 1.3 s on one call and 65 s on another), so a stalled attempt is
+  abandoned and retried instead of waited out, and a 503 "high demand" is retried too.
+- **`agent-anywhere voice-log`** lists the conversation's recent transcripts — what was heard, what
+  became of it, and the saved audio file — for the turn where a message reads like a mishearing.
+  Every transcription is also logged to `<configDir>/voice-log.jsonl` (0600). It is deliberately not
+  advertised in the agent's prompt; `--help` and the bundled skill document it.
+
+### Fixed
+
+- **A voice note with no caption no longer puts the whole recording into the prompt as base64.**
+  When a message had no text, the adapter's own `content` was used instead — and adapters build that
+  by serializing the message's elements, so for a Telegram voice note it was
+  `<audio src="data:audio/opus;base64,…"/>`. A 25 KB voice note reached the agent as 34,000
+  characters of base64, above the attachment line that already pointed at the saved file. The
+  fallback now applies only to a message with neither text nor attachments.
+
 ## [1.33.2] - 2026-09-24
 
 ### Fixed

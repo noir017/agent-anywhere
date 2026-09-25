@@ -35,11 +35,17 @@ export interface InboundMessage {
   /** Original timestamp (ms); injected by the adapter so core logic never reads the system clock. */
   timestamp: number;
   /**
-   * Platform URLs of attachments (image/file), fetchable by the agent on demand.
+   * Platform URLs of attachments (image/audio/file), fetchable by the agent on demand.
    * mime/size are best-effort from the adapter (undefined if unavailable); used to decide inbound download/injection.
+   *
+   * `audio` is its own type (rather than folded into `file`, as it was) because it is the one
+   * distinction a later decision needs and cannot recover: a voice message is transcribed (see
+   * core/voice.ts), and a Feishu voice note declares no mime and no name, so once the element type
+   * is flattened nothing short of downloading it says it was audio. Everywhere else it is treated
+   * exactly as a file.
    */
   attachments?: Array<{
-    type: 'image' | 'file';
+    type: 'image' | 'audio' | 'file';
     url: string;
     name?: string;
     /** Content type (e.g. `text/plain`, `image/png`), filled if the adapter can obtain it. */

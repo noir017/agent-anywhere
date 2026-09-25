@@ -49,6 +49,16 @@ interface Stream {
   onerror: (() => void) | null;
 }
 
+/** What the page can see of a fake MediaRecorder: enough to feed it audio and read what it chose. */
+interface FakeRecorder {
+  mimeType: string;
+  state: 'inactive' | 'recording';
+  /** Tracks of the stream it records, so a test can see the microphone was let go. */
+  tracksStopped: () => boolean;
+  /** Hand it a chunk, as the browser does while recording. */
+  feed: (bytes: string) => void;
+}
+
 interface Harness {
   window: DOMWindow;
   doc: Document;
@@ -69,6 +79,8 @@ interface Harness {
   clipboard: string[];
   /** Everything the page raised in an `alert()`. */
   alerts: string[];
+  /** Every MediaRecorder the page constructed (only with the `mic` option), oldest first. */
+  recorders: FakeRecorder[];
   el: (id: string) => HTMLElement;
   /** Messages currently painted in the transcript. */
   painted: () => number;
@@ -142,6 +154,58 @@ function message(id: string, html: string, own = false): Record<string, unknown>
   return { id, html, at: 1758240000000, own };
 }
 
+/**
+ * A recording-capable browser, installed before the page's script runs: `getUserMedia` answers a
+ * stream whose tracks remember being stopped, and MediaRecorder hands back what it was fed, as the
+ * real one does — in `dataavailable` events, then `stop`, asynchronously.
+ */
+function installMic(w: any, mic: { types: string[]; deny?: boolean }, recorders: FakeRecorder[]): void {
+  Object.defineProperty(w.navigator, 'mediaDevices', {
+    configurable: true,
+    value: {
+      getUserMedia: () => {
+        if (mic.deny) return Promise.reject(Object.assign(new Error('Permission denied'), { name: 'NotAllowedError' }));
+        const tracks = [{ stopped: false, stop() { this.stopped = true; } }];
+        return Promise.resolve({ getTracks: () => tracks });
+      },
+    },
+  });
+  class FakeMediaRecorder {
+    static isTypeSupported(t: string): boolean {
+      return mic.types.includes(t);
+    }
+    state: 'inactive' | 'recording' = 'inactive';
+    mimeType: string;
+    ondataavailable: ((e: { data: Blob }) => void) | null = null;
+    onstop: (() => void) | null = null;
+    private chunks: string[] = [];
+    constructor(
+      readonly stream: { getTracks(): Array<{ stopped: boolean }> },
+      opts?: { mimeType?: string }
+    ) {
+      this.mimeType = opts?.mimeType ?? '';
+      recorders.push(this);
+    }
+    tracksStopped(): boolean {
+      return this.stream.getTracks().every((t) => t.stopped);
+    }
+    feed(bytes: string): void {
+      this.chunks.push(bytes);
+    }
+    start(): void {
+      this.state = 'recording';
+    }
+    stop(): void {
+      this.state = 'inactive';
+      setTimeout(() => {
+        for (const c of this.chunks) this.ondataavailable?.({ data: new w.Blob([c]) });
+        this.onstop?.();
+      }, 0);
+    }
+  }
+  w.MediaRecorder = FakeMediaRecorder;
+}
+
 async function open(
   opts: {
     url?: string;
@@ -165,6 +229,11 @@ async function open(
     terminalEnd?: boolean;
     /** Whether the shared secret is still a way in, i.e. which of the two gates is served. */
     password?: boolean;
+    /**
+     * A browser that can record: the MediaRecorder types it supports, and whether the user
+     * refuses the microphone. Absent = jsdom as it is, with neither mediaDevices nor MediaRecorder.
+     */
+    mic?: { types: string[]; deny?: boolean };
   } = {}
 ): Promise<Harness> {
   const {
@@ -178,8 +247,10 @@ async function open(
     terminal = false,
     terminalEnd = false,
     password = true,
+    mic,
   } = opts;
   const streams: Stream[] = [];
+  const recorders: FakeRecorder[] = [];
   const calls: Call[] = [];
   const clipboard: string[] = [];
   const alerts: string[] = [];
@@ -224,6 +295,7 @@ async function open(
       (w as any).alert = (s: string) => {
         alerts.push(String(s));
       };
+      if (mic) installMic(w, mic, recorders);
       (w as any).fetch = (path: string, init: { body: string }) => {
         calls.push({ path, body: JSON.parse(init.body) });
         const code = status[path] ?? 200;
@@ -254,6 +326,7 @@ async function open(
     idb,
     clipboard,
     alerts,
+    recorders,
     cached: (topic) => readCache(idb, topic),
     emit: async (ev) => {
       live().onmessage?.({ data: JSON.stringify(ev) });
@@ -1728,5 +1801,100 @@ describe('webui page: the terminal window', () => {
     await h.click('[data-del="a1b2c3d4"]');
     await tick();
     expect(frames(h)).toHaveLength(0);
+  });
+});
+
+/**
+ * The voice-message button.
+ *
+ * What makes a recording a voice message is that it is sent ALONE: the daemon transcribes a message
+ * that is audio and nothing else, and reads audio with a caption as a file (core/voice.ts). So the
+ * load-bearing assertions are that stopping sends the recording by itself, and that whatever was
+ * half-typed in the composer is neither sent with it nor lost.
+ */
+describe('webui page: recording a voice message', () => {
+  const recording = async (mic: { types: string[]; deny?: boolean }): Promise<Harness> => {
+    const h = await open({ mic });
+    await h.emit(sync('a1b2c3d4', [], ['a1b2c3d4']));
+    return h;
+  };
+  const sends = (h: Harness) => h.calls.filter((c) => c.path === 'api/send');
+
+  it('is hidden where the browser cannot record', async () => {
+    const h = await open();
+    expect(h.el('mic').hidden).toBe(true);
+  });
+
+  it('records, and sends the recording on its own the moment it stops', async () => {
+    const h = await recording({ types: ['audio/webm;codecs=opus'] });
+    expect(h.el('mic').hidden).toBe(false);
+    await h.click('#mic');
+    await tick();
+    expect(h.recorders).toHaveLength(1);
+    expect(h.recorders[0]!.mimeType).toBe('audio/webm;codecs=opus');
+    expect(h.el('mic').classList.contains('rec')).toBe(true);
+
+    h.recorders[0]!.feed('pretend-opus');
+    await h.click('#mic');
+    await until('the recording is sent', () => sends(h).length === 1);
+
+    const body = sends(h)[0]!.body as { text: string; files: Array<{ name: string; mime: string; data: string }> };
+    expect(body.text).toBe('');
+    expect(body.files).toHaveLength(1);
+    // The container, without the codec parameter: that is what the daemon sniffs and types.
+    expect(body.files[0]).toMatchObject({ name: 'voice-1.webm', mime: 'audio/webm' });
+    expect(atob(body.files[0]!.data)).toBe('pretend-opus');
+    expect(h.recorders[0]!.tracksStopped()).toBe(true); // the microphone is let go
+    expect(h.el('mic').classList.contains('rec')).toBe(false);
+  });
+
+  it('leaves a half-typed draft in the composer, unsent', async () => {
+    const h = await recording({ types: ['audio/webm;codecs=opus'] });
+    const input = h.el('input') as HTMLTextAreaElement;
+    input.value = 'draft I have not sent';
+    await h.click('#mic');
+    await tick();
+    h.recorders[0]!.feed('x');
+    await h.click('#mic');
+    await until('the recording is sent', () => sends(h).length === 1);
+    expect((sends(h)[0]!.body as { text: string }).text).toBe('');
+    expect(input.value).toBe('draft I have not sent');
+  });
+
+  it('prefers Ogg where the browser offers it, and names Safari’s MP4 as m4a', async () => {
+    const ogg = await recording({ types: ['audio/ogg;codecs=opus', 'audio/webm;codecs=opus'] });
+    await ogg.click('#mic');
+    await tick();
+    expect(ogg.recorders[0]!.mimeType).toBe('audio/ogg;codecs=opus');
+
+    const safari = await recording({ types: ['audio/mp4'] });
+    await safari.click('#mic');
+    await tick();
+    safari.recorders[0]!.feed('aac');
+    await safari.click('#mic');
+    await until('the recording is sent', () => sends(safari).length === 1);
+    expect((sends(safari)[0]!.body as { files: Array<{ name: string }> }).files[0]!.name).toBe('voice-1.m4a');
+  });
+
+  it('Esc throws the recording away and sends nothing', async () => {
+    const h = await recording({ types: ['audio/webm;codecs=opus'] });
+    await h.click('#mic');
+    await tick();
+    h.recorders[0]!.feed('never mind');
+    const win = h.doc.defaultView as Window & typeof globalThis;
+    h.doc.dispatchEvent(new win.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await tick();
+    await tick();
+    expect(sends(h)).toHaveLength(0);
+    expect(h.recorders[0]!.tracksStopped()).toBe(true);
+    expect(h.el('mic').classList.contains('rec')).toBe(false);
+  });
+
+  it('says why when the microphone is refused, instead of doing nothing', async () => {
+    const h = await recording({ types: ['audio/webm;codecs=opus'], deny: true });
+    await h.click('#mic');
+    await tick();
+    expect(h.el('note').textContent).toContain('Could not record: Permission denied');
+    expect(h.recorders).toHaveLength(0);
   });
 });

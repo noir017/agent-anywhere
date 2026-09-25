@@ -499,3 +499,43 @@ describe('opening a value menu', () => {
     expect(settingValuePage({ ...row('model.oc'), value: 'opusplan' }, options)).toBe(0);
   });
 });
+
+describe('the voice-confirmation switch', () => {
+  const withVoice: Config = parseConfig({
+    platforms: { tg: { type: 'telegram', token: 't' } },
+    agents: [{ id: 'cc', harness: 'claude' }],
+    routing: { default: 'cc' },
+    voice: { transcriber: { baseUrl: 'http://gw/v1beta', apiKey: 'k', model: 'gemini-3-flash' } },
+  });
+  const voiceCtx: SettingsContext = { boundAgent: 'cc', models: [] };
+
+  it('is a row only where transcription is configured — a switch for a feature that is off does nothing', () => {
+    expect(settingsRows(cfg).some((r) => r.id === 'voice')).toBe(false);
+    const rows = settingsRows(withVoice);
+    // Last, so every row above it keeps its menu index whether or not the feature is on.
+    expect(rows.at(-1)).toMatchObject({ id: 'voice', value: 'on', effect: 'live' });
+  });
+
+  it('resolves `voice` and `voice.confirm`, and writes voice.confirm', () => {
+    for (const key of ['voice', 'voice.confirm']) {
+      const r = resolveSettingKey(key, withVoice, voiceCtx);
+      expect(r.kind).toBe('row');
+      if (r.kind === 'row') expect(settingLocation(r.row)).toEqual({ kind: 'path', path: ['voice', 'confirm'] });
+    }
+  });
+
+  it('takes on/off like every toggle, and reads back the boolean', () => {
+    const r = resolveSettingKey('voice', withVoice, voiceCtx);
+    if (r.kind !== 'row') throw new Error('expected a row');
+    expect(parseSettingValue(r.row, 'off', withVoice, voiceCtx)).toMatchObject({ value: false, display: 'off' });
+    expect(settingOptions(r.row, withVoice, voiceCtx).map((o) => o.raw)).toEqual(['on', 'off']);
+    expect(readSettingValue(r.row, withVoice)).toBe(true);
+  });
+
+  it('refuses the transcriber, and the switch itself where there is no voice: block, by name', () => {
+    const transcriber = resolveSettingKey('voice.transcriber.model', withVoice, voiceCtx);
+    expect(transcriber.kind).toBe('refused');
+    if (transcriber.kind === 'refused') expect(transcriber.text).toContain('endpoint and a key');
+    expect(resolveSettingKey('voice', cfg, ctx).kind).toBe('refused');
+  });
+});

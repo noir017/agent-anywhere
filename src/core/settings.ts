@@ -36,7 +36,7 @@ import { pageCount, pageOf, pageSlice, truncateLabel, wrapPage } from './paging.
  */
 
 /** The settings this gateway can write. Everything else is refused by name. */
-export type SettingId = 'agent' | 'model' | 'idle' | 'scope' | 'stream';
+export type SettingId = 'agent' | 'model' | 'idle' | 'scope' | 'stream' | 'voice';
 
 /**
  * When a change reaches the running daemon.
@@ -179,6 +179,10 @@ const NOT_EDITABLE: Record<string, string> = {
   inbound: 'the streaming experience',
   attachments: 'the streaming experience',
   ipc: 'the streaming experience',
+  // Reached only when no row matched — i.e. anything under `voice.` other than the confirm switch,
+  // or `voice` itself on a deployment with no `voice:` block.
+  voice: 'voice transcription beyond its confirm switch',
+  transcriber: 'voice transcription beyond its confirm switch',
 };
 
 /**
@@ -197,6 +201,8 @@ const REFUSAL_REASON: Record<string, string> = {
   'per-platform response gating': 'it is not wired into /setting',
   'the streaming experience':
     'it is not in config.yaml at all — those values are frozen in the code on purpose (see src/config/README.md)',
+  'voice transcription beyond its confirm switch':
+    'the transcriber is an endpoint and a key, and turning the feature on is a `voice:` block to add, not a value to pick (`/setting voice` appears once it exists)',
 };
 
 /** Full config paths accepted as aliases for the short keys, so both spellings work. */
@@ -213,6 +219,9 @@ const KEY_ALIASES: Record<string, SettingId> = {
   stream: 'stream',
   streaming: 'stream',
   'stream.enabled': 'stream',
+  voice: 'voice',
+  'voice.confirm': 'voice',
+  voiceconfirm: 'voice',
 };
 
 // ─────────────────────────────── reading ───────────────────────────────
@@ -282,6 +291,16 @@ export function settingsRows(cfg: Config): SettingRow[] {
       effect: 'live',
     }
   );
+  // Only where transcription is configured: a switch for a feature that is off is a row that can
+  // be set and does nothing. Last, so the rows above keep their indices either way.
+  if (cfg.voice) {
+    rows.push({
+      id: 'voice',
+      label: 'Confirm voice transcripts',
+      value: cfg.voice.confirm ? 'on' : 'off',
+      effect: 'live',
+    });
+  }
   return rows;
 }
 
@@ -301,6 +320,11 @@ export function settingDescription(row: SettingRow): string {
         'Whether a reply is typed out by editing one message as it arrives (`on`), or sent whole once ' +
         'each part is finished (`off`, the default). Off costs no edits, so a long reply can never run ' +
         'into a platform’s per-message edit cap; either way a segment is sent at every tool boundary.'
+      );
+    case 'voice':
+      return (
+        'Whether a voice message’s transcript waits for your ✅ Send (`on`, the default) or goes to the ' +
+        'agent at once (`off`). Either way the transcript is shown in the chat, labelled as one.'
       );
     default: {
       const _exhaustive: never = row.id;
@@ -422,6 +446,11 @@ export function settingOptions(row: SettingRow, cfg: Config, ctx: SettingsContex
         { raw: 'off', label: 'off — send each finished part as a whole message' },
         { raw: 'on', label: 'on — type the reply out by editing one message' },
       ];
+    case 'voice':
+      return [
+        { raw: 'on', label: 'on — wait for ✅ Send before the agent sees it' },
+        { raw: 'off', label: 'off — send each transcript on at once' },
+      ];
     default: {
       const _exhaustive: never = row.id;
       return _exhaustive;
@@ -472,6 +501,7 @@ export function parseSettingValue(
       return { kind: 'value', value: match[0], display: match[0] };
     }
     case 'stream':
+    case 'voice':
       return parseBooleanValue(input);
     default: {
       const _exhaustive: never = row.id;
@@ -555,6 +585,8 @@ export function settingLocation(row: SettingRow): SettingLocation {
       return { kind: 'path', path: ['session', 'scope'] };
     case 'stream':
       return { kind: 'path', path: ['stream', 'enabled'] };
+    case 'voice':
+      return { kind: 'path', path: ['voice', 'confirm'] };
     default: {
       const _exhaustive: never = row.id;
       return _exhaustive;
@@ -596,6 +628,8 @@ export function readSettingValue(row: SettingRow, cfg: Config): string | number 
       return cfg.session.scope;
     case 'stream':
       return cfg.stream.enabled;
+    case 'voice':
+      return cfg.voice?.confirm;
     default: {
       const _exhaustive: never = row.id;
       return _exhaustive;

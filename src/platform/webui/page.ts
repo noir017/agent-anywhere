@@ -307,6 +307,8 @@ button:disabled{opacity:.5;cursor:default}
    moment it is the control being looked for. */
 #stop-turn{color:#f87171;border-color:rgba(248,113,113,.4)}
 #stop-turn:hover{border-color:#f87171}
+/* Recording: red and counting, so it cannot be mistaken for idle while the microphone is open. */
+#mic.rec{color:#f87171;border-color:#f87171;font-variant-numeric:tabular-nums}
 #input{flex:1;resize:none;max-height:40vh;max-height:40dvh;padding:8px 10px;background:var(--field);color:var(--fg);border:1px solid var(--line);border-radius:4px;font:inherit;overflow-y:auto}
 #input:focus,#login input:focus{outline:none;border-color:#3d3d3d}
 #note{color:var(--dim);font-size:12px;padding:0 16px 8px;max-width:860px;width:100%;margin:0 auto}
@@ -1546,6 +1548,90 @@ const SCRIPT = `
     take(found, pastedName);
   });
 
+  /**
+   * The voice-message button: tap to record, tap again to send.
+   *
+   * A recording is sent the moment it stops, as a message of its own, and the composer is left
+   * alone. Both halves are load-bearing. The daemon transcribes a message that is audio and NOTHING
+   * else (core/voice.ts) — a recording sent together with a half-typed draft would be read as a
+   * file with a caption, and handed to the agent untranscribed. And whatever was being typed is
+   * the user's, so recording must not cost it.
+   *
+   * The format is the browser's to choose, in this order: Ogg/Opus (Firefox), WebM/Opus
+   * (Chromium), MP4/AAC (Safari) — the transcriber takes all three. Capped at ten minutes, which
+   * is far past any voice message and well inside what the daemon will transcribe; at the cap it
+   * stops and sends rather than discarding what was said. Esc throws a recording away.
+   */
+  var micBtn=$('mic'), rec=null, recStarting=false, voices=0;
+  var MIC_TYPES=['audio/ogg;codecs=opus','audio/webm;codecs=opus','audio/mp4','audio/webm'];
+  var MIC_MAX_MS=10*60*1000;
+  micBtn.hidden = !(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
+
+  function recordType(){
+    for(var i=0;i<MIC_TYPES.length;i++){
+      try { if(MediaRecorder.isTypeSupported(MIC_TYPES[i])) return MIC_TYPES[i]; } catch(e){}
+    }
+    return '';
+  }
+  function micLabel(){
+    if(!rec){ micBtn.innerHTML='&#127908;'; micBtn.classList.remove('rec'); micBtn.title='Record a voice message'; return; }
+    var s=Math.floor((Date.now()-rec.started)/1000);
+    micBtn.textContent='\\u25A0 '+Math.floor(s/60)+':'+('0'+(s%60)).slice(-2);
+    micBtn.classList.add('rec');
+    micBtn.title='Stop and send the recording (Esc discards it)';
+  }
+  function micFailed(e){
+    recStarting=false;
+    note.textContent='Could not record: '+((e && (e.message || e.name)) || 'the microphone is unavailable')+'.';
+    micLabel();
+  }
+  function releaseMic(r){ r.stream.getTracks().forEach(function(t){ t.stop(); }); }
+  function voiceExt(mime){ var sub=mime.split('/')[1] || 'webm'; return sub==='mp4' ? 'm4a' : sub; }
+
+  function startRec(){
+    recStarting=true;
+    navigator.mediaDevices.getUserMedia({audio:true}).then(function(stream){
+      recStarting=false;
+      var type=recordType(), mr;
+      try { mr = type ? new MediaRecorder(stream, {mimeType:type}) : new MediaRecorder(stream); }
+      catch(e){ stream.getTracks().forEach(function(t){ t.stop(); }); micFailed(e); return; }
+      var r={mr:mr, stream:stream, type:type, parts:[], started:Date.now(), keep:true, timer:0, cap:0};
+      mr.ondataavailable=function(ev){ if(ev.data && ev.data.size) r.parts.push(ev.data); };
+      mr.onstop=function(){
+        releaseMic(r);
+        if(!r.keep || !r.parts.length) return;
+        var mime=(mr.mimeType || r.type || 'audio/webm').split(';')[0];
+        var fr=new FileReader();
+        fr.onload=function(){
+          var s=String(fr.result), c=s.indexOf(',');
+          voices++;
+          dispatch('', [{name:'voice-'+voices+'.'+voiceExt(mime), mime:mime, data:c<0?'':s.slice(c+1)}]);
+        };
+        fr.readAsDataURL(new Blob(r.parts, {type:mime}));
+      };
+      rec=r;
+      mr.start();
+      r.timer=setInterval(micLabel, 1000);
+      r.cap=setTimeout(function(){ stopRec(true); }, MIC_MAX_MS);
+      note.textContent='';
+      micLabel();
+    }, micFailed);
+  }
+  function stopRec(keep){
+    var r=rec;
+    if(!r) return;
+    rec=null;
+    r.keep=keep;
+    clearInterval(r.timer); clearTimeout(r.cap);
+    micLabel();
+    try { r.mr.stop(); } catch(e){ releaseMic(r); }
+  }
+  micBtn.addEventListener('click', function(){
+    if(rec) stopRec(true);
+    else if(!recStarting && topic) startRec();
+  });
+  document.addEventListener('keydown', function(e){ if(e.key === 'Escape' && rec) stopRec(false); });
+
   function suggest(){
     var v=input.value;
     if(v.charAt(0)!=='/' || v.indexOf(' ')>=0 || v.indexOf('\\n')>=0){ hints.hidden=true; hints.innerHTML=''; return; }
@@ -1852,6 +1938,10 @@ __GATE__
           <textarea id="input" rows="1" placeholder="Message" autocomplete="off"></textarea>
           <input id="picker" type="file" multiple hidden>
           <button type="button" id="attach" title="Attach a file">+</button>
+          <!-- A voice message: tap to record, tap again to send it on its own. Hidden where the
+               browser cannot record (no MediaRecorder, or an insecure origin, where
+               navigator.mediaDevices does not exist at all). -->
+          <button type="button" id="mic" title="Record a voice message" hidden>&#127908;</button>
           <!-- /stop, while there is a turn to stop. Beside Send because that is where the eye
                already is while a reply streams in, and separate from it because the composer
                still sends mid-turn (queued behind the running turn, or interrupting it under

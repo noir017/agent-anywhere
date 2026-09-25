@@ -47,6 +47,7 @@ conversation, not part of its name — see [`daemon/README.md`](../daemon/README
 | `outbound-errors.ts` | The four failure classes the delivery layer needs from the platforms |
 | `runtime-footer.ts` | The `cc · 18k / 1M (2%) · claude-opus-4-5` tagline |
 | `attachment-ingest.ts` | Inbound attachment orchestration (download/save injected) |
+| `voice.ts` | Voice messages as data: what counts as one, container sniffing, the transcriber request and response, the confirmation card, the log fold |
 | `command-translate.ts` | The generic slash vocabulary and its per-harness translation |
 | `skills-catalog.ts` | `/skills`: the bound agent's own commands as text |
 | `settings.ts` | `/setting` as data: which config.yaml fields are editable, what they accept, when a change lands |
@@ -546,6 +547,7 @@ The editable set is deliberately narrow (`model` expands to one row per configur
 | `idle` | `session.idleTimeoutMs` | `off`, `<n>m`, `<n>h` | **now** — the sweeper is re-armed |
 | `scope` | `session.scope` | the four `SessionScope` values | **on restart** — file only |
 | `stream` | `stream.enabled` | `on` / `off` | **now** — `TurnRunner` resolves the delivery mode per turn |
+| `voice` | `voice.confirm` | `on` / `off` | **now** — read when each transcript is ready. A row only where a `voice:` block exists |
 
 `scope` is the one that is written but not applied, and that is the interesting decision.
 The scope decides how `conversationKey` is computed, so changing it live would silently

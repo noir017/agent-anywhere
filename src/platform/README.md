@@ -249,6 +249,18 @@ cap applies), and the ingest names the attachment from its mime rather than the 
 chunk of the URL, which here is a slice of base64. The failure lines quote a truncated form for the
 same reason: quoting a `data:` URL back would paste the whole file into the prompt.
 
+A third layer had to learn it too, and was the costliest miss. When the element walk in
+`satori-core.ts` finds no text it used to fall back to the adapter's own `content` — which the
+adapters build by **serializing the elements** (adapter-telegram: `segments.join("")`), so for a
+voice note with no caption the "text" was `<audio src="data:audio/opus;base64,…"/>`, the whole
+recording. That string became the prompt: a 25 KB voice note reached the agent as 34,000
+characters of base64 (2026-09-18). The fallback now fires only when the walk found neither text
+nor an attachment.
+
+Audio elements keep their own attachment type (`audio`) rather than folding into `file`: a
+Feishu voice note declares no mime and no name, so the element type is the only thing that says
+it is audio before it is downloaded — and the daemon needs to know that to transcribe it.
+
 Getting that far first needs `satori-file-url.ts`, which repairs an upstream collision: adapter-telegram
 asks for a file by its API-relative path (`/photos/file_13.jpg`) against an `endpoint` carrying the
 token, and `@satorijs/core`'s own `http/file` listener runs `new URL()` on that path *before*

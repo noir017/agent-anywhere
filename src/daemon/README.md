@@ -30,6 +30,7 @@ session id, agy's conversation id). One conversation holds one session *per agen
 | `skills-scan.ts` | The `/skills` list: where each harness keeps its installed skills, read off disk |
 | `conversation-token-registry.ts` | Per-conversation reverse-command token ↔ conversation id |
 | `attachment-io.ts` | Real attachment IO + the SSRF guards |
+| `voice.ts` | Voice messages: download, transcribe (Gemini `generateContent`), the Send/Cancel card, re-entry as text, `voice-log.jsonl` |
 | `reverse-cli-shim.ts` | Guarantees `agent-anywhere` is on the agent's PATH |
 
 ## Inbound flow
@@ -54,8 +55,11 @@ ConversationRegistry.route
    ├─ unconfigured agent `/agy` with no agy agent → say so, run no turn. Never forwarded.
    ├─ bind or rebind     new conversation → bind; explicit `/oc` → rebind; else keep the bound agent
    ├─ bare command       `/oc` alone → its command menu, or a binding ack if it reports none
+   ├─ voice message      audio and nothing else → VoiceIntake: transcribe, card, and — on ✅ Send —
+   │                     back into route() as typed text. Nothing reaches the merger until then.
    ├─ command translate  generic → native, or refuse
    ├─ header bubble      once per conversation, on receipt
+   ├─ supersede          a typed message drops any transcript still waiting here
    ▼
 InboundMerger.ingest ── merge window / queue / interrupt
    ▼
@@ -81,6 +85,52 @@ Several orderings in `route()` are load-bearing and commented in place:
 - **The unconfigured-harness check runs before binding**, and only on a name `resolveAgent`
   declined — so a `when.command` rule or a configured harness always wins, and a name nobody
   claimed never binds a conversation on its way to being refused.
+
+## Voice messages
+
+A message that is audio and nothing else — a Telegram or Feishu voice note, a web UI recording,
+an audio file sent without a caption — is taken by `VoiceIntake` (`voice.ts`) when config has a
+`voice:` block. The decisions (what counts, which formats, the prompt, the card's wording, the log
+fold) are pure and live in [`core/voice.ts`](../core/README.md); this file does the IO.
+
+```
+route() ──take()──► download (attachment-io: SSRF guard, platform fetcher)
+                    → sniff the container, save the file
+                    → transcribe: <baseUrl>/models/<model>:generateContent
+                    → card: "🎙️ Voice transcript · <model> · <s>" + [✅ Send] [✖ Cancel]
+                          (confirm: false, or no buttons on this platform → posted as sent, at once)
+          ✅ Send ──► route(msg with the transcript as content, no attachments, same messageId,
+                          { transcript: true })
+```
+
+Why it is shaped this way, one line each:
+
+- **Taken before the merger.** The merger interrupts the running turn; a recording nobody has
+  approved must not. The interruption happens when the transcript is sent, like any typed message.
+- **Re-enters through `route()`**, not `dispatchTo`, so a transcript is answered exactly as typed
+  text: it can answer a question the agent is waiting on, and `/stop` said aloud is a `/stop`.
+  `{ transcript: true }` stops it being offered for transcription again and stops it superseding
+  the *other* transcripts waiting (confirming one of two voice notes must not drop the second).
+- **The message id is kept**, so the 👀/✅ reactions land on the voice note.
+- **Typing supersedes.** The card says to type a corrected version instead of tapping, and a typed
+  message reaching the agent retires every transcript still waiting in that conversation —
+  including one still being transcribed, whose card then arrives already marked.
+- **`/stop` and `/new` call transcripts off**, pending or in flight; `/stop` says so when that was
+  all there was.
+- **Serialized per conversation**, so two notes sent back to back reach the agent in order even
+  when the second transcribes faster.
+- **`confirm` is read when the transcript is ready**, not when the job starts — `/setting voice` is
+  live, and applies to a note already being transcribed.
+- **Two deadlines.** `transcriber.timeoutMs` bounds the whole transcription; each attempt has its
+  own shorter one and is retried when it stalls, because the upstream's latency is erratic rather
+  than slow (the same six-second note took 1.3 s and 65 s on 2026-09-25). A 400 that refuses the
+  thinking config is retried once without it — `gemini-3-flash` behind newapi is an alias for 3.6 on
+  some channels and 3.7 on others, and they accept different thinking levels.
+
+Every step is logged: `[voice]` lines in daemon.log, and one JSON event per fact in
+`<configDir>/voice-log.jsonl` (0600, rotated to `.1` past 5 MB) — the transcript with its audio
+path, model, latency and token counts, then its outcome. The agent reads its own conversation's
+entries with `agent-anywhere voice-log`; nothing in its prompt says a message was spoken.
 
 ## Routing, binding, and conversation keys
 
@@ -924,7 +974,8 @@ translation; `routing.test.ts`, `command-routing.test.ts`, `session-control.test
 `multi-platform.test.ts`, `slash-register.test.ts`, `ask-button.test.ts`,
 `picker-click.test.ts`, `model-menu-click.test.ts`, `settings-command.test.ts`,
 `local-commands.test.ts`, `agy-cli-command.test.ts`, `agy-statusline.test.ts`,
-`permission.test.ts`, and `attachment-io.test.ts` cover the rest.
+`permission.test.ts`, `attachment-io.test.ts`, `voice.test.ts` and `voice-routing.test.ts` cover
+the rest.
 
 Two of those are worth knowing about before you touch the agy harness.
 `agy-cli-command.test.ts` is written as negative assertions — each case asserts that a

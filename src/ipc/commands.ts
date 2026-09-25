@@ -257,4 +257,24 @@ export const REVERSE_COMMANDS: ReverseCommandSpec[] = [
     // to put buttons in front of the user, and without it they can only ask in prose.
     inject: 'no-native-ask',
   },
+  {
+    usage: 'voice-log',
+    description:
+      "List this conversation's recent voice-message transcripts: what the user said, what was sent on, and the saved audio file (TOON table on stdout)",
+    options: [{ flags: '-l, --limit <n>', description: 'number of transcripts (default 10)', parse: intArg('--limit') }],
+    build: (_positionals, opts) => {
+      // The log is keyed by conversation and read for the caller's own; there is no other channel
+      // to point it at, so a --channel is refused rather than silently ignored.
+      if (str(opts.channel) !== undefined) {
+        throw new Error("voice-log reads this conversation's own transcripts; --channel does not apply");
+      }
+      return { kind: 'voice-log', limit: typeof opts.limit === 'number' ? opts.limit : undefined };
+    },
+    hint: "Check what a voice message actually said: agent-anywhere voice-log [--limit 10] (this conversation's transcripts, their outcome, and the saved audio path)",
+    // Deliberately never injected. A confirmed transcript reaches the agent as the user's own typed
+    // words — the user read and approved them — so telling every session that some messages were
+    // spoken would only invite second-guessing text that has already been checked. The command is
+    // for the rare turn where a message reads like a mishearing; `--help` and the bundled skill
+    // document it.
+  },
 ];

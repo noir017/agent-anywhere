@@ -17,7 +17,7 @@ nothing else from the project.
 ## The central design decision: a small user surface
 
 The config file has exactly five sections — `platforms`, `agents`, `routing`,
-`session`, `access` — plus an optional `display` and `stream`. Everything else that
+`session`, `access` — plus the optional `display`, `stream`, `title` and `voice`. Everything else that
 *looks* like config (stream throttling, tool-bubble rendering, inbound merge windows,
 attachment limits, reaction emoji, the IPC socket) is **not** user-configurable. It lives
 in the frozen `EXPERIENCE` constant in `schema.ts` and is merged into every loaded
@@ -36,6 +36,12 @@ They were removed because nobody tuned them and exposing them only bloated the f
 **So before adding a config field, ask which side of that line it falls on.** A
 per-deployment decision (a credential, which agent answers where, who is allowed) goes
 in `ConfigSchema`. A tuning knob for the streaming experience goes in `EXPERIENCE`.
+
+`voice` is on the user side because it is a credential and an endpoint (the transcriber), plus
+one decision — `confirm`, whether a transcript waits for a tap. Everything that tunes it (the
+size cap, the card TTL, the retry and per-attempt deadlines) is a constant in `core/voice.ts` /
+`daemon/voice.ts` rather than in `EXPERIENCE`, because a key `EXPERIENCE` owned would overwrite the
+operator's `voice:` block at load.
 
 Two fields were deliberately promoted from `EXPERIENCE` to the user surface when they
 turned out to be per-deployment decisions after all: `freeResponseChannels` and
@@ -113,8 +119,9 @@ Three writers, in increasing order of how much they claim:
 
 `/setting` is the one that changed the assumption that this file is only ever
 hand-edited: config.yaml is now written **while the daemon is running**, from a chat
-message. Five fields are reachable that way (`routing.default`, `agents[].model`,
-`session.idleTimeoutMs`, `session.scope`, `stream.enabled`) and the rest are refused by name — see
+message. Six fields are reachable that way (`routing.default`, `agents[].model`,
+`session.idleTimeoutMs`, `session.scope`, `stream.enabled`, and `voice.confirm` where a `voice:`
+block exists) and the rest are refused by name — see
 [`core/settings.ts`](../core/README.md#settingsts) for the table and
 [`daemon/settings-store.ts`](../daemon/README.md#settings-storets) for the order the write
 happens in. Two constraints from that path land here:

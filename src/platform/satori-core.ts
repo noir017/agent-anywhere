@@ -26,6 +26,11 @@ import type { PlatformProfile } from './profile.js';
 import { installProxy } from '../core/proxy.js';
 import { installRelativeFileUrlFix } from './satori-file-url.js';
 
+/** The attachment type of a non-image media element: audio stays audio, the rest is a file. */
+function fileKind(elementType: string): 'audio' | 'file' {
+  return elementType === 'audio' ? 'audio' : 'file';
+}
+
 /**
  * Assemble a generic PlatformAdapter from a profile + one platform instance
  * (`platforms.<id>` entry + its id). InboundMessage.platform and interaction
@@ -102,7 +107,7 @@ export async function createSatoriAdapter(
 
   /**
    * Normalize session/history elements into { plain text, attachment list }.
-   * Images are img/image, files are file, audio/video map to file.
+   * Images are img/image, audio is audio, files and video are file.
    * Attachment mime/size go through profile.attachmentMeta (keys differ per platform).
    */
   const normalizeElements = (
@@ -140,7 +145,9 @@ export async function createSatoriAdapter(
             if (url) {
               const meta = profile.attachmentMeta(node);
               attachments.push({
-                type: 'file',
+                // Audio keeps its own type: it is the only evidence a Feishu voice note is audio
+                // before it is downloaded (see InboundMessage.attachments).
+                type: fileKind(node.type),
                 url,
                 name: node.attrs?.file as string | undefined,
                 mime: meta.mime,
@@ -188,6 +195,23 @@ export async function createSatoriAdapter(
     quote?.user?.name ?? quote?.member?.name ?? quote?.member?.nick ?? undefined;
 
   /**
+   * The message's text: what the element walk found, falling back to the adapter's own `content`
+   * only when the walk found NOTHING — no text and no attachment.
+   *
+   * The fallback is for a message whose elements the walk cannot read. It must not fire for one
+   * that is only an attachment, because adapters build `content` by serializing the elements
+   * (adapter-telegram 4.5.11: `message.content = segments.join("")`) — for a voice note that is
+   * `<audio src="data:audio/opus;base64,…"/>`, the whole recording as base64. That string used to
+   * become the prompt: a 25 KB voice note reached the agent as 34,000 characters of base64
+   * (observed 2026-09-18), on top of the attachment line that already pointed at the saved file.
+   */
+  const contentOf = (
+    text: string,
+    attachments: InboundMessage['attachments'],
+    raw: string | undefined
+  ): string => text || (attachments ? '' : (raw ?? ''));
+
+  /**
    * Resolve an inbound session to a full ConversationRef.
    *
    * The profile answers the platform-shaped half (channel / thread / space / kind) and core
@@ -215,7 +239,7 @@ export async function createSatoriAdapter(
       conversation: inboundConversation(session),
       platformType: profile.type,
       messageId: session.messageId ?? '',
-      content: text || (session.content ?? ''),
+      content: contentOf(text, attachments, session.content),
       // session.quote is the quoted message object (with id), present on replies.
       quoteId: session.quote?.id,
       timestamp: session.timestamp ?? Date.now(),
@@ -252,7 +276,7 @@ export async function createSatoriAdapter(
       },
       platformType: profile.type,
       messageId: msg.id ?? '',
-      content: text || (msg.content ?? ''),
+      content: contentOf(text, attachments, msg.content),
       quoteId: msg.quote?.id,
       timestamp: msg.createdAt ?? msg.timestamp ?? Date.now(),
       attachments,

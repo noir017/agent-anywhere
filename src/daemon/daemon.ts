@@ -91,12 +91,16 @@ import type { ConversationStore } from './conversation-store.js';
 import type { WorkdirUsageStore } from './workdir-usage.js';
 import { resolvePageSize } from '../core/paging.js';
 import { IpcServer } from '../ipc/server.js';
-import type { IpcAction } from '../ipc/protocol.js';
+import type { IpcAction, VoiceLogResult } from '../ipc/protocol.js';
 import {
   DEFAULT_ASK_TIMEOUT_MS as PROTOCOL_DEFAULT_ASK_TIMEOUT_MS,
   DEFAULT_ASK_REMINDER_MS,
   DEFAULT_ASK_REMINDER_TEXT,
 } from '../ipc/protocol.js';
+import { VoiceIntake } from './voice.js';
+
+/** Transcripts `agent-anywhere voice-log` lists when no `--limit` is given. */
+const DEFAULT_VOICE_LOG_LIMIT = 10;
 
 /** Valid slash name: lowercase/digit/_/-, 1-32 chars (Discord constraint). Non-matching names are skipped on registration. */
 const SLASH_NAME_RE = /^[a-z0-9_-]{1,32}$/;
@@ -626,6 +630,9 @@ export class Daemon {
   /** The budget itself. Held so `stop()` can drain what is still queued. */
   private readonly pacer: OutboundPacer;
 
+  /** Voice messages → confirmed text (see daemon/voice.ts). Inert when config has no `voice:`. */
+  private readonly voice: VoiceIntake;
+
   constructor(
     private readonly config: Config,
     platforms: Map<string, PlatformAdapter>,
@@ -649,6 +656,15 @@ export class Daemon {
     this.platforms = new Map(
       [...platforms].map(([id, adapter]) => [id, withOutboundPacing(adapter, this.pacer)])
     );
+
+    // Built on the PACED adapters, so a transcript card waits its turn on the chat's budget like
+    // every other write. A confirmed transcript re-enters the registry as a typed message, marked so
+    // it is neither transcribed again nor treated as a correction of the other transcripts waiting.
+    this.voice = new VoiceIntake(config, {
+      platforms: this.platforms,
+      deliver: (msg) => this.registry.route(msg, { transcript: true }),
+      clock,
+    });
 
     this.registry = new ConversationRegistry(config, this.platforms, agents, clock, {
       // A conversation's agent reported its command list → record it under that AGENT (feeds pickers).
@@ -687,6 +703,11 @@ export class Daemon {
       // or a `/new` that just cleared one.
       onWorkdirMenuRequest: (id, agentId, msg, menu) =>
         this.onWorkdirMenuRequest(id, agentId, msg, menu),
+      // A voice message is transcribed and confirmed before it becomes a prompt; typing drops a
+      // transcript still waiting, and /stop and /new call them off.
+      takeVoice: (id, msg) => this.voice.take(id, msg),
+      supersedeVoice: (id) => this.voice.supersede(id),
+      cancelPendingVoice: (id, reason) => this.voice.cancel(id, reason),
     }, store, workdirUsage);
     this.ipc = new IpcServer(socketPath, {
       // resolveAddress is also the sole capture point for the conversation owning this reverse
@@ -777,6 +798,7 @@ export class Daemon {
     this.pendingModelMenus.clear();
     this.pendingEffortMenus.clear();
     this.pendingSettingsMenus.clear();
+    this.voice.dispose();
     // Clear pending asks after ipc/platform are down: no new clicks or asks can arrive now. Clear each
     // timer and resolve null ("no selection") so any caller still blocked on ask IPC gets a result
     // rather than hanging forever. Best-effort: never throw.
@@ -879,6 +901,15 @@ export class Daemon {
           throw new Error('unsupported operation: this platform does not support interactive buttons (ask)');
         }
         return this.handleAsk(platform, action, address);
+      case 'voice-log': {
+        // The caller's own conversation, read off the scratch slot before anything could await.
+        const id = this.lastResolvedConversationId;
+        const result: VoiceLogResult = {
+          enabled: this.config.voice !== undefined,
+          entries: id ? this.voice.history(id, action.limit ?? DEFAULT_VOICE_LOG_LIMIT) : [],
+        };
+        return result;
+      }
       default: {
         // Exhaustiveness guard: a new IpcAction variant missed here fails to compile.
         const _exhaustive: never = action;
@@ -1216,8 +1247,9 @@ export class Daemon {
 
   /** Button click: resolve the matching model menu, effort menu, directory menu, settings menu, pending ask, or picker; otherwise ignore. */
   private onButton(ev: ButtonInteraction): void {
-    // Prefixes are pairwise non-prefixing (`mdl:`/`mpg:`/`eff:`/`wdr:`/`wdp:`/`stg:`/`stv:`/`stp:`/
-    // `stb:`/`cmd:`/`ask:`), so this order is for readability, not correctness.
+    // Prefixes are pairwise non-prefixing (`vtx:`/`mdl:`/`mpg:`/`eff:`/`wdr:`/`wdp:`/`stg:`/`stv:`/
+    // `stp:`/`stb:`/`cmd:`/`ask:`), so this order is for readability, not correctness.
+    if (this.voice.onClick(ev)) return;
     const model = parseModelButtonId(ev.buttonId);
     if (model) {
       this.onModelClick(ev, model);

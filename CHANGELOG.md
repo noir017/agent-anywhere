@@ -5,6 +5,17 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-09-28
+
+### Changed
+- **Claude harness upgraded to `@agentclientprotocol/claude-agent-acp` 0.81.2** (from 0.76.0),
+  with `@agentclientprotocol/sdk` 1.5.0 (from 1.4.0). The bundled Claude Code moves from 2.1.257
+  to 2.1.280, which newer models such as `claude-opus-5-5` require — on 0.3.1 every turn with
+  those models failed with "API Error: 400 Claude Code 2.1.257 does not support this model".
+  ACP protocol version is unchanged (1); `initialize` + `session/new` re-verified against a real
+  spawned adapter, `agentCapabilities.loadSession` is still advertised, and the two non-public SDK
+  shapes (`AsyncQueue.values`, `ClientContext.attachSession`) are still present.
+
 ## [0.3.1] - 2026-09-11
 
 ### Fixed

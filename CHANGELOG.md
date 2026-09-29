@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.35.0] - 2026-09-29
+
 ### Changed
 
 - **Web UI: coming back to a topic puts you where you were reading.** Switching topics used to

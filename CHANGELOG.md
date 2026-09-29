@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.34.2] - 2026-09-29
+
 ### Fixed
 
 - **A failed turn no longer throws away the answer it had already written.** Reply text is sent

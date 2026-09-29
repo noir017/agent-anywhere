@@ -355,6 +355,21 @@ export class TurnRunner {
     } catch (err) {
       // Log error detail (InboundMerger only adds a ❌ reaction, keeping no reason).
       console.error(`[turn] ${conversationId} turn failed:`, err instanceof Error ? err.stack ?? err.message : err);
+      // Deliver what the turn DID produce before saying it failed — the same clean finalize an
+      // interrupted turn gets, with no footer because it did not finish.
+      //
+      // Not a nicety: text is only sent when its segment completes (at the next tool boundary, or
+      // here at the end), so a failed turn used to throw away everything after its last tool —
+      // which is usually the conclusion. Reported 2026-09-29: an answer claude-agent-acp never
+      // closed (see FOLDED_PROMPT_GRACE_MS in agent-acp.ts) sat complete in this buffer for the
+      // full ten-minute watchdog, and the only thing that ever reached the chat was the ❌.
+      //
+      // Guarded separately: a failure to flush must neither swallow the ❌ nor replace the error
+      // the merger is about to mark.
+      render.abort();
+      await render
+        .finalize('')
+        .catch((e) => console.error('[turn] failed to flush a failed turn\'s output:', describeOutboundError(e)));
       // Surface a readable reason in-channel: the agent-acp error messages (auth_required, startup
       // / turn timeout, command not on PATH) are written to be user-actionable, but otherwise only
       // a bare ❌ reaction reaches the user. Best-effort and capped — a send failure here must not

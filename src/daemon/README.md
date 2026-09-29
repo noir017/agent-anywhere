@@ -380,8 +380,12 @@ Turn outcomes:
 - **Interrupted** (`signal.aborted`): finalize the partial reply cleanly — drop the
   no footer, no ✅, skip the command fallback. The continuing batch produces its
   own reply.
-- **Failed**: log the stack, send a capped (300 char) `❌ This turn failed: <reason>`
-  in-channel, then rethrow for the merger to mark ❌. The reason is surfaced because the
+- **Failed**: log the stack, deliver what the turn had produced (the same no-footer
+  finalize as an interrupt), then send a capped (300 char) `❌ This turn failed: <reason>`
+  in-channel and rethrow for the merger to mark ❌. The flush is not optional: text is sent
+  when its segment completes, so everything after the last tool — usually the conclusion —
+  exists only in the buffer until finalize, and skipping it threw the answer away
+  (2026-09-29, `turn-failure.test.ts`). The reason is surfaced because the
   runtime error messages (`auth_required`, startup/turn timeout, command not on PATH) are
   written to be user-actionable — a bare ❌ reaction wastes them.
 - **Command with zero output**: some harness built-ins (`/compact`) produce a
@@ -408,6 +412,19 @@ conversation's errors can be picked out of a log shared by all of them:
 It never ends a turn: a logged error is evidence something went wrong, not that the turn
 is lost — opencode often retries and wins. A missing file, a renamed field or an
 unparsable line yields nothing, which puts the message back to exactly its old text.
+
+One more silence is not a hang at all: claude-agent-acp's **folded prompt** (upstream
+#1145, unfixed as of 0.84.0). A prompt sent while Claude Code is reporting a finished
+background task on its own is folded into that cycle and answered there, but the cycle's
+result is filed as autonomous and `session/prompt` never returns. The adapter still says
+the cycle ended — the result-tied `usage_update` carries `_meta["_claude/origin"]` — so a
+turn that sees an autonomous cycle end and then hears nothing of its own for
+`FOLDED_PROMPT_GRACE_MS` (30 s, or half the watchdog if that is less) ends normally with
+what it rendered. It sends no cancel, because a prompt merely *queued* behind that cycle
+looks the same until its own output starts; if that output is later than the grace, it
+still arrives, as a background update. The abandoned prompt is settled by the adapter at
+the next prompt, so a turn only ends on a `stop` carrying **its own** prompt's response —
+otherwise that late settlement would end the next turn before its reply was read.
 
 ## Agent runtimes
 

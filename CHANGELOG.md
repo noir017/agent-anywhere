@@ -5,6 +5,30 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **A failed turn no longer throws away the answer it had already written.** Reply text is sent
+  when its segment completes, at the next tool call or when the turn ends, so the part after the
+  last tool, which is usually the conclusion, sits in a buffer until the very end. When a turn
+  failed, the gateway posted `❌ This turn failed` and dropped that buffer. On 2026-09-29 a web-UI
+  conversation lost a complete 613-character answer this way: the model finished at 10:21, and at
+  10:31 the only thing the page gained was the ❌. A failed turn now sends what it has first, with
+  no footer (like an interrupted one), and then the failure. This applies to every failure, not
+  only timeouts.
+- **Claude Code turns no longer hang for ten minutes when the message is answered inside a
+  background report.** When a background task finishes, Claude Code starts a turn of its own to
+  report it. A message sent during that turn gets folded in and answered there. But
+  claude-agent-acp files that turn's result as Claude Code's own work, so the message's request
+  never completes (upstream issue #1145, still open and unfixed in 0.84.0). The answer arrived,
+  then the conversation sat on "running" until the silence watchdog failed it as hung. Most
+  occurrences went unnoticed because sending another message cancels the stuck turn; this one
+  surfaced because the user waited. The adapter still reports the origin of each result, so a
+  turn that sees a background cycle end and then 30 seconds of silence now ends normally. It
+  sends no cancel, so a message that was only queued behind that cycle is not cut short: if its
+  reply comes later than that, it still arrives, as a background update. And a turn now ends only
+  on its own prompt's completion, so the late completion the adapter delivers at the next message
+  cannot end that next turn early.
+
 ## [1.34.1] - 2026-09-26
 
 ### Fixed

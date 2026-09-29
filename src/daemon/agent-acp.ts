@@ -13,6 +13,7 @@ import type {
   CreateElicitationResponse,
   McpServer,
   PermissionOption,
+  PromptResponse,
   RequestPermissionRequest,
   RequestPermissionResponse,
   SessionConfigOption,
@@ -230,6 +231,78 @@ const QUEUE_REJECT_BACKOFF_MS = 50;
  * even that belongs in the background, which is now forwarded properly (see FollowUpSink).
  */
 export const TOOL_SILENCE_FACTOR = 2;
+
+/**
+ * How long a turn waits, after an AUTONOMOUS cycle of the harness ends inside it with no reply of
+ * the turn's own, before concluding that its prompt was answered inside that cycle.
+ *
+ * ── The upstream bug this works around ─────────────────────────────────────────────────────────
+ * claude-agent-acp issue #1145 (open as of 2026-09-29; the fix, PR #1185, unmerged; still present
+ * in 0.84.0). A background task finishes, and Claude Code starts a cycle of its own to report it
+ * (`origin: {kind: "task-notification"}`). A prompt sent while that cycle runs is FOLDED into it:
+ * Claude Code's transcript records `queue-operation remove, reason: "absorbed_mid_turn"`. The model
+ * answers both and the cycle ends with one `result`, which names the prompt in
+ * `user_message_uuid(s)` — but the adapter classifies results by origin alone, files it as
+ * autonomous, and never settles the prompt. `session/prompt` does not return until something else
+ * releases it: the next prompt, or a cancel.
+ *
+ * Seen live 2026-09-29 (web topic, quantlab): the answer streamed in full, then nothing, and the
+ * silence watchdog failed the turn ten minutes later as "hung". Most occurrences never get that
+ * far — `inbound.interruptOnNewMessage` cancels the stuck turn as soon as the user says anything —
+ * which is why thirty-odd folds in a week surfaced as one failure.
+ *
+ * ── What the gateway can see, and why this waits instead of acting at once ────────────────────
+ * The adapter still reports the cycle's end: the result-tied `usage_update` carries the result's
+ * origin in `_meta["_claude/origin"]` (see autonomousResultOrigin). What it cannot say is whether
+ * THIS prompt was folded into that cycle or merely queued behind it; a queued prompt starts its
+ * own cycle right after, and output resumes. So the turn waits for silence: renderable output
+ * cancels the wait, and nothing arriving means there is nothing left to wait for.
+ *
+ * Getting it wrong costs little either way. Too early — a queued prompt whose first output is
+ * slower than this — and the turn ends with what it has, while the real reply still arrives and
+ * is rendered as a background update (see FollowUpSink); nothing is lost. The stale prompt is left
+ * for the adapter to settle at the next prompt, and runTurn only ends on a `stop` that is its own,
+ * so that late settlement cannot end the next turn. Too late costs the same wait as today, bounded
+ * by the watchdog. Thirty seconds sits well past a cached cycle's time to first output, and far
+ * short of the ten minutes it replaces — and in `once` delivery mode the answer's last segment is
+ * not sent until the turn ends, so this IS how late the answer arrives.
+ *
+ * Capped at half the silence budget when that is smaller, because the point is to decide before
+ * the watchdog does: a fold declared after the turn already failed as hung is no help.
+ */
+export const FOLDED_PROMPT_GRACE_MS = 30_000;
+
+/**
+ * Result origins claude-agent-acp files as AUTONOMOUS — work the model did on its own rather than
+ * for the prompt. A copy of the adapter's own AUTONOMOUS_RESULT_ORIGINS (0.81.2 dist/acp-agent.js),
+ * kept in step with it deliberately: an origin the adapter treats as the user's own settles the
+ * prompt normally, so listing more here would only arm a wait that the prompt's `stop` cancels.
+ */
+const AUTONOMOUS_RESULT_ORIGINS: ReadonlySet<string> = new Set([
+  'task-notification',
+  'peer',
+  'coordinator',
+  'observer',
+  'observer-activity',
+]);
+
+/**
+ * The origin of the cycle a result-tied `usage_update` reports, when that cycle was autonomous —
+ * i.e. "Claude Code just finished something nobody's prompt asked for". Undefined for everything
+ * else, including the ordinary end of a prompt's own cycle.
+ *
+ * ⚠️ HYRUM'S LAW: `_claude/origin` is claude-agent-acp's private extension, not ACP. Verified in
+ * 0.81.2 (2026-09-29), where the result handler sends `usage_update` with
+ * `_meta: {"_claude/origin": message.origin}` whenever the SDK result carries an origin. If a
+ * release stops sending it, this returns undefined and folded prompts fall back to the silence
+ * watchdog — the behaviour before this existed, not a new failure.
+ */
+export function autonomousResultOrigin(update: SessionUpdate): string | undefined {
+  if (!isResultUsage(update)) return undefined;
+  const origin = update._meta?.['_claude/origin'];
+  const kind = typeof origin === 'object' && origin !== null && 'kind' in origin ? origin.kind : undefined;
+  return typeof kind === 'string' && AUTONOMOUS_RESULT_ORIGINS.has(kind) ? kind : undefined;
+}
 
 /**
  * How often a turn asks the harness's own log what went wrong (see harness-log.ts).
@@ -635,15 +708,20 @@ function createAcpSession(
    */
   let turnState: TurnState | undefined;
   /**
-   * Called by the pump after every update it hands to the running turn, to re-arm the silence
-   * watchdog. Undefined between turns (nothing is being timed).
+   * Called by the pump with every update it hands to the running turn — to re-arm the silence
+   * watchdog, and to notice the end of an autonomous cycle (see FOLDED_PROMPT_GRACE_MS). Undefined
+   * between turns (nothing is being timed).
    */
-  let onTurnUpdate: (() => void) | undefined;
+  let onTurnUpdate: ((update: SessionUpdate) => void) | undefined;
   /**
-   * Ends the running turn's wait, because the harness's prompt settled (queue `stop`) or the queue
-   * rejected. Undefined between turns.
+   * Ends the running turn's wait, because a prompt settled (queue `stop`, passed its response) or
+   * the queue rejected (passed nothing). Undefined between turns.
+   *
+   * The turn decides whether a `stop` is ITS OWN — it is not always: a prompt the turn gave up on
+   * (see FOLDED_PROMPT_GRACE_MS) settles later, typically at the next prompt, and its `stop` lands
+   * in that next turn's wait.
    */
-  let endTurnWait: (() => void) | undefined;
+  let endTurnWait: ((response?: PromptResponse) => void) | undefined;
   /** Where out-of-turn output goes; installed by TurnRunner at the top of every turn. */
   let followUpSink: FollowUpSink | undefined;
   /**
@@ -1392,7 +1470,8 @@ function createAcpSession(
       if (active !== session) return;
 
       if (msg.kind === 'stop') {
-        endTurnWait?.();
+        // The response travels with it so the turn can tell its own `stop` from a stale one.
+        endTurnWait?.(msg.response);
         continue;
       }
 
@@ -1440,7 +1519,7 @@ function createAcpSession(
       }
 
       if (turnState) {
-        onTurnUpdate?.(); // the turn is alive: re-arm its silence watchdog
+        onTurnUpdate?.(update); // the turn is alive: re-arm its silence watchdog
         continue;
       }
       // A result-tied `usage_update` says a piece of work finished, so it is the cue to seal the
@@ -1466,6 +1545,67 @@ function createAcpSession(
       // surface as an unhandled rejection that takes the daemon down.
       console.error('[acp] update reader stopped unexpectedly:', e instanceof Error ? e.stack ?? e.message : e);
     });
+  }
+
+  /**
+   * Watch one turn for the sign that its prompt was folded into an autonomous cycle and answered
+   * there — the claude-agent-acp bug described at FOLDED_PROMPT_GRACE_MS, where the prompt's own
+   * `stop` never comes.
+   *
+   * The evidence is an autonomous cycle ending (autonomousResultOrigin) followed by silence. Any
+   * renderable output in between cancels it: a prompt that was only queued behind that cycle is now
+   * running as its own, and will end with its own `stop`.
+   *
+   * Two states decline rather than decide, leaving the turn to the watchdog exactly as before: a
+   * question put to the user (the agent is waiting on a person, not finished), and a tool call
+   * still open (something is visibly running, whatever the cycle's result said).
+   */
+  function watchForFoldedPrompt(state: TurnState): {
+    /** Feed every update the turn receives once its prompt is out. */
+    observe: (update: SessionUpdate) => void;
+    /** Resolves when the turn should stop waiting for a `stop` that is not coming. */
+    folded: Promise<'folded'>;
+    stop: () => void;
+  } {
+    const graceMs =
+      turnTimeoutMs > 0 ? Math.min(FOLDED_PROMPT_GRACE_MS, turnTimeoutMs / 2) : FOLDED_PROMPT_GRACE_MS;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let declare: () => void = () => {};
+    const folded = new Promise<'folded'>((resolve) => {
+      declare = () => resolve('folded');
+    });
+    const disarm = (): void => {
+      if (timer) clearTimeout(timer);
+      timer = undefined;
+    };
+    const decide = (origin: string): void => {
+      timer = undefined;
+      if (awaitingUser > 0) return;
+      if (hasOpenToolCall(state)) {
+        console.log(
+          `[acp] ${conversationId}: a ${origin} cycle ended with a tool call still open; leaving this turn to the watchdog`
+        );
+        return;
+      }
+      console.log(
+        `[acp] ${conversationId}: a ${origin} cycle ended ${graceMs}ms ago and this prompt has had no reply of its own; ` +
+          'treating it as answered inside that cycle (claude-agent-acp #1145) and ending the turn'
+      );
+      declare();
+    };
+    return {
+      folded,
+      observe: (update) => {
+        const origin = autonomousResultOrigin(update);
+        if (origin) {
+          disarm();
+          timer = setTimeout(() => decide(origin), graceMs);
+          return;
+        }
+        if (isRenderableUpdate(update)) disarm();
+      },
+      stop: disarm,
+    };
   }
 
   /**
@@ -1610,12 +1750,34 @@ function createAcpSession(
       // re-arm the watchdog and to end the wait below. All three are cleared in `finally`, so a late
       // `stop` or a stray update can never bleed into the next turn.
       turnState = state;
-      onTurnUpdate = rearmWatchdog;
       // Runs alongside the watchdog for harnesses that admit their failures only to their own log;
       // for every other harness this allocates a Set and starts no timer.
       const logWatch = watchHarnessLog(handlers);
+      const fold = watchForFoldedPrompt(state);
+      /**
+       * This turn's prompt once sent, and its response once settled — the response being what a
+       * `stop` has to carry to end THIS turn (see endTurnWait: a prompt an earlier turn gave up on
+       * settles later, into this wait).
+       */
+      let promptDone: Promise<PromptResponse> | undefined;
+      let ownResponse: PromptResponse | undefined;
+      onTurnUpdate = (update) => {
+        rearmWatchdog();
+        // Only once this prompt is out: a cycle that ended before it was sent cannot have absorbed it.
+        if (promptDone) fold.observe(update);
+      };
       const settled = new Promise<void>((resolve) => {
-        endTurnWait = resolve;
+        endTurnWait = (response) => {
+          // A rejected read carries nothing: wake, and let promptDone say what went wrong.
+          if (response === undefined || response === ownResponse) return resolve();
+          const ignore = (): void =>
+            console.log(`[acp] ${conversationId}: ignoring a stop that belongs to an earlier prompt`);
+          if (!promptDone) return ignore();
+          // Not yet known to be ours. Normally ownResponse is already set by now (its callback was
+          // attached before the pump could read this stop), but the question is settled on the
+          // prompt itself rather than on which of two callbacks ran first.
+          void promptDone.then((own) => (own === response ? resolve() : ignore()), () => {});
+        };
       });
       const timedOut = new Promise<never>((_, reject) => {
         hung = reject;
@@ -1632,7 +1794,15 @@ function createAcpSession(
         // long conversation is guaranteed to lose).
         if (replayFence) await replayFence;
         promptedYet = true; // from here on, renderable output is this session's own (see promptedYet)
-        const promptDone = active!.prompt(decorate(input, hint));
+        promptDone = active!.prompt(decorate(input, hint));
+        // Attached straight after the SDK's own callback (which enqueues the `stop`), so this runs
+        // before the pump can read that `stop` — see endTurnWait above.
+        void promptDone.then(
+          (r) => {
+            ownResponse = r;
+          },
+          () => {}
+        );
         // Pre-attach a no-op rejection handler: when the watchdog wins the race we rethrow without
         // awaiting the prompt, and a rejection nobody is listening for would surface as an
         // unhandled rejection. `await promptDone` below still rethrows — a promise can have more
@@ -1650,7 +1820,16 @@ function createAcpSession(
         // forever, pinning the conversation in `running`. So: a promise that rejects with the
         // prompt's error and never resolves on success (that half is `settled`'s job).
         const promptFailed = promptDone.then(() => new Promise<never>(() => {}));
-        await Promise.race([settled, timedOut, promptFailed]);
+        const outcome = await Promise.race([settled, timedOut, promptFailed, fold.folded]);
+        if (outcome === 'folded') {
+          // Answered inside an autonomous cycle, and the harness will not say so. End the turn with
+          // what it rendered and leave the prompt pending: the adapter settles it at the next
+          // prompt, whose turn ignores that stale `stop` (see endTurnWait). No `session/cancel` —
+          // if this was a misjudged queued prompt rather than a folded one, a cancel would kill
+          // the very reply that is about to start; left alone, it arrives as a background update.
+          flushPendingTools(state);
+          return;
+        }
         await promptDone; // already resolved at stop; here only settles / rethrows an in-turn error
         flushPendingTools(state);
       } catch (err) {
@@ -1671,6 +1850,7 @@ function createAcpSession(
       } finally {
         if (watchdog) clearTimeout(watchdog);
         logWatch.stop();
+        fold.stop();
         turnState = undefined;
         onTurnUpdate = undefined;
         endTurnWait = undefined;

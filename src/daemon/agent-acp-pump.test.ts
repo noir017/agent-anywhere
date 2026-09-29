@@ -1,8 +1,10 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { createAcpAgentFactory, TOOL_SILENCE_FACTOR } from './agent-acp.js';
+import type { SessionUpdate } from '@agentclientprotocol/sdk';
+import { autonomousResultOrigin, createAcpAgentFactory, TOOL_SILENCE_FACTOR } from './agent-acp.js';
 import { parseConfig, type Config } from '../config/schema.js';
 import type { AgentSession, AgentStreamHandlers } from './agent.js';
 
@@ -42,6 +44,20 @@ const resultUsage = (sessionId, used) =>
     size: 200000,
     cost: { amount: 0.01, currency: 'USD' },
   });
+// The same marker for a cycle Claude Code started ON ITS OWN (a background task reporting in):
+// claude-agent-acp 0.81.x forwards the SDK result's origin in _meta — see autonomousResultOrigin.
+const autonomousResultUsage = (sessionId, used) =>
+  notify(sessionId, {
+    sessionUpdate: 'usage_update',
+    used,
+    size: 200000,
+    cost: { amount: 0.01, currency: 'USD' },
+    _meta: { '_claude/origin': { kind: 'task-notification' } },
+  });
+// A prompt the adapter answered but never settled (claude-agent-acp #1145). It stays pending until
+// the next prompt arrives, which is when the real adapter hands it off with end_turn — BEFORE that
+// next prompt's own output, which is what makes its stale stop dangerous.
+let unsettled = null;
 
 readline.createInterface({ input: process.stdin }).on('line', (line) => {
   let msg;
@@ -125,6 +141,55 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
   if (msg.method === 'session/prompt') {
     const sessionId = msg.params.sessionId;
     const asked = JSON.stringify(msg.params.prompt ?? '');
+    if (unsettled !== null) {
+      reply(unsettled, { stopReason: 'end_turn' });
+      unsettled = null;
+    }
+    if (asked.includes('FOLD_ME')) {
+      // #1145 as seen live 2026-09-29: the prompt is folded into a task-notification cycle, which
+      // answers it and ends with a result the adapter files as autonomous — and session/prompt is
+      // never answered.
+      text(sessionId, 'the bridge is reachable; checking the backend. ');
+      notify(sessionId, {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'fold-1',
+        title: 'broker status',
+        kind: 'execute',
+        status: 'in_progress',
+        rawInput: { command: './status.sh' },
+      });
+      if (!asked.includes('TOOL_OPEN')) {
+        notify(sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'fold-1', status: 'completed' });
+      }
+      text(sessionId, 'the bridge is online');
+      autonomousResultUsage(sessionId, 1200);
+      unsettled = msg.id;
+      return;
+    }
+    if (asked.includes('QUEUED_BEHIND')) {
+      // The look-alike that must NOT be cut short: the prompt was only queued behind an autonomous
+      // cycle. That cycle ends first; then, after a pause, the prompt runs as a cycle of its own.
+      text(sessionId, 'background check done. ');
+      autonomousResultUsage(sessionId, 1100);
+      setTimeout(() => {
+        text(sessionId, 'and here is your answer');
+        resultUsage(sessionId, 1300);
+        reply(msg.id, { stopReason: 'end_turn' });
+      }, 120);
+      return;
+    }
+    if (asked.includes('NEXT_PROMPT')) {
+      // An ordinary turn whose output lands in one burst right before its response — the shape
+      // in which a turn that ends on the WRONG stop finishes before its own tail is read. The
+      // loss is a race between the reader and the response, so the burst is sized to lose it
+      // every time: at forty chunks the unfixed code failed one run in three.
+      setTimeout(() => {
+        for (let i = 0; i < 400; i++) text(sessionId, 'part' + i + ' ');
+        resultUsage(sessionId, 1400);
+        reply(msg.id, { stopReason: 'end_turn' });
+      }, 50);
+      return;
+    }
     if (asked.includes('HANG_SILENT')) return;          // never speaks, never answers
     if (asked.includes('HANG_IN_TOOL')) {
       // Opens a tool and then goes quiet — indistinguishable from a long script.
@@ -544,5 +609,112 @@ describe('the silence watchdog distinguishes a hang from a long tool call', () =
     expect(Date.now() - started).toBeGreaterThanOrEqual(TIMEOUT * (1 + TOOL_SILENCE_FACTOR));
     // ...but the ceiling is finite, which is what keeps a wedged tool from pinning the
     // conversation in `running` forever.
+  });
+});
+
+/**
+ * claude-agent-acp #1145: a prompt folded into a cycle Claude Code started on its own is answered
+ * but never settled, so `session/prompt` does not return. Before the workaround the watchdog failed
+ * such a turn ten minutes after its answer had arrived — and the answer's last segment, which in
+ * `once` mode is only sent when the turn ends, went down with it (see turn-failure.test.ts).
+ *
+ * TIMEOUT is chosen so the fold is decided at half of it (see FOLDED_PROMPT_GRACE_MS): every
+ * "ended in time" assertion below is therefore also an assertion that the watchdog did not win.
+ */
+describe('a prompt folded into an autonomous cycle (claude-agent-acp #1145)', () => {
+  const TIMEOUT = 600;
+
+  it('ends the turn once that cycle has gone quiet, instead of failing it as hung', async () => {
+    const { session } = rig({ turnTimeoutMs: TIMEOUT });
+    const turn = collector();
+    const started = Date.now();
+    await session.runTurn({ prompt: 'FOLD_ME', sessionToken: 'tok' }, turn.handlers);
+
+    expect(turn.turn.join('')).toBe('the bridge is reachable; checking the backend. the bridge is online');
+    expect(Date.now() - started).toBeLessThan(TIMEOUT);
+  });
+
+  it("does not let that prompt's late stop end the next turn", async () => {
+    const { session } = rig({ turnTimeoutMs: TIMEOUT });
+    const sink = sinkSpy();
+    sink.install(session);
+    await session.runTurn({ prompt: 'FOLD_ME', sessionToken: 'tok' }, collector().handlers);
+
+    // The adapter settles the stale prompt the moment the next one arrives, ahead of that prompt's
+    // output. A turn that took any `stop` as its own would end right there and leave its reply to
+    // be posted as a "background update".
+    const next = collector();
+    await session.runTurn({ prompt: 'NEXT_PROMPT', sessionToken: 'tok' }, next.handlers);
+    await settle();
+
+    const whole = Array.from({ length: 400 }, (_, i) => `part${i} `).join('');
+    expect(next.turn.join('')).toBe(whole);
+    expect(sink.text).toEqual([]);
+  });
+
+  it('waits for a prompt that was only queued behind the cycle', async () => {
+    const { session } = rig({ turnTimeoutMs: TIMEOUT });
+    const sink = sinkSpy();
+    sink.install(session);
+    const turn = collector();
+    await session.runTurn({ prompt: 'QUEUED_BEHIND', sessionToken: 'tok' }, turn.handlers);
+
+    // Its own output cancelled the wait, and it ended on its own stop — all of it in the turn.
+    expect(turn.turn.join('')).toBe('background check done. and here is your answer');
+    expect(sink.text).toEqual([]);
+  });
+
+  it('leaves a turn with a tool still open to the watchdog', async () => {
+    // A cycle that claims to be over while a tool it opened never reported back is not something
+    // to guess about: the turn keeps its old outcome rather than ending on a maybe.
+    const { session } = rig({ turnTimeoutMs: 200 });
+    await expect(
+      session.runTurn({ prompt: 'FOLD_ME TOOL_OPEN', sessionToken: 'tok' }, collector().handlers)
+    ).rejects.toThrow(/sent no update/);
+  });
+});
+
+describe('autonomousResultOrigin', () => {
+  const usage = (meta?: Record<string, unknown>, cost = true): SessionUpdate =>
+    ({
+      sessionUpdate: 'usage_update',
+      used: 1,
+      size: 2,
+      ...(cost ? { cost: { amount: 0.01, currency: 'USD' } } : {}),
+      ...(meta ? { _meta: meta } : {}),
+    }) as SessionUpdate;
+
+  it('names a cycle the harness started on its own', () => {
+    expect(autonomousResultOrigin(usage({ '_claude/origin': { kind: 'task-notification' } }))).toBe(
+      'task-notification'
+    );
+    expect(autonomousResultOrigin(usage({ '_claude/origin': { kind: 'peer' } }))).toBe('peer');
+  });
+
+  it('says nothing about a prompt’s own cycle, or about anything that is not a result', () => {
+    // The user's own origins, as the adapter classifies them — these settle the prompt normally.
+    expect(autonomousResultOrigin(usage({ '_claude/origin': { kind: 'human' } }))).toBeUndefined();
+    expect(autonomousResultOrigin(usage({ '_claude/origin': { kind: 'channel' } }))).toBeUndefined();
+    expect(autonomousResultOrigin(usage())).toBeUndefined();
+    // A mid-stream snapshot carries no cost, whatever else it says.
+    expect(
+      autonomousResultOrigin(usage({ '_claude/origin': { kind: 'task-notification' } }, false))
+    ).toBeUndefined();
+    expect(autonomousResultOrigin(usage({ '_claude/origin': 'task-notification' }))).toBeUndefined();
+  });
+
+  it('reads the field the installed claude-agent-acp actually sends (contract)', () => {
+    // Hyrum's Law guard for a private extension: if the adapter stops forwarding the result's
+    // origin, folded prompts silently fall back to the ten-minute watchdog. Fail here instead.
+    const dist = readFileSync(
+      createRequire(import.meta.url).resolve('@agentclientprotocol/claude-agent-acp/dist/acp-agent.js'),
+      'utf8'
+    );
+    const send = dist.indexOf('_meta: { "_claude/origin": message.origin }');
+    expect(send).toBeGreaterThan(0);
+    // ...and it is the result-tied usage_update that carries it, cost and all.
+    const before = dist.slice(Math.max(0, send - 600), send);
+    expect(before).toContain('sessionUpdate: "usage_update"');
+    expect(before).toContain('cost: {');
   });
 });

@@ -191,9 +191,10 @@ Do not weaken these without saying so explicitly in the PR:
 
 ## Git
 
-- Branches: work lands on `main`. `dev` was the integration branch through 1.15.1 and is no
-  longer used — do not branch from it or push to it. This also means CI (`ci.yml`, which only
-  triggers on `main`) now actually sees your work before a release does.
+- Branches: `main` is the only branch, and work lands on it. `dev` was the integration branch
+  through 1.15.1; it was deleted on 2026-09-29 (everything on it was already in `main`), so do
+  not recreate it. This also means CI (`ci.yml`, which only triggers on `main`) sees your work
+  before a release does.
 - Merges use `--no-ff` (a real merge commit), never fast-forward.
 - Commits carry no AI attribution or generated-with trailers.
 - User-visible changes get a `CHANGELOG.md` entry under `## [Unreleased]`
@@ -211,7 +212,7 @@ Deployment spans two repositories and three steps. **Do steps 1 and 2. Never do 
 
 | # | step | who |
 |---|---|---|
-| 1 | `npm run release -- X.Y.Z` → push `dev` + the tag → `release.yml` publishes a GitHub Release (tarball + `SHA256SUMS`) | **you** |
+| 1 | `npm run release -- X.Y.Z --push` → pushes `main` + the tag → `release.yml` publishes a GitHub Release (tarball + `SHA256SUMS`) | **you** |
 | 2 | in the `uniagent` repo: `gh workflow run bump-agent-anywhere.yml -f version=X.Y.Z` → multi-arch image to GHCR | **you** |
 | 3 | on the oracle host: `uniagent update` | **the operator, by hand** |
 

@@ -221,6 +221,11 @@ async function open(
      * and must not take the page down with it.
      */
     idb?: IDBFactory | null;
+    /**
+     * localStorage as the page finds it. jsdom gives every page a fresh one, so this is how a
+     * reload carries what the last page wrote: read it off that page's window and pass it here.
+     */
+    storage?: Record<string, string>;
     /** What `confirm()` returns — a destructive control is only half tested by the yes path. */
     confirm?: boolean;
     /** Whether the daemon serves a terminal, which the page is told once at render time. */
@@ -243,6 +248,7 @@ async function open(
     replies = {},
     status = {},
     idb = new IDBFactory(),
+    storage = {},
     confirm = true,
     terminal = false,
     terminalEnd = false,
@@ -263,6 +269,7 @@ async function open(
       Object.defineProperty(w, 'innerWidth', { value: width, configurable: true });
       Object.defineProperty(w, 'innerHeight', { value: height, configurable: true });
       if (idb) (w as any).indexedDB = idb;
+      for (const [k, v] of Object.entries(storage)) w.localStorage.setItem(k, v);
       Object.defineProperty(w.navigator, 'clipboard', {
         configurable: true,
         value: {
@@ -858,6 +865,327 @@ describe('webui page: topics', () => {
     // And the header says the useful half of "running AND waiting on you".
     expect(h.el('topic-status').textContent).toBe('awaiting you');
     expect(h.el('topic-status').className).toBe('chat-status asking');
+  });
+});
+
+/** Every row in a transcript is this tall, and the viewport onto it this tall; see `layout`. */
+const ROW = 100;
+const VIEW = 300;
+
+/**
+ * A layout for `#log`, which jsdom does not have at all: every child is `ROW` pixels tall, the
+ * viewport is `VIEW`, and scrollHeight, clientHeight and every rect follow from the order of the
+ * children and the scrollTop the page last set. That is all scrolling means to the script — it
+ * never reads a style — so it is enough to tell "put back" from "at the bottom".
+ *
+ * scrollTop is clamped on every read AND after every change to the log's children, the way a
+ * browser clamps it at the next layout. The second matters: without it, a position set before a
+ * topic was left would still be sitting in the stub when the topic came back, and a page that
+ * restored nothing at all would pass.
+ */
+function layout(h: Harness): HTMLElement {
+  const log = h.el('log');
+  let top = 0;
+  const clamp = (): number => (top = Math.min(Math.max(0, top), Math.max(0, log.children.length * ROW - VIEW)));
+  Object.defineProperty(log, 'clientHeight', { configurable: true, get: () => VIEW });
+  Object.defineProperty(log, 'scrollHeight', { configurable: true, get: () => Math.max(VIEW, log.children.length * ROW) });
+  Object.defineProperty(log, 'scrollTop', {
+    configurable: true,
+    get: clamp,
+    set: (v: number) => {
+      top = v;
+      clamp();
+    },
+  });
+  new h.window.MutationObserver(clamp).observe(log, { childList: true });
+  const box = (y: number): DOMRect => ({ top: y, bottom: y + ROW, height: ROW, y }) as DOMRect;
+  const own = h.window.Element.prototype.getBoundingClientRect;
+  h.window.Element.prototype.getBoundingClientRect = function (this: Element): DOMRect {
+    if (this === log) return { top: 0, bottom: VIEW, height: VIEW, y: 0 } as DOMRect;
+    if (this.parentNode === log) return box(Array.prototype.indexOf.call(log.children, this) * ROW - clamp());
+    return own.call(this);
+  };
+  return log;
+}
+
+/** `n` agent messages, `line 1` onwards, the way a long topic's ring holds them. */
+function lines(n: number): Array<Record<string, unknown>> {
+  return Array.from({ length: n }, (_, i) => message(`m${i + 1}`, `<p>line ${i + 1}</p>`));
+}
+
+/** The body of the message at the top edge of the viewport, and how much of it is scrolled off. */
+function onTop(log: HTMLElement): { text: string | null | undefined; hidden: number } {
+  const row = log.children[Math.floor(log.scrollTop / ROW)];
+  return { text: row?.querySelector('.b')?.textContent, hidden: log.scrollTop % ROW };
+}
+
+describe('webui page: coming back to a topic', () => {
+  const A = 'a1b2c3d4';
+  const B = 'b2c3d4e5';
+
+  it('puts the reader back on the message they left, not at the bottom', async () => {
+    const h = await open();
+    const log = layout(h);
+    await h.emit(sync(A, lines(20), [A, B]));
+    // A topic never read before opens at the bottom, as it always has.
+    expect(log.scrollTop).toBe(20 * ROW - VIEW);
+
+    // Scrolled up to line 8, with 30px of it above the top edge.
+    log.scrollTop = 730;
+    await h.click(`[data-topic="${B}"]`);
+    await h.click(`[data-topic="${A}"]`);
+
+    // Put back as soon as the cache has painted — not a moment later, when the sync lands, which
+    // would be a visible jump from wherever it was painted first.
+    await until('A is painted from cache', () => h.painted() === 20);
+    expect(onTop(log)).toEqual({ text: 'line 8', hidden: 30 });
+
+    await h.emit(sync(A, lines(20), [A, B]));
+    expect(onTop(log)).toEqual({ text: 'line 8', hidden: 30 });
+  });
+
+  it('finds that message again when the sync puts older ones above it', async () => {
+    // The cache keeps the last 200 messages and the ring holds 500, so a long topic comes back
+    // short and the sync then adds the head of it — above the message being read. Restoring a
+    // scrollTop would land a hundred rows off; this is the reason the view is a message.
+    const h = await open();
+    const log = layout(h);
+    await h.emit(sync(A, lines(210), [A, B]));
+    log.scrollTop = 100 * ROW + 30;
+    expect(onTop(log).text).toBe('line 101');
+
+    await h.click(`[data-topic="${B}"]`);
+    await h.click(`[data-topic="${A}"]`);
+    await until('A is painted from cache', () => h.painted() === 200);
+    expect(onTop(log)).toEqual({ text: 'line 101', hidden: 30 });
+
+    await h.emit(sync(A, lines(210), [A, B]));
+    expect(h.painted()).toBe(210);
+    expect(onTop(log)).toEqual({ text: 'line 101', hidden: 30 });
+  });
+
+  it('brings a topic left at the bottom back to the bottom, with what was said since', async () => {
+    // At the bottom means following along, and the thing to follow is whatever arrived while this
+    // was somewhere else. Putting the reader back on the message they last saw would leave the new
+    // ones under the fold, which is the opposite of what they were doing.
+    const h = await open();
+    const log = layout(h);
+    await h.emit(sync(A, lines(20), [A, B]));
+    await h.click(`[data-topic="${B}"]`);
+    await h.click(`[data-topic="${A}"]`);
+    await until('A is painted from cache', () => h.painted() === 20);
+
+    await h.emit(sync(A, lines(22), [A, B]));
+    expect(log.scrollTop).toBe(22 * ROW - VIEW);
+    expect(onTop(log).text).toBe('line 20');
+  });
+
+  it('does not pull back a reader who scrolled while the topic was still loading', async () => {
+    const h = await open();
+    const log = layout(h);
+    await h.emit(sync(A, lines(20), [A, B]));
+    log.scrollTop = 730;
+    await h.click(`[data-topic="${B}"]`);
+    await h.click(`[data-topic="${A}"]`);
+    await until('A is painted from cache', () => h.painted() === 20);
+
+    // Between the cache and the sync: the transcript is on screen and is being read.
+    log.scrollTop = 200;
+    await h.emit(sync(A, lines(20), [A, B]));
+    expect(log.scrollTop).toBe(200);
+  });
+
+  it('keeps the place in a topic flicked through before it loaded, with no cache to paint it', async () => {
+    // With no IndexedDB, a topic shows placeholders until its sync — and leaving it then must not
+    // be read as "left at the bottom", or passing through on the way somewhere else forgets it.
+    const h = await open({ idb: null });
+    const log = layout(h);
+    await h.emit(sync(A, lines(20), [A, B]));
+    log.scrollTop = 730;
+
+    await h.click(`[data-topic="${B}"]`);
+    await h.click(`[data-topic="${A}"]`);
+    expect(h.skeletons()).toBeGreaterThan(0);
+    await h.click(`[data-topic="${B}"]`);
+    await h.click(`[data-topic="${A}"]`);
+
+    await h.emit(sync(A, lines(20), [A, B]));
+    expect(onTop(log)).toEqual({ text: 'line 8', hidden: 30 });
+  });
+});
+
+/**
+ * One composer serves every topic, so what is in it has to be swapped on the way through — text,
+ * caret and attachments alike. Before, a half-written prompt followed the reader into the next
+ * topic, and so did a pasted screenshot, which then went out with whatever was sent there.
+ */
+describe('webui page: a composer per topic', () => {
+  const A = 'a1b2c3d4';
+  const B = 'b2c3d4e5';
+  const input = (h: Harness): HTMLTextAreaElement => h.el('input') as HTMLTextAreaElement;
+  const stored = (h: Harness): unknown => JSON.parse(h.window.localStorage.getItem('aa_drafts') ?? 'null');
+  const sends = (h: Harness): Call[] => h.calls.filter((c) => c.path === 'api/send');
+
+  /** A screenshot pasted into the page, the way the pasting tests below build one. */
+  const paste = (h: Harness): void => {
+    const file = new h.window.File([new Uint8Array([137, 80, 78, 71])], 'image.png', { type: 'image/png' });
+    const ev = new h.window.Event('paste', { bubbles: true, cancelable: true });
+    Object.defineProperty(ev, 'clipboardData', {
+      value: { items: [{ kind: 'file', type: 'image/png', getAsFile: () => file }] },
+    });
+    h.el('input').dispatchEvent(ev);
+  };
+
+  /** The page going into the background, which is the write that has to survive a discard. */
+  const hide = (h: Harness): void => {
+    Object.defineProperty(h.doc, 'visibilityState', { configurable: true, get: () => 'hidden' });
+    h.doc.dispatchEvent(new h.window.Event('visibilitychange'));
+  };
+
+  it('gives each topic its own text, and puts the caret back where it was', async () => {
+    const h = await open();
+    await h.emit(sync(A, [], [A, B]));
+    input(h).value = 'for A, half written';
+    input(h).setSelectionRange(5, 5);
+
+    await h.click(`[data-topic="${B}"]`);
+    expect(input(h).value).toBe('');
+    input(h).value = 'for B';
+
+    await h.click(`[data-topic="${A}"]`);
+    expect(input(h).value).toBe('for A, half written');
+    expect(input(h).selectionStart).toBe(5);
+
+    await h.click(`[data-topic="${B}"]`);
+    expect(input(h).value).toBe('for B');
+  });
+
+  it('keeps an attachment with the topic it was attached in', async () => {
+    const h = await open();
+    await h.emit(sync(A, [], [A, B]));
+    paste(h);
+    await until('the chip is rendered', () => h.el('chips').textContent === 'pasted-1.png');
+
+    await h.click(`[data-topic="${B}"]`);
+    expect(h.el('chips').textContent).toBe('');
+    input(h).value = 'nothing attached here';
+    await h.click('#composer button[type="submit"]');
+    expect(sends(h)[0]?.body.files).toBeUndefined();
+
+    await h.click(`[data-topic="${A}"]`);
+    expect(h.el('chips').textContent).toBe('pasted-1.png');
+    await h.click('#composer button[type="submit"]');
+    expect((sends(h)[1]?.body.files as unknown[]).length).toBe(1);
+    expect(sends(h)[1]?.body.topic).toBe(A);
+  });
+
+  it('lands a file still being read in the topic it was picked in, not the one switched to', async () => {
+    // FileReader answers a few turns after the paste; a click on another topic in between is
+    // exactly the moment a global list would hand the file to the wrong conversation.
+    const h = await open();
+    await h.emit(sync(A, [], [A, B]));
+    paste(h);
+    h.doc.querySelector<HTMLElement>(`[data-topic="${B}"]`)!.click();
+    for (let i = 0; i < 20; i++) await tick();
+    expect(h.el('chips').textContent).toBe('');
+
+    await h.click(`[data-topic="${A}"]`);
+    expect(h.el('chips').textContent).toBe('pasted-1.png');
+  });
+
+  it('keeps the text across a reload, written when the page is hidden rather than per keystroke', async () => {
+    const first = await open({ url: `http://localhost:8787/?t=${A}` });
+    await first.emit(sync(A, [], [A, B]));
+    input(first).value = 'survives a reload';
+    // Typing alone writes nothing: storage is touched on the way out, not on every key.
+    input(first).dispatchEvent(new first.window.Event('input', { bubbles: true }));
+    expect(stored(first)).toBeNull();
+
+    hide(first);
+    expect(stored(first)).toEqual({ [A]: 'survives a reload' });
+
+    const again = await open({
+      url: `http://localhost:8787/?t=${A}`,
+      storage: { aa_drafts: first.window.localStorage.getItem('aa_drafts')! },
+    });
+    // Before the stream has said anything: the draft is this browser's, not the daemon's.
+    expect(input(again).value).toBe('survives a reload');
+
+    await again.emit(sync(A, [], [A, B]));
+    await again.click('#composer button[type="submit"]');
+    // Sent, so gone — a reload now must not offer it for sending a second time.
+    expect(stored(again)).toEqual({});
+  });
+
+  it('picks up its draft from the first sync when the visit named no topic', async () => {
+    const h = await open({ storage: { aa_drafts: JSON.stringify({ [A]: 'from last time' }) } });
+    expect(input(h).value).toBe('');
+    await h.emit(sync(A, [], [A]));
+    expect(input(h).value).toBe('from last time');
+  });
+
+  it('leaves drafts another tab wrote alone', async () => {
+    const h = await open();
+    await h.emit(sync(A, [], [A, B]));
+    // Written by a second tab on this origin, after this one loaded.
+    h.window.localStorage.setItem('aa_drafts', JSON.stringify({ c3d4e5f6: 'the other tab' }));
+    input(h).value = 'this tab';
+
+    await h.click(`[data-topic="${B}"]`);
+    expect(stored(h)).toEqual({ c3d4e5f6: 'the other tab', [A]: 'this tab' });
+  });
+
+  it('keeps a very long draft in memory only', async () => {
+    // localStorage is one small budget for the whole origin; a pasted log must not fill it and take
+    // the read marks and the drawer state down with it.
+    const h = await open();
+    await h.emit(sync(A, [], [A, B]));
+    const long = 'x'.repeat(70 * 1024);
+    input(h).value = long;
+
+    await h.click(`[data-topic="${B}"]`);
+    expect(stored(h)).toBeNull();
+    await h.click(`[data-topic="${A}"]`);
+    expect(input(h).value).toBe(long);
+  });
+
+  it('touches no storage at all switching between two empty composers', async () => {
+    // Most switches are exactly this, and the draft swap is on the path of every one of them.
+    const h = await open();
+    await h.emit(sync(A, [], [A, B]));
+    const touched: string[] = [];
+    const proto = h.window.Storage.prototype;
+    const get = proto.getItem;
+    const set = proto.setItem;
+    proto.getItem = function (this: Storage, k: string) {
+      if (k === 'aa_drafts') touched.push('get');
+      return get.call(this, k);
+    };
+    proto.setItem = function (this: Storage, k: string, v: string) {
+      if (k === 'aa_drafts') touched.push('set');
+      return set.call(this, k, v);
+    };
+
+    await h.click(`[data-topic="${B}"]`);
+    await h.click(`[data-topic="${A}"]`);
+    expect(touched).toEqual([]);
+  });
+
+  it('forgets the draft of a topic that is deleted, and every draft when all are cleared', async () => {
+    const h = await open({ replies: { 'api/topics/clear': { topic: { id: 'deadbeef', title: '', lastAt: 2000 } } } });
+    await h.emit(sync(A, [], [A, B]));
+    input(h).value = 'for A';
+    await h.click(`[data-topic="${B}"]`);
+    input(h).value = 'for B';
+    await h.click(`[data-topic="${A}"]`);
+    expect(stored(h)).toEqual({ [A]: 'for A', [B]: 'for B' });
+
+    await h.click(`[data-del="${B}"]`);
+    await until('B is forgotten', () => JSON.stringify(stored(h)) === JSON.stringify({ [A]: 'for A' }));
+
+    await h.click('#clear-topics');
+    await until('every draft is gone', () => stored(h) === null);
+    expect(input(h).value).toBe('');
   });
 });
 

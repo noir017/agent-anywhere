@@ -644,6 +644,75 @@ const SCRIPT = `
   function atBottom(){ return log.scrollHeight - log.scrollTop - log.clientHeight < 80; }
   function toBottom(){ log.scrollTop = log.scrollHeight; }
 
+  // ── Where each topic was being read ────────────────────────────────────────
+  /**
+   * The place in a topic to come back to: the first message on screen when it was left, and how
+   * far its top sat from the top of the viewport. No entry means the bottom — which is where a
+   * reader who was following along wants to be, and where whatever was said while they were away
+   * is going to land.
+   *
+   * A message rather than a scrollTop, because the transcript a topic comes back to is not the one
+   * it was left with: it is rebuilt from the cache, which keeps the last 200 messages, and then
+   * reconciled against a ring of 500 — so the sync can put a few hundred older messages above the
+   * one being read. A pixel offset would land in the middle of those; a message does not move.
+   *
+   * In memory only, and with no scroll listener. The whole cost is one measurement on the way out
+   * of a topic, and one or two on the way back in (see land).
+   */
+  var views = {};
+  // The view being restored on the way into the current topic, until its first sync has landed;
+  // and the scrollTop that landing left behind, which is how a reader who has scrolled since is
+  // told apart from one who has not. -1 until something has been landed.
+  var view = null, landedAt = -1;
+
+  /**
+   * The first message whose bottom edge is below the top of the viewport. A binary search, since
+   * the children are in vertical order and a topic can hold 500 of them: every rect after the
+   * first is read off a layout that is already up to date, so this forces one layout, not one per
+   * message.
+   */
+  function firstVisible(){
+    var kids = log.children, top = log.getBoundingClientRect().top;
+    var lo = 0, hi = kids.length;
+    while(lo < hi){
+      var mid = (lo + hi) >> 1;
+      if(kids[mid].getBoundingClientRect().bottom <= top) lo = mid + 1; else hi = mid;
+    }
+    // Past the divider, the waiting line and the placeholders: only a message has a key to find
+    // again.
+    for(var i=lo; i<kids.length; i++){ if(kids[i].getAttribute('data-k')) return kids[i]; }
+    return null;
+  }
+
+  /** Remember where the topic being left was being read. */
+  function saveView(id){
+    if(!id) return;
+    // Still on the way in: nothing on screen yet says more than the view being restored does, so
+    // flicking through a topic before it has loaded must not forget where it was being read. A
+    // reader who has scrolled the cached transcript since it was landed has answered for themselves.
+    if(entering && (landedAt < 0 || log.scrollTop === landedAt)){
+      if(view) views[id] = view; else delete views[id];
+      return;
+    }
+    // No box to measure (the terminal window is over the transcript), or at the bottom, which is
+    // what no entry already means.
+    var el = (log.clientHeight && !atBottom()) ? firstVisible() : null;
+    if(!el){ delete views[id]; return; }
+    views[id] = { key: el.getAttribute('data-k'),
+      off: el.getBoundingClientRect().top - log.getBoundingClientRect().top };
+  }
+
+  /**
+   * Put the reader back where they left this topic, or at the bottom when there is nowhere to put
+   * them: it was left there, it was never read, or the message they were on is no longer held.
+   */
+  function land(){
+    var el = view && els[view.key];
+    if(el) log.scrollTop += el.getBoundingClientRect().top - log.getBoundingClientRect().top - view.off;
+    else toBottom();
+    landedAt = log.scrollTop;
+  }
+
   function clock(ms){
     var d=new Date(ms), p=function(n){ return (n<10?'0':'')+n; };
     return p(d.getHours())+':'+p(d.getMinutes());
@@ -938,7 +1007,10 @@ const SCRIPT = `
    */
   function adopt(list){
     clearSkeleton();
-    var stick = entering || atBottom();
+    // On the way into a topic this is usually the first real paint, so it is where the reader is
+    // put back (land, below). Otherwise the sync got here first and only someone already at the
+    // bottom is kept there.
+    var stick = !entering && atBottom();
     // Captured once: every history node goes in front of the same first live message, which is
     // what keeps them in the order they were said rather than reversing them.
     var anchor = synced ? log.firstChild : null;
@@ -958,7 +1030,7 @@ const SCRIPT = `
     syncEmptyNote();
     // Last, so it is last in the log: what the sync may still add goes under what the cache had.
     showSyncing();
-    if(stick) toBottom();
+    if(entering) land(); else if(stick) toBottom();
   }
 
   function paintTopics(){
@@ -1144,6 +1216,9 @@ const SCRIPT = `
     // The topic being left, written now rather than at the end of its window — in a moment
     // nothing on screen belongs to it any more and there is nothing left to write.
     cacheFlush();
+    // Both read off the topic being left, so both before anything below takes it off screen.
+    saveView(topic);
+    stashDraft(topic);
     topic = id;
     history.replaceState(null,'',urlNow());
     // Before the transcript work below, so the terminal follows the topic in the same frame
@@ -1172,6 +1247,9 @@ const SCRIPT = `
     syncingEl=null;
     entering=true;
     synced=false;
+    view = views[id] || null;
+    landedAt = -1;
+    loadDraft(id);
     // The shape of a transcript while both the cache read and the stream are outstanding. The
     // cache normally answers first and replaces it; nothing about that is guaranteed, which is
     // why the placeholders go in regardless.
@@ -1206,6 +1284,10 @@ const SCRIPT = `
           createTopic();
         }
       }
+      // After the switch, which is what writes down the view and the draft of the topic being
+      // left — this one, when it was the one on screen. The broadcast that is also on its way
+      // prunes the same entries; this is so a draft of a deleted topic is not waiting on it.
+      forget(delId);
     });
   }
 
@@ -1216,16 +1298,24 @@ const SCRIPT = `
       // one for us, so testing ev.topic against an empty string threw away the only sync that
       // visit was ever going to get and left the page an empty shell.
       if(topic && ev.topic !== topic) return;
+      var named = !topic;
       topic = ev.topic;
+      // A visit that named no topic learns only here which room it is in, and so which composer
+      // is its own. Not over anything already typed, though: that was typed into this room.
+      if(named && drafts[topic] && !input.value && !files.length) loadDraft(topic);
       history.replaceState(null,'',urlNow());
       // The other half of "asked for is not shown": a reload straight into terminal mode, or a
       // first visit with no ?t= at all, only learns which topic to point at here.
       applyTerm();
-      // Where the reader was, decided BEFORE the transcript moves under them. Opening a topic goes
-      // to the bottom; a resync after a dropped connection must not yank someone out of the
-      // history they were reading, which is only a choice at all now that the reconcile leaves
-      // their scroll position intact.
-      var stick = entering || atBottom();
+      // Where the reader was, decided BEFORE the transcript moves under them. Opening a topic lands
+      // where it was left (or at the bottom); a resync after a dropped connection must not yank
+      // someone out of the history they were reading, which is only a choice at all now that the
+      // reconcile leaves their scroll position intact. Nor may the sync that finishes OPENING a
+      // topic, once the cache has put the transcript up and the reader has scrolled it — but when
+      // they have not, landing again is what finds their message after the sync has put older
+      // ones above it.
+      var arriving = entering && (landedAt < 0 || log.scrollTop === landedAt);
+      var stick = atBottom();
       entering = false;
       // Which run of the daemon everything in this sync belongs to. Anything already on screen
       // from another one is cached history from here on, whatever it was painted as.
@@ -1247,7 +1337,10 @@ const SCRIPT = `
       commands = ev.commands || [];
       topics = ev.topics || [];
       paintTopics();
-      note.textContent=''; if(stick) toBottom();
+      prune();
+      note.textContent='';
+      if(arriving) land(); else if(stick) toBottom();
+      view = null;
     }
     else if(ev.t==='msg'){
       // Before the upsert: if this is the echo of something typed here, it takes over the node
@@ -1298,6 +1391,9 @@ const SCRIPT = `
           createTopic();
         }
       }
+      // After any switch above, which writes down the view and draft of the topic it leaves — a
+      // topic that has just gone, in that case.
+      prune();
     }
     else if(ev.t==='bye'){ done=true; if(stream) stream.close(); note.textContent='Disconnected. Reload when it is back.'; }
   }
@@ -1390,6 +1486,11 @@ const SCRIPT = `
       cacheClear();
       readCounts={};
       saveReads();
+      // And what was being read and typed in them. topic is cleared below before the switch, so
+      // nothing of the old room is written back on the way out either.
+      views={};
+      drafts={};
+      try { localStorage.removeItem(DRAFTS); } catch(x){}
       // Same as deleting one, for every row at once: the windows belonged to topics that no
       // longer exist, so they are unmounted here rather than left pointing at ids the daemon
       // has forgotten.
@@ -1489,17 +1590,128 @@ const SCRIPT = `
     chips.innerHTML=h;
   }
 
+  // ── A composer per topic ───────────────────────────────────────────────────
+  /**
+   * What each topic's composer held when it was left: the text, where the caret was, and the files
+   * attached. One textarea serves every topic, so before this a half-written prompt followed the
+   * reader into the next topic — and so did its attachments, which is how a screenshot meant for
+   * one conversation got sent into another.
+   *
+   * The text is written through to localStorage, so a reload does not cost it either. Files are
+   * not: they are base64, and a failed message cannot be retried after a reload for the same reason.
+   *
+   * Written when a topic is left, when a message is sent and when the page is hidden — never per
+   * keystroke. visibilitychange is the last event every way out of a page reliably fires (another
+   * tab, the app backgrounded, the window closed), so nothing typed is still only in memory by the
+   * time the browser is free to discard the page. A crash in the foreground can still cost a
+   * draft; a write per keystroke to avoid that is not a trade worth making in a text field.
+   */
+  var DRAFTS='aa_drafts';
+  // Past this a draft is kept in memory only. localStorage is one ~5MB budget for the origin, and a
+  // pasted log that filled it would take down the writes of the read marks and the drawer state too.
+  var DRAFT_MAX=64*1024;
+  var drafts={};
+  (function(){
+    var saved=null;
+    try { saved = JSON.parse(localStorage.getItem(DRAFTS) || 'null'); } catch(x){}
+    if(!saved || typeof saved !== 'object') return;
+    for(var id in saved){
+      var s = saved[id];
+      if(Object.prototype.hasOwnProperty.call(saved, id) && typeof s === 'string' && s)
+        drafts[id] = {text:s, s:s.length, e:s.length, files:[]};
+    }
+  })();
+
+  /**
+   * Write one topic's draft through to storage and leave every other entry as it is ON DISK: a
+   * second tab on this origin keeps drafts of its own, and writing this tab's whole map would put
+   * back ones that tab has since sent. Nothing is written when nothing would change.
+   */
+  function writeDraft(id){
+    try {
+      var all = JSON.parse(localStorage.getItem(DRAFTS) || 'null') || {};
+      var d = drafts[id];
+      var want = (d && d.text && d.text.length <= DRAFT_MAX) ? d.text : undefined;
+      if(all[id] === want) return;
+      if(want === undefined) delete all[id]; else all[id] = want;
+      localStorage.setItem(DRAFTS, JSON.stringify(all));
+    } catch(x){}
+  }
+
+  /**
+   * Take the composer's contents off the topic being left. Storage is only consulted when this
+   * topic had a draft before or has one now — leaving an empty composer for an empty one, which is
+   * most switches, reads and writes nothing.
+   */
+  function stashDraft(id){
+    if(!id) return;
+    var had = Boolean(drafts[id]);
+    if(input.value || files.length)
+      drafts[id] = {text:input.value, s:input.selectionStart, e:input.selectionEnd, files:files};
+    else delete drafts[id];
+    if(had || drafts[id]) writeDraft(id);
+  }
+
+  /**
+   * Put a topic's own composer back — an empty one, when it has none. Each step only when it
+   * changes something: grow() measures the textarea, which forces a layout in the middle of the
+   * switch, and an empty composer replacing an empty one needs neither that nor new chips.
+   */
+  function loadDraft(id){
+    var d = id ? drafts[id] : null;
+    var next = d ? d.text : '', list = d ? d.files : [];
+    var chipsChange = files.length || list.length;
+    files = list;
+    if(chipsChange) renderChips();
+    if(input.value !== next){ input.value = next; suggest(); grow(); }
+    if(d) try { input.setSelectionRange(d.s, d.e); } catch(x){}
+  }
+
+  /** Everything this page remembers about one topic, for a topic that no longer exists. */
+  function forget(id){
+    delete views[id];
+    if(!drafts[id]) return;
+    delete drafts[id];
+    writeDraft(id);
+  }
+
+  /**
+   * Forget the topics the list no longer carries — deleted here, in another tab, or by a clear.
+   * Storage is only touched for a topic that actually had a draft.
+   */
+  function prune(){
+    // An empty list is a list about to be replaced (the page creates a topic in answer), not an
+    // instruction to throw every draft away.
+    if(!topics.length) return;
+    var known={}, id;
+    for(var i=0;i<topics.length;i++) known[topics[i].id]=1;
+    for(id in views) if(!known[id]) delete views[id];
+    for(id in drafts) if(!known[id]) forget(id);
+  }
+
+  // The way out of the page, whichever it is. The hidden transition is "the last reliable time to
+  // save app and user data"; beforeunload and unload are not, since on mobile neither fires when a
+  // tab or the browser itself is closed (developer.chrome.com, Page Lifecycle API, read
+  // 2026-09-29). pagehide is the belt: a second write of an unchanged draft writes nothing.
+  document.addEventListener('visibilitychange', function(){ if(document.visibilityState === 'hidden') stashDraft(topic); });
+  window.addEventListener('pagehide', function(){ stashDraft(topic); });
+
   // The rename argument exists for the clipboard, which is the one source that hands over files
   // the browser has already named badly — see the paste handler below. Everything else passes
   // the name through, and this stays the single place a file becomes a chip.
   function take(list, rename){
+    // The topic this is being attached in, fixed now: FileReader answers a turn or more later, and
+    // a topic switched to in between must not receive a file picked in the one before it.
+    var into = topic;
     for(var i=0;i<list.length;i++){
       (function(f){
         var r=new FileReader();
         r.onload=function(){
           var s=String(r.result), c=s.indexOf(',');
-          files.push({name:(rename ? rename(f) : f.name) || 'file', mime:f.type||'', data:c<0?'':s.slice(c+1)});
-          renderChips();
+          var file={name:(rename ? rename(f) : f.name) || 'file', mime:f.type||'', data:c<0?'':s.slice(c+1)};
+          if(!into || into === topic){ files.push(file); renderChips(); return; }
+          var d = drafts[into] || (drafts[into] = {text:'', s:0, e:0, files:[]});
+          d.files.push(file);
         };
         r.readAsDataURL(f);
       })(list[i]);
@@ -1683,6 +1895,9 @@ const SCRIPT = `
     if(!typed.trim() && !files.length) return;
     var attached = files;
     input.value=''; files=[]; renderChips(); suggest(); grow();
+    // The stored draft of this topic is what was just sent. Left on disk, a reload would put it
+    // back in the composer to be sent again.
+    stashDraft(topic);
     dispatch(typed, attached);
   }
 
@@ -1844,6 +2059,10 @@ const SCRIPT = `
   // longer produce it. A visit with no ?t= has no topic to ask about yet and is restored from
   // the sync instead.
   restore(topic);
+
+  // What was being typed into this topic before the reload. A visit with no ?t= does not know its
+  // topic yet, and picks its draft up from the first sync.
+  if(topic && drafts[topic]) loadDraft(topic);
 
   // Reopens the pane a reload arrived in, when ?t= already named a topic. Without one this
   // does nothing and the sync handler picks it up instead.

@@ -281,6 +281,73 @@ checked — a numbered list that markdown renumbered read as a different message
 the compose box. `.b .raw` in `page.ts` carries the `pre-wrap` that keeps its line breaks, since
 nothing turned them into tags.
 
+## Switching topics
+
+Leaving a topic and coming back used to cost two things. The transcript came back at the bottom
+wherever it had been read, and the composer did not change at all: one textarea serves every
+topic, so a half-written prompt followed you into the next one, and so did its attachments. A
+screenshot pasted in one topic went out with whatever you sent in the next. Both are now per
+topic, and both only do work at the moment of a switch.
+
+**Where you were reading is kept as a message, not as a pixel offset.** On the way out,
+`saveView` records the first message on screen and how far its top sits from the top of the
+viewport. A scrollTop would not survive the way back in. The transcript is rebuilt from the cache,
+which keeps the last 200 messages, and then reconciled against a ring of 500. So on a long topic
+the sync inserts older messages *above* the one being read, and a restored offset would land that
+many rows off. A binary search over `#log`'s children finds that message with one forced layout,
+not one per message.
+
+- **At the bottom means "follow along", and it is recorded as no entry at all.** A topic left at
+  the bottom comes back at the bottom, with whatever was said while you were away on screen.
+  Putting you back on the last message you saw would leave the new ones under the fold, which is
+  the opposite of what you were doing.
+- **`land` runs twice on the way in, and the second time is conditional.** It runs first when the
+  cache paints, which is the first real paint, so there is no visible jump. It runs again when
+  the sync lands, because the sync may have put the head of the topic above the message. The second
+  run only happens if `scrollTop` is still what the first one left: once you have scrolled the
+  cached transcript, it is not the page's to move. A reconnect's sync, as opposed to an entry's,
+  keeps its old rule and only holds someone who is already at the bottom.
+- **Leaving before the topic has loaded keeps the view that was being restored.** Otherwise
+  passing through a topic on the way somewhere else would measure its placeholders, find no
+  message, and forget where it had been read.
+- **Memory only.** Nothing about a reload asks to be put back mid-transcript, and keeping it in
+  memory means there is no write at all.
+
+**The composer is swapped with the topic: text, caret and files** (`stashDraft` / `loadDraft`).
+The text is also written to localStorage under `aa_drafts`, so a reload does not cost it. Files
+are not written: they are base64, and a failed message is not retryable after a reload for the
+same reason. A few decisions here are not obvious:
+
+- **Writes happen when a topic is left, when a message is sent, and when the page is hidden. They
+  never happen per keystroke.** The hidden transition is the last event every way out of a page
+  reliably fires, so nothing typed is still only in memory by the time the browser may discard
+  it. The one case this gives up is a crash in the foreground.
+- **Each write is a read-modify-write of one key, not the whole map.** A second tab on the origin
+  keeps drafts of its own, and writing this tab's map wholesale would put back drafts that tab
+  has since sent.
+- **A switch between two empty composers touches no storage and no DOM.** That is most switches.
+  Storage is only consulted for a topic that had a draft or has one now. `grow()` measures the
+  textarea, which forces a layout mid-switch, so it only runs when the text actually changes.
+  `page.dom.test.ts` pins the no-storage half.
+- **Over 64KB, a draft stays in memory only.** localStorage is one ~5MB budget for the origin, and
+  a pasted log that filled it would also break the writes for the read marks and the drawer state.
+- **A file is attached to the topic it was picked in.** `FileReader` answers a few turns after
+  the paste or pick, and clicking another topic in between used to hand the file to the wrong
+  conversation.
+- **A topic's view and draft go with it**, on a delete, on "Clear all topics", and whenever the list
+  stops carrying an id (`prune`).
+
+Measured in Chromium on switches into a 250-message topic, 31 per run, compared with the code
+before the change. `saveView` costs at most 0.1ms, which is the resolution of Chrome's timer.
+`loadDraft` costs about 1ms, and only when the two
+composers hold different text, which is `grow()`'s layout. Click to transcript painted was
+84.6–90.7ms before and 88.6–92.6ms after, which is within run-to-run noise. The cache read
+(~7ms), `adopt` (~20ms) and the sync handler (~35ms) are where a switch spends its time, and none
+of them changed.
+
+**Not solved here:** a voice recording is the one piece of composer state that still does not
+follow its topic. Stop it after switching, and it goes to the topic on screen.
+
 ## Transport: SSE, not WebSocket
 
 `GET api/events` is an event stream; the page uses the browser's own `EventSource`, which
@@ -724,7 +791,7 @@ events `room.ts` actually emits — asserting on what a person would see: messag
 drawer open or shut, where the URL points. Add to it whenever you touch `page.ts`; the string
 assertions in `page.test.ts` were green throughout the release that rendered nothing.
 
-Three things about it that are not obvious:
+Four things about it that are not obvious:
 
 - **The stubs are installed in `beforeParse`**, before the inline script runs. Evaluating the
   script a second time to hand it a global would register every listener twice. `indexedDB` is
@@ -742,8 +809,18 @@ Three things about it that are not obvious:
   normally.
 - **`jsdom` is pinned to `^27`**, because CI runs Node 20 and jsdom 28+ nests an undici that
   needs a newer one. Read the note in `package.json`'s `comments.pinnedDeps` before bumping it.
+- **There is no layout, so scrolling is faked.** jsdom reports every rect and every `scrollHeight`
+  as 0, so without help `atBottom()` is always true and nothing about [switching
+  topics](#switching-topics) can be seen. `layout()` gives `#log` rows of a fixed height. It
+  clamps `scrollTop` after every change to the log's children, as a browser does at its next
+  layout. Without that clamp, a position set before a topic was left would still be sitting in
+  the stub when the topic came back, and a page that restored nothing would pass. The fake shows
+  *which* message a reader lands on. It cannot show whether the landing looks right, so that part
+  was checked in real Chromium.
 
 The suite is mutation-checked: restoring the sync-guard bug fails eight tests, removing the
 backdrop element fails the whole file, and dropping the 16px field rule, the safe-area padding,
 the collapsed-drawer offset or the narrow-screen focus guard each fails exactly the test that
-names it — including when a rule is *moved out* of the `@media` block rather than deleted.
+names it — including when a rule is *moved out* of the `@media` block rather than deleted. The
+same was done for switching topics: fifteen mutations, one per decision in that section, and
+each fails the test written for it.

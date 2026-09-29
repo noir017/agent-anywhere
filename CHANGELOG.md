@@ -5,6 +5,34 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **Web UI: coming back to a topic puts you where you were reading.** Switching topics used to
+  land every transcript at the bottom, so reading back through a long answer, checking another
+  topic, and returning meant finding the place again by hand. The page now remembers the message
+  at the top of the screen when you leave, and how far it was scrolled, and puts you back on it.
+  That is a message, not a scroll offset, because on a long topic the transcript comes back from a
+  200-message cache and the sync then adds older messages above it: in Chromium, on a
+  250-message topic, the same message comes back to within a pixel after both the cache and the
+  sync. A topic you left at the bottom still comes back at the bottom, with whatever arrived while
+  you were away on screen. Once you have scrolled a topic that is still loading, the sync that
+  finishes it no longer pulls you back. The position is kept in memory only, so a reload still
+  opens at the bottom.
+
+### Fixed
+
+- **Web UI: each topic has its own composer.** One text box served every topic, so a half-written
+  prompt followed you into the next topic. So did its attachments, and a screenshot pasted in one
+  conversation went out with the next message sent in another. Text, caret position and
+  attachments now belong to the topic they were typed in. The text is also saved in the browser,
+  so a reload keeps it. It is saved when you switch topics, send, or put the page in the
+  background, never on each keystroke. Attachments stay in memory, for the same reason a failed
+  message cannot be retried after a reload. A draft over 64 KB stays in memory too, so it cannot
+  fill the browser's storage. Deleting a topic, or clearing all of them, throws its draft away.
+  Neither change costs anything measurable: switching between two empty composers touches no
+  storage and no DOM, and in Chromium a switch into a 250-message topic took 88.6–92.6 ms
+  afterwards, against 84.6–90.7 ms before, which is within run-to-run noise.
+
 ## [1.34.2] - 2026-09-29
 
 ### Fixed

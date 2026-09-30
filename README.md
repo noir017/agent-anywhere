@@ -38,7 +38,7 @@ streams its answer into a single, live-edited message.
 - **Chat actions** — the agent sends files, reacts, replies, opens threads, reads history, asks button questions.
 - **Attachments** — inbound images and files are downloaded and handed to the agent.
 - **Voice messages** — a voice note is transcribed (Gemini), shown to you labelled as a transcript, and sent on as your message once you tap ✅ — or at once, if you turn confirmation off.
-- **Topics are first-class** — a Telegram topic, Feishu topic (话题), Slack thread or Discord thread is its own conversation, with its own agent; sticky per conversation, `/oc` to switch.
+- **Topics are first-class** — a Telegram topic, Feishu topic (话题), Slack thread or Discord thread is its own conversation, with its own agent; a topic keeps the agent it started with.
 - **Persistent conversations** — survive restarts; reset via `/new`, interrupt a turn with `/stop`, end a stuck agent's process with `/kill`; scoped per thread, channel, user, or globally. Idle ones release their agent process and resume from it on the next message.
 - **Small config** — five sections, typed credentials, `${VAR}` and `.env` expansion; `/setting` edits the handful of fields worth changing from chat.
 
@@ -338,15 +338,19 @@ An **agent command** is named after its harness — `/cc` claude, `/oc` opencode
 are registered. It does two things:
 
 ```
-/oc fix the failing test    →  switch this conversation to opencode, and ask it
-/oc                         →  switch, then ask WHERE (a new conversation),
+/oc fix the failing test    →  answer this conversation with opencode, and ask it
+/oc                         →  choose opencode, then ask WHERE (a new conversation),
                                or list opencode's own commands (an ongoing one)
 ```
 
-The binding is **sticky**: everything after `/oc` keeps going to opencode until
-you name someone else, and switching back resumes that agent's own thread rather
-than restarting it. The full harness name (`/opencode`) still works if you type
-it — it is just not registered, so it costs no slot in the platform menu.
+The binding is **sticky**: everything after `/oc` keeps going to opencode. And
+once that agent has a session in the topic, **the topic keeps it** — naming a
+different agent there is refused, with the session id and working directory of
+the one that is answering. To carry the work on with another agent, open a new
+topic, start it with that agent's command, and hand it the id: it can read the
+earlier conversation itself. `/new` clears a topic, after which any agent can
+take it. The full harness name (`/opencode`) still works if you type it — it is
+just not registered, so it costs no slot in the platform menu.
 
 A name whose harness you have **not** configured (`/agy` with no `harness: agy`
 agent) is answered with exactly that, and runs no turn — otherwise it reaches

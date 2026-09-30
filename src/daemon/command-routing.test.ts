@@ -71,18 +71,32 @@ const clock = {
 /** Let the merge window elapse and the turn reach the agent stub. */
 const drain = (): Promise<void> => new Promise((r) => setTimeout(r, 20));
 
-/** Rig: records outbound text, the prompts that reached an agent, and picker hook calls. */
-function rig(cfg: Config = baseConfig, persistedAgent?: string) {
-  const prompts: Array<{ sessionId: string; prompt: string }> = [];
+/**
+ * Rig: records outbound text, the prompts that reached an agent, and picker hook calls.
+ *
+ * The store stub is stateful, because the agent-switch lock reads it: `persistedAgent` and
+ * `persistedSessions` simulate what a previous daemon run left in conversations.json, and with
+ * `startsSessions` every turn records a session id for the agent that ran it — which is what the
+ * real runtimes do at `session/new`, and the condition that locks a topic to its agent.
+ */
+function rig(
+  cfg: Config = baseConfig,
+  persistedAgent?: string,
+  opts: { persistedSessions?: Record<string, string>; startsSessions?: boolean } = {}
+) {
+  const prompts: Array<{ sessionId: string; agentId: string; prompt: string }> = [];
   const sessions = new Map<string, AgentSession>();
+  let bound = persistedAgent;
+  let agentSessions: Record<string, string> = { ...(opts.persistedSessions ?? {}) };
   const factory: AgentFactory = {
-    getOrCreate(conversationId) {
+    getOrCreate(conversationId, agentId) {
       let s = sessions.get(conversationId);
       if (!s) {
         s = {
           conversationId,
           runTurn: async (input) => {
-            prompts.push({ sessionId: conversationId, prompt: input.prompt });
+            prompts.push({ sessionId: conversationId, agentId, prompt: input.prompt });
+            if (opts.startsSessions) agentSessions[agentId] = `sess-${agentId}`;
           },
           abort: () => {},
           dispose: () => {},
@@ -116,16 +130,23 @@ function rig(cfg: Config = baseConfig, persistedAgent?: string) {
     factory,
     clock,
     { onPickerRequest: (sessionId, agentId) => void pickerCalls.push({ sessionId, agentId }) },
-    // Store stub. `persistedAgent` simulates a binding left by a previous daemon run.
+    // Store stub, stateful for the switch lock (see the rig's doc).
     {
-      boundAgent: () => persistedAgent,
-      bind: () => {},
-      agentSession: () => undefined,
+      boundAgent: () => bound,
+      bind: (_k: string, agentId: string) => {
+        bound = agentId;
+      },
+      agentSession: (_k: string, agentId: string) => agentSessions[agentId],
       setAgentSession: () => {},
-      clear: () => {},
+      clear: () => {
+        bound = undefined;
+        agentSessions = {};
+      },
       conversationCwd: () => undefined,
       setConversationCwd: () => {},
-      clearAgentSessions: () => {},
+      clearAgentSessions: () => {
+        agentSessions = {};
+      },
       // Naming reads these on the way into every turn; a stub without them would fail the turn.
       conversationTitle: () => undefined,
       titlePinned: () => false,
@@ -243,9 +264,10 @@ describe('bare agent command → harness picker', () => {
     expect(prompts).toEqual([]); // the picker is UI, never a prompt
   });
 
-  it('switches first when the conversation is on another harness, then offers ITS commands', async () => {
+  it('switches first when the conversation has no session yet, then offers ITS commands', async () => {
     // The old picker answered "does not apply here, switch with /<agent> first" — advice the
-    // command itself can follow, since a bare `/oc` is also how you switch.
+    // command itself can follow, since a bare `/oc` is also how you choose. Only while there is no
+    // session to strand, though: see "a topic keeps its agent" below for the locked case.
     const { send, pickerCalls, prompts } = rig();
     await send('/cc hello'); // bind to claude
     await send('/oc');
@@ -471,7 +493,9 @@ describe('sticky agent binding (the reported bug)', () => {
     expect(prompts[1]!.prompt).toContain('second turn');
   });
 
-  it('an explicit /name rebinds, and the next plain message follows the NEW agent', async () => {
+  it('an explicit /name still chooses while no session exists, and the next plain message follows it', async () => {
+    // The rig's agents record no session id, so nothing locks the topic yet — this is choosing an
+    // agent, not switching one (the locked case is its own suite below).
     const { send, prompts, sent } = rig();
 
     await send('/oc hi');
@@ -479,6 +503,7 @@ describe('sticky agent binding (the reported bug)', () => {
     await send('still you');
 
     expect(prompts.map((p) => p.sessionId)).toEqual([KEY, KEY, KEY]);
+    expect(prompts.map((p) => p.agentId)).toEqual(['oc', 'cc', 'cc']);
     expect(sent.some((t) => t.includes('is answering this conversation now'))).toBe(true);
   });
 
@@ -510,9 +535,9 @@ describe('sticky agent binding (the reported bug)', () => {
  * opposite ways, which is why each gets a case.
  */
 describe('first message after a restart', () => {
-  it('an explicit /cc outranks the persisted binding', async () => {
-    // The user just said who they want. Reading the store first would make this message answer as
-    // whoever was bound before and ignore its own prefix.
+  it('an explicit /cc outranks a persisted binding that never got a session', async () => {
+    // The user just said who they want, and nothing is lost by it. Reading the store first would
+    // make this message answer as whoever was bound before and ignore its own prefix.
     const { send, sent } = rig(baseConfig, 'oc');
     await send('/cc hello');
     // No rebind notice: this is the conversation's first binding in this run, not a switch.
@@ -528,5 +553,80 @@ describe('first message after a restart', () => {
     // routing.default is cc; the persisted binding must win.
     expect(sent.some((t) => t.includes('🤖 opencode'))).toBe(true);
     expect(sent.some((t) => t.includes('🤖 claude'))).toBe(false);
+  });
+
+  it('a persisted session holds the topic to its agent even with no in-memory state', async () => {
+    // The lock reads the store, not the registry's map, precisely so a restart is not a way around it.
+    const { send, sent, prompts } = rig(baseConfig, 'oc', { persistedSessions: { oc: 'ses_abc' } });
+    await send('/cc hello');
+    expect(prompts).toEqual([]);
+    expect(sent.some((t) => t.includes('does not switch agents') && t.includes('`ses_abc`'))).toBe(true);
+  });
+});
+
+/**
+ * A topic keeps the agent it started with, once that agent has a session there (2026-09-30).
+ *
+ * Switching in place was possible before and unused in practice; what it produced was a topic whose
+ * tag, header and history named one agent while another answered blind. The refusal hands over what
+ * the next agent needs instead — its session id and directory — and every case below asserts the
+ * negatives too: no turn, no picker, no binding change.
+ */
+describe('a topic keeps its agent', () => {
+  it('refuses /oc in a topic claude has a session in, and says where the session is', async () => {
+    const { send, sent, prompts } = rig(baseConfig, undefined, { startsSessions: true });
+    await send('/cc hi');
+    await send('/oc take over');
+    expect(prompts.map((p) => p.agentId)).toEqual(['cc']);
+    const refusal = sent.find((t) => t.includes('does not switch agents'))!;
+    expect(refusal).toContain('stays with claude');
+    expect(refusal).toContain('`sess-cc`');
+    // The command to use in the new topic is the registered short form, not the harness name.
+    expect(refusal).toContain('`/oc`');
+    expect(sent.some((t) => t.includes('is answering this conversation now'))).toBe(false);
+  });
+
+  it('keeps answering with the bound agent after a refusal', async () => {
+    const { send, prompts } = rig(baseConfig, undefined, { startsSessions: true });
+    await send('/cc hi');
+    await send('/oc take over');
+    await send('carry on');
+    expect(prompts.map((p) => p.agentId)).toEqual(['cc', 'cc']);
+    expect(prompts[1]!.prompt).toContain('carry on');
+  });
+
+  it('refuses the bare form too, without opening the other agent\'s menu', async () => {
+    const { send, sent, prompts, pickerCalls } = rig(baseConfig, undefined, { startsSessions: true });
+    await send('/cc hi');
+    await send('/oc');
+    expect(pickerCalls).toEqual([]);
+    expect(prompts).toHaveLength(1);
+    expect(sent.some((t) => t.includes('does not switch agents'))).toBe(true);
+  });
+
+  it('naming the agent already bound is not a switch', async () => {
+    const { send, sent, prompts } = rig(baseConfig, undefined, { startsSessions: true });
+    await send('/cc hi');
+    await send('/cc more please');
+    expect(prompts.map((p) => p.agentId)).toEqual(['cc', 'cc']);
+    expect(sent.some((t) => t.includes('does not switch agents'))).toBe(false);
+  });
+
+  it('/new empties the topic, after which any agent can take it', async () => {
+    const { send, sent, prompts } = rig(baseConfig, undefined, { startsSessions: true });
+    await send('/cc hi');
+    await send('/new');
+    await send('/oc fresh start');
+    expect(prompts.map((p) => p.agentId)).toEqual(['cc', 'oc']);
+    expect(sent.some((t) => t.includes('does not switch agents'))).toBe(false);
+  });
+
+  it('a daemon command behind the prefix still works — `/oc /new` clears the topic', async () => {
+    const { send, sent, prompts } = rig(baseConfig, undefined, { startsSessions: true });
+    await send('/cc hi');
+    await send('/oc /new');
+    expect(sent.some((t) => t.includes('Context cleared'))).toBe(true);
+    expect(sent.some((t) => t.includes('does not switch agents'))).toBe(false);
+    expect(prompts).toHaveLength(1);
   });
 });

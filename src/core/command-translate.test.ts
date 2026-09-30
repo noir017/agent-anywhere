@@ -169,8 +169,9 @@ describe('agentCommandSpecs', () => {
   it('describes every agent command with one phrasing', () => {
     // agy read "Switch this conversation to agy" while its neighbours read "Switch to claude — …",
     // so one menu described the same action two ways and agy looked like a different kind of entry.
+    // The verb itself is "Use" since topics stopped switching agents (2026-09-30).
     const specs = agentCommandSpecs({ agents: [agent('g', 'agy'), agent('cc', 'claude')] });
-    for (const spec of specs) expect(spec.description).toMatch(/^Switch to [a-z]+(?: —|$)/);
+    for (const spec of specs) expect(spec.description).toMatch(/^Use [a-z]+(?: —|$)/);
   });
 
   it('every description fits the Discord 100-char cap', () => {

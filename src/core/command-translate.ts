@@ -446,9 +446,11 @@ export function genericNativeNames(harness: Harness | undefined): Set<string> {
 /**
  * One agent command per configured harness (`/cc`, `/oc`, `/agy`, …), deduped and ordered stably.
  *
- * `/<cmd> <prompt>` switches the conversation to that agent and asks it; the bare `/<cmd>` binds
- * and then offers the agent's own harness-specific commands, which are deliberately NOT registered
- * globally (see the file header for why a union menu could not attribute or route them).
+ * `/<cmd> <prompt>` asks that agent — choosing it for a conversation that has none yet; a topic
+ * whose agent already has a session keeps it, and is refused with a handover note instead (see
+ * ConversationRegistry.refuseAgentSwitch). The bare `/<cmd>` binds and then offers the agent's own
+ * harness-specific commands, which are deliberately NOT registered globally (see the file header
+ * for why a union menu could not attribute or route them).
  *
  * Ordered by the registered name so the menu is stable across restarts and config edits.
  */
@@ -463,12 +465,13 @@ export function agentCommandSpecs(cfg: Pick<Config, 'agents'>): SlashCommandSpec
     .map(({ harness, cmd }) => ({
       name: cmd.name,
       // Names what the command DOES, since the short name no longer says it. One phrasing for
-      // every agent command — `Switch to <harness>` — because a menu whose entries describe the
-      // same action in two different sentences reads as two different features; the bare form is
-      // then advertised only on a harness that actually has a list to show.
+      // every agent command — `Use <harness>` — because a menu whose entries describe the same
+      // action in two different sentences reads as two different features; the bare form is then
+      // advertised only on a harness that actually has a list to show. "Use", not "Switch to":
+      // a topic with a session no longer switches, so the old verb promised what the tap refuses.
       description: cmd.picker
-        ? `Switch to ${harness} — alone, lists its own commands`
-        : `Switch to ${harness}`,
+        ? `Use ${harness} — alone, lists its own commands`
+        : `Use ${harness}`,
     }));
 }
 
@@ -493,7 +496,7 @@ export function buildHelpText(
 
   const agents = agentCommandSpecs(cfg);
   if (agents.length > 0) {
-    lines.push('', '**Agents** — `/<cmd> <prompt>` asks it; alone, switches and lists its commands');
+    lines.push('', '**Agents** — `/<cmd> <prompt>` asks it; alone, lists its commands. A topic keeps the agent it started with; `/new` to choose again');
     // Named by harness rather than reusing the menu description, which repeats the line above:
     // the menu has no header to carry that explanation, this section does.
     for (const spec of agents) lines.push(`\`/${spec.name}\` — ${harnessForCommand(spec.name)}`);

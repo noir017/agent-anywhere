@@ -53,7 +53,8 @@ ConversationRegistry.route
    ├─ /kill              /stop, then end the agent child; the session id is kept. Never forwarded.
    ├─ /help              the registered vocabulary, from core/command-translate. Never forwarded.
    ├─ unconfigured agent `/agy` with no agy agent → say so, run no turn. Never forwarded.
-   ├─ bind or rebind     new conversation → bind; explicit `/oc` → rebind; else keep the bound agent
+   ├─ agent switch lock  explicit `/oc` in a topic whose agent has a session → refuse, hand over its id
+   ├─ bind or rebind     new conversation → bind; explicit `/oc` with no session yet → rebind; else keep
    ├─ bare command       `/oc` alone → its command menu, or a binding ack if it reports none
    ├─ voice message      audio and nothing else → VoiceIntake: transcribe, card, and — on ✅ Send —
    │                     back into route() as typed text. Nothing reaches the merger until then.
@@ -172,8 +173,20 @@ on platform or channel only supplies that conversation's default answerer.
 | situation | what happens |
 |---|---|
 | conversation is new | bind the resolved agent (or the one the store remembers, after a restart) |
-| existing + explicit `/oc` | **rebind**: dispose the outgoing subprocess, keep its stored session id |
+| existing + explicit `/oc`, bound agent has **no** session id yet | **rebind** — this is still choosing: nothing to strand |
+| existing + explicit `/oc`, bound agent **has** a session id | **refuse** (`refuseAgentSwitch`): no turn, no rebind; the reply carries the bound agent's session id and directory |
 | existing + not explicit | **use the bound agent** — the fix for the reported bug |
+
+**A topic keeps its agent** (2026-09-30). Switching in place used to be supported, and was
+unused: none of the 335 conversations on the live deployment had ever held two agents'
+sessions. What it cost was a topic whose `[cc]` tag, header and history described one agent
+while another answered it blind. So a topic whose agent has a session is locked to it, and
+the refusal is written as a handover — the session id and working directory are exactly what
+another agent, in a new topic, needs to read the earlier conversation off disk. `/new` (and
+`/cd`, which also drops the ids) empties a topic, after which naming any agent is choosing
+again. The check reads the **store**, not in-memory state, so the first message after a
+restart is held to the same rule. It sits after the daemon commands, so `/oc /new` still
+clears, and before the pending-question check, so `/oc …` is never filed as an answer.
 
 A non-command rule deliberately does *not* rebind an existing conversation: re-applying
 it on every message would make the binding impossible to change, and stickiness
@@ -212,9 +225,9 @@ orchestration.
 decides the store's shape: `ConversationStore` (`<configDir>/conversations.json`) holds,
 per conversation, the bound agent *and* a map of `agentId → that agent's own session id`.
 
-Keying sessions by `(conversation, agent)` is what makes `/oc` → `/cc` → `/oc` *resume*
-opencode's thread instead of starting over — and what stops claude from ever being handed
-opencode's session id. The harness keeps the actual history on its own disk; this only
+Keying sessions by `(conversation, agent)` is what stops claude from ever being handed
+opencode's session id — and what once made `/oc` → `/cc` → `/oc` *resume* opencode's thread,
+before topics stopped switching agents (above). The harness keeps the actual history on its own disk; this only
 remembers *which* of its sessions belongs where, so a restarted daemon can `session/load`
 it (ACP) or pass `--conversation` (agy) rather than starting blank.
 

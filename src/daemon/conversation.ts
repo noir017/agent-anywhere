@@ -234,6 +234,28 @@ const KILL_ACK: Record<KillOutcome, string> = {
 };
 
 /**
+ * What a refused agent switch says (see ConversationRegistry.refuseAgentSwitch).
+ *
+ * Carries the session id and the directory because those two are what the NEXT agent needs to find
+ * this conversation on disk — the refusal is a handover note, not just a no. Both are in code spans
+ * so a tap copies them whole on a phone.
+ */
+export function agentSwitchRefusalText(p: {
+  bound: string;
+  wanted: string;
+  wantedCommand: string;
+  sessionId: string;
+  workdir?: string;
+}): string {
+  return [
+    `This topic stays with ${p.bound} — a topic does not switch agents once it has a session.`,
+    `• ${p.bound} session id: \`${p.sessionId}\``,
+    ...(p.workdir ? [`• Working directory: \`${p.workdir}\``] : []),
+    `To continue with ${p.wanted}, open a new topic, start it with \`${p.wantedCommand}\` and give it that session id — it can find the earlier conversation itself. (\`/new\` here clears this topic, and then any agent can take it.)`,
+  ].join('\n');
+}
+
+/**
  * How often the idle sweeper looks for conversations to reclaim.
  *
  * Independent of session.idleTimeoutMs, and deliberately coarse: the deadline it enforces is
@@ -831,6 +853,12 @@ export class ConversationRegistry {
     // Commands the gateway answers itself, before any agent sees them.
     if (this.answerDaemonCommand(key, msg, address, choice.agentId)) return;
 
+    // A topic keeps the agent it started with (see refuseAgentSwitch). After the daemon commands,
+    // so `/oc /new` still clears the topic — the one route to choosing again — and before the
+    // pending-question check, so a `/oc …` typed while a question is on screen is refused rather
+    // than filed away as its answer with the prefix silently eaten.
+    if (this.refuseAgentSwitch(key, choice, address, msg)) return;
+
     // A question is on screen and this message is the answer to it (see answersPendingQuestion).
     // Placed here deliberately:
     //
@@ -1181,14 +1209,64 @@ export class ConversationRegistry {
   }
 
   /**
-   * Move a conversation to a different agent, on an explicit `/name`.
+   * Refuse to move a topic that already has a session to a different agent, and hand the user what
+   * they need to carry the work elsewhere. Returns true when it refused (no turn runs, nothing binds).
    *
-   * What is disposed and what is NOT is the whole point:
+   * ── Why a topic does not switch ─────────────────────────────────────────────────────────────
+   * A topic is one piece of work with one agent's context behind it. Switching in place used to be
+   * supported (the store keeps a session id per agent so `/oc` → `/cc` → `/oc` could resume), and
+   * on 2026-09-30 none of the 335 conversations on the live deployment had ever held more than one
+   * agent's session: the feature was unused, while its cost was real — the topic's `[cc]` tag, its
+   * header and its history all describe an answerer who is no longer there, and the new agent
+   * starts blind in a place that looks like it has context. So the rule is now the operator's: to
+   * continue with another agent, open another topic and give that agent the session id — it can
+   * read the earlier conversation off disk itself (a claude session id is literally the file name,
+   * `~/.claude/projects/<dir>/<id>.jsonl`), which is a better handover than a context-free rebind.
+   *
+   * ── What still switches ─────────────────────────────────────────────────────────────────────
+   * Only a topic whose bound agent has a session id on record is locked. Before that there is
+   * nothing to strand — a new topic, one whose first turn never got a session up, or one that
+   * `/new` (or `/cd`, which also drops the ids) has just emptied — so naming an agent there is
+   * CHOOSING one, and rebind() still does it. Naming the agent already bound is not a switch at all.
+   *
+   * The id is read from the store rather than from in-memory state so the first message after a
+   * restart is held to the same rule: in-memory state is gone then, the session is not.
+   */
+  private refuseAgentSwitch(
+    key: ConversationId,
+    choice: AgentChoice,
+    address: ConversationAddress,
+    msg: InboundMessage
+  ): boolean {
+    if (!choice.explicit) return false;
+    const bound = this.conversations.get(key)?.agentId ?? this.store?.boundAgent(key);
+    if (!bound || bound === choice.agentId) return false;
+    const sessionId = this.store?.agentSession(key, bound);
+    if (sessionId === undefined) return false;
+    console.log(`[conversation] ${key} is bound to "${bound}" with a session; refused a switch to "${choice.agentId}"`);
+    const text = agentSwitchRefusalText({
+      bound: agentDisplayName(findAgent(this.config, bound), bound),
+      wanted: agentDisplayName(findAgent(this.config, choice.agentId), choice.agentId),
+      wantedCommand: `/${harnessCommandName(findAgent(this.config, choice.agentId)?.harness) ?? choice.agentId}`,
+      sessionId,
+      workdir: this.workdirOf(key, bound),
+    });
+    void this.platforms
+      .get(msg.conversation.platform)
+      ?.sendMessage(address, text)
+      .catch((e) => console.warn('[conversation] failed to refuse an agent switch:', e instanceof Error ? e.message : e));
+    return true;
+  }
+
+  /**
+   * Move a conversation to a different agent, on an explicit `/name` — reached only while the
+   * conversation has no session to lose (see refuseAgentSwitch, which answers everything else).
+   *
+   * What is disposed and what is NOT:
    *  - the OUTGOING agent's subprocess is disposed, because leaving it resident would keep
    *    streaming into a conversation it no longer owns;
-   *  - its persisted session id is KEPT, so `/oc` later resumes opencode's own thread rather than
-   *    restarting the user's task. The agent owns its context; this gateway only decides who is
-   *    being addressed right now.
+   *  - any session id the INCOMING agent already has here is kept and resumed. With the switch
+   *    lock that only happens on a conversation that held two agents before the lock existed.
    *
    * The header is re-armed because the answerer changed — that is exactly what it reports.
    */

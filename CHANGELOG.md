@@ -5,6 +5,20 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **A topic keeps the agent it started with.** Naming another agent (`/oc …`, or `/oc` alone) in
+  a topic whose agent already has a session used to switch the topic over in place. That was
+  unused — none of the 335 conversations on the live deployment had ever held two agents'
+  sessions — and what it produced was a topic whose tag, header and history named one agent while
+  another answered it with none of that context. It is now refused, and the refusal is a handover
+  note: the answering agent's session id and working directory, in code spans so a tap copies
+  them. To carry the work on with another agent, open a new topic with that agent's command and
+  give it the id; it can read the earlier conversation off disk itself (a Claude Code session id
+  is the transcript's file name). A topic with no session yet — a new one, one whose first turn
+  never got a session started, or one `/new` has just cleared — still takes whichever agent you
+  name. The menu entries now read "Use claude" rather than "Switch to claude".
+
 ## [1.35.0] - 2026-09-29
 
 ### Changed

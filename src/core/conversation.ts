@@ -116,6 +116,54 @@ export function parseAddress(s: string): ConversationAddress {
 }
 
 /**
+ * A textual `--channel` / `--to` value, parsed: the address, and the platform INSTANCE it named,
+ * if it named one.
+ *
+ * `platform` is absent for the original form (`<channel>[/<thread>]`), which means "on the platform
+ * the calling conversation is on" — an address alone cannot identify a platform, and that form
+ * predates there being any way to say which one.
+ */
+export interface ChannelTarget {
+  platform?: string;
+  address: ConversationAddress;
+}
+
+/**
+ * Separator between the instance id and the address in a qualified target (`tg:5865716608/8068`).
+ *
+ * `:` is safe on the LEFT even though channel ids may contain it (see ADDRESS_SEP): instance ids are
+ * `[a-z0-9][a-z0-9_-]{0,31}` (config/schema.ts), so the first `:` is the only candidate, and it is
+ * taken as a separator only when what precedes it is a configured instance. A channel id that
+ * happens to start with `<an instance id>:` would be misread — named here because it is the one
+ * input this cannot tell apart, and no platform in the tree mints ids of that shape.
+ */
+const TARGET_SEP = ':';
+
+/**
+ * `<instance>:<channel>[/<thread>]` — what `channels` prints and what a cross-platform target takes.
+ * Round-trips through parseTarget whenever `platform` is a configured instance.
+ */
+export function formatTarget(platform: string, a: ConversationAddress): string {
+  return `${platform}${TARGET_SEP}${formatAddress(a)}`;
+}
+
+/**
+ * Parse a target, qualified or not, VALIDATING the address part exactly as parseAddress does.
+ *
+ * `instances` is the set of configured platform instance ids — the only way to know whether a
+ * leading `x:` is a platform or part of a channel id. Unqualified input keeps its old meaning, so
+ * every `--channel` value that worked before still does.
+ */
+export function parseTarget(s: string, instances: ReadonlySet<string>): ChannelTarget {
+  const i = s.indexOf(TARGET_SEP);
+  if (i > 0) {
+    const platform = s.slice(0, i);
+    if (instances.has(platform)) return { platform, address: parseAddress(s.slice(i + 1)) };
+  }
+  return { address: parseAddress(s) };
+}
+
+/**
  * Whether one config entry (a textual address an operator wrote) selects `a`.
  *
  * Two forms, and the second is the one that had to change: `<chat>/<thread>` names exactly
@@ -147,7 +195,9 @@ export function addressListed(list: readonly string[], a: ConversationAddress): 
 /**
  * Field separator for conversation keys. `#` is not `/` (the address separator) on
  * purpose: a key is not an address and must never be parsed as one. Keys are opaque
- * map/JSON keys — nothing in the codebase parses them back.
+ * map/JSON keys — the one exception is core/channel-list.ts laneFromLegacyKey, a
+ * migration aid for records written before the store kept each conversation's lane,
+ * which says there why it is safe.
  */
 const KEY_SEP = '#';
 

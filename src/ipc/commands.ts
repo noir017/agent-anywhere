@@ -1,4 +1,5 @@
 import type { IpcAction } from './protocol.js';
+import { DEFAULT_CHANNEL_LIMIT } from './protocol.js';
 
 /**
  * Reverse-command catalog: single source of truth.
@@ -57,7 +58,8 @@ export interface ReverseCommandSpec {
 /** The "target channel" option shared by all reverse commands; empty = current session. */
 export const CHANNEL_OPTION: ReverseOption = {
   flags: '-c, --channel <id>',
-  description: 'target channel (defaults to the current session)',
+  description:
+    'target channel: <channel>[/<thread>] on this platform, or <instance>:<channel>[/<thread>] on any (ids from `agent-anywhere channels`; defaults to the current conversation)',
 };
 
 const str = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
@@ -276,5 +278,32 @@ export const REVERSE_COMMANDS: ReverseCommandSpec[] = [
     // spoken would only invite second-guessing text that has already been checked. The command is
     // for the rare turn where a message reads like a mishearing; `--help` and the bundled skill
     // document it.
+  },
+  {
+    usage: 'channels',
+    description:
+      'List the chats and topics this gateway can post to, with the ids --channel accepts (TOON table on stdout)',
+    options: [
+      { flags: '-p, --platform <instance>', description: 'only this platform instance (e.g. tg, web)' },
+      { flags: '-q, --query <text>', description: 'filter by id, title or agent' },
+      {
+        flags: '-l, --limit <n>',
+        description: `number of topics (default ${DEFAULT_CHANNEL_LIMIT}, most recent first)`,
+        parse: intArg('--limit'),
+      },
+    ],
+    build: (_positionals, opts) => {
+      // Lists places rather than acting in one, so a target would mean nothing — refused, not ignored.
+      if (str(opts.channel) !== undefined) {
+        throw new Error('channels lists places to post to; --channel does not apply');
+      }
+      return {
+        kind: 'list-channels',
+        platform: str(opts.platform),
+        query: str(opts.query),
+        limit: typeof opts.limit === 'number' ? opts.limit : undefined,
+      };
+    },
+    hint: 'List places you can post to: agent-anywhere channels [--platform tg] [--query text] (ids for --channel)',
   },
 ];

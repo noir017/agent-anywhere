@@ -6,7 +6,9 @@ import {
   conversationKey,
   describeConversation,
   formatAddress,
+  formatTarget,
   parseAddress,
+  parseTarget,
   sameAddress,
   type ConversationRef,
 } from './conversation.js';
@@ -111,6 +113,36 @@ describe('address encode/decode', () => {
 
   it('names the offending input in the error', () => {
     expect(() => parseAddress('a/b/c')).toThrow('"a/b/c"');
+  });
+});
+
+describe('parseTarget / formatTarget (platform-qualified targets)', () => {
+  const instances = new Set(['tg', 'web', 'fs']);
+
+  it('round-trips a qualified target, lane or not', () => {
+    for (const a of [{ channel: '5865716608', thread: '8068' }, { channel: 'oc_abc' }]) {
+      expect(parseTarget(formatTarget('tg', a), instances)).toEqual({ platform: 'tg', address: a });
+    }
+    expect(formatTarget('web', { channel: 'main', thread: '21316953' })).toBe('web:main/21316953');
+  });
+
+  it('keeps the unqualified form meaning "the caller\'s own platform"', () => {
+    // Every --channel value that worked before the prefix existed must still parse the same way.
+    expect(parseTarget('5865716608/8068', instances)).toEqual({ address: { channel: '5865716608', thread: '8068' } });
+  });
+
+  it('treats a colon as part of the channel unless an instance precedes it', () => {
+    // Channel ids may legitimately contain `:`; only a configured instance id makes it a prefix.
+    expect(parseTarget('private:12345', instances)).toEqual({ address: { channel: 'private:12345' } });
+    expect(parseTarget('tg:private:12345', instances)).toEqual({
+      platform: 'tg',
+      address: { channel: 'private:12345' },
+    });
+  });
+
+  it('validates the address part the same way parseAddress does', () => {
+    expect(() => parseTarget('tg:a/b/c', instances)).toThrow(/too many/);
+    expect(() => parseTarget('tg:', instances)).toThrow(/empty channel/);
   });
 });
 

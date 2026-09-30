@@ -4,7 +4,7 @@ import { encode } from '@toon-format/toon';
 import { loadConfig, resolveSocketPath } from '../config/load.js';
 import { callDaemon } from '../ipc/client.js';
 import { DEFAULT_FETCH_FIELDS } from '../ipc/commands.js';
-import type { IpcAction, VoiceLogResult } from '../ipc/protocol.js';
+import type { IpcAction, ListChannelsResult, VoiceLogResult } from '../ipc/protocol.js';
 import { ASK_CLIENT_TIMEOUT_MARGIN_MS, DEFAULT_ASK_TIMEOUT_MS } from '../ipc/protocol.js';
 import type { InboundMessage } from '../types.js';
 
@@ -84,6 +84,12 @@ export async function runReverse(rawAction: IpcAction): Promise<void> {
  * the agent can branch on it directly (an empty line means timeout/no-selection).
  */
 function printResult(action: IpcAction, data: unknown): void {
+  // Commands whose answer depends only on the data, not on the options that asked for it.
+  const tabular = DATA_PRINTERS[action.kind];
+  if (tabular) {
+    tabular(data);
+    return;
+  }
   switch (action.kind) {
     case 'ask': {
       const chosen = (data as { chosen?: string | null } | undefined)?.chosen ?? null;
@@ -103,9 +109,6 @@ function printResult(action: IpcAction, data: unknown): void {
     }
     case 'fetch-messages':
       printFetchMessages(action, data);
-      return;
-    case 'voice-log':
-      printVoiceLog(data);
       return;
     case 'create-thread': {
       const threadId = (data as { threadId?: string } | undefined)?.threadId;
@@ -247,6 +250,39 @@ function printVoiceLog(data: unknown): void {
     ],
   });
 }
+
+/**
+ * Shape list-channels into a TOON table (AXI §1/§5/§9): channel roots, then recent topics, each with
+ * the id `--channel` takes. The help lines say what an id is for and when the list was cut, because
+ * the next step is always "use one of these", and a cut list that looks complete sends an agent
+ * looking for a topic it was never shown.
+ */
+function printChannels(data: unknown): void {
+  const result = (data as ListChannelsResult | undefined) ?? { channels: [], totalTopics: 0, limit: 0 };
+  if (result.channels.length === 0) {
+    emit({ count: 0, note: 'no chats or topics match; the list only holds places this gateway has answered in' });
+    return;
+  }
+  const shown = result.channels.filter((c) => c.kind === 'topic').length;
+  const help = [
+    'Pass an id to --channel on any command (send-message, send-file …) to post there.',
+    'kind=channel is a chat root: where a new topic would be opened. current=true is this conversation.',
+  ];
+  if (result.totalTopics > shown) {
+    help.push(`Showing the ${shown} most recent of ${result.totalTopics} topics; narrow with --query or raise --limit.`);
+  }
+  emit({ count: result.channels.length, channels: result.channels, help });
+}
+
+/**
+ * Printers for the commands whose output is a function of the response alone. A table rather than
+ * more switch arms: every gateway query added one, and the switch in printResult is about the
+ * commands whose rendering also depends on what was asked (ask's timeout, fetch's columns).
+ */
+const DATA_PRINTERS: Partial<Record<IpcAction['kind'], (data: unknown) => void>> = {
+  'voice-log': printVoiceLog,
+  'list-channels': printChannels,
+};
 
 /**
  * Wrap low-level socket errnos like "can't connect to daemon" into an actionable structured

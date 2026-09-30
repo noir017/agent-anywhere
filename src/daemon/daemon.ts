@@ -96,6 +96,7 @@ import {
   DEFAULT_ASK_TIMEOUT_MS as PROTOCOL_DEFAULT_ASK_TIMEOUT_MS,
   DEFAULT_ASK_REMINDER_MS,
   DEFAULT_ASK_REMINDER_TEXT,
+  DEFAULT_CHANNEL_LIMIT,
 } from '../ipc/protocol.js';
 import { VoiceIntake } from './voice.js';
 
@@ -615,6 +616,13 @@ export class Daemon {
    * dispatch it can't be clobbered by another connection (Node single-threaded, no interleaving).
    */
   private lastResolvedConversationId: ConversationId | undefined;
+  /**
+   * The platform instance a qualified `--channel <instance>:<address>` named, for the command being
+   * dispatched right now — undefined when the value was unqualified or absent. Same scratch-slot
+   * contract as lastResolvedConversationId, and written beside it: the IPC handler signature carries
+   * an address, and an address alone cannot say which platform it is on.
+   */
+  private lastResolvedPlatform: string | undefined;
 
   /**
    * Platform adapters keyed by instance id (one daemon drives all configured instances), each
@@ -709,16 +717,22 @@ export class Daemon {
       supersedeVoice: (id) => this.voice.supersede(id),
       cancelPendingVoice: (id, reason) => this.voice.cancel(id, reason),
     }, store, workdirUsage);
-    this.ipc = new IpcServer(socketPath, {
-      // resolveAddress is also the sole capture point for the conversation owning this reverse
-      // command: IPC only forwards the address to handle. So reverse-lookup by token and stash it
-      // for the synchronously-following handleReverse (see lastResolvedConversationId).
-      resolveAddress: (token, override) => {
-        this.lastResolvedConversationId = this.registry.conversationForToken(token);
-        return this.registry.resolveAddress(token, override);
+    this.ipc = new IpcServer(
+      socketPath,
+      {
+        // resolveAddress is also the sole capture point for the conversation owning this reverse
+        // command: IPC only forwards the address to handle. So reverse-lookup by token and stash it
+        // for the synchronously-following handleReverse (see lastResolvedConversationId). The
+        // platform a qualified `--channel` named rides in the same kind of slot, for the same reason.
+        resolveAddress: (token, override) => {
+          this.lastResolvedConversationId = this.registry.conversationForToken(token);
+          this.lastResolvedPlatform = override?.platform;
+          return this.registry.resolveAddress(token, override?.address);
+        },
+        handle: (action, address) => this.handleReverse(action, address),
       },
-      handle: (action, address) => this.handleReverse(action, address),
-    });
+      new Set(Object.keys(config.platforms))
+    );
   }
 
   async run(): Promise<void> {
@@ -816,15 +830,19 @@ export class Daemon {
   }
 
   /**
-   * Adapter for the conversation owning the current reverse command. Reads the scratch
-   * lastResolvedConversationId (see its doc: valid because this runs synchronously after
-   * resolveAddress within one dispatch) and resolves conversation → platform instance →
-   * adapter. Cross-channel override sends go to the SAME instance as the conversation —
-   * an address alone can't identify a platform.
+   * Adapter for the current reverse command: the instance a qualified `--channel` named, else the
+   * one the calling conversation is on. Reads the scratch slots (see lastResolvedConversationId:
+   * valid because this runs synchronously after resolveAddress within one dispatch).
+   *
+   * An unqualified override still goes to the conversation's own instance, as it always has — an
+   * address alone can't identify a platform. The qualified form (`tg:5865716608/8068`, what
+   * `agent-anywhere channels` prints) is how an agent answering on the web UI posts to Telegram.
+   * The instance was already checked against config when IPC parsed the value, so a miss here means
+   * the conversation expired, not that the agent named a platform that does not exist.
    */
   private reverseAdapter(): PlatformAdapter {
     const id = this.lastResolvedConversationId;
-    const pid = id ? this.registry.platformFor(id) : undefined;
+    const pid = this.lastResolvedPlatform ?? (id ? this.registry.platformFor(id) : undefined);
     const adapter = pid ? this.platforms.get(pid) : undefined;
     if (!adapter) {
       throw new Error('cannot resolve the platform instance for this reverse command (conversation expired?)');
@@ -901,19 +919,44 @@ export class Daemon {
           throw new Error('unsupported operation: this platform does not support interactive buttons (ask)');
         }
         return this.handleAsk(platform, action, address);
+      case 'voice-log':
+      case 'list-channels':
+        return this.handleGatewayQuery(action);
+      default: {
+        // Exhaustiveness guard: a new IpcAction variant missed here fails to compile.
+        const _exhaustive: never = action;
+        throw new Error(`unknown reverse command: ${JSON.stringify(_exhaustive)}`);
+      }
+    }
+  }
+
+  /**
+   * The reverse commands that ask the GATEWAY something rather than act on a chat: they never touch
+   * the adapter handleReverse resolved, and read the caller's conversation only to scope or mark
+   * their answer. Split out so the chat-action switch stays about chat actions — and synchronous
+   * here, because both read the scratch slot, which is only valid before the first await.
+   */
+  private handleGatewayQuery(action: Extract<IpcAction, { kind: 'voice-log' | 'list-channels' }>): unknown {
+    const id = this.lastResolvedConversationId;
+    switch (action.kind) {
       case 'voice-log': {
-        // The caller's own conversation, read off the scratch slot before anything could await.
-        const id = this.lastResolvedConversationId;
         const result: VoiceLogResult = {
           enabled: this.config.voice !== undefined,
           entries: id ? this.voice.history(id, action.limit ?? DEFAULT_VOICE_LOG_LIMIT) : [],
         };
         return result;
       }
+      case 'list-channels':
+        // About the whole deployment rather than the caller's lane; the caller only marks its row.
+        return this.registry.listChannels({
+          platform: action.platform,
+          query: action.query,
+          limit: action.limit ?? DEFAULT_CHANNEL_LIMIT,
+          currentKey: id,
+        });
       default: {
-        // Exhaustiveness guard: a new IpcAction variant missed here fails to compile.
         const _exhaustive: never = action;
-        throw new Error(`unknown reverse command: ${JSON.stringify(_exhaustive)}`);
+        throw new Error(`unknown gateway query: ${JSON.stringify(_exhaustive)}`);
       }
     }
   }

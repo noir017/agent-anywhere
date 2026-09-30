@@ -59,6 +59,18 @@ export interface ConversationRecord {
    * whatever the rename policy is. Cleared by `/title auto`.
    */
   titlePinned?: boolean;
+  /**
+   * Where this conversation was last answered: the platform instance and the address its last turn
+   * ran at. What `agent-anywhere channels` lists, so an agent can name a place to post to.
+   *
+   * Persisted rather than parsed back out of the key, because a key is opaque by design (see
+   * core/conversation.ts KEY_SEP) and under `per_user` / `shared` it names no place at all.
+   * Records written before this field existed have none; channel-list.ts reads their keys as a
+   * one-off fallback and says so there.
+   */
+  lane?: { platform: string; channel: string; thread?: string };
+  /** When a turn last started here (epoch ms). Orders the channel list; absent on older records. */
+  lastAt?: number;
 }
 
 export class ConversationStore {
@@ -202,6 +214,33 @@ export class ConversationStore {
   }
 
   /**
+   * Record where and when a turn ran (see ConversationRecord.lane). Called once per turn, so it is
+   * one write per turn — the same order as the session-id writes already made at spawn.
+   */
+  recordLane(
+    key: string,
+    agentId: string,
+    platform: string,
+    address: { channel: string; thread?: string },
+    at: number
+  ): void {
+    const rec = this.map.get(key) ?? { agent: agentId, agentSessions: {} };
+    rec.lane = {
+      platform,
+      channel: address.channel,
+      ...(address.thread != null && address.thread !== '' ? { thread: address.thread } : {}),
+    };
+    rec.lastAt = at;
+    this.map.set(key, rec);
+    this.flush();
+  }
+
+  /** Every record, in insertion order (oldest conversation first). Read-only use: `channels`. */
+  entries(): Array<[string, ConversationRecord]> {
+    return [...this.map.entries()];
+  }
+
+  /**
    * Forget a conversation entirely — every agent's session id AND the binding.
    *
    * The only context-destroying path in the system, reached solely from an explicit `/new`.
@@ -232,6 +271,8 @@ function toRecord(v: unknown): ConversationRecord | null {
     cwd?: unknown;
     title?: unknown;
     titlePinned?: unknown;
+    lane?: unknown;
+    lastAt?: unknown;
   };
   if (typeof o.agent !== 'string' || !o.agent) return null;
   const sessions: Record<string, string> = {};
@@ -240,18 +281,41 @@ function toRecord(v: unknown): ConversationRecord | null {
       if (typeof val === 'string') sessions[k] = val;
     }
   }
+  const lane = toLane(o.lane);
   return {
     agent: o.agent,
     agentSessions: sessions,
     // A malformed cwd is dropped rather than rejecting the whole record: the binding and the
     // session ids are still good, and losing them would restart the user's task over a bad field.
     ...(typeof o.cwd === 'string' && o.cwd ? { cwd: o.cwd } : {}),
-    // Same tolerance as cwd: a bad title is worth less than the session ids it sits next to. The
-    // cost of dropping it is one redundant rename.
-    ...(typeof o.title === 'string' && o.title ? { title: o.title } : {}),
-    // Only a pin recorded alongside a real title means anything; a pin on its own would freeze a
-    // conversation's naming at a name nobody set.
-    ...(o.titlePinned === true && typeof o.title === 'string' && o.title ? { titlePinned: true } : {}),
+    ...titleFields(o.title, o.titlePinned),
+    // Listing metadata, same tolerance again: the next turn writes both afresh.
+    ...(lane ? { lane } : {}),
+    ...(typeof o.lastAt === 'number' && Number.isFinite(o.lastAt) ? { lastAt: o.lastAt } : {}),
+  };
+}
+
+/**
+ * The title and its pin, validated together. Same tolerance as cwd: a bad title is worth less than
+ * the session ids it sits next to, and the cost of dropping it is one redundant rename. Only a pin
+ * recorded alongside a real title means anything; a pin on its own would freeze a conversation's
+ * naming at a name nobody set.
+ */
+function titleFields(title: unknown, pinned: unknown): Pick<ConversationRecord, 'title' | 'titlePinned'> {
+  if (typeof title !== 'string' || !title) return {};
+  return pinned === true ? { title, titlePinned: true } : { title };
+}
+
+function toLane(v: unknown): ConversationRecord['lane'] {
+  if (!v || typeof v !== 'object') return undefined;
+  const o = v as { platform?: unknown; channel?: unknown; thread?: unknown };
+  if (typeof o.platform !== 'string' || !o.platform || typeof o.channel !== 'string' || !o.channel) {
+    return undefined;
+  }
+  return {
+    platform: o.platform,
+    channel: o.channel,
+    ...(typeof o.thread === 'string' && o.thread ? { thread: o.thread } : {}),
   };
 }
 

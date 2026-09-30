@@ -44,6 +44,13 @@ export const DEFAULT_ASK_REMINDER_TEXT =
 export const ASK_CLIENT_TIMEOUT_MARGIN_MS = 10_000;
 
 /**
+ * How many topic rows `channels` returns when the caller names no `--limit`. Here for the reason the
+ * ask timeout is: the CLI prints it in its help line and the daemon applies it, and they must agree.
+ * Thirty is a screenful of recent work; the live deployment had 335 conversations on 2026-09-30.
+ */
+export const DEFAULT_CHANNEL_LIMIT = 30;
+
+/**
  * Zod schema per action kind. Each arm maps one-to-one to the IpcAction union below;
  * a new action must be added in both, kept aligned at compile time via z.infer.
  * strict() rejects extra fields, narrowing the trusted input surface.
@@ -105,6 +112,15 @@ const IpcActionSchema = z.discriminatedUnion('kind', [
   // Reads the calling conversation's own transcripts only — there is no channel override, because
   // the log is keyed by conversation, and another conversation's voice notes are not this agent's.
   z.object({ kind: z.literal('voice-log'), limit: z.number().int().positive().optional() }).strict(),
+  // Lists places, so it has no target of its own — no channelId, for the same reason voice-log has none.
+  z
+    .object({
+      kind: z.literal('list-channels'),
+      platform: z.string().min(1).optional(),
+      query: z.string().min(1).optional(),
+      limit: z.number().int().positive().optional(),
+    })
+    .strict(),
 ]);
 
 const IpcRequestSchema = z
@@ -138,7 +154,8 @@ export type IpcAction =
   | { kind: 'fetch-messages'; channelId?: string; limit?: number; before?: string; fields?: string[] }
   | { kind: 'create-thread'; messageId: string; name: string; channelId?: string }
   | { kind: 'ask'; prompt: string; options: string[]; channelId?: string; timeoutMs?: number }
-  | { kind: 'voice-log'; limit?: number };
+  | { kind: 'voice-log'; limit?: number }
+  | { kind: 'list-channels'; platform?: string; query?: string; limit?: number };
 
 // Compile-time alignment: the zod-inferred type must equal the hand-written union;
 // if either side drifts, this type errors.
@@ -191,4 +208,23 @@ export interface VoiceLogResult {
     audio: string;
     reason?: string;
   }>;
+}
+
+/**
+ * Response body for list-channels. Shaped like core/channel-list.ts ChannelRow, restated here because
+ * ipc/ imports nothing but types.ts (the same arrangement VoiceLogResult has).
+ */
+export interface ListChannelsResult {
+  channels: Array<{
+    id: string;
+    kind: 'channel' | 'topic';
+    platform: string;
+    title: string;
+    agent: string;
+    lastAt: string;
+    current: boolean;
+  }>;
+  /** Topic rows that matched before `limit` cut them. */
+  totalTopics: number;
+  limit: number;
 }

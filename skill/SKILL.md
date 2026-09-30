@@ -118,6 +118,19 @@ agent-anywhere create-thread <messageId> "thread name"
 Prints `threadId`. To post into the thread, pass `--channel <threadId>` on subsequent
 commands.
 
+### Other chats and topics
+
+```bash
+agent-anywhere channels [--platform tg] [--query <text>] [--limit 30]
+```
+
+Lists the places this gateway can post to — every chat and topic a turn has run in — with
+ids of the form `<instance>:<channel>[/<thread>]` (e.g. `tg:5865716608/8068`,
+`web:main/21316953`). Pass one to `--channel` on any command to post there, including on a
+different platform from the one you are answering on. `kind=channel` rows are chat roots;
+`current=true` marks this conversation. The list only holds places the gateway has already
+answered in: most platforms cannot enumerate a bot's chats.
+
 ### Asking the user (blocking)
 
 **First check whether you already have your own question tool** (Claude Code's
@@ -196,7 +209,9 @@ socket liveness, and agent harness reachability (`claude` / `gemini` / `codex` /
 ## Conventions
 
 - Omit `--channel` in the normal case; it defaults to the current conversation. Pass
-  `--channel <id>` only for cross-channel pushes or posting into a thread.
+  `--channel <id>` only for cross-channel pushes or posting into a thread. A bare
+  `<channel>[/<thread>]` stays on this platform; `<instance>:<channel>[/<thread>]` (from
+  `agent-anywhere channels`) can name any.
 - Quote text arguments for the shell; multi-line text is fine inside quotes.
 - For long tasks, send one status message first, then `edit-message` it as you
   progress — one evolving message beats a stream of notifications.

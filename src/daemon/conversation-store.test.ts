@@ -177,6 +177,38 @@ describe('ConversationStore: working directory (/cd)', () => {
   });
 });
 
+describe('ConversationStore: lane and last use (what `channels` lists)', () => {
+  it('records where and when a turn ran, and survives a reload', () => {
+    const s = new ConversationStore(file);
+    s.recordLane('tg#586#8068', 'cc', 'tg', { channel: '586', thread: '8068' }, 1_000);
+    const again = new ConversationStore(file);
+    expect(again.entries()).toEqual([
+      ['tg#586#8068', expect.objectContaining({ agent: 'cc', lane: { platform: 'tg', channel: '586', thread: '8068' }, lastAt: 1_000 })],
+    ]);
+  });
+
+  it('keeps the binding and session ids of a record it updates', () => {
+    const s = new ConversationStore(file);
+    s.bind('k', 'oc');
+    s.setAgentSession('k', 'oc', 'ses_1');
+    s.recordLane('k', 'oc', 'web', { channel: 'main', thread: 't' }, 2);
+    expect(s.boundAgent('k')).toBe('oc');
+    expect(s.agentSession('k', 'oc')).toBe('ses_1');
+  });
+
+  it('drops a malformed lane on load without losing the record around it', () => {
+    fs.writeFileSync(
+      file,
+      JSON.stringify({ k: { agent: 'cc', agentSessions: { cc: 's' }, lane: { platform: 'tg' }, lastAt: 'soon' } })
+    );
+    const s = new ConversationStore(file);
+    expect(s.agentSession('k', 'cc')).toBe('s');
+    const [, rec] = s.entries()[0]!;
+    expect(rec.lane).toBeUndefined();
+    expect(rec.lastAt).toBeUndefined();
+  });
+});
+
 describe('ConversationStore: durability', () => {  it('a missing file starts empty rather than throwing', () => {
     expect(() => new ConversationStore(path.join(dir, 'nope', 'x.json'))).not.toThrow();
   });

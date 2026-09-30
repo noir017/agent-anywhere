@@ -94,6 +94,8 @@ import { fallbackTitle, generateTitle } from '../core/title-namer.js';
 import { shouldRespond, type GateConfig } from '../core/inbound-gate.js';
 import { TurnRunner } from './turn-runner.js';
 import type { ConversationStore } from './conversation-store.js';
+import { buildChannelList } from '../core/channel-list.js';
+import type { ListChannelsResult } from '../ipc/protocol.js';
 
 /** Daemon-level context-control commands (intercepted in route(), never forwarded to the agent). */
 const CONTEXT_CLEAR_RE = /^\/(new|clear)(@\S+)?$/;
@@ -575,6 +577,9 @@ export class ConversationRegistry {
             state.lane = address;
             state.lanePlatform = platformId;
           }
+          // Persisted too, once per turn: it is what `agent-anywhere channels` lists (see
+          // ConversationRecord.lane), and the in-memory copy dies with the process.
+          this.store?.recordLane?.(id, this.agentIdOf(id), platformId, address, this.clock.now());
         },
         followUpTarget: (id) => this.laneOf(id),
         touch: (id) => this.touch(id),
@@ -2501,6 +2506,33 @@ ${formatTokens(left)} left before compaction — ${name}`;
    */
   conversationForToken(token: string): ConversationId | undefined {
     return this.tokens.conversationFor(token);
+  }
+
+  /**
+   * `agent-anywhere channels`: every place this deployment has answered in, as `--channel` ids.
+   *
+   * Read from the store, not from `conversations`: the map holds only what THIS process has seen,
+   * and a list that forgot every topic on each restart would be no list at all. The shaping is
+   * core/channel-list.ts; this only supplies the records and the configured instances. An
+   * unknown `--platform` is refused by name rather than answered with an empty list, which would
+   * read as "that platform has no chats".
+   */
+  listChannels(opts: { platform?: string; query?: string; limit: number; currentKey?: ConversationId }): ListChannelsResult {
+    const instances = new Map(Object.entries(this.config.platforms).map(([id, p]) => [id, p.type as string]));
+    if (opts.platform !== undefined && !instances.has(opts.platform)) {
+      throw new Error(
+        `unknown platform instance "${opts.platform}"; configured: ${[...instances.keys()].join(', ')}`
+      );
+    }
+    const sources = (this.store?.entries?.() ?? []).map(([key, rec]) => ({
+      key,
+      agent: rec.agent,
+      ...(rec.title !== undefined ? { title: rec.title } : {}),
+      ...(rec.lane !== undefined ? { lane: rec.lane } : {}),
+      ...(rec.lastAt !== undefined ? { lastAt: rec.lastAt } : {}),
+    }));
+    const list = buildChannelList(sources, { instances, ...opts });
+    return { channels: list.rows, totalTopics: list.totalTopics, limit: opts.limit };
   }
 
   /**

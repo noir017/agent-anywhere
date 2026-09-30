@@ -19,6 +19,21 @@ All notable changes to this project are documented here. The format is based on
   never got a session started, or one `/new` has just cleared — still takes whichever agent you
   name. The menu entries now read "Use claude" rather than "Switch to claude".
 
+### Added
+
+- **`agent-anywhere channels`, and `--channel` that can name another platform.** An agent could
+  post to another chat only on the platform it was answering on: an address alone cannot say
+  which platform it is on, so every `--channel` went to the caller's own instance, and an agent
+  answering on the web UI had no way to reach Telegram. A target can now carry its instance —
+  `tg:5865716608/8068`, `web:main/21316953` — and `channels` lists every chat and topic the gateway
+  has answered in, in exactly that form: chat roots first, then the most recent topics, with their
+  titles and agents, filterable by platform or text. The list comes from `conversations.json`
+  because most platforms cannot enumerate a bot's chats (the Telegram Bot API has no call for it),
+  which is also why it only holds places someone has actually talked to the bot in. The store now
+  records each conversation's lane and last use for this; records from before the upgrade are read
+  off their keys until their next turn writes both. An unqualified `--channel` means exactly what it
+  did, including ids that contain a colon.
+
 ## [1.35.0] - 2026-09-29
 
 ### Changed

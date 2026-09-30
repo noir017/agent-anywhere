@@ -38,7 +38,8 @@ conversation, not part of its name — see [`daemon/README.md`](../daemon/README
 
 | File | Role |
 |---|---|
-| `conversation.ts` | Conversation identity: `ConversationRef` / `ConversationAddress`, the key function, the address parser |
+| `conversation.ts` | Conversation identity: `ConversationRef` / `ConversationAddress`, the key function, the address parser, and the platform-qualified target (`tg:586/8068`) `--channel` accepts |
+| `channel-list.ts` | `agent-anywhere channels` as data: the places a turn has run, in the qualified id form, roots first then recent topics |
 | `inbound-gate.ts` | "Should we respond to this message?" — a pure decision tree |
 | `inbound-merger.ts` | Per-conversation state machine: coalesce bursts, queue while busy, interrupt |
 | `stream-buffer.ts` | Outbound text: throttled in-place editing, chunking, backoff, degradation |

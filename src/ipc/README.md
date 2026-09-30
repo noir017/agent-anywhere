@@ -48,7 +48,7 @@ hint follow automatically, and a missing `handleReverse` arm **fails to compile*
 add a command by hand-registering it in `cli.ts`.
 
 The catalog: `send-message`, `reply`, `edit-message`, `send-file`, `react`, `delete`,
-`fetch-messages`, `create-thread`, `ask`, `voice-log`.
+`fetch-messages`, `create-thread`, `ask`, `voice-log`, `channels`.
 
 ## Only `send-file` is injected everywhere
 
@@ -70,6 +70,7 @@ Most of it was redundant anyway:
 | `send-message`, `reply` | The agent's plain text already streams into the chat. A command to send text is a slower way to do what happens by itself. |
 | `edit-message` | The daemon already live-edits the turn's message. |
 | `react`, `delete`, `create-thread`, `fetch-messages` | Chat-client chrome, not the work the agent was asked to do. |
+| `channels` | Only needed to post somewhere other than here, which is rare and always deliberate. |
 | `voice-log` | A confirmed voice transcript reaches the agent as the user's own typed words — the user read and approved them — so telling every session that some messages were spoken would only invite second-guessing text that was already checked. It exists for the rare turn where a message reads like a mishearing. |
 
 `send-file` stays because it is the one act the text channel cannot perform: a file has to
@@ -87,10 +88,21 @@ current conversation", which is the default an agent should almost always use �
 `--channel` override exists for pushing proactively somewhere else.
 
 Its value is `<channel>` or `<channel>/<thread>`, so an agent can target one topic or
-thread rather than only a channel root. `server.ts` parses it through `parseAddress`,
-which **validates**: a malformed value fails at the boundary with the input named,
+thread rather than only a channel root. `server.ts` parses it through `parseTarget`, which
+**validates**: a malformed value fails at the boundary with the input named,
 instead of reaching a platform API as a garbled id (Telegram answers those with an opaque
 400 far from the cause).
+
+Either form can be **qualified** with a platform instance — `<instance>:<channel>[/<thread>]`,
+e.g. `tg:5865716608/8068` — to post on a platform other than the caller's. An address alone
+cannot say which platform it is on, so before this every override went to the calling
+conversation's own instance, and an agent answering on the web UI had no way to post to
+Telegram. The prefix is recognised only when it is a **configured** instance id (the server
+is constructed with the set), because channel ids may themselves contain `:`; an unqualified
+value means exactly what it always did. `agent-anywhere channels` prints ids in the
+qualified form: every place a turn has run, from `conversations.json` (most platforms cannot
+enumerate a bot's chats — the Telegram Bot API has no such call), channel roots first, then
+the most recent topics. See `core/channel-list.ts`.
 
 ## The trust boundary
 

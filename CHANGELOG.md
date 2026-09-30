@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.36.1] - 2026-09-30
+
 ### Fixed
 
 - **`/usage` and `/context` no longer interrupt a running turn.** Both were passed to the agent

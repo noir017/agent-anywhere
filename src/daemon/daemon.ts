@@ -99,6 +99,20 @@ import {
   DEFAULT_CHANNEL_LIMIT,
 } from '../ipc/protocol.js';
 import { VoiceIntake } from './voice.js';
+import { ScheduleService } from './schedule-service.js';
+import type { ScheduleStore } from './schedule-store.js';
+import { taskListText } from '../core/schedule.js';
+import {
+  buildScheduleDeleteConfirm,
+  buildScheduleListMenu,
+  buildScheduleTaskMenu,
+  parseScheduleButtonId,
+  scheduleEntryLabel,
+  scheduleMenuExpiredText,
+  scheduleOpenButtonId,
+  type ScheduleMenuAction,
+  type ScheduleMenuClick,
+} from '../core/schedule-menu.js';
 
 /** Transcripts `agent-anywhere voice-log` lists when no `--limit` is given. */
 const DEFAULT_VOICE_LOG_LIMIT = 10;
@@ -139,6 +153,31 @@ const DEDUP_TTL_MS = 15_000;
  * and the two must not drift apart.
  */
 const DEFAULT_ASK_TIMEOUT_MS = PROTOCOL_DEFAULT_ASK_TIMEOUT_MS;
+
+/**
+ * The reverse commands answered by the gateway rather than carried out on a chat (see
+ * handleGatewayQuery). A `satisfies`-checked table, so a kind that is not an IpcAction fails to
+ * compile — and the chat switch's `never` guard catches a new action that belongs in neither.
+ */
+const GATEWAY_QUERY_KINDS = {
+  'voice-log': true,
+  'list-channels': true,
+  'schedule-add': true,
+  'schedule-list': true,
+  'schedule-op': true,
+} as const satisfies Partial<Record<IpcAction['kind'], true>>;
+type GatewayQuery = Extract<IpcAction, { kind: keyof typeof GATEWAY_QUERY_KINDS }>;
+const isGatewayQuery = (a: IpcAction): a is GatewayQuery => a.kind in GATEWAY_QUERY_KINDS;
+
+/** The verbs `/setting schedule <verb> <id>` accepts, onto the service's operations. */
+const SCHEDULE_TYPED_OPS: Record<string, 'pause' | 'resume' | 'remove' | 'run'> = {
+  pause: 'pause',
+  resume: 'resume',
+  delete: 'remove',
+  remove: 'remove',
+  rm: 'remove',
+  run: 'run',
+};
 
 /**
  * Max buttons in a harness-command menu. Discord allows 25 components per message (5 rows × 5);
@@ -517,6 +556,23 @@ interface PendingSettingsMenu {
 }
 
 /**
+ * A posted scheduled-task menu (core/schedule-menu.ts), awaiting clicks. Usually the settings menu's
+ * own message, edited in place: the entry button hands the message over from one map to the other,
+ * and "◀ Settings" hands it back.
+ */
+interface PendingScheduleMenu {
+  conversationId: ConversationId;
+  conversation: ConversationRef;
+  ref?: MessageRef;
+  /** Task ids as the list last showed them; an `sct:` index points into THIS. */
+  ids: string[];
+  /** The task on screen, and whether its delete is awaiting the second tap. */
+  open?: { id: string; confirm: boolean };
+  /** Carried so "◀ Settings" can rebuild the settings menu on this message. */
+  pageSize: number;
+}
+
+/**
  * A posted directory menu, awaiting clicks.
  *
  * Shaped like PendingModelMenu and for the same reasons — a frozen option snapshot that pick
@@ -592,6 +648,8 @@ export class Daemon {
   private pendingEffortMenus = new Map<string, PendingEffortMenu>();
   /** Live settings menus: reqId → the conversation, row snapshot and open level it was built for. */
   private pendingSettingsMenus = new Map<string, PendingSettingsMenu>();
+  /** Scheduled-task menus, by reqId (often a settings menu's own, handed over — see PendingScheduleMenu). */
+  private pendingScheduleMenus = new Map<string, PendingScheduleMenu>();
   /**
    * Live directory menus: reqId → the conversation and directory snapshot it was built for.
    *
@@ -641,6 +699,9 @@ export class Daemon {
   /** Voice messages → confirmed text (see daemon/voice.ts). Inert when config has no `voice:`. */
   private readonly voice: VoiceIntake;
 
+  /** Scheduled tasks (see daemon/schedule-service.ts). Absent when started without a task store. */
+  private readonly schedules?: ScheduleService;
+
   constructor(
     private readonly config: Config,
     platforms: Map<string, PlatformAdapter>,
@@ -649,7 +710,12 @@ export class Daemon {
     /** Persistent conversation state (agent binding + each agent's own session id). */
     private readonly store?: ConversationStore,
     /** `/cd` usage history, used to order the directory menu. Absent = alphabetical. */
-    workdirUsage?: WorkdirUsageStore
+    workdirUsage?: WorkdirUsageStore,
+    /**
+     * Scheduled tasks: the task file, and the directory bash runs log into. Optional so the many
+     * tests that build a daemon for something else need not; `start` always passes it.
+     */
+    schedules?: { store: ScheduleStore; runsDir: string }
   ) {
     // Real runtime clock; core classes never read the system clock directly (for testability).
     const clock = {
@@ -707,6 +773,10 @@ export class Daemon {
         this.onEffortMenuRequest(id, agentId, msg, selector),
       // A `/setting` on a platform that can carry (and later edit) buttons.
       onSettingMenuRequest: (id, msg, menu) => this.onSettingMenuRequest(id, msg, menu),
+      // `/setting schedule …` — the tasks live here, not in the registry.
+      onScheduleSetting: (id, msg, args, canMenu) => this.onScheduleSetting(id, msg, args, canMenu),
+      scheduleSummary: () =>
+        this.schedules ? `⏰ \`/setting schedule\` — ${this.schedules.tasks().length} scheduled task(s)` : undefined,
       // A directory menu is wanted: `/cd`, a bare agent command in a conversation with no history,
       // or a `/new` that just cleared one.
       onWorkdirMenuRequest: (id, agentId, msg, menu) =>
@@ -717,6 +787,11 @@ export class Daemon {
       supersedeVoice: (id) => this.voice.supersede(id),
       cancelPendingVoice: (id, reason) => this.voice.cancel(id, reason),
     }, store, workdirUsage);
+    if (schedules) {
+      // On the PACED adapters, like everything else: a scheduled run's notice and output wait their
+      // turn on the chat's write budget.
+      this.schedules = new ScheduleService(config, this.platforms, this.registry, clock, schedules.store, schedules.runsDir);
+    }
     this.ipc = new IpcServer(
       socketPath,
       {
@@ -760,6 +835,9 @@ export class Daemon {
     // registered once here rather than re-derived whenever an agent reports its commands.
     await this.registerCommands();
     await this.ipc.start();
+    // After the platforms and IPC are up: a run that is due right away (a catch-up after the update
+    // that restarted us) needs somewhere to post, and an agent run needs its reverse commands.
+    this.schedules?.scheduler.start();
     // Graceful stop on SIGINT (Ctrl-C) / SIGTERM (kill / container stop); otherwise resident ACP
     // child processes are orphaned and the socket file lingers. Removed again in stop().
     this.installSignalHandlers();
@@ -790,6 +868,9 @@ export class Daemon {
     this.stopping = true;
     this.signalCleanup?.();
     this.signalCleanup = null;
+    // First, so nothing new starts while the rest goes down. Bash runs in flight are signalled and
+    // record themselves as interrupted; agent runs end with the registry below.
+    this.schedules?.scheduler.stop();
     await this.ipc.stop();
     // Deliver what the pacer is still holding BEFORE the adapters go down: a queued write is
     // somebody's reply, and a lane that was paced or paused at the wrong moment must not lose it
@@ -812,6 +893,7 @@ export class Daemon {
     this.pendingModelMenus.clear();
     this.pendingEffortMenus.clear();
     this.pendingSettingsMenus.clear();
+    this.pendingScheduleMenus.clear();
     this.voice.dispose();
     // Clear pending asks after ipc/platform are down: no new clicks or asks can arrive now. Clear each
     // timer and resolve null ("no selection") so any caller still blocked on ask IPC gets a result
@@ -859,6 +941,8 @@ export class Daemon {
     // background job leaves that job reporting through this socket, into a conversation that from
     // the registry's side looks like nobody has said anything in an hour.
     if (this.lastResolvedConversationId) this.registry.touch(this.lastResolvedConversationId);
+    // Questions for the gateway itself, not actions on a chat — answered before the chat switch.
+    if (isGatewayQuery(action)) return this.handleGatewayQuery(action, address);
     switch (action.kind) {
       case 'send-message':
         return platform.sendMessage(address, action.text);
@@ -919,9 +1003,6 @@ export class Daemon {
           throw new Error('unsupported operation: this platform does not support interactive buttons (ask)');
         }
         return this.handleAsk(platform, action, address);
-      case 'voice-log':
-      case 'list-channels':
-        return this.handleGatewayQuery(action);
       default: {
         // Exhaustiveness guard: a new IpcAction variant missed here fails to compile.
         const _exhaustive: never = action;
@@ -934,9 +1015,15 @@ export class Daemon {
    * The reverse commands that ask the GATEWAY something rather than act on a chat: they never touch
    * the adapter handleReverse resolved, and read the caller's conversation only to scope or mark
    * their answer. Split out so the chat-action switch stays about chat actions — and synchronous
-   * here, because both read the scratch slot, which is only valid before the first await.
+   * here, because every one reads the scratch slots, which are only valid before the first await.
+   *
+   * `address` is only read by `schedule-add`, where it is the task's target: the `--channel` the
+   * agent named, else its own lane (resolveAddress already chose). The platform comes the same way.
    */
-  private handleGatewayQuery(action: Extract<IpcAction, { kind: 'voice-log' | 'list-channels' }>): unknown {
+  private handleGatewayQuery(
+    action: GatewayQuery,
+    address: ConversationAddress
+  ): unknown {
     const id = this.lastResolvedConversationId;
     switch (action.kind) {
       case 'voice-log': {
@@ -954,11 +1041,29 @@ export class Daemon {
           limit: action.limit ?? DEFAULT_CHANNEL_LIMIT,
           currentKey: id,
         });
+      case 'schedule-add': {
+        const schedules = this.requireSchedules();
+        if (!id) throw new Error('cannot tell which conversation this came from (conversation expired?)');
+        const platform = this.lastResolvedPlatform ?? this.registry.platformFor(id);
+        if (!platform) throw new Error('cannot resolve the platform for this conversation');
+        const { kind: _kind, channelId: _channel, ...input } = action;
+        return { task: schedules.add(input, id, { platform, address }) };
+      }
+      case 'schedule-list':
+        return this.requireSchedules().list(id, action.id);
+      case 'schedule-op':
+        return { task: this.requireSchedules().op(action.id, action.op, id) };
       default: {
         const _exhaustive: never = action;
         throw new Error(`unknown gateway query: ${JSON.stringify(_exhaustive)}`);
       }
     }
+  }
+
+  /** The schedule service, or a sentence saying this daemon was started without one. */
+  private requireSchedules(): ScheduleService {
+    if (!this.schedules) throw new Error('scheduled tasks are not enabled in this daemon');
+    return this.schedules;
   }
 
   /**
@@ -1311,6 +1416,11 @@ export class Daemon {
     const setting = parseSettingButtonId(ev.buttonId);
     if (setting) {
       this.onSettingClick(ev, setting);
+      return;
+    }
+    const schedule = parseScheduleButtonId(ev.buttonId);
+    if (schedule) {
+      this.onScheduleClick(ev, schedule);
       return;
     }
     const pick = parsePickButtonId(ev.buttonId);
@@ -2136,7 +2246,12 @@ export class Daemon {
           pageSize: menu.pageSize,
           ...(menu.open.hint ? { hint: menu.open.hint } : {}),
         })
-      : buildSettingsMenu({ reqId, rows: menu.rows });
+      : buildSettingsMenu({
+          reqId,
+          rows: menu.rows,
+          // The way into the scheduled tasks, after the settings themselves (core/schedule-menu.ts).
+          ...(this.schedules ? { extra: { id: scheduleOpenButtonId(reqId), label: scheduleEntryLabel(this.schedules.tasks()) } } : {}),
+        });
     return { text: prefix ? `${prefix}\n\n${view.text}` : view.text, buttons: view.buttons };
   }
 
@@ -2147,6 +2262,12 @@ export class Daemon {
       this.pendingSettingsMenus.delete(reqId);
       this.editSettingsMenu(menu, settingsMenuSupersededText(), []);
     }
+    // A task menu is the same screen one level down: the one-live-menu rule covers it too.
+    for (const [reqId, menu] of this.pendingScheduleMenus) {
+      if (menu.conversationId !== conversationId) continue;
+      this.pendingScheduleMenus.delete(reqId);
+      this.editMenuMessage(menu, settingsMenuSupersededText(), []);
+    }
   }
 
   /**
@@ -2156,6 +2277,15 @@ export class Daemon {
    */
   private editSettingsMenu(
     menu: PendingSettingsMenu,
+    text: string,
+    buttons: Array<{ id: string; label: string }>
+  ): void {
+    this.editMenuMessage(menu, text, buttons);
+  }
+
+  /** The in-place edit both the settings menu and the task menu use (they share a message). */
+  private editMenuMessage(
+    menu: { conversation: ConversationRef; ref?: MessageRef },
     text: string,
     buttons: Array<{ id: string; label: string }>
   ): void {
@@ -2296,6 +2426,189 @@ export class Daemon {
     delete menu.open;
     menu.rows = this.registry.settingRows();
     this.editSettingsMenu(menu, ...this.viewParts(reqId, menu, 0, ack));
+  }
+
+  // ───────────────────── scheduled tasks under /setting (core/schedule-menu.ts) ─────────────────────
+
+  /**
+   * `/setting schedule [pause|resume|delete|run <id>]`, typed. Bare, it is the task list — a menu
+   * where buttons work, text elsewhere; with a verb it acts, and the task's card is the answer (the
+   * same card the agent's commands post), so a text-only platform manages tasks as fully as any.
+   */
+  private onScheduleSetting(id: ConversationId, msg: InboundMessage, args: string[], canMenu: boolean): void {
+    const adapter = this.platforms.get(msg.conversation.platform);
+    if (!adapter) return;
+    const reply = (text: string): void =>
+      void adapter.sendMessage(addressOf(msg.conversation), text).catch((e) => console.warn('[schedule] reply failed:', e instanceof Error ? e.message : e));
+    if (!this.schedules) {
+      reply('Scheduled tasks are not enabled in this gateway.');
+      return;
+    }
+    const [verb, rawId] = args;
+    if (!verb) {
+      if (canMenu) this.postScheduleMenu(id, msg, adapter);
+      else reply(`${taskListText(this.schedules.tasks(), this.schedules.now())}\n\nManage one with \`/setting schedule pause|resume|delete|run <id>\`.`);
+      return;
+    }
+    const op = SCHEDULE_TYPED_OPS[verb.toLowerCase()];
+    if (!op || !rawId) {
+      reply('Usage: `/setting schedule` to list, or `/setting schedule pause|resume|delete|run <id>`.');
+      return;
+    }
+    try {
+      const view = this.schedules.op(rawId.replace(/^#/, ''), op, id);
+      if (op === 'run') reply(`⏰ Running \`#${view.id}\` **${view.name}** now.`);
+    } catch (e) {
+      reply(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  /** Post the task list as its own menu message (the typed route; the button route edits in place). */
+  private postScheduleMenu(conversationId: ConversationId, msg: InboundMessage, adapter: PlatformAdapter): void {
+    this.retireSettingsMenusFor(conversationId);
+    const reqId = randomUUID().slice(0, 8);
+    const menu: PendingScheduleMenu = {
+      conversationId,
+      conversation: msg.conversation,
+      ids: [],
+      pageSize: resolvePageSize(adapter.capabilities.menuPageSize),
+    };
+    this.pendingScheduleMenus.set(reqId, menu);
+    const view = this.renderScheduleMenu(reqId, menu);
+    void adapter
+      .sendButtons(addressOf(msg.conversation), view.text, view.buttons)
+      .then((ref) => {
+        menu.ref = ref;
+      })
+      .catch((e) => {
+        this.pendingScheduleMenus.delete(reqId);
+        console.error('[schedule] failed to post the menu:', e instanceof Error ? e.message : e);
+      });
+  }
+
+  /**
+   * The level a task menu is on. The task is re-read on every render, so a task deleted or changed
+   * elsewhere (by the agent, or a second menu) is shown as it is now — or said to be gone.
+   */
+  private renderScheduleMenu(reqId: string, menu: PendingScheduleMenu, prefix?: string): { text: string; buttons: Array<{ id: string; label: string }> } {
+    const schedules = this.schedules!;
+    const now = schedules.now();
+    const withPrefix = (v: { text: string; buttons: Array<{ id: string; label: string }> }) => ({
+      text: prefix ? `${prefix}\n\n${v.text}` : v.text,
+      buttons: v.buttons,
+    });
+    if (menu.open) {
+      const task = schedules.get(menu.open.id);
+      if (task) {
+        return withPrefix(menu.open.confirm ? buildScheduleDeleteConfirm(reqId, task) : buildScheduleTaskMenu(reqId, task, now));
+      }
+      prefix = `\`#${menu.open.id}\` no longer exists.${prefix ? ` ${prefix}` : ''}`;
+      delete menu.open;
+    }
+    const list = buildScheduleListMenu(reqId, schedules.tasks(), now);
+    menu.ids = list.ids;
+    return withPrefix(list);
+  }
+
+  /** A task-menu button: open the list (from settings), open a task, or act on the open one. */
+  private onScheduleClick(ev: ButtonInteraction, click: ScheduleMenuClick): void {
+    const clicker = ev.conversation;
+    const allow = this.config.access.allowFrom;
+    // Re-checked for the reason onSettingClick gives: a shared channel's menu can be tapped by anyone.
+    if (allow.length > 0 && !allow.includes(`${clicker.platform}:${clicker.user}`)) {
+      console.log(`[access] denied schedule-menu click from ${clicker.platform}:${clicker.user}`);
+      return;
+    }
+    if (!this.schedules) return;
+
+    if (click.kind === 'open') {
+      // Handed over from the settings menu: same message, same reqId, the other map.
+      const settings = this.pendingSettingsMenus.get(click.reqId);
+      if (!settings) {
+        this.replyToClick(ev, scheduleMenuExpiredText());
+        return;
+      }
+      this.pendingSettingsMenus.delete(click.reqId);
+      const menu: PendingScheduleMenu = {
+        conversationId: settings.conversationId,
+        conversation: settings.conversation,
+        ids: [],
+        pageSize: settings.pageSize,
+        ...(settings.ref ? { ref: settings.ref } : {}),
+      };
+      this.pendingScheduleMenus.set(click.reqId, menu);
+      this.editMenuMessage(menu, ...this.scheduleParts(click.reqId, menu));
+      return;
+    }
+
+    const menu = this.pendingScheduleMenus.get(click.reqId);
+    if (!menu) {
+      this.replyToClick(ev, scheduleMenuExpiredText());
+      return;
+    }
+    if (click.kind === 'task') {
+      const id = menu.ids[click.index];
+      if (id) menu.open = { id, confirm: false };
+      this.editMenuMessage(menu, ...this.scheduleParts(click.reqId, menu));
+      return;
+    }
+    this.onScheduleAction(click.reqId, menu, click.action);
+  }
+
+  private onScheduleAction(reqId: string, menu: PendingScheduleMenu, action: ScheduleMenuAction): void {
+    const schedules = this.schedules!;
+    const open = menu.open;
+    let ack: string | undefined;
+    switch (action) {
+      case 'settings': {
+        // Back up to the settings screen, on this same message.
+        this.pendingScheduleMenus.delete(reqId);
+        const settings: PendingSettingsMenu = {
+          conversationId: menu.conversationId,
+          conversation: menu.conversation,
+          rows: this.registry.settingRows(),
+          pageSize: menu.pageSize,
+          ...(menu.ref ? { ref: menu.ref } : {}),
+        };
+        this.pendingSettingsMenus.set(reqId, settings);
+        this.editSettingsMenu(settings, ...this.viewParts(reqId, settings));
+        return;
+      }
+      case 'back':
+        if (open?.confirm) open.confirm = false;
+        else delete menu.open;
+        break;
+      case 'delete':
+        if (open) open.confirm = true;
+        break;
+      case 'pause':
+      case 'resume':
+      case 'confirm-delete': {
+        if (!open) break;
+        const op = action === 'confirm-delete' ? 'remove' : action;
+        try {
+          // No card: this message is the answer, and posting one beside it would say it twice.
+          const view = schedules.op(open.id, op, menu.conversationId, false);
+          ack = `${op === 'remove' ? '🗑 Deleted' : op === 'pause' ? '⏸ Paused' : '▶ Resumed'} \`#${view.id}\` **${view.name}**.`;
+          if (op === 'remove') delete menu.open;
+        } catch (e) {
+          ack = e instanceof Error ? e.message : String(e);
+          open.confirm = false;
+        }
+        console.log(`[schedule] ${menu.conversationId}: ${op} #${open.id} from the menu`);
+        break;
+      }
+      default: {
+        const _exhaustive: never = action;
+        throw new Error(`unknown schedule action: ${JSON.stringify(_exhaustive)}`);
+      }
+    }
+    this.editMenuMessage(menu, ...this.scheduleParts(reqId, menu, ack));
+  }
+
+  private scheduleParts(reqId: string, menu: PendingScheduleMenu, prefix?: string): [string, Array<{ id: string; label: string }>] {
+    const view = this.renderScheduleMenu(reqId, menu, prefix);
+    return [view.text, view.buttons];
   }
 
   /**

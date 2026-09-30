@@ -89,7 +89,7 @@ import type { WorkdirUsageStore } from './workdir-usage.js';
 import { resolveAgentCwd, resolveConversationCwd, buildHarnessEnv } from './agent-common.js';
 import { formatAgyCliOutput, runAgyCliCommand } from './agent-agy.js';
 import { formatRuntimeFooter, formatTokens } from '../core/runtime-footer.js';
-import { InboundMerger } from '../core/inbound-merger.js';
+import { InboundMerger, type SoloOutcome } from '../core/inbound-merger.js';
 import { fallbackTitle, generateTitle } from '../core/title-namer.js';
 import { shouldRespond, type GateConfig } from '../core/inbound-gate.js';
 import { TurnRunner } from './turn-runner.js';
@@ -147,6 +147,12 @@ const TITLE_NAMES = new Set(['title', 'rename', 'topic']);
  * `skill` singular is accepted and not registered — the HARNESS_COMMANDS.aliases trade.
  */
 const SKILLS_NAMES = new Set(['skills', 'skill']);
+
+/**
+ * `/setting schedule` — the scheduled tasks, reached from the settings screen. `schedules`, `tasks`
+ * and `cron` are what people type for it; none is a setting key, so none can collide with one.
+ */
+const SCHEDULE_SETTING_NAMES = new Set(['schedule', 'schedules', 'tasks', 'cron']);
 
 /**
  * Shape a lane name: `[<agent>] <subject>`.
@@ -530,6 +536,13 @@ export class ConversationRegistry {
       supersedeVoice?(id: ConversationId): number;
       /** `/stop` / `/new`: call off every transcript here, returning how many there were. */
       cancelPendingVoice?(id: ConversationId, reason: string): number;
+      /**
+       * `/setting schedule [pause|resume|delete <id>]`. The tasks live on the daemon (schedule-service),
+       * so the registry only recognises the key and says whether this platform can carry a menu.
+       */
+      onScheduleSetting?(id: ConversationId, msg: InboundMessage, args: string[], canMenu: boolean): void;
+      /** One line for the text `/setting` list pointing at the scheduled tasks; absent = no line. */
+      scheduleSummary?(): string | undefined;
     },
     /** Persistent conversation state (agent binding + each agent's own session id). */
     private readonly store?: ConversationStore,
@@ -1577,7 +1590,15 @@ export class ConversationRegistry {
     if (!rawKey) {
       console.log(`[setting] listing settings for ${key}`);
       if (canMenu) this.hooks!.onSettingMenuRequest!(key, msg, { rows: settingsRows(this.config) });
-      else reply(settingsListText(this.config));
+      else reply([settingsListText(this.config), this.hooks?.scheduleSummary?.()].filter(Boolean).join('\n'));
+      return;
+    }
+
+    // Scheduled tasks are reached from the settings screen but are not settings: no config path, no
+    // parser, no ack of their own (see core/schedule-menu.ts). Handed to the daemon, which holds them.
+    if (SCHEDULE_SETTING_NAMES.has(rawKey.toLowerCase())) {
+      if (this.hooks?.onScheduleSetting) this.hooks.onScheduleSetting(key, msg, valueParts, canMenu);
+      else reply('Scheduled tasks are not enabled in this gateway.');
       return;
     }
 
@@ -2558,6 +2579,153 @@ ${formatTokens(left)} left before compaction — ${name}`;
   /** The agent currently bound to a conversation (falls back to routing.default). */
   private agentIdOf(id: ConversationId): string {
     return this.conversations.get(id)?.agentId ?? this.config.routing.default;
+  }
+
+  // ───────────────────────────── scheduled runs (daemon/scheduler.ts) ─────────────────────────────
+
+  /** The agent bound to a conversation, in memory or on disk; undefined when it has none yet. */
+  boundAgentOf(key: ConversationId): string | undefined {
+    return this.conversations.get(key)?.agentId ?? this.store?.boundAgent(key);
+  }
+
+  /**
+   * Where this conversation is answered — the lane its last turn ran at. Falls back to what the
+   * store recorded, so a card for a task deleted from `/setting` after a restart still has somewhere
+   * to go.
+   */
+  laneFor(key: ConversationId): { address: ConversationAddress; platformId: string } | undefined {
+    const live = this.laneOf(key);
+    if (live) return live;
+    const rec = this.store?.entries?.().find(([k]) => k === key)?.[1].lane;
+    if (!rec) return undefined;
+    return {
+      platformId: rec.platform,
+      address: rec.thread ? { channel: rec.channel, thread: rec.thread } : { channel: rec.channel },
+    };
+  }
+
+  /**
+   * The conversation an address belongs to, and the agent bound there — what a fixed-session task
+   * registered against that address will run in. Undefined under `per_user`, where an address names
+   * no single conversation (it is keyed by whoever is writing).
+   *
+   * The ref is built as `direct`: a scheduled run has no sender, and `direct` is the kind that
+   * neither prefixes speaker names nor opens a thread per turn — neither of which a timer wants.
+   */
+  conversationAt(platform: string, address: ConversationAddress): { key: ConversationId; agent?: string } | undefined {
+    const ref: ConversationRef = {
+      platform,
+      channel: address.channel,
+      ...(address.thread ? { thread: address.thread } : {}),
+      kind: 'direct',
+      user: '',
+    };
+    if (resolveScope(this.config, { ...ref, isBot: false }) === 'per_user') return undefined;
+    const key = this.idForRef(ref);
+    const agent = this.conversations.get(key)?.agentId ?? this.store?.boundAgent(key);
+    return agent !== undefined ? { key, agent } : { key };
+  }
+
+  /**
+   * Run one scheduled prompt as a turn in a conversation — its own turn, queued behind anything
+   * running there and interrupting nothing (InboundMerger.enqueueSolo). Resolves when the turn ends.
+   *
+   * Creates the conversation's state if this process has none (a restart, or a topic nobody has
+   * written in since), bound to what the store remembers. It REFUSES rather than rebinds when the
+   * conversation is answered by a different agent: a topic keeps its agent (refuseAgentSwitch), and
+   * after `/new` the user may have chosen another on purpose — a schedule must not undo that.
+   */
+  runScheduledPrompt(opts: {
+    key: ConversationId;
+    platform: string;
+    address: ConversationAddress;
+    agentId: string;
+    prompt: string;
+  }): Promise<SoloOutcome | { refused: string }> {
+    const state = this.ensureState(opts.key, opts.platform, opts.agentId);
+    if (state.agentId !== opts.agentId) {
+      return Promise.resolve({ refused: `this topic is now answered by ${state.agentId}, not ${opts.agentId}` });
+    }
+    state.reclaimOnIdle = false;
+    this.touch(opts.key);
+    const msg: InboundMessage = {
+      conversation: {
+        platform: opts.platform,
+        channel: opts.address.channel,
+        ...(opts.address.thread ? { thread: opts.address.thread } : {}),
+        kind: 'direct',
+        user: 'schedule',
+      },
+      // No platform message behind it: the merger puts no reactions on a solo turn.
+      messageId: '',
+      content: opts.prompt,
+      timestamp: this.clock.now(),
+    };
+    return state.merger.enqueueSolo(msg);
+  }
+
+  /**
+   * Where a new-session run happens: a new topic in the target when the platform can open one — so
+   * the run is a conversation the user can carry on in — else a throwaway conversation that posts
+   * into the target and is forgotten after the run (`ephemeral`, see releaseScheduled).
+   *
+   * The topic is created with its name already in the gateway's `[agent] subject` form and that name
+   * is recorded, so the automatic namer leaves it alone instead of renaming it after the prompt.
+   */
+  async openScheduledConversation(opts: {
+    platform: string;
+    address: ConversationAddress;
+    agentId: string;
+    title: string;
+    cwd?: string;
+    ephemeralKey: ConversationId;
+  }): Promise<{ key: ConversationId; address: ConversationAddress; ephemeral: boolean }> {
+    const adapter = this.platforms.get(opts.platform);
+    if (!adapter) throw new Error(`platform instance "${opts.platform}" is not running`);
+    const title = formatLaneTitle(opts.agentId, opts.title);
+    let opened: ConversationAddress | undefined;
+    if (adapter.capabilities.thread) {
+      try {
+        opened = (await adapter.createThread({ address: opts.address, messageId: '' }, title)).address;
+      } catch (e) {
+        console.warn(`[schedule] could not open a topic on ${opts.platform}; posting into the chat instead: ${e instanceof Error ? e.message : e}`);
+      }
+    }
+    const conv = opened ? this.conversationAt(opts.platform, opened) : undefined;
+    const key = conv?.key ?? opts.ephemeralKey;
+    const address = opened && conv ? opened : opts.address;
+    this.ensureState(key, opts.platform, opts.agentId, { fresh: true });
+    if (opts.cwd) this.store?.setConversationCwd(key, opts.agentId, opts.cwd);
+    if (key !== opts.ephemeralKey) this.store?.setConversationTitle(key, opts.agentId, title);
+    return { key, address, ephemeral: key === opts.ephemeralKey };
+  }
+
+  /** Forget a throwaway scheduled conversation entirely: its child, its state, its record. */
+  releaseScheduled(key: ConversationId): void {
+    this.agents.dispose(key);
+    this.releaseState(key);
+    this.store?.clear(key);
+  }
+
+  /**
+   * This conversation's state, created if absent. `fresh` binds the given agent regardless of what
+   * the store remembers — for a conversation that was created a moment ago for exactly that agent.
+   */
+  private ensureState(
+    key: ConversationId,
+    platform: string,
+    agentId: string,
+    opts: { fresh?: boolean } = {}
+  ): ConversationState {
+    let state = this.conversations.get(key);
+    if (!state) {
+      const bound = opts.fresh ? agentId : (this.store?.boundAgent(key) ?? agentId);
+      state = { merger: this.buildMerger(key), agentId: bound, platform, lastActivityAt: this.clock.now() };
+      this.conversations.set(key, state);
+      this.store?.bind(key, bound);
+      console.log(`[conversation] ${key} bound to agent "${bound}" (scheduled run)`);
+    }
+    return state;
   }
 
   /**

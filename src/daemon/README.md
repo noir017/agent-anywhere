@@ -31,6 +31,10 @@ session id, agy's conversation id). One conversation holds one session *per agen
 | `conversation-token-registry.ts` | Per-conversation reverse-command token ↔ conversation id |
 | `attachment-io.ts` | Real attachment IO + the SSRF guards |
 | `voice.ts` | Voice messages: download, transcribe (Gemini `generateContent`), the Send/Cancel card, re-entry as text, `voice-log.jsonl` |
+| `scheduler.ts` | Scheduled tasks' timing: one re-armed timer, what is due, the bookkeeping that keeps a restart from repeating or losing a run |
+| `schedule-store.ts` | `<configDir>/schedules.json`: 0600, atomic writes, a bad entry dropped loudly |
+| `schedule-service.ts` | Scheduled tasks wired to the rest: a run as a bash process or a turn, the agent's `schedule` commands, the cards |
+| `schedule-bash.ts` | One `--bash` run: its own process group, a bounded output tail, the full log on disk |
 | `reverse-cli-shim.ts` | Guarantees `agent-anywhere` is on the agent's PATH |
 
 ## Inbound flow
@@ -330,6 +334,77 @@ resident and said so once, not once a minute.
 Verified resumable on the three harnesses in use: `claude` (claude-agent-acp advertises
 `loadSession: true`), `opencode` 1.18.18 (same, plus `sessionCapabilities.resume`), and
 `agy` (`--conversation=<id>`, recorded as soon as its `init` event names one).
+
+## Scheduled tasks
+
+An agent registers them (`agent-anywhere schedule add …`, documented to it on demand by
+`agent-anywhere help schedule`); the daemon keeps and runs them. The decisions are
+[`core/schedule.ts`](../core/README.md) — when a task next runs, whether a late run is still worth
+making, every sentence said about one — and the files here do the timing and the IO.
+
+**Why the gateway schedules at all.** The harnesses have schedulers (Claude Code's CronCreate), and
+they live in the harness PROCESS — which this daemon reclaims after an idle hour and restarts on
+every upgrade. A "every morning at 8" made that way is gone by lunchtime. A task here is a file and a
+timer in the one process that is always up. The harness tools are left enabled: the gateway does not
+edit an agent's toolbox, and the help page says which one survives.
+
+```
+schedule add ──IPC──► ScheduleService.add ── core buildTask (every rule, every refusal) ──► ScheduleStore
+                                         └── card posted in the caller's conversation (the daemon's words)
+Scheduler.look ── core decide ──► run │ skip │ missed │ expire │ done
+      run ─► ScheduleService.run ─┬─ bash  → schedule-bash (process group, tail + log) → result posted
+                                  ├─ fixed → notice, then registry.runScheduledPrompt in THAT conversation
+                                  └─ new   → registry.openScheduledConversation (new topic, or throwaway)
+                                             → notice → runScheduledPrompt → released if throwaway
+```
+
+What each piece is shaped by, one line each:
+
+- **At most once.** `lastPlannedAt` is written before a run starts, so a daemon killed mid-run does not
+  make it again on restart. The next run is the first planned time after it.
+- **Catch-up is one run, the latest.** A run missed by less than `CATCH_UP_GRACE_MS` (1 h — the update
+  that restarted us) is made once when the daemon comes back; older is recorded `missed`. After a long
+  outage an every-minute task makes one run, not a burst.
+- **No overlap.** A run due while the previous run of the same task is still going is `skipped`.
+- **One timer, capped at a minute.** Re-armed after every look for the earliest thing due, so a host
+  clock that jumps costs at most a minute and no timeout comes near Node's 2^31 ms ceiling.
+- **A fixed-session run is a SOLO turn** (`InboundMerger.enqueueSolo`): it waits behind the turn
+  running there instead of interrupting it, is never merged into what the user is typing, goes behind
+  the user's own queued messages, and gets no reactions (there is no platform message). The reverse
+  still holds — a message typed during it interrupts it, recorded `interrupted`.
+- **A fixed-session task lives 24 h** (`FIXED_SESSION_WINDOW_MS`, the operator's rule): a topic a
+  schedule talks into forever grows a context nobody reads. `--at` beyond the window, or a cron with
+  no run inside it, is refused at registration; at the end it is marked `expired` and kept (visible,
+  deletable, not resumable), and a line says so where it ran.
+- **A topic keeps its agent** — so a fixed-session task for another agent is refused at registration,
+  and a run that finds the topic answered by someone else (after `/new`) is skipped with a line,
+  never rebinds.
+- **A new-session run gets a topic where the platform can open one** (web UI, Telegram forums,
+  Discord), created already named `[agent] ⏰ name · time` and recorded so the namer leaves it alone;
+  the user can carry on in it. Elsewhere it runs in a throwaway conversation (`schedule#<id>#<planned>`)
+  that posts into the target and is released afterwards.
+- **A bash run is not an agent**: `bash -lc` in its own process group (killed whole on timeout — `a |
+  b` forks), the daemon's environment minus the reverse-command token, a 16 KB tail kept for the chat
+  and the full output in `<configDir>/schedule-runs/<id>/` (20 per task). Longer than 3000 characters
+  inline, the log is attached.
+- **Every run speaks first.** A notice before an agent run, the result for a bash one — output that
+  arrives unasked always says which task produced it.
+- **Cards are the daemon's.** Register, pause, resume and delete post the task's card in the caller's
+  conversation, never left to the agent's retelling. `/setting` (below) answers in its own message
+  instead of posting a second one.
+- **Trust.** Registering needs a reverse-command token — an agent the operator already runs with
+  full tool access — so a bash task grants nothing that agent could not have written into crontab
+  itself. What IS new is persistence past the session: a prompt-injected agent's task outlives the
+  conversation that planted it. That is what the cards and the `/setting` list are for — nothing
+  is scheduled that the user was not shown — and why the task file is 0600. `access.allowFrom`
+  remains the gate ([security invariant #1](../../AGENTS.md#security-invariants)).
+
+`/setting` reaches the tasks through one extra button after the settings rows. They are not rows —
+every row is a config.yaml value with a parser and an ack — so the button edits the settings message
+into the task menu (`core/schedule-menu.ts`), and "◀ Settings" edits it back: one message, handed
+between `pendingSettingsMenus` and `pendingScheduleMenus` under the same reqId. Pause and resume are
+one tap; delete asks twice. Where there are no buttons, `/setting schedule [pause|resume|delete|run
+<id>]` does the same by typing and answers with the card.
 
 ## `TurnRunner`
 
@@ -723,10 +798,11 @@ SIGTERM mid-turn).
 
 `buildReverseHint(harness)` generates the per-turn `<system-reminder>` from the specs in
 `REVERSE_COMMANDS` marked `inject`. `send-file` is `'always'`; `ask` is `'no-native-ask'`,
-so it reaches only the harnesses that cannot ask over ACP (see below) — on `claude` the
-hint is one line. It cannot drift from the actual CLI. See
-[`src/ipc/README.md`](../ipc/README.md) for why the other seven are reachable but not
-advertised.
+so it reaches only the harnesses that cannot ask over ACP (see below). One more line follows: the
+pointer to `agent-anywhere help`, carrying the few capabilities an agent could not guess the gateway
+has (a schedule that survives restarts first of all). On `claude` the hint is those two lines. It
+cannot drift from the actual CLI. See
+[`src/ipc/README.md`](../ipc/README.md) for why the rest is loaded on demand.
 
 ### `session/load` replay must not reach the chat
 

@@ -838,14 +838,23 @@ export function parseSettingButtonId(buttonId: string): SettingButtonClick | nul
   return null;
 }
 
-/** The list level: one button per setting, labelled with its current value. */
-export function buildSettingsMenu(menu: { reqId: string; rows: SettingRow[] }): SettingsMenuView {
+/**
+ * The list level: one button per setting, labelled with its current value — plus, when given, one
+ * `extra` entry after them that leads somewhere other than a value (the scheduled-task list, whose
+ * menu is core/schedule-menu.ts).
+ */
+export function buildSettingsMenu(menu: {
+  reqId: string;
+  rows: SettingRow[];
+  extra?: { id: string; label: string };
+}): SettingsMenuView {
   const shown = menu.rows.slice(0, SETTING_ROW_MAX);
   const overflow = menu.rows.slice(SETTING_ROW_MAX);
   const buttons = shown.map((row, i) => ({
     id: settingRowButtonId(menu.reqId, i),
     label: truncateLabel(`${row.label} · ${row.value}`),
   }));
+  if (menu.extra) buttons.push(menu.extra);
   let text = 'Settings — saved to config.yaml, not just this conversation. Tap one to change it.';
   if (overflow.length > 0) {
     text += `\n\n${overflow.length} more (type them): ${overflow.map((r) => `\`/setting ${settingKeyOf(r)}\``).join(', ')}`;

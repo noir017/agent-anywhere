@@ -30,6 +30,11 @@ describe('parseIpcRequest — valid requests round-trip', () => {
     { kind: 'send-message', text: 'hi', channelId: 'web:main/t1' },
     { kind: 'list-channels' },
     { kind: 'list-channels', platform: 'tg', query: '量化', limit: 10 },
+    { kind: 'schedule-add', cron: '0 8 * * *', prompt: 'brief', session: 'new', channelId: 'tg:586' },
+    { kind: 'schedule-add', at: '+30m', bash: 'du -sh /', timeoutMs: 60_000, cwd: '/tmp' },
+    { kind: 'schedule-list' },
+    { kind: 'schedule-list', id: 'a1b2c3' },
+    { kind: 'schedule-op', id: 'a1b2c3', op: 'remove' },
   ];
   it.each(valid)('accepts %j', (action) => {
     const r = parseIpcRequest({ token: TOKEN, action });
@@ -60,6 +65,13 @@ describe('parseIpcRequest — rejects malformed / hostile input', () => {
     ['list-channels with a channel', { token: TOKEN, action: { kind: 'list-channels', channelId: 'c2' } }],
     ['list-channels empty query', { token: TOKEN, action: { kind: 'list-channels', query: '' } }],
     ['list-channels zero limit', { token: TOKEN, action: { kind: 'list-channels', limit: 0 } }],
+    // The schedule arms check shape only (buildTask owns the cross-field rules), but shape strictly.
+    ['schedule-add unknown session', { token: TOKEN, action: { kind: 'schedule-add', cron: 'x', prompt: 'p', session: 'forever' } }],
+    ['schedule-add extra field', { token: TOKEN, action: { kind: 'schedule-add', cron: 'x', prompt: 'p', shell: 'zsh' } }],
+    ['schedule-add empty prompt', { token: TOKEN, action: { kind: 'schedule-add', cron: 'x', prompt: '' } }],
+    ['schedule-op unknown op', { token: TOKEN, action: { kind: 'schedule-op', id: 'a', op: 'explode' } }],
+    ['schedule-op missing id', { token: TOKEN, action: { kind: 'schedule-op', op: 'remove' } }],
+    ['schedule-list with a channel', { token: TOKEN, action: { kind: 'schedule-list', channelId: 'c' } }],
   ];
   it.each(bad)('rejects %s', (_label, raw) => {
     const r = parseIpcRequest(raw);

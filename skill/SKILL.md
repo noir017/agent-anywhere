@@ -6,7 +6,9 @@ description: >-
   chat; push a proactive notification (e.g. after a long task finishes); reply to,
   edit, delete, or react to a specific message; fetch chat history the user is
   referring to ("the one above", "that earlier link"); open a thread; or ask the user
-  a blocking multiple-choice question with buttons and branch on the answer. Also use
+  a blocking multiple-choice question with buttons and branch on the answer; or schedule
+  a task (a prompt or a bash command) that runs later or repeatedly and survives restarts.
+  Also use
   it when the user reports the gateway misbehaving or asks to change its settings —
   it covers diagnosing with `doctor` and editing the gateway config. Do NOT use it
   for an ordinary reply — your plain text output already streams back to the chat
@@ -130,6 +132,28 @@ ids of the form `<instance>:<channel>[/<thread>]` (e.g. `tg:5865716608/8068`,
 different platform from the one you are answering on. `kind=channel` rows are chat roots;
 `current=true` marks this conversation. The list only holds places the gateway has already
 answered in: most platforms cannot enumerate a bot's chats.
+
+### Scheduled tasks
+
+```bash
+agent-anywhere schedule add --cron "0 8 * * *" --prompt "…" [--session fixed|new] [--agent cc]
+agent-anywhere schedule add --at +30m --bash "backup.sh" [--timeout 10m] [--cwd <dir>]
+agent-anywhere schedule list | show <id> | pause <id> | resume <id> | run <id> | rm <id>
+```
+
+Tasks kept by the gateway, which survive idle reclaim and restarts — use these, not a scheduling
+tool built into your own harness, which lives only as long as your process. `agent-anywhere help
+schedule` is the full reference; the essentials:
+
+- `--prompt` runs as an agent. `--session fixed` (default) is a turn in this conversation, with
+  its agent, so context accumulates — and lives 24 h from registration. `--session new` is a
+  fresh session per run, in a new topic where the platform can open one; no time limit.
+- `--bash` is run by the gateway (`bash -lc`); exit code, duration and the end of the output are
+  posted, long output attached. Default timeout 10 min.
+- `--at`: `+30m`, `08:00`, `"2026-10-01 08:00"`, or ISO with a zone. `--cron`: 5 fields. Both in
+  `--tz`, default the gateway's zone. `--channel` is where output goes (default: here).
+- The gateway posts the task's card when it is added, paused, resumed or deleted; the user can
+  manage tasks with `/setting schedule`.
 
 ### Asking the user (blocking)
 

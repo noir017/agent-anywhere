@@ -21,6 +21,38 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **Scheduled tasks.** Asked for "every morning at 8, …" or "in half an hour, run the backup", an
+  agent now registers a task the gateway keeps, in `<configDir>/schedules.json`. The harnesses have
+  schedulers of their own, but those live in the harness process, which the gateway reclaims after
+  an idle hour and restarts on every upgrade, so a daily job set up that way was gone by lunchtime.
+  There are three kinds. A prompt in a **fixed session** is a turn in the conversation it was
+  registered from, answered by that conversation's agent, so context builds up and you can follow
+  up in place; it lives 24 hours and is then marked expired. A prompt in a **new session** starts a
+  fresh session every run, in a new topic where the platform can open one (web UI, Telegram
+  forums, Discord), and has no time limit. A **bash** task is run by the gateway itself, and its
+  exit code, duration and the end of its output are posted, with the full log attached when it is
+  long. Output can go to any chat the gateway has answered in, on any platform. A run the gateway
+  missed by less than an hour, because it was restarting, is made once when it comes back; an
+  older one is recorded as missed. A run that comes due while the previous one is still going is
+  skipped. A scheduled turn never cuts off what you are in the middle of: it waits behind the
+  running turn and behind your queued messages. Every change posts a card with the task's details,
+  written by the gateway, not retold by the agent, so what you read is what will run. `/setting`
+  gains a **⏰ Scheduled tasks** button listing every task with its next and last run, with pause,
+  resume and a two-tap delete; `/setting schedule pause|resume|delete|run <id>` does the same where
+  there are no buttons. The harness schedulers are left enabled, because the gateway does not edit
+  an agent's toolbox; the help page tells the agent which one survives.
+- **The agent's instructions load on demand: `agent-anywhere help <topic>`.** The hint injected
+  into a session's first turn gains one line. It points at `agent-anywhere help` and names the
+  three things an agent could not guess the gateway does: scheduled tasks, posting to other chats,
+  and chat history. Each help page prints its commands, rendered from the command catalog so they
+  cannot drift, and its rules. A command now has to name the page it is documented on. This is the
+  skill pattern done in the CLI, because every harness here has a shell and not all of them load
+  skills. MCP tools would have been the opposite: only Claude Code defers their definitions, and
+  opencode, codex and agy would carry every schema in every request. Tested 2026-09-30 against a
+  throwaway daemon: asked in plain words to run a command in two minutes, Claude Code read
+  `agent-anywhere help`, then `help schedule`, then registered the task correctly, told nothing
+  beyond the pointer line. `help <command>` still shows one command's flags, and `--help` still
+  lists everything.
 - **`agent-anywhere channels`, and `--channel` that can name another platform.** An agent could
   post to another chat only on the platform it was answering on: an address alone cannot say
   which platform it is on, so every `--channel` went to the caller's own instance, and an agent

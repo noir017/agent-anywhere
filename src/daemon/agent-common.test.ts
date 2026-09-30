@@ -44,12 +44,19 @@ describe('buildReverseHint', () => {
     }
   });
 
-  it('stays a single command on claude, which asks with its own tool', () => {
+  it('stays a single command on claude, which asks with its own tool, plus the on-demand pointer', () => {
     const hint = buildReverseHint('claude');
     // claude sends ACP `elicitation/create`, so advertising the CLI would offer a second, worse
     // way to do the same thing.
     expect(hint).not.toContain('agent-anywhere ask');
-    expect(hint.split('\n').filter((l) => l.trim().startsWith('- '))).toHaveLength(1);
+    const items = hint.split('\n').filter((l) => l.trim().startsWith('- '));
+    expect(items).toHaveLength(2);
+    expect(items[1]).toMatch(/loaded when you need them — scheduled\/recurring tasks that survive restarts, .*: agent-anywhere help$/);
+  });
+
+  it('keeps the whole hint short — the pointer is one line, not a manual', () => {
+    // The 13-line, ~350-token block this replaced is why the budget is stated at all.
+    expect(buildReverseHint('claude').length).toBeLessThan(420);
   });
 
   it('keeps `ask` for harnesses that cannot ask over ACP', () => {

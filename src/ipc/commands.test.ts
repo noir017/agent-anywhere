@@ -1,0 +1,103 @@
+import { describe, expect, it } from 'vitest';
+import { HELP_TOPICS, REVERSE_COMMANDS, helpPointer, renderHelpIndex, renderHelpTopic } from './commands.js';
+import type { IpcAction } from './protocol.js';
+
+/**
+ * The catalog as the agent meets it: through `agent-anywhere help`, and through commander parsing
+ * `schedule …` into an action. The help pages are the only place the non-injected commands are
+ * documented to the agent, so "every command is on a page" is a property worth pinning.
+ */
+
+const spec = (usage: string) => REVERSE_COMMANDS.find((c) => c.usage.startsWith(usage))!;
+const schedule = (positionals: string[], opts: Record<string, unknown> = {}): IpcAction => spec('schedule').build(positionals, opts);
+
+describe('help topics', () => {
+  it('puts every command on a page that exists, and every page has something on it or to say', () => {
+    const names = new Set(HELP_TOPICS.map((t) => t.name));
+    for (const c of REVERSE_COMMANDS) expect(names.has(c.topic)).toBe(true);
+    for (const t of HELP_TOPICS) {
+      const commands = REVERSE_COMMANDS.filter((c) => c.topic === t.name);
+      expect(commands.length + t.notes.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('the index names every topic on one line each', () => {
+    const index = renderHelpIndex();
+    for (const t of HELP_TOPICS) expect(index).toMatch(new RegExp(`^  ${t.name}\\s+${t.summary.slice(0, 20)}`, 'm'));
+  });
+
+  it('a topic page carries its commands, their flags and its rules', () => {
+    const page = renderHelpTopic('schedule')!;
+    expect(page).toContain('agent-anywhere schedule <action> [id]');
+    expect(page).toContain('--cron <expr>');
+    expect(page).toContain('-c, --channel <id>');
+    // The rule that makes the whole feature worth having must be on the page the agent reads.
+    expect(page).toMatch(/rather than a scheduling tool built into your own harness/);
+    expect(page).toMatch(/lives 24h/);
+  });
+
+  it('answers undefined for a page that does not exist (the CLI then tries a command name)', () => {
+    expect(renderHelpTopic('nope')).toBeUndefined();
+    expect(renderHelpTopic('SCHEDULE')).toBeDefined();
+  });
+
+  it('the pointer advertises what an agent could not guess the gateway does', () => {
+    expect(helpPointer()).toBe(
+      'More, loaded when you need them — scheduled/recurring tasks that survive restarts, posting to other chats, chat history: agent-anywhere help'
+    );
+  });
+});
+
+describe('schedule <action> [id]', () => {
+  it('builds an add from its options, --channel as the target', () => {
+    expect(
+      schedule(['add'], { cron: '0 8 * * *', prompt: 'brief', session: 'new', agent: 'oc', channel: 'tg:586', timeout: undefined })
+    ).toEqual({
+      kind: 'schedule-add',
+      channelId: 'tg:586',
+      cron: '0 8 * * *',
+      prompt: 'brief',
+      session: 'new',
+      agent: 'oc',
+      name: undefined,
+      at: undefined,
+      tz: undefined,
+      bash: undefined,
+      cwd: undefined,
+      timeoutMs: undefined,
+    });
+  });
+
+  it('parses --timeout as a duration', () => {
+    const parse = spec('schedule').options.find((o) => o.flags.startsWith('--timeout'))!.parse!;
+    expect(parse('90s')).toBe(90_000);
+    expect(parse('10m')).toBe(600_000);
+    expect(parse('1h')).toBe(3_600_000);
+    expect(parse('1500')).toBe(1_500);
+    expect(() => parse('soon')).toThrow(/duration like 90s/);
+  });
+
+  it.each([
+    [['list'], { kind: 'schedule-list' }],
+    [['ls'], { kind: 'schedule-list' }],
+    [['show', 'a1b2c3'], { kind: 'schedule-list', id: 'a1b2c3' }],
+    [['pause', '#a1b2c3'], { kind: 'schedule-op', id: 'a1b2c3', op: 'pause' }],
+    [['resume', 'a1b2c3'], { kind: 'schedule-op', id: 'a1b2c3', op: 'resume' }],
+    [['run', 'a1b2c3'], { kind: 'schedule-op', id: 'a1b2c3', op: 'run' }],
+    [['rm', 'a1b2c3'], { kind: 'schedule-op', id: 'a1b2c3', op: 'remove' }],
+    [['delete', 'a1b2c3'], { kind: 'schedule-op', id: 'a1b2c3', op: 'remove' }],
+  ])('schedule %j', (positionals, want) => {
+    expect(schedule(positionals)).toEqual(want);
+  });
+
+  it.each([
+    [['pause'], {}, /needs a task id/],
+    [['frobnicate'], {}, /unknown schedule action "frobnicate"/],
+    [['list'], { cron: '0 8 * * *' }, /--cron only applies to `schedule add`/],
+    [['rm', 'x'], { channel: 'tg:1' }, /--channel only applies to `schedule add`/],
+    [['add', 'x'], { cron: '0 8 * * *' }, /takes no id/],
+    [['add'], { session: 'forever' }, /--session must be fixed or new/],
+  ])('refuses %j %j', (positionals, opts, why) => {
+    expect(() => schedule(positionals, opts)).toThrow(why);
+  });
+});

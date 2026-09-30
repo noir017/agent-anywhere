@@ -4,7 +4,7 @@ import { encode } from '@toon-format/toon';
 import { loadConfig, resolveSocketPath } from '../config/load.js';
 import { callDaemon } from '../ipc/client.js';
 import { DEFAULT_FETCH_FIELDS } from '../ipc/commands.js';
-import type { IpcAction, ListChannelsResult, VoiceLogResult } from '../ipc/protocol.js';
+import type { IpcAction, ListChannelsResult, ScheduleListResult, ScheduleTaskView, VoiceLogResult } from '../ipc/protocol.js';
 import { ASK_CLIENT_TIMEOUT_MARGIN_MS, DEFAULT_ASK_TIMEOUT_MS } from '../ipc/protocol.js';
 import type { InboundMessage } from '../types.js';
 
@@ -41,6 +41,10 @@ function resolvePathArg(p: string): string {
 function normalizeActionPaths(action: IpcAction): IpcAction {
   if (action.kind === 'send-file') {
     return { ...action, path: resolvePathArg(action.path) };
+  }
+  // Same reason: a schedule's --cwd is read by the daemon, whose own CWD is not the agent's.
+  if (action.kind === 'schedule-add' && action.cwd !== undefined) {
+    return { ...action, cwd: resolvePathArg(action.cwd) };
   }
   return action;
 }
@@ -275,6 +279,43 @@ function printChannels(data: unknown): void {
 }
 
 /**
+ * schedule-add / schedule-op: the one task, in full, and the next step. The id is the thing to
+ * keep, and the card the gateway posted is what the user sees — said so, so the agent does not
+ * restate every field in its reply.
+ */
+function printScheduleTask(data: unknown): void {
+  const task = (data as { task?: ScheduleTaskView } | undefined)?.task;
+  if (!task) {
+    emit({ ok: true });
+    return;
+  }
+  emit({
+    task,
+    help: [
+      `The gateway posted this task's card in the chat. Manage it with: agent-anywhere schedule pause|resume|run|rm ${task.id}`,
+    ],
+  });
+}
+
+/** schedule-list: every task as one table, or one task in full for `show`. */
+function printScheduleList(data: unknown): void {
+  const tasks = (data as ScheduleListResult | undefined)?.tasks ?? [];
+  if (tasks.length === 0) {
+    emit({ count: 0, note: 'no scheduled tasks; add one with agent-anywhere schedule add (see agent-anywhere help schedule)' });
+    return;
+  }
+  if (tasks.length === 1 && (tasks[0]!.prompt !== undefined || tasks[0]!.command !== undefined)) {
+    emit({ task: tasks[0] });
+    return;
+  }
+  emit({
+    count: tasks.length,
+    tasks,
+    help: ['here=true: registered from, or running in, this conversation. `schedule show <id>` prints one task with its prompt or command.'],
+  });
+}
+
+/**
  * Printers for the commands whose output is a function of the response alone. A table rather than
  * more switch arms: every gateway query added one, and the switch in printResult is about the
  * commands whose rendering also depends on what was asked (ask's timeout, fetch's columns).
@@ -282,6 +323,9 @@ function printChannels(data: unknown): void {
 const DATA_PRINTERS: Partial<Record<IpcAction['kind'], (data: unknown) => void>> = {
   'voice-log': printVoiceLog,
   'list-channels': printChannels,
+  'schedule-add': printScheduleTask,
+  'schedule-op': printScheduleTask,
+  'schedule-list': printScheduleList,
 };
 
 /**

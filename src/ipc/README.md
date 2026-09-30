@@ -35,27 +35,48 @@ This module imports nothing from the project except `types.ts`.
 
 ## `REVERSE_COMMANDS` is the single source of truth
 
-One spec array drives three places, so they cannot drift:
+One spec array drives four places, so they cannot drift:
 
 - `cli.ts` registers commander subcommands from it (usage string, options, `build`).
 - `agent-common.ts` `buildReverseHint()` generates the per-turn `<system-reminder>` the
   agent sees, from the `hint` of each spec **marked `inject`**.
+- `agent-anywhere help <topic>` renders each spec's usage and options onto the page its
+  `topic` names (see below).
 - `daemon.ts` `handleReverse` dispatches, with an exhaustive `never` guard.
 
 **Adding a reverse command is two edits**: one arm in the `IpcAction` union
-(`protocol.ts`) and one entry in `REVERSE_COMMANDS`. CLI registration and the agent-facing
-hint follow automatically, and a missing `handleReverse` arm **fails to compile**. Do not
-add a command by hand-registering it in `cli.ts`.
+(`protocol.ts`) and one entry in `REVERSE_COMMANDS`, whose `topic` is required — a command
+has to say which help page an agent will find it on. CLI registration, the help page and the
+agent-facing hint follow automatically, and a missing `handleReverse` arm **fails to compile**.
+Do not add a command by hand-registering it in `cli.ts`. (`help` itself is the one command
+registered there by hand: it is local, and never reaches the daemon.)
 
 The catalog: `send-message`, `reply`, `edit-message`, `send-file`, `react`, `delete`,
-`fetch-messages`, `create-thread`, `ask`, `voice-log`, `channels`.
+`fetch-messages`, `create-thread`, `ask`, `voice-log`, `channels`, `schedule`.
 
-## Only `send-file` is injected everywhere
+## Loaded on demand: the injected hint is a pointer
 
 `inject` is set on two specs — `send-file` as `'always'` and `ask` as `'no-native-ask'` —
-and the rest of the catalog is reachable only by typing it (`agent-anywhere --help` lists
-everything; scripts keep working). The flag governs one thing: what is spent from the
-model's attention before it has read the user's first word.
+and the hint adds exactly one more line: a pointer to `agent-anywhere help`, carrying the
+`pointer` phrases of the topics in `HELP_TOPICS` that have one (scheduled tasks that survive
+restarts, posting to other chats, chat history). Everything else costs nothing until the model
+runs `agent-anywhere help <topic>`, which prints that topic's commands — rendered from the specs
+— and its `notes`: the rules, the traps, the defaults. The flag governs one thing: what is
+spent from the model's attention before it has read the user's first word.
+
+It is the skill pattern — a line of description in context, the body loaded when relevant —
+done in the CLI, because every harness here has a shell and not every harness has skills (the
+ones that do keep them in different places). MCP tools were the other candidate and lose where
+it matters: only Claude Code defers MCP tool definitions, and only past a size threshold;
+opencode, codex and agy would carry every schema in every request. Verified 2026-09-30 against a
+test daemon: asked in plain Chinese to "run this command in two minutes", claude ran
+`agent-anywhere help`, then `help schedule`, then a correct `schedule add` — having been told
+nothing but the pointer line.
+
+The pointer's phrases are a budget, not a list: a topic earns one only when an agent could not
+guess the gateway does it. `schedule` is the case the whole design exists for — without the
+line, a model asked for "every morning at 8" reaches for its own harness's session-bound cron
+tool and the task dies with the process.
 
 The hint used to carry all nine commands with full usage — about 350 tokens of chat-bot
 operating manual in the **first text block** of every session's opening turn. The cost was
@@ -71,6 +92,7 @@ Most of it was redundant anyway:
 | `edit-message` | The daemon already live-edits the turn's message. |
 | `react`, `delete`, `create-thread`, `fetch-messages` | Chat-client chrome, not the work the agent was asked to do. |
 | `channels` | Only needed to post somewhere other than here, which is rare and always deliberate. |
+| `schedule` | Not injected, but advertised by the pointer — see above for why it is the one that has to be. |
 | `voice-log` | A confirmed voice transcript reaches the agent as the user's own typed words — the user read and approved them — so telling every session that some messages were spoken would only invite second-guessing text that was already checked. It exists for the rare turn where a message reads like a mishearing. |
 
 `send-file` stays because it is the one act the text channel cannot perform: a file has to

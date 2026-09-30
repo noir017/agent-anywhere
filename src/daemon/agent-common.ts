@@ -3,7 +3,7 @@ import { join, resolve, delimiter } from 'node:path';
 import { mkdirSync, statSync } from 'node:fs';
 import type { ChildProcess } from 'node:child_process';
 import type { AgentDef } from '../config/schema.js';
-import { REVERSE_COMMANDS } from '../ipc/commands.js';
+import { REVERSE_COMMANDS, helpPointer } from '../ipc/commands.js';
 import { ensureReverseCliShim } from './reverse-cli-shim.js';
 
 /**
@@ -49,7 +49,10 @@ const NATIVE_ASK_HARNESSES: ReadonlySet<AgentDef['harness']> = new Set(['claude'
  * gets buttons in front of the user. See ReverseCommandSpec.inject for the per-command reasoning.
  *
  * The other commands are still registered and still work when typed; they are simply not spent
- * from the model's attention up front.
+ * from the model's attention up front. What IS spent is one pointer line (ipc/commands.ts
+ * helpPointer): the few capabilities a model could not guess the gateway has — a schedule that
+ * survives restarts above all, which it would otherwise build with its own harness's session-bound
+ * tools and lose within the hour — and the command that loads their instructions on demand.
  */
 export function buildReverseHint(harness?: AgentDef['harness']): string {
   const nativeAsk = harness !== undefined && NATIVE_ASK_HARNESSES.has(harness);
@@ -61,6 +64,7 @@ export function buildReverseHint(harness?: AgentDef['harness']): string {
     '<system-reminder>',
     'Your replies reach the user automatically — just answer normally. For anything text cannot carry, run these with Bash:',
     ...injected.map((c) => `  - ${c.hint}`),
+    `  - ${helpPointer()}`,
     '</system-reminder>',
   ].join('\n');
 }

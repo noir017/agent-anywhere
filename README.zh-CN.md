@@ -36,6 +36,7 @@ Code、Codex、OpenCode，以及 Google 的 Antigravity CLI。给机器人发消
 - **任意 ACP 智能体，外加 agy** —— 内置 Claude Code、Codex、OpenCode 与 Antigravity（`agy`）预设，另有 `custom`；按平台、频道、用户或斜杠命令路由。
 - **原生流式体验** —— 消息原地编辑、工具调用气泡、生命周期回应表情、新消息打断。
 - **在聊天中行动** —— 智能体可发文件、加回应、引用回复、开子区、读历史、发按钮提问。
+- **定时任务** —— 「每天早上 8 点……」会变成网关自己保存的任务：智能体提示词或 bash 命令，结果可发往任意聊天，重启不丢；在 `/setting` 里管理。
 - **附件处理** —— 收到的图片和文件自动下载并交给智能体。
 - **语音消息** —— 语音自动转成文字（Gemini），先标明「语音识别结果」给你看，点 ✅ 后才作为你的消息发给智能体；关掉确认后则直接发送。
 - **话题是一等公民** —— Telegram 话题、飞书话题、Slack 线程、Discord 子区各自是独立会话，各自绑定智能体；话题固定使用最初接手的智能体。
@@ -516,6 +517,26 @@ config.yaml。
 `ask` 这条 CLI，模型照样能给你弹按钮；再不行就用纯文本把问题问出来并结束这一轮，
 你在下一条消息里回答即可。
 
+## 定时任务
+
+直接用大白话说——「每天早上 8 点，总结一下夜里挂掉的 CI」「30 分钟后跑一下备份，告诉我结果」——
+智能体就会登记一个由网关保存的任务。智能体进程被回收、守护进程重启，任务都还在，这是各
+harness 自带的定时工具做不到的。
+
+| 类型 | 执行什么 | 结果发在哪 |
+|---|---|---|
+| 提示词 · **固定会话**（默认） | 在当前会话里跑一轮，由该会话的智能体回答——上下文累积，可以接着追问 | 当前会话；登记后 **24 小时**有效，之后标为已过期 |
+| 提示词 · **新开会话** | 每次都是全新会话，可指定任意智能体 | 平台能开话题的（web 界面、Telegram 论坛群、Discord）每次新开一个话题，否则发在当前聊天；不限时长 |
+| **bash** | 由网关直接执行命令，不经过智能体 | 退出码、耗时和输出末尾，输出太长会附上完整日志文件 |
+
+结果可以发到网关回答过的任意聊天，跨平台也行（`agent-anywhere channels` 列出这些地方）。
+网关重启期间错过的运行，晚了不到一小时的会在恢复后补跑一次，更久的记为错过。每次改动都会贴
+一张任务卡片，由网关写、不经智能体转述，你看到的就是实际会执行的。
+
+`/setting` 里有一个 **⏰ Scheduled tasks** 按钮：列出每个任务的下次和上次运行，可以暂停、
+恢复、删除（删除要点两次）。没有按钮的平台，用 `/setting schedule [pause|resume|delete|run <id>]`
+打字完成同样的操作。
+
 ## 在聊天中行动
 
 纯文本回答自动流式返回。智能体被告知的，只有文本通道唯一做不到的那一件事：
@@ -524,13 +545,14 @@ config.yaml。
 agent-anywhere send-file ./report.pdf --caption "Q3 数据"
 ```
 
-其余命令智能体依然能用，但**刻意不告诉它**——在模型读到你第一个字之前，一份命令清单
-先花掉的是它的注意力：`send-message`、`reply`、`edit-message`、`react`、`delete`、
-`fetch-messages`、`create-thread`。完整列表见 `agent-anywhere --help`，每一条为什么
-冗余见 [`src/ipc/README.md`](src/ipc/README.md)。
+外加一行指向 `agent-anywhere help` 的提示，点出它猜不到网关能做的事——定时任务、发到别的
+聊天、读聊天记录。其余命令都**按需加载**：智能体需要时运行 `agent-anywhere help <主题>`，
+才读到那个主题的命令和规则，在模型读到你第一个字之前，不占它任何注意力。主题有：`files`、
+`schedule`、`channels`、`history`、`messages`（`send-message`、`reply`、`edit-message`、
+`react`、`delete`）、`threads`、`ask`、`voice`。为什么注入部分这么小，见
+[`src/ipc/README.md`](src/ipc/README.md)。
 
-如果你希望智能体熟练使用它们，装上内置 [skill](skill/SKILL.md)——它带完整用法，
-按需加载，而不是每个会话都注入一遍：
+内置的 [skill](skill/SKILL.md) 以 skill 的形式带着同一套用法，给会加载 skill 的 harness 用：
 
 ```bash
 npx skills add https://github.com/noir017/agent-anywhere/tree/main/skill -g

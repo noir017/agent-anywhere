@@ -36,6 +36,7 @@ streams its answer into a single, live-edited message.
 - **Any ACP agent, plus agy** — presets for Claude Code, Codex, OpenCode and Antigravity (`agy`), plus `custom`; route by platform, channel, user, or slash command.
 - **Native streaming** — in-place edits, live tool-call bubbles, lifecycle reactions, interrupt on new message.
 - **Chat actions** — the agent sends files, reacts, replies, opens threads, reads history, asks button questions.
+- **Scheduled tasks** — "every morning at 8, …" becomes a task the gateway keeps: an agent prompt or a bash command, output to any chat, surviving restarts; managed from `/setting`.
 - **Attachments** — inbound images and files are downloaded and handed to the agent.
 - **Voice messages** — a voice note is transcribed (Gemini), shown to you labelled as a transcript, and sent on as your message once you tap ✅ — or at once, if you turn confirmation off.
 - **Topics are first-class** — a Telegram topic, Feishu topic (话题), Slack thread or Discord thread is its own conversation, with its own agent; a topic keeps the agent it started with.
@@ -597,6 +598,28 @@ Harnesses that do not implement elicitation — `opencode` and `dsh`, as of 1.18
 buttons in front of you. Failing that, the model asks in plain text and ends its turn, and
 you answer in the next message.
 
+## Scheduled tasks
+
+Ask for it in plain words — *"every morning at 8, summarise the overnight CI failures"*,
+*"in 30 minutes, run the backup and tell me how it went"* — and the agent registers a task the
+gateway keeps. Tasks survive the agent's process being reclaimed and the daemon restarting,
+which the harnesses' own schedulers do not.
+
+| kind | what runs | where it answers |
+|---|---|---|
+| prompt, **fixed session** (default) | a turn in this conversation, by its agent — context accumulates, you can follow up in place | here, for **24 h** from registration; then it is marked expired |
+| prompt, **new session** | a fresh session each run, by any agent | a new topic per run where the platform can open one (web UI, Telegram forums, Discord), else this chat; no time limit |
+| **bash** | a command, run by the gateway itself — no agent | exit code, duration and the end of the output, long output attached |
+
+Output can go to any chat the gateway has answered in, on any platform (`agent-anywhere
+channels` lists them). A run the gateway missed by less than an hour — it was restarting — is
+made when it comes back; older is recorded as missed. Every change posts a card with the task's
+details, written by the gateway rather than the agent, so what you read is what will run.
+
+`/setting` has a **⏰ Scheduled tasks** button: every task with its next and last run, and
+pause, resume and delete (delete asks twice). Where there are no buttons,
+`/setting schedule [pause|resume|delete|run <id>]` does the same by typing.
+
 ## Acting in the chat
 
 Plain text streams back automatically, and the agent is told about exactly one thing it
@@ -606,15 +629,16 @@ cannot do that way:
 agent-anywhere send-file ./report.pdf --caption "Q3 numbers"
 ```
 
-The rest of the CLI is available to the agent but deliberately **not** advertised to it,
-because a command list in the prompt costs attention before the model has read your first
-word: `send-message`, `reply`, `edit-message`, `react`, `delete`, `fetch-messages`,
-`create-thread`. Run `agent-anywhere --help` for the full set, and see
-[`src/ipc/README.md`](src/ipc/README.md) for why each one is redundant.
+plus one line pointing at `agent-anywhere help`, which names what it could not guess the
+gateway does — scheduled tasks, posting to other chats, reading chat history. The rest of the
+CLI is loaded **on demand**: `agent-anywhere help <topic>` prints a topic's commands and rules
+when the agent needs them, so none of it costs attention before the model has read your first
+word. The topics: `files`, `schedule`, `channels`, `history`, `messages` (`send-message`,
+`reply`, `edit-message`, `react`, `delete`), `threads`, `ask`, `voice`. See
+[`src/ipc/README.md`](src/ipc/README.md) for why the injected part is this small.
 
-If you want an agent to use them fluently, install the bundled
-[skill](skill/SKILL.md) — it carries the full playbook and is loaded on demand rather
-than injected every session:
+The bundled [skill](skill/SKILL.md) carries the same playbook as a skill, for harnesses that
+load those:
 
 ```bash
 npx skills add https://github.com/noir017/agent-anywhere/tree/main/skill -g

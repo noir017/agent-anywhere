@@ -40,6 +40,8 @@ conversation, not part of its name — see [`daemon/README.md`](../daemon/README
 |---|---|
 | `conversation.ts` | Conversation identity: `ConversationRef` / `ConversationAddress`, the key function, the address parser, and the platform-qualified target (`tg:586/8068`) `--channel` accepts |
 | `channel-list.ts` | `agent-anywhere channels` as data: the places a turn has run, in the qualified id form, roots first then recent topics |
+| `schedule.ts` | Scheduled tasks as data: building one from `schedule add`, when it runs next, catch-up and expiry, every sentence about one |
+| `schedule-menu.ts` | `/setting` → ⏰ Scheduled tasks: the list, one task, the delete confirmation, their button ids |
 | `inbound-gate.ts` | "Should we respond to this message?" — a pure decision tree |
 | `inbound-merger.ts` | Per-conversation state machine: coalesce bursts, queue while busy, interrupt |
 | `stream-buffer.ts` | Outbound text: throttled in-place editing, chunking, backoff, degradation |
@@ -116,6 +118,30 @@ idle ──ingest──► collecting ──window elapsed──► running ─�
 - **Lifecycle reactions**: 👀 received, ✅ done, ❌ error, gated by `reactionsEnabled`
   (`display.reactions.enabled`) independently of the emoji themselves, which stay
   frozen.
+- **Solo turns** (`enqueueSolo`): input nobody typed — a scheduled task firing. It runs as a
+  batch of one, never trips the interrupt, waits behind the running turn and behind the user's
+  own queued messages (a person waiting outranks a clock), gets no reactions, and resolves with
+  how its turn ended. A message typed while it runs still interrupts it: the person is there,
+  the schedule is not. `/stop` stops a running solo turn but keeps queued ones, since the
+  backlog it drops is what the user typed.
+
+## `schedule.ts` and `schedule-menu.ts`
+
+Scheduled tasks as data — see [`daemon/README.md`](../daemon/README.md#scheduled-tasks) for the
+running half. `buildTask` turns `schedule add` into a task or into a sentence naming the flag and
+the fix (the reader is an agent that retries with whatever it is told). `decide` is the whole
+timing policy: the next planned time strictly after the last one handled, catch-up to the
+LATEST missed time within an hour, a fixed-session window of 24 h. Times are computed with
+[croner](https://github.com/hexagon/croner) (MIT, no dependencies, time-zone and DST aware) given
+an explicit reference date; nothing here reads a clock, and croner is constructed without a
+callback so it arms no timer. `--at` accepts relative (`+30m`), clock (`08:00`, the next time the
+clock reads it), wall-clock (`2026-10-01 08:00`, in `--tz`) and zoned ISO forms; a zoneless ISO
+time is read as wall-clock in `--tz`, never silently as UTC. Displayed times carry seconds when
+they are not on a minute — `11:28` for a run due at 11:28:28 once led the registering agent to
+tell the user the task would fire early.
+
+`schedule-menu.ts` is the `/setting` → ⏰ task menu: list, one task, the delete confirmation,
+and the append-only `sca:` action indices (a posted menu's buttons carry them).
 
 ## `stream-buffer.ts`
 

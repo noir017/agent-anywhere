@@ -121,6 +121,29 @@ const IpcActionSchema = z.discriminatedUnion('kind', [
       limit: z.number().int().positive().optional(),
     })
     .strict(),
+  // channelId here is where the task's output goes (and, for a fixed session, the conversation it
+  // runs in). Which of prompt/bash, cron/at is present — and every rule linking them — is checked by
+  // core/schedule.ts buildTask, which can say which flag is wrong; the boundary checks shape only.
+  z
+    .object({
+      kind: z.literal('schedule-add'),
+      channelId,
+      name: z.string().min(1).max(200).optional(),
+      cron: z.string().min(1).max(200).optional(),
+      at: z.string().min(1).max(100).optional(),
+      tz: z.string().min(1).max(64).optional(),
+      prompt: z.string().min(1).max(20_000).optional(),
+      bash: z.string().min(1).max(20_000).optional(),
+      agent: z.string().min(1).optional(),
+      session: z.enum(['fixed', 'new']).optional(),
+      cwd: z.string().min(1).optional(),
+      timeoutMs: z.number().int().positive().optional(),
+    })
+    .strict(),
+  z.object({ kind: z.literal('schedule-list'), id: z.string().min(1).optional() }).strict(),
+  z
+    .object({ kind: z.literal('schedule-op'), id: z.string().min(1), op: z.enum(['remove', 'pause', 'resume', 'run']) })
+    .strict(),
 ]);
 
 const IpcRequestSchema = z
@@ -155,7 +178,23 @@ export type IpcAction =
   | { kind: 'create-thread'; messageId: string; name: string; channelId?: string }
   | { kind: 'ask'; prompt: string; options: string[]; channelId?: string; timeoutMs?: number }
   | { kind: 'voice-log'; limit?: number }
-  | { kind: 'list-channels'; platform?: string; query?: string; limit?: number };
+  | { kind: 'list-channels'; platform?: string; query?: string; limit?: number }
+  | {
+      kind: 'schedule-add';
+      channelId?: string;
+      name?: string;
+      cron?: string;
+      at?: string;
+      tz?: string;
+      prompt?: string;
+      bash?: string;
+      agent?: string;
+      session?: 'fixed' | 'new';
+      cwd?: string;
+      timeoutMs?: number;
+    }
+  | { kind: 'schedule-list'; id?: string }
+  | { kind: 'schedule-op'; id: string; op: 'remove' | 'pause' | 'resume' | 'run' };
 
 // Compile-time alignment: the zod-inferred type must equal the hand-written union;
 // if either side drifts, this type errors.
@@ -227,4 +266,31 @@ export interface ListChannelsResult {
   /** Topic rows that matched before `limit` cut them. */
   totalTopics: number;
   limit: number;
+}
+
+/**
+ * One scheduled task as the CLI prints it (core/schedule.ts taskView). Flat, so a list renders as
+ * one TOON table; the detail fields appear only on `schedule show` and `schedule add`.
+ */
+export interface ScheduleTaskView {
+  id: string;
+  name: string;
+  state: string;
+  when: string;
+  next: string;
+  runs: string;
+  target: string;
+  last: string;
+  count: number;
+  expires: string;
+  here: boolean;
+  prompt?: string;
+  command?: string;
+  timeout?: string;
+  cwd?: string;
+}
+
+/** Response body for schedule-list. */
+export interface ScheduleListResult {
+  tasks: ScheduleTaskView[];
 }

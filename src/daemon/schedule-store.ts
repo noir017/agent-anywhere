@@ -1,0 +1,152 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { z } from 'zod';
+import type { ScheduleTask } from '../core/schedule.js';
+
+/**
+ * Scheduled tasks on disk (`<configDir>/schedules.json`) — its own file, not a section of
+ * conversations.json, because a task is not a property of a conversation: a bash task has none, a
+ * new-session task makes a fresh one every run, and deleting a topic must not delete a schedule.
+ *
+ * ── What is different from the other state files ──────────────────────────────────────────────
+ * - **0600, written atomically** (temp file + rename). This file holds shell commands the daemon
+ *   will execute unattended, so it is not world-readable, and a crash mid-write must leave either
+ *   the old file or the new one — never a truncated one that drops every task.
+ * - **A bad entry is dropped LOUDLY.** conversations.json degrades quietly because losing a binding
+ *   costs a restart of context; losing a task means something the user is counting on silently
+ *   stops happening. So each rejected entry is logged with its id and the reason, and the rest load.
+ *
+ * Write-through on every change, like the other stores. Tasks are few; the whole file is rewritten.
+ */
+
+const TargetSchema = z.object({ platform: z.string().min(1), channel: z.string().min(1), thread: z.string().min(1).optional() });
+
+const WhenSchema = z.union([
+  z.object({ cron: z.string().min(1), tz: z.string().min(1) }).strict(),
+  z.object({ at: z.number().finite(), tz: z.string().min(1) }).strict(),
+]);
+
+const RunSchema = z.discriminatedUnion('kind', [
+  z
+    .object({
+      kind: z.literal('agent'),
+      agent: z.string().min(1),
+      prompt: z.string().min(1),
+      session: z.enum(['fixed', 'new']),
+      cwd: z.string().min(1).optional(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal('bash'),
+      command: z.string().min(1),
+      cwd: z.string().min(1).optional(),
+      timeoutMs: z.number().int().positive(),
+    })
+    .strict(),
+]);
+
+const TaskSchema = z
+  .object({
+    id: z.string().regex(/^[a-z0-9]{4,16}$/),
+    name: z.string().min(1),
+    when: WhenSchema,
+    run: RunSchema,
+    target: TargetSchema,
+    conversation: z.string().min(1).optional(),
+    state: z.enum(['active', 'paused', 'expired', 'done']),
+    createdAt: z.number().finite(),
+    createdBy: z.object({ conversation: z.string(), platform: z.string() }),
+    expiresAt: z.number().finite().optional(),
+    lastPlannedAt: z.number().finite().optional(),
+    lastRun: z
+      .object({
+        at: z.number().finite(),
+        status: z.enum(['ok', 'failed', 'interrupted', 'skipped', 'missed']),
+        durationMs: z.number().finite().optional(),
+        exitCode: z.number().int().optional(),
+        error: z.string().optional(),
+      })
+      .optional(),
+    runs: z.number().int().nonnegative(),
+  })
+  .superRefine((t, ctx) => {
+    // The one cross-field rule the scheduler depends on: a fixed-session run has to know where.
+    if (t.run.kind === 'agent' && t.run.session === 'fixed' && !t.conversation) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'a fixed-session task has no conversation' });
+    }
+  });
+
+// Drift between the persisted shape and the domain type fails to compile.
+type _Aligned = [
+  z.infer<typeof TaskSchema> extends ScheduleTask ? true : never,
+  ScheduleTask extends z.infer<typeof TaskSchema> ? true : never,
+];
+const _aligned: _Aligned = [true, true];
+
+export class ScheduleStore {
+  private tasks = new Map<string, ScheduleTask>();
+
+  constructor(private readonly file: string) {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(fs.readFileSync(this.file, 'utf8'));
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
+        console.error(`[schedule] ${this.file} could not be read; starting with no tasks: ${e instanceof Error ? e.message : e}`);
+      }
+      return;
+    }
+    const entries = raw && typeof raw === 'object' && Array.isArray((raw as { tasks?: unknown }).tasks)
+      ? ((raw as { tasks: unknown[] }).tasks)
+      : [];
+    for (const entry of entries) {
+      const parsed = TaskSchema.safeParse(entry);
+      if (parsed.success) {
+        this.tasks.set(parsed.data.id, parsed.data);
+      } else {
+        const id = (entry as { id?: unknown } | null)?.id;
+        const issue = parsed.error.issues[0];
+        console.error(
+          `[schedule] dropped task ${typeof id === 'string' ? `#${id}` : '(no id)'} from ${this.file}: ` +
+            `${issue?.path.join('.') || '(root)'} ${issue?.message ?? ''}`.trim()
+        );
+      }
+    }
+  }
+
+  list(): ScheduleTask[] {
+    return [...this.tasks.values()].sort((a, b) => a.createdAt - b.createdAt);
+  }
+
+  get(id: string): ScheduleTask | undefined {
+    return this.tasks.get(id);
+  }
+
+  has(id: string): boolean {
+    return this.tasks.has(id);
+  }
+
+  /** Insert or replace, then persist. */
+  put(task: ScheduleTask): void {
+    this.tasks.set(task.id, task);
+    this.flush();
+  }
+
+  remove(id: string): boolean {
+    const removed = this.tasks.delete(id);
+    if (removed) this.flush();
+    return removed;
+  }
+
+  private flush(): void {
+    try {
+      fs.mkdirSync(path.dirname(this.file), { recursive: true });
+      const tmp = `${this.file}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify({ version: 1, tasks: this.list() }, null, 2) + '\n', { mode: 0o600 });
+      fs.renameSync(tmp, this.file);
+    } catch (e) {
+      console.error('[schedule] failed to persist tasks:', e instanceof Error ? e.message : e);
+    }
+  }
+}

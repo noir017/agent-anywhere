@@ -86,7 +86,8 @@ get an explicit Hyrum's Law warning and a contract test.
 
 **Single sources of truth.** Several lists are deliberately defined once and consumed
 in many places. Extend the source, never a copy:
-- `ipc/commands.ts` `REVERSE_COMMANDS` → CLI registration, the agent-facing hint, docs.
+- `ipc/commands.ts` `REVERSE_COMMANDS` → CLI registration, the agent-facing hint, the
+  `agent-anywhere help` pages (`HELP_TOPICS`), docs.
 - `core/command-translate.ts` `GENERIC_COMMANDS` → the registered slash menu + translation.
 - `core/settings.ts` — the `/setting` table → the menu rows, the text list, value validation,
   the config path patched, and the ack sentence.
@@ -176,8 +177,10 @@ Do not weaken these without saying so explicitly in the PR:
   `AgentFactory` if it does not (as `agent-agy.ts` does).
   See [src/daemon/README.md](src/daemon/README.md).
 - **A reverse command** → an arm in the `IpcAction` union + an entry in
-  `REVERSE_COMMANDS`; CLI registration and the agent hint follow automatically, and a
-  missing `handleReverse` arm fails to compile.
+  `REVERSE_COMMANDS`, whose required `topic` puts it on an `agent-anywhere help` page; CLI
+  registration and the agent hint follow automatically, and a missing `handleReverse` arm fails
+  to compile. Do not add it to the injected hint: the hint is a pointer, and what an agent reads
+  up front is the one budget here that every session pays.
   See [src/ipc/README.md](src/ipc/README.md).
 - **A config field** → `config/schema.ts`. But first ask whether it belongs in the
   frozen `EXPERIENCE` block instead: the user-facing surface is deliberately five

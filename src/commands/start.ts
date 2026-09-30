@@ -5,6 +5,7 @@ import { createPlatformAdapters } from '../platform/platform-factory.js';
 import { createAgentFactory } from '../daemon/agent-factory.js';
 import { ConversationStore, migrateLegacySessions } from '../daemon/conversation-store.js';
 import { WorkdirUsageStore } from '../daemon/workdir-usage.js';
+import { ScheduleStore } from '../daemon/schedule-store.js';
 import { ensureReverseCliShim } from '../daemon/reverse-cli-shim.js';
 import { conversationKey } from '../core/conversation.js';
 
@@ -42,7 +43,13 @@ export async function runStart(): Promise<void> {
   const workdirUsage = new WorkdirUsageStore(path.join(configDir(), 'workdir-usage.json'));
   // Dispatches per agent to the ACP runtime or the agy runtime (see agent-factory).
   const agents = createAgentFactory(cfg, socket, store);
-  const daemon = new Daemon(cfg, platforms, agents, socket, store, workdirUsage);
+  // Scheduled tasks: their own file (a task is not a property of a conversation), and a directory
+  // of bash-run logs beside it. See daemon/schedule-store.ts for why that file is 0600 and atomic.
+  const schedules = {
+    store: new ScheduleStore(path.join(configDir(), 'schedules.json')),
+    runsDir: path.join(configDir(), 'schedule-runs'),
+  };
+  const daemon = new Daemon(cfg, platforms, agents, socket, store, workdirUsage, schedules);
 
   await daemon.run();
   console.log(`🚀 Agent Anywhere daemon is running (socket: ${socket})`);

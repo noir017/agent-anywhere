@@ -48,10 +48,18 @@ export interface MergerDeps {
 
 type Phase = 'idle' | 'collecting' | 'running';
 
+/** How a solo turn (enqueueSolo) ended. */
+export type SoloOutcome = 'ok' | 'failed' | 'interrupted';
+
 export class InboundMerger {
   private phase: Phase = 'idle';
   private buffer: InboundMessage[] = [];      // batch being collected
   private queued: InboundMessage[] = [];      // single-slot queue: messages arriving while running
+  /**
+   * Turns that must run ALONE and must not cut anything short (enqueueSolo): each is one message,
+   * never merged into a batch, started only when nothing else is running or collecting.
+   */
+  private solo: Array<{ msg: InboundMessage; settle: (o: SoloOutcome) => void }> = [];
   private collectTimer: (() => void) | null = null;
   private collectStartedAt = 0;               // merge-window start (for the hard cap)
   private interrupted = false;                // turn interrupted by a new message (then skip ✅)
@@ -101,6 +109,31 @@ export class InboundMerger {
     return 'idle';
   }
 
+  /**
+   * Run one message as a turn of its own, WITHOUT interrupting anything — for input nobody typed
+   * (a scheduled task firing). Resolves when that turn has ended, with how it ended.
+   *
+   * Differs from ingest() on every axis ingest() is tuned for a person typing:
+   *  - it never trips interruptOnNewMessage — a timer firing must not cancel what the user is in the
+   *    middle of; it waits behind the running turn instead;
+   *  - it is never merged with other messages — a user message and a scheduled prompt coalesced into
+   *    one turn would be answered as one question;
+   *  - it goes behind the user's own queued messages, not ahead: a person waiting outranks a clock;
+   *  - it gets no lifecycle reactions — there is no platform message to put them on.
+   *
+   * The reverse does still hold: a message typed while a solo turn runs interrupts it as it would any
+   * turn, and the outcome says `interrupted`. The person is there; the schedule is not.
+   *
+   * `/stop` (interrupt()) stops a running solo turn but leaves queued solo turns queued: the backlog
+   * it drops is what the user typed for the turn being stopped, and a scheduled run is not that.
+   */
+  enqueueSolo(msg: InboundMessage): Promise<SoloOutcome> {
+    return new Promise((settle) => {
+      this.solo.push({ msg, settle });
+      if (this.phase === 'idle') void this.drainQueue();
+    });
+  }
+
   /** Entry: called once per inbound message. */
   async ingest(msg: InboundMessage): Promise<void> {
     // The "received" reaction is best-effort and must never gate the pipeline:
@@ -144,6 +177,15 @@ export class InboundMerger {
     console.log(`[dispatch] triggered, ${this.buffer.length} message(s) into this turn`);
     const batch = this.buffer;
     this.buffer = [];
+    await this.runBatch(batch);
+    await this.drainQueue();
+  }
+
+  /**
+   * Run one batch as a turn and mark its last message with the outcome. Resolves with the outcome
+   * rather than throwing, so a solo caller can report it and a normal one can ignore it.
+   */
+  private async runBatch(batch: InboundMessage[], opts: { solo?: boolean } = {}): Promise<SoloOutcome> {
     this.phase = 'running';
     this.interrupted = false;
     // Fresh per-turn abort: an interrupting message trips it so the runner finalizes the partial reply
@@ -152,37 +194,45 @@ export class InboundMerger {
     this.activeAbort = abort;
 
     const last = batch[batch.length - 1]!; // batch is non-empty here (dispatch returns early when empty)
+    // A solo turn has no platform message behind it, so there is nothing to react on.
+    const mark = (emoji: string): Promise<void> =>
+      opts.solo ? Promise.resolve() : this.safeReaction({ address: addressOf(last.conversation), messageId: last.messageId }, emoji);
     try {
       await this.deps.runTurn(batch, abort.signal);
       // Skip ✅ for an interrupted turn: the continuing batch will mark its own latest message.
-      if (!this.interrupted) {
-        await this.safeReaction(
-          { address: addressOf(last.conversation), messageId: last.messageId },
-          this.opts.reactions.done
-        );
-      }
+      if (this.interrupted) return 'interrupted';
+      await mark(this.opts.reactions.done);
+      return 'ok';
     } catch {
-      await this.safeReaction(
-        { address: addressOf(last.conversation), messageId: last.messageId },
-        this.opts.reactions.error
-      );
+      await mark(this.opts.reactions.error);
+      return 'failed';
     } finally {
       this.activeAbort = null;
-      await this.drainQueue();
     }
   }
 
-  /** After a turn ends, start the queued messages as a fresh batch. */
+  /**
+   * After a turn ends: start the queued messages as a fresh batch, else the next solo turn, else go
+   * idle. The user's own backlog first — see enqueueSolo for why a clock waits behind a person.
+   */
   private async drainQueue(): Promise<void> {
-    if (this.queued.length === 0) {
+    if (this.queued.length > 0) {
+      this.buffer = this.queued;
+      this.queued = [];
+      this.phase = 'collecting';
+      // Queued messages start immediately (already waited, no second merge window).
+      await this.dispatch();
+      return;
+    }
+    const next = this.solo.shift();
+    if (!next) {
       this.toIdle();
       return;
     }
-    this.buffer = this.queued;
-    this.queued = [];
-    this.phase = 'collecting';
-    // Queued messages start immediately (already waited, no second merge window).
-    await this.dispatch();
+    console.log('[dispatch] triggered, 1 solo message into this turn');
+    const outcome = await this.runBatch([next.msg], { solo: true });
+    next.settle(outcome);
+    await this.drainQueue();
   }
 
   /** Switch to idle and notify the registry (for idle reclaim). */

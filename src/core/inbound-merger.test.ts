@@ -119,6 +119,82 @@ describe('InboundMerger interrupt', () => {
 });
 
 /**
+ * Solo turns (enqueueSolo) — a scheduled task firing into a conversation. Every case is about what a
+ * timer must NOT do to a person: cancel their turn, merge into their batch, or jump their queue.
+ */
+describe('InboundMerger enqueueSolo', () => {
+  it('waits behind a running turn instead of interrupting it, even with interruptOnNewMessage', async () => {
+    const h = harness(true);
+    await h.merger.ingest(msg('user'));
+    h.clock.advance(1500); // the user's turn is running (pending)
+
+    const done = h.merger.enqueueSolo(msg('sched'));
+    await tick();
+    expect(h.abortTurn).not.toHaveBeenCalled();
+    expect(h.signals[0]?.aborted).toBe(false);
+    expect(h.deps.runTurn).toHaveBeenCalledTimes(1);
+
+    h.resolveFirst();
+    expect(await done).toBe('ok');
+    expect(h.batches).toEqual([['user'], ['sched']]);
+    expect(h.merger.isIdle()).toBe(true);
+  });
+
+  it('is never merged into a batch the user is still collecting', async () => {
+    const h = harness(false);
+    await h.merger.ingest(msg('typing'));
+    const done = h.merger.enqueueSolo(msg('sched'));
+    h.clock.advance(1500); // the user's batch dispatches (first turn, pending)
+    h.resolveFirst();
+    await done;
+    expect(h.batches).toEqual([['typing'], ['sched']]);
+  });
+
+  it('goes behind the user\'s own queued messages', async () => {
+    const h = harness(false);
+    await h.merger.ingest(msg('first'));
+    h.clock.advance(1500);
+    const done = h.merger.enqueueSolo(msg('sched'));
+    await h.merger.ingest(msg('queued'));
+    h.resolveFirst();
+    await done;
+    expect(h.batches).toEqual([['first'], ['queued'], ['sched']]);
+  });
+
+  it('runs at once on an idle conversation, with no merge window and no reactions', async () => {
+    const h = harness(false);
+    const done = h.merger.enqueueSolo(msg('sched'));
+    // First turn in this harness stays pending: it started without the clock advancing.
+    await tick();
+    expect(h.batches).toEqual([['sched']]);
+    h.resolveFirst();
+    expect(await done).toBe('ok');
+    expect(h.deps.addReaction).not.toHaveBeenCalled();
+  });
+
+  it('is itself interrupted by a message typed while it runs, and says so', async () => {
+    const h = harness(true);
+    const done = h.merger.enqueueSolo(msg('sched'));
+    await tick();
+    await h.merger.ingest(msg('person'));
+    expect(h.abortTurn).toHaveBeenCalledTimes(1);
+    h.resolveFirst();
+    expect(await done).toBe('interrupted');
+    await tick();
+    expect(h.batches).toEqual([['sched'], ['person']]);
+  });
+
+  it('reports a failed turn as failed', async () => {
+    const clock = makeClock();
+    const merger = new InboundMerger(
+      { mergeWindowMs: 1, maxMergeWindowMs: 1, interruptOnNewMessage: true, reactions },
+      { now: clock.now, schedule: clock.schedule, addReaction: vi.fn(), runTurn: () => Promise.reject(new Error('x')) }
+    );
+    expect(await merger.enqueueSolo(msg('sched'))).toBe('failed');
+  });
+});
+
+/**
  * Lifecycle reactions (display.reactions.enabled).
  *
  * The emoji land on the USER's own message — 👀 while the turn runs, then ✅/❌ (Telegram maps those

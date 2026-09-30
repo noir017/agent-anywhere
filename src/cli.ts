@@ -5,7 +5,7 @@ import { encode } from '@toon-format/toon';
 import { runSetup } from './commands/setup.js';
 import { runDoctor } from './commands/doctor.js';
 import { runReverse } from './commands/reverse.js';
-import { REVERSE_COMMANDS, CHANNEL_OPTION } from './ipc/commands.js';
+import { REVERSE_COMMANDS, CHANNEL_OPTION, renderHelpIndex, renderHelpTopic } from './ipc/commands.js';
 
 // Note: the start path pulls in the heavy koishi + claude agent sdk stack, so it's
 // lazy-loaded to keep --help / setup / doctor / reverse commands lightweight to start.
@@ -73,6 +73,32 @@ for (const spec of REVERSE_COMMANDS) {
     return runReverse(spec.build(positionals, opts));
   });
 }
+
+// `help [topic]` replaces commander's implicit `help [command]`: it is the on-demand half of what an
+// agent is told (see HELP_TOPICS), so it answers by TOPIC — `help schedule` — and still falls back to
+// a command's own flags for `help send-file`. `--help` keeps commander's full list for humans.
+program.helpCommand(false);
+program
+  .command('help [topic]')
+  .description('Gateway tools for agents, by topic (schedule, channels, …); `help <command>` for one command')
+  .action((topic?: string) => {
+    if (!topic) {
+      console.log(renderHelpIndex());
+      return;
+    }
+    const page = renderHelpTopic(topic);
+    if (page) {
+      console.log(page);
+      return;
+    }
+    const cmd = program.commands.find((c) => c.name() === topic);
+    if (cmd) {
+      console.log(cmd.helpInformation());
+      return;
+    }
+    console.log(encode({ error: `no help topic or command "${topic}"`, help: 'Run `agent-anywhere help` for the topic list.' }));
+    process.exitCode = 1;
+  });
 
 program.parseAsync(process.argv).catch((e) => {
   // AXI §6: structured error on stdout (not stderr) so an invoking agent can read and act on it.

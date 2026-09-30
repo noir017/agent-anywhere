@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.36.0] - 2026-09-30
+
 ### Changed
 
 - **A topic keeps the agent it started with.** Naming another agent (`/oc …`, or `/oc` alone) in

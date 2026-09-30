@@ -64,6 +64,7 @@ export class InboundMerger {
   private collectStartedAt = 0;               // merge-window start (for the hard cap)
   private interrupted = false;                // turn interrupted by a new message (then skip ✅)
   private activeAbort: AbortController | null = null; // current running turn's abort (interruptOnNewMessage)
+  private runStartedAt: number | undefined;   // deps.now() when the running turn began (runningSince)
 
   constructor(
     private readonly opts: InboundMergerOptions,
@@ -73,6 +74,16 @@ export class InboundMerger {
   /** Whether currently idle (lets the registry decide if it can reclaim safely). */
   isIdle(): boolean {
     return this.phase === 'idle';
+  }
+
+  /**
+   * When the turn now running began, on the deps clock; undefined while idle OR collecting. The
+   * distinction matters to the one caller (a busy `/usage`): a batch still inside its merge window
+   * is busy — a command forwarded now would be merged into it — but it has not started, so there is
+   * no elapsed time to report.
+   */
+  runningSince(): number | undefined {
+    return this.phase === 'running' ? this.runStartedAt : undefined;
   }
 
   /**
@@ -188,6 +199,7 @@ export class InboundMerger {
   private async runBatch(batch: InboundMessage[], opts: { solo?: boolean } = {}): Promise<SoloOutcome> {
     this.phase = 'running';
     this.interrupted = false;
+    this.runStartedAt = this.deps.now();
     // Fresh per-turn abort: an interrupting message trips it so the runner finalizes the partial reply
     // cleanly. Cleared in finally so a late abort can never bleed into the next turn.
     const abort = new AbortController();

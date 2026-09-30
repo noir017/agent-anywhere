@@ -11,6 +11,7 @@ import {
   harnessForCommand,
   harnessHasPicker,
   isGenericCommand,
+  isSessionQuery,
   translateCommand,
 } from './command-translate.js';
 import type { AgentDef } from '../config/schema.js';
@@ -382,5 +383,25 @@ describe('isCliAnsweredCommand', () => {
     expect(isCliAnsweredCommand('model', 'claude')).toBe(false);
     expect(isCliAnsweredCommand('usage', 'opencode')).toBe(false);
     expect(isCliAnsweredCommand('model', undefined)).toBe(false);
+  });
+});
+
+/**
+ * Session queries: the generic commands a busy conversation gets answered by the gateway instead of
+ * forwarded — a forwarded one interrupts the turn it asks about (GenericCommand.query).
+ */
+describe('isSessionQuery', () => {
+  it('marks /usage and /context, case-insensitively', () => {
+    expect(isSessionQuery('usage')).toBe(true);
+    expect(isSessionQuery('context')).toBe(true);
+    expect(isSessionQuery('USAGE')).toBe(true);
+  });
+
+  it('leaves out commands that do work on the session, and names outside the vocabulary', () => {
+    // /compact and /review change or produce something; answering them from a snapshot would be a
+    // lie, and delaying them is not the gateway's call. /status is codex's own spelling, not ours.
+    for (const name of ['compact', 'review', 'init', 'model', 'effort', 'mcp', 'doctor', 'status', 'cost']) {
+      expect(isSessionQuery(name)).toBe(false);
+    }
   });
 });

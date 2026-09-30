@@ -7,7 +7,10 @@ import {
   harnessCommandName,
   harnessHasPicker,
   isCliAnsweredCommand,
+  isGenericCommand,
+  isSessionQuery,
   unconfiguredHarnessCommand,
+  type CommandTranslation,
 } from '../core/command-translate.js';
 import {
   parseTextCommand,
@@ -89,6 +92,7 @@ import type { WorkdirUsageStore } from './workdir-usage.js';
 import { resolveAgentCwd, resolveConversationCwd, buildHarnessEnv } from './agent-common.js';
 import { formatAgyCliOutput, runAgyCliCommand } from './agent-agy.js';
 import { formatRuntimeFooter, formatTokens } from '../core/runtime-footer.js';
+import { busyNote, formatUsageSnapshot } from '../core/busy-snapshot.js';
 import { InboundMerger, type SoloOutcome } from '../core/inbound-merger.js';
 import { fallbackTitle, generateTitle } from '../core/title-namer.js';
 import { shouldRespond, type GateConfig } from '../core/inbound-gate.js';
@@ -351,6 +355,13 @@ interface ConversationState {
    */
   lastUsage?: AgentUsage;
   /**
+   * The last cumulative session cost the agent reported, kept apart from `lastUsage` because most
+   * snapshots carry none: claude-agent-acp attaches it only to the one tied to a finished result, so
+   * the mid-stream snapshot that follows would otherwise overwrite it with nothing. Read by a busy
+   * `/usage` (see answerBusyQuery). Cleared with `lastUsage`: a new session starts its own total.
+   */
+  lastCost?: { amount: number; currency: string };
+  /**
    * Whether a turn has ended normally under the CURRENT binding since the last reset.
    *
    * Only `/context` reads it, and only to choose between two different empty answers: before the
@@ -577,7 +588,9 @@ export class ConversationRegistry {
         getWorkdir: (id) => this.workdirOf(id),
         recordUsage: (id, usage) => {
           const state = this.conversations.get(id);
-          if (state) state.lastUsage = usage;
+          if (!state) return;
+          state.lastUsage = usage;
+          if (usage.cost) state.lastCost = usage.cost;
         },
         recordTurnComplete: (id) => {
           const state = this.conversations.get(id);
@@ -1510,11 +1523,19 @@ export class ConversationRegistry {
    * image sent here could only be silently dropped. Such a message keeps its old meaning — a new
    * instruction, interrupting the turn — which is also the way out of a question whose options are
    * all wrong on a harness that offers no free-text field.
+   *
+   * Nor is a command from the generic vocabulary (`/usage`, `/model`, `/compact`, …). Those are
+   * menu entries the gateway registered itself, so a user tapping one is asking the gateway, not
+   * answering the agent — and filing `/usage` away as the answer to "which approach?" both loses the
+   * question and answers it with nonsense. Only the registered names, not anything with a leading
+   * slash: a path like `/srv/data` is a perfectly good answer to "where should it go?".
    */
   private answersPendingQuestion(key: ConversationId, msg: InboundMessage): boolean {
     if ((msg.attachments?.length ?? 0) > 0) return false;
     const answer = msg.content.trim();
     if (answer.length === 0) return false;
+    const command = parseTextCommand(answer);
+    if (command && isGenericCommand(command.name)) return false;
     return this.hooks?.answerPendingAsk?.(key, answer) ?? false;
   }
 
@@ -1756,6 +1777,10 @@ export class ConversationRegistry {
     const name = agentDisplayName(def, state.agentId);
 
     const result = translateCommand(parsed.name, def?.harness);
+    if (this.answersWhileBusy(state, parsed.name, result)) {
+      this.answerBusyQuery(key, state, parsed.name, msg);
+      return undefined;
+    }
     if (result.kind === 'passthrough') {
       // Passthrough is what lets a skill name reach the agent untouched — and it is also how a
       // command the HARNESS's own CLI answers would get there, which on agy kills the session
@@ -1795,6 +1820,59 @@ export class ConversationRegistry {
     const content = parsed.rest ? `/${result.native} ${parsed.rest}` : `/${result.native}`;
     console.log(`[command] /${parsed.name} → /${result.native} for ${state.agentId} (${name})`);
     return { ...msg, content };
+  }
+
+  /**
+   * Whether a command is a session query that must be answered here because the conversation is
+   * busy (see GenericCommand.query for why forwarding it is the bug).
+   *
+   * "Busy" is anything but idle, and both non-idle phases earn it: a RUNNING turn is what a
+   * forwarded command interrupts, and a batch still inside its merge window is what it would be
+   * glued onto — `hello\n/usage` is one prompt, and the harness no longer sees a command in it.
+   *
+   * Only where the command would otherwise be FORWARDED (translated, or passed through to a
+   * `custom` harness). A `local` answer never touches the session anyway, and an unsupported one
+   * keeps its refusal: a snapshot of a harness that has no such command would answer a question
+   * nobody could have asked it.
+   */
+  private answersWhileBusy(state: ConversationState, name: string, result: CommandTranslation): boolean {
+    if (result.kind === 'local' || result.kind === 'unsupported') return false;
+    return isSessionQuery(name) && !state.merger.isIdle();
+  }
+
+  /**
+   * Answer a session query from what the gateway already holds, while the session is busy.
+   *
+   * `/context` reuses describeContext — the answer the `local` harnesses always get. `/usage` adds
+   * the last cumulative cost and how long the running turn has been going. The note on the end is
+   * the part that must not be dropped: this answer is less than the harness's own (claude's adds
+   * per-model tokens, cache and API time), and it says so, along with how to get the full one.
+   */
+  private answerBusyQuery(
+    key: ConversationId,
+    state: ConversationState,
+    name: string,
+    msg: InboundMessage
+  ): void {
+    const command = name.toLowerCase();
+    const label = agentDisplayName(findAgent(this.config, state.agentId), state.agentId);
+    const since = state.merger.runningSince();
+    const body =
+      command === 'context'
+        ? this.describeContext(state)
+        : formatUsageSnapshot({
+            agent: label,
+            ...(state.lastUsage ? { usage: state.lastUsage } : {}),
+            ...(state.lastCost ? { cost: state.lastCost } : {}),
+            ...(since !== undefined ? { runningForMs: this.clock.now() - since } : {}),
+          });
+    console.log(`[command] /${command} answered by the gateway for ${key} (${state.agentId}): busy, not forwarded`);
+    void this.platforms
+      .get(msg.conversation.platform)
+      ?.sendMessage(addressOf(msg.conversation), `${body}\n\n${busyNote(command, label)}`)
+      .catch((e) =>
+        console.warn('[command] failed to answer a busy query:', e instanceof Error ? e.message : e)
+      );
   }
 
   /**
@@ -1895,6 +1973,7 @@ export class ConversationRegistry {
 
   /** Drop this conversation's context snapshot; the pair moves together or the answer lies. */
   private forgetUsage(state: ConversationState): void {    state.lastUsage = undefined;
+    state.lastCost = undefined;
     state.turnCompleted = false;
   }
 

@@ -302,6 +302,9 @@ platforms:
 | `/cc`、`/oc`、`/cx`、`/gm`、`/agy` | 每个已配置 harness 一个，见下 |
 | `/compact`、`/context`、`/model`、`/effort`、`/usage`、`/doctor`、`/mcp`、`/init`、`/review` | 通用词表，按 harness 翻译成各自的原生拼写 |
 
+智能体正在跑一轮时发 `/usage`、`/context`，由网关自己回答（上下文、目前的花费、这一轮跑了多久），
+不再转给智能体 —— 转过去会打断这一轮。等这一轮结束再发一次，拿到的是智能体自己更完整的回答。
+
 **智能体命令**以 harness 命名 —— `/cc` claude、`/oc` opencode、`/cx` codex、
 `/gm` gemini、`/agy` Antigravity。只有你实际配置了的 harness 才会被注册。
 它有两种用法：

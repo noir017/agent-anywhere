@@ -334,6 +334,11 @@ Discord, Slack), and equally usable as plain text everywhere else.
 | `/cc`, `/oc`, `/cx`, `/gm`, `/agy` | one per configured harness — see below |
 | `/compact`, `/context`, `/model`, `/effort`, `/usage`, `/doctor`, `/mcp`, `/init`, `/review` | a generic vocabulary, translated to each harness's own spelling |
 
+`/usage` and `/context` sent while the agent is in the middle of a turn are answered by the
+gateway itself — context, cost so far, how long the turn has run — instead of being passed to the
+agent, which would interrupt the turn. Send them again once it finishes for the agent's own, fuller
+answer.
+
 An **agent command** is named after its harness — `/cc` claude, `/oc` opencode,
 `/cx` codex, `/gm` gemini, `/agy` Antigravity. Only the harnesses you configure
 are registered. It does two things:

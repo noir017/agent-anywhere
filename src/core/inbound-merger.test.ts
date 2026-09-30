@@ -119,6 +119,31 @@ describe('InboundMerger interrupt', () => {
 });
 
 /**
+ * runningSince — read by a busy `/usage` to say how long the turn has been going. Collecting is
+ * busy but NOT running (nothing has reached the agent yet), so it reports no start time.
+ */
+describe('InboundMerger runningSince', () => {
+  it('is undefined while idle and collecting, the dispatch time while running, and cleared after', async () => {
+    const h = harness(false);
+    expect(h.merger.runningSince()).toBeUndefined();
+
+    await h.merger.ingest(msg('m1'));
+    expect(h.merger.isIdle()).toBe(false);
+    expect(h.merger.runningSince()).toBeUndefined(); // collecting: busy, but not started
+
+    h.clock.advance(1500); // dispatched at t=1500
+    expect(h.merger.runningSince()).toBe(1500);
+    h.clock.advance(4000);
+    expect(h.merger.runningSince()).toBe(1500); // the start, not the latest tick
+
+    h.resolveFirst();
+    await tick();
+    expect(h.merger.isIdle()).toBe(true);
+    expect(h.merger.runningSince()).toBeUndefined();
+  });
+});
+
+/**
  * Solo turns (enqueueSolo) — a scheduled task firing into a conversation. Every case is about what a
  * timer must NOT do to a person: cancel their turn, merge into their batch, or jump their queue.
  */

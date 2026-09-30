@@ -2220,7 +2220,7 @@ export function translateUpdate(u: SessionUpdate, st: TurnState): void {
     // model's reported capabilities), so the footer never has to guess a limit. Emitted several
     // times per turn as full snapshots — the consumer keeps the latest.
     case 'usage_update': {
-      ingestUsage(st, u.used, u.size);
+      ingestUsage(st, u.used, u.size, u.cost);
       break;
     }
 
@@ -2246,14 +2246,21 @@ export function translateUpdate(u: SessionUpdate, st: TurnState): void {
  * segment" rather than a bogus "0%". Extracted from translateUpdate to keep that switch's
  * complexity within the lint budget.
  */
-function ingestUsage(st: TurnState, used: unknown, size: unknown): void {
+function ingestUsage(st: TurnState, used: unknown, size: unknown, cost: unknown): void {
   if (typeof used !== 'number') return;
   // A local override wins over the harness's window (see AgentDef.contextWindow): the harness
   // under-reports for models missing from its hardcoded table, so a configured window is the more
   // accurate number. Fall back to the reported size when no override is set.
   const window = st.contextWindow ?? size;
   if (typeof window !== 'number' || window <= 0) return;
-  st.handlers.onUsage?.({ used, size: window });
+  // Cost rides along only when it is a real number: it is the one field a busy `/usage` quotes
+  // verbatim, so a malformed one is dropped rather than printed as "$NaN".
+  const c = cost as { amount?: unknown; currency?: unknown } | null | undefined;
+  const reported =
+    typeof c?.amount === 'number' && Number.isFinite(c.amount) && typeof c.currency === 'string'
+      ? { cost: { amount: c.amount, currency: c.currency } }
+      : {};
+  st.handlers.onUsage?.({ used, size: window, ...reported });
 }
 
 /** Merge a tool's latest fields, then trigger start / finish per readiness. */

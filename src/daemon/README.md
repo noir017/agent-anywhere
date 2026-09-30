@@ -553,7 +553,7 @@ back into `AgentStreamHandlers`:
 | `agent_message_chunk` | `onText` |
 | `tool_call` / `tool_call_update` | `onToolStart` / `onToolFinish` |
 | `available_commands_update` | `onAvailableCommands` |
-| `usage_update` | `onUsage` (feeds the footer's context segment) |
+| `usage_update` | `onUsage` (feeds the footer's context segment; its `cost`, when present, feeds a busy `/usage`) |
 | `config_option_update` | `onModel`, `onEffort` |
 | `session_info_update` | `onTitle` (renames the chat lane — see below) |
 | `session/request_permission` | **auto-approved** — see below |

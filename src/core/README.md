@@ -49,6 +49,7 @@ conversation, not part of its name — see [`daemon/README.md`](../daemon/README
 | `outbound-pacer.ts` | One write budget per chat: token buckets, one FIFO, in-place edit coalescing |
 | `outbound-errors.ts` | The four failure classes the delivery layer needs from the platforms |
 | `runtime-footer.ts` | The `cc · 18k / 1M (2%) · claude-opus-4-5` tagline |
+| `busy-snapshot.ts` | The gateway's own `/usage` answer while a turn runs, and the note saying whose answer it is |
 | `attachment-ingest.ts` | Inbound attachment orchestration (download/save injected) |
 | `voice.ts` | Voice messages as data: what counts as one, container sniffing, the transcriber request and response, the confirmation card, the log fold |
 | `command-translate.ts` | The generic slash vocabulary and its per-harness translation |
@@ -118,6 +119,9 @@ idle ──ingest──► collecting ──window elapsed──► running ─�
 - **Lifecycle reactions**: 👀 received, ✅ done, ❌ error, gated by `reactionsEnabled`
   (`display.reactions.enabled`) independently of the emoji themselves, which stay
   frozen.
+- **`runningSince()`**: when the running turn began, on the injected clock — undefined while idle
+  *or* collecting, since a batch in its merge window is busy but has not started. Read only by a
+  busy `/usage`, to say how long the turn has been going.
 - **Solo turns** (`enqueueSolo`): input nobody typed — a scheduled task firing. It runs as a
   batch of one, never trips the interrupt, waits behind the running turn and behind the user's
   own queued messages (a person waiting outranks a clock), gets no reactions, and resolves with
@@ -489,7 +493,9 @@ Two rules keep this honest:
 
 - **A native spelling wins.** `/context` on claude still reaches claude's own `/context`,
   which knows more about claude than this gateway does. The fallback fills a hole; it
-  never covers a harness that solved the problem itself. `/model` on claude looks like an
+  never covers a harness that solved the problem itself. The one exception is a busy
+  conversation, and only for the two session queries — see
+  [below](#session-queries-while-busy). `/model` on claude looks like an
   exception and is not: probed live, the adapter does not advertise `model` at all, so a
   forwarded `/model` is a plain prompt — it spends a turn and prints
   `Current model: … Usage: /model <name>`, i.e. text to type against — while the same
@@ -501,6 +507,34 @@ Two rules keep this honest:
   `agy` speaks no ACP — it reports no usage numbers — so claiming a local
   answer for `/context` there would hand the user "no numbers yet, send a message first" forever. An
   honest "not supported" beats an answer that never arrives.
+
+### Session queries while busy
+
+`/usage` and `/context` are marked `query` in `GENERIC_COMMANDS` (`isSessionQuery`): they ask
+*about* the session and do no work *for* it. Forwarding one is still what the table does, and a
+forwarded command is just another inbound message — so under `interruptOnNewMessage` it cancels the
+running turn. Seen live on 2026-09-30: a cc turn running typecheck + the full suite was cancelled
+mid-Bash by a `/usage` that Claude Code answered in under 50 ms without calling the model, and the
+work stayed stopped until the user typed "继续".
+
+So while the conversation's merger is not idle, `ConversationRegistry.answersWhileBusy` keeps a
+forwarded query (translated, or passed through to `custom`) out of the session, and the gateway
+answers from what it already holds: `/context` with the same `describeContext` the `local`
+harnesses always get, `/usage` with `busy-snapshot.ts` — the live context numbers, the last
+cumulative cost the harness reported (claude-agent-acp only, attached to its result-tied
+`usage_update`; probed to survive a `session/load`), and how long the turn has run. Every such
+answer ends with `busyNote`, which says the snapshot is the gateway's and how to get the
+harness's own once the turn ends. Collecting counts as busy too: a command forwarded inside the
+merge window is glued onto the waiting message and stops being a command.
+
+Idle conversations are unchanged — the harness's own answer knows more (claude's adds per-model
+tokens, cache and API time). `local` and `unsupported` answers are unchanged too: neither touches
+the session, and a snapshot of a harness with no `/usage` would answer a question nobody asked it.
+
+The same registered vocabulary is also why a pending question (`answersPendingQuestion`) no longer
+takes a generic command as its answer: a tapped `/usage` is someone asking the gateway, not answering
+the agent. Only registered names — `TEXT_COMMAND_RE` needs whitespace after the name, so a path like
+`/srv/data` is not command-shaped and still answers "where should it go?".
 
 `/model` matches on any substring that picks exactly one model, because opencode offers
 93 of them: far past a button menu's 25 and past what is readable as a list, but

@@ -177,6 +177,19 @@ describe('translateUpdate usage_update (live context numbers)', () => {
     expect(usage).toEqual([{ used: 0, size: 200_000 }]);
   });
 
+  // The result-tied snapshot carries the session's cumulative cost; a busy `/usage` quotes it.
+  it('carries a reported cost along, and only a well-formed one', () => {
+    const { st, usage } = recorder();
+    feed(st, { sessionUpdate: 'usage_update', used: 1, size: 10, cost: { amount: 0.3187, currency: 'USD' } });
+    feed(st, { sessionUpdate: 'usage_update', used: 2, size: 10, cost: { amount: 'lots', currency: 'USD' } });
+    feed(st, { sessionUpdate: 'usage_update', used: 3, size: 10, cost: null });
+    expect(usage).toEqual([
+      { used: 1, size: 10, cost: { amount: 0.3187, currency: 'USD' } },
+      { used: 2, size: 10 }, // the context numbers still count; only the bogus cost is dropped
+      { used: 3, size: 10 },
+    ]);
+  });
+
   it('contextWindow override replaces the harness window (200k fallback → configured 1M)', () => {
     const { st, usage } = recorder();
     st.contextWindow = 1_000_000;

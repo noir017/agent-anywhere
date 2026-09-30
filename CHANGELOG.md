@@ -5,6 +5,25 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **`/usage` and `/context` no longer interrupt a running turn.** Both were passed to the agent
+  like any other message, so with `interruptOnNewMessage` on (the default) asking how much a turn
+  had cost cancelled it. On cc that meant a Bash call running the test suite was killed so that
+  Claude Code could answer `/usage` locally in under 50 ms, and the work then sat stopped until
+  someone noticed and typed "继续". While a turn is running, or a message is still inside its merge
+  window, the gateway now answers these itself, on every harness that would otherwise have been
+  sent them (claude, codex, gemini, custom): `/context` with the same numbers the footer uses, and
+  `/usage` with the context, the session's cumulative cost as of the last finished turn (claude
+  reports it; codex does not, and the reply says so) and how long the turn has run. The reply ends
+  with a line saying it is the gateway's snapshot and that sending the command again once the turn
+  ends gets the agent's own, fuller answer. An idle conversation still gets the agent's own answer.
+- **A command typed while the agent has a question on screen is no longer taken as the answer.**
+  Sending `/usage` while cc waited on a button question used to file the literal text "/usage"
+  away as the reply to that question. A command from the registered menu is now treated as a
+  command, so the question stays on screen for its real answer. Text that merely starts with a
+  slash, like a path, still answers the question.
+
 ## [1.36.0] - 2026-09-30
 
 ### Changed

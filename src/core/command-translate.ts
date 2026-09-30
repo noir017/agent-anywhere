@@ -122,6 +122,22 @@ interface GenericCommand {
    * of one is evidence, not optimism.
    */
   local?: Harness[];
+  /**
+   * A question ABOUT the session rather than work FOR it — the gateway answers it itself while the
+   * conversation is busy, instead of forwarding it (see isSessionQuery).
+   *
+   * Forwarding is what the translation table does, and a forwarded command is just another inbound
+   * message: under `inbound.interruptOnNewMessage` (on by default) it cancels the running turn. For
+   * `/usage` that trade is absurd. Seen live on 2026-09-30: a cc turn running typecheck + the full
+   * suite was cancelled mid-Bash by a `/usage` that Claude Code then answered in under 50ms without
+   * calling the model (a `local_command` in the transcript) — and the work stayed stopped until the
+   * user typed "继续" six minutes later and the tests were run again.
+   *
+   * Only while busy. An idle conversation still gets the harness's own answer, which knows more
+   * than the gateway does (per-model tokens, cache, API time on claude); the gateway's copy is the
+   * best that can be said without touching a session that is in the middle of something.
+   */
+  query?: true;
 }
 
 /**
@@ -158,6 +174,9 @@ const GENERIC_COMMANDS: Record<string, GenericCommand> = {
     // gpt-5.6-terra). Notably this one predates the migration — Zed's adapter reported it too — so
     // it is the one context-related thing codex did not gain by switching.
     local: ['opencode', 'dsh', 'agy', 'codex'],
+    // Where it IS forwarded (claude's own `/context`, gemini's `stats`), a busy conversation gets
+    // the gateway's copy instead — the same answer the `local` harnesses always get.
+    query: true,
   },
   model: {
     description: 'Show or change the model',
@@ -213,6 +232,9 @@ const GENERIC_COMMANDS: Record<string, GenericCommand> = {
     // one-shot process instead. Probed on 1.2.0 — four tab-separated columns of pool, metric,
     // remaining percentage and reset timestamp, answered from local state with no model invoked.
     local: ['agy'],
+    // claude and codex forward it, so a busy conversation gets the gateway's snapshot instead.
+    // agy never needed this: its answer is already a separate process that touches no session.
+    query: true,
   },
   doctor: {
     description: "Health-check this agent's own setup",
@@ -373,6 +395,15 @@ export function translateCommand(name: string, harness: Harness | undefined): Co
 /** Whether a name belongs to the generic vocabulary (i.e. is subject to translation). */
 export function isGenericCommand(name: string): boolean {
   return Object.hasOwn(GENERIC_COMMANDS, name.toLowerCase());
+}
+
+/**
+ * Whether a generic command only asks about the session (`/usage`, `/context`), so that a busy
+ * conversation can have the gateway answer it rather than forward it into the running turn — see
+ * GenericCommand.query for the incident that made this a rule.
+ */
+export function isSessionQuery(name: string): boolean {
+  return GENERIC_COMMANDS[name.toLowerCase()]?.query === true;
 }
 
 /**

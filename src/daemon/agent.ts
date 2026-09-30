@@ -136,6 +136,14 @@ export interface AgentUsage {
   used: number;
   /** Total context window size in tokens. */
   size: number;
+  /**
+   * Cumulative session cost, when the harness reports one (ACP `UsageUpdate.cost`). Absent on most
+   * snapshots: claude-agent-acp sends it only with the one tied to a finished result, and codex-acp
+   * never does. Probed on claude-agent-acp 0.81.0 (2026-09-30): it grows across turns ($0.319 →
+   * $0.327) and carries on from there after the child is killed and the session reloaded ($0.337),
+   * so it is the SESSION's total, not the process's — which is what lets the gateway quote it.
+   */
+  cost?: { amount: number; currency: string };
 }
 
 export interface RunTurnInput {

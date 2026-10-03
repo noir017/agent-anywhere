@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.36.2] - 2026-10-03
+
 ### Fixed
 
 - **agy's `/model` list now shows models added since the daemon started.** The list was read

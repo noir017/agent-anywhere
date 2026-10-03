@@ -2091,6 +2091,11 @@ ${formatTokens(left)} left before compaction — ${name}`;
     // indistinguishable from a dropped command — so say something is happening, best-effort.
     const typing = this.platforms.get(msg.conversation.platform);
     void typing?.startTyping?.(addressOf(msg.conversation)).catch(() => undefined);
+    // Re-ask before reading: a list the harness serves outside the session (agy's) can have grown
+    // since the daemon started, and `/model` is precisely the question "what is on offer now". Only
+    // here — a click on the menu this opens re-checks against the list fetched here, and paying a
+    // second CLI start (~1.5s) per click would buy nothing.
+    await this.agents.getOrCreate(key, state.agentId).refreshModels?.();
     const warm = await this.warmModelSelector(key, state.agentId);
     void typing?.stopTyping?.(addressOf(msg.conversation)).catch(() => undefined);
     if (warm.error) return modelStartFailedText(warm.error);

@@ -5,6 +5,19 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **agy's `/model` list now shows models added since the daemon started.** The list was read
+  from `agy models` once, when the daemon started, on the assumption that it only changes when
+  agy is upgraded. It does not: Google serves it, and on 2026-10-03 an agy binary that had not
+  changed since 09-29 offered Claude Opus 5.5 while a daemon started on 09-29 still showed the
+  older list, and `/model claude-opus-5-5-medium` answered "No model matches". Only a restart
+  fixed it. Every `/model` now asks `agy models` again (about a second and a half, while the
+  typing indicator is on) before answering. If that run fails or comes back empty, the previous
+  list is kept, so a brief network failure does not turn into "this harness offers no model
+  selector". The same refresh also recovers a startup fetch that failed, which used to leave
+  `/model` broken until a restart.
+
 ## [1.36.1] - 2026-09-30
 
 ### Fixed

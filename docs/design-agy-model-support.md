@@ -94,6 +94,14 @@ async function fetchModels(): Promise<Array<{ value: string; name: string }>> {
 restarts the daemon anyway. An operator who adds a model provider and wants it
 reflected can restart the daemon or send `/new` — the same cost as today's `/setting`.
 
+> **Superseded 2026-10-03.** The premise was wrong: `agy models` prints "Fetching
+> available models..." and the list is served by Google, not shipped in the binary. An
+> agy 1.2.13 binary unchanged since 2026-09-29 listed `claude-opus-5-5-*` on 2026-10-03,
+> while a daemon started on 09-29 still offered its startup list, and `/new` did not help
+> (the cache is per factory, not per session). Every `/model` now re-runs `agy models`
+> through `AgentSession.refreshModels`; a failed or empty answer keeps the previous list.
+> See `src/daemon/README.md`.
+
 **Failure mode**: if `agy models` fails (not on PATH, auth expired), `cachedModels`
 stays `undefined` and `modelSelector()` returns `undefined` — `/model` answers "no
 selector" with the same text ACP sessions use when they have no live child. The turn

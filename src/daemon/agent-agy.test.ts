@@ -447,6 +447,71 @@ describe('createAgyAgentFactory — model selector and switching', () => {
   });
 });
 
+describe('createAgyAgentFactory — refreshing the model list', () => {
+  // The list is served by Google, not the binary: on 2026-10-03 an unchanged agy 1.2.13 listed
+  // Opus 5.5 while a daemon started days earlier still offered its startup list.
+  const BEFORE = [{ value: 'gemini-3.8-flash-high', name: 'Gemini 3.8 Flash (High)' }];
+  const AFTER = [...BEFORE, { value: 'claude-opus-5-5-medium', name: 'Claude Opus 5.5 (Medium)' }];
+  const cfg = { agents: [def({ id: 'agy-main', harness: 'agy' })] } as unknown as Config;
+
+  /** A fetcher answering from a queue, so each test scripts what successive `agy models` runs say. */
+  function scripted(...answers: Array<typeof BEFORE | Error>) {
+    const fetcher = vi.fn(async () => {
+      const next = answers.length > 1 ? answers.shift()! : answers[0]!;
+      if (next instanceof Error) throw next;
+      return next;
+    });
+    return fetcher;
+  }
+
+  async function started(fetcher: ReturnType<typeof scripted>) {
+    const factory = createAgyAgentFactory(cfg, '/tmp/test.sock', undefined, fetcher);
+    const session = factory.getOrCreate('conv-1', 'agy-main');
+    await session.ensureSession?.('sess_x'); // the startup prefetch
+    return session;
+  }
+
+  it('picks up a model added after the daemon started', async () => {
+    const fetcher = scripted(BEFORE, AFTER);
+    const session = await started(fetcher);
+    expect(session.modelSelector?.()?.options).toEqual(BEFORE);
+
+    await session.refreshModels?.();
+    expect(session.modelSelector?.()?.options).toEqual(AFTER);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the known list when a refresh comes back empty', async () => {
+    // defaultFetchAgyModels reports every failure as [], so [] must not read as "no models".
+    const session = await started(scripted(BEFORE, []));
+    await session.refreshModels?.();
+    expect(session.modelSelector?.()?.options).toEqual(BEFORE);
+  });
+
+  it('keeps the known list when a refresh throws, and does not reject', async () => {
+    const session = await started(scripted(BEFORE, new Error('network down')));
+    await expect(session.refreshModels?.()).resolves.toBeUndefined();
+    expect(session.modelSelector?.()?.options).toEqual(BEFORE);
+  });
+
+  it('recovers a startup fetch that came back empty', async () => {
+    // Before refreshes existed, an `agy models` that failed at boot left /model saying "no model
+    // selector" until the daemon was restarted.
+    const session = await started(scripted([], AFTER));
+    expect(session.modelSelector?.()).toBeUndefined();
+    await session.refreshModels?.();
+    expect(session.modelSelector?.()?.options).toEqual(AFTER);
+  });
+
+  it('shares one `agy models` run between overlapping refreshes', async () => {
+    const fetcher = scripted(BEFORE, AFTER);
+    const session = await started(fetcher);
+    await Promise.all([session.refreshModels?.(), session.refreshModels?.()]);
+    expect(fetcher).toHaveBeenCalledTimes(2); // the prefetch, then ONE refresh
+    expect(session.modelSelector?.()?.options).toEqual(AFTER);
+  });
+});
+
 describe('formatAgyQuota', () => {
   // Verbatim from `agy -p=/usage` on agy 1.2.0 (2026-09-17).
   const raw = [

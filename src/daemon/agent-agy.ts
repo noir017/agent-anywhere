@@ -318,37 +318,51 @@ export function createAgyAgentFactory(
 ): AgentFactory {
   const sessions = new Map<string, AgentSession>();
   let cachedModels: Array<{ value: string; name: string }> | undefined;
-  let fetchPromise: Promise<Array<{ value: string; name: string }>> | undefined;
+  let fetchPromise: Promise<void> | undefined;
 
-  function ensureModels(): void {
-    if (cachedModels !== undefined || fetchPromise !== undefined) return;
-    fetchPromise = modelFetcher()
+  /**
+   * Run `agy models` now, or join the run already in flight.
+   *
+   * A non-empty answer replaces the cache. An empty one only fills a cache that was never filled:
+   * defaultFetchAgyModels reports every failure as `[]`, so letting `[]` overwrite a known list
+   * would turn one network blip during a `/model` into "this harness offers no model selector".
+   * A fetcher that throws leaves the cache alone, and ensureModels tries again on the next read.
+   */
+  function fetchModels(): Promise<void> {
+    fetchPromise ??= modelFetcher()
       .then((models) => {
-        cachedModels = models;
-        fetchPromise = undefined;
-        return models;
+        if (models.length > 0 || cachedModels === undefined) cachedModels = models;
       })
       .catch((e) => {
         console.debug('[agy] failed to fetch models:', e instanceof Error ? e.message : e);
+      })
+      .finally(() => {
         fetchPromise = undefined;
-        return [];
       });
+    return fetchPromise;
+  }
+
+  /** Fetch once if nothing is known yet. Fire-and-forget — awaitModels is the waiting form. */
+  function ensureModels(): void {
+    if (cachedModels === undefined) void fetchModels();
   }
 
   /**
    * Start the prefetch if needed and wait for whichever attempt is in flight.
    *
    * Read `fetchPromise` AFTER ensureModels so a caller arriving before the first prefetch settles
-   * joins it rather than returning immediately on a still-empty cache. Never rejects — ensureModels
-   * already turns a failed `agy models` into an empty list, and a caller's job is then to report
-   * "no models offered", not to fail.
+   * joins it rather than returning immediately on a still-empty cache. Never rejects — fetchModels
+   * swallows a failed `agy models`, and a caller's job is then to report "no models offered", not to
+   * fail.
    */
   async function awaitModels(): Promise<void> {
     ensureModels();
     await fetchPromise;
   }
 
-  // Eager pre-fetch so the model list is ready when /model is invoked.
+  // Eager pre-fetch so the model list is ready when /model is invoked. Only a starting point: the
+  // list is Google's and changes under a running daemon, so each `/model` re-fetches it as well
+  // (AgentSession.refreshModels).
   ensureModels();
 
   // Point agy's status line at this daemon's shim, once per distinct home among the agy agents —
@@ -392,6 +406,7 @@ export function createAgyAgentFactory(
             return cachedModels;
           },
           awaitModels,
+          fetchModels,
           wiredHomes.has(agentHome(def)) ? statusSilence : undefined
         );
         sessions.set(sessionId, s);
@@ -437,6 +452,8 @@ function createAgySession(
    * told the harness has no model selector, which is simply untrue.
    */
   awaitModels?: () => Promise<void>,
+  /** Re-run `agy models` into the factory's cache (see AgentSession.refreshModels). */
+  refreshModels?: () => Promise<void>,
   /**
    * Called when a turn succeeded without this child's status line reporting once. Undefined when
    * no frames are expected (see the factory), which is what keeps a deliberate opt-out quiet.
@@ -855,6 +872,10 @@ function createAgySession(
       // session. So "make a selector available" means "wait for the prefetch", and deliberately
       // NOT "spawn a child" — starting one here would cost a process and teach nothing.
       await awaitModels?.();
+    },
+
+    async refreshModels(): Promise<void> {
+      await refreshModels?.();
     },
 
     modelSelector(): ModelSelector | undefined {

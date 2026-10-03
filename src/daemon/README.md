@@ -780,6 +780,13 @@ child, and the next turn respawns with `--model=<value>` while `--conversation=<
 conversation context intact from local disk. `modelSelector()` reports the parsed model list,
 bringing the `/model` menu and command to the agy harness.
 
+That list is cached per factory, and the cache is not the source of truth: Google serves it, so it
+grows under a running daemon without agy being upgraded (Opus 5.5 appeared on 2026-10-03 on a
+binary unchanged since 09-29). The startup prefetch is therefore only a starting point —
+`applyModelCommand` calls `refreshModels()` before every `/model`, which re-runs `agy models`
+(~1.5s) and keeps the old list when the answer is empty or the run fails. Clicks on the menu that
+`/model` opened do not re-ask; they re-check against the list that `/model` just fetched.
+
 Context usage: agy reports none over its protocol, so `agy-statusline.ts` installs a shim into
 agy's `statusLine` setting, and the shim writes each snapshot to a fourth stdio pipe (fd 3) the
 runtime opens when it spawns agy — agy passes the descriptor on to its status-line command, which

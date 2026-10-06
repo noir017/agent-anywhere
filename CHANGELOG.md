@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.36.3] - 2026-10-06
+
 ### Fixed
 
 - **cc no longer reports "hung" while Claude Code is retrying a failing API.** On 2026-10-06 the

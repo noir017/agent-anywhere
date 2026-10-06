@@ -71,8 +71,9 @@ export interface AgentStreamHandlers {
    */
   onElicit?(request: AgentElicitation): Promise<ElicitAnswer>;
   /**
-   * Something worth saying about this turn that is not part of the agent's reply — today, that the
-   * harness logged an error and is retrying (see harness-log.ts).
+   * Something worth saying about this turn that is not part of the agent's reply: the harness
+   * logged an error and is retrying (see harness-log.ts), or reported a retry, an advisory or a
+   * failure over ACP itself (see session-failure.ts).
    *
    * Sent as its own message rather than pushed into the streaming body, because the body belongs to
    * the agent: folding a gateway diagnostic into it would leave a sentence the agent never wrote

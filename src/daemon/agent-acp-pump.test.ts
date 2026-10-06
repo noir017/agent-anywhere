@@ -58,11 +58,19 @@ const autonomousResultUsage = (sessionId, used) =>
 // the next prompt arrives, which is when the real adapter hands it off with end_turn — BEFORE that
 // next prompt's own output, which is what makes its stale stop dangerous.
 let unsettled = null;
+// A typed failure record in the shape claude-agent-acp 0.81.x encodes one (see session-failure.ts):
+// a retry warning or a failure with no turn, sent as a session_info_update.
+const recordMeta = (record) => ({ jetbrains: { air: { version: 1, sessionFailure: { actions: [], ...record } } } });
+const failureRecord = (sessionId, record) =>
+  notify(sessionId, { sessionUpdate: 'session_info_update', _meta: recordMeta(record) });
+// What the client sent at initialize, so a turn can report whether it asked for those records.
+let initCaps = null;
 
 readline.createInterface({ input: process.stdin }).on('line', (line) => {
   let msg;
   try { msg = JSON.parse(line); } catch { return; }
   if (msg.method === 'initialize') {
+    initCaps = msg.params.clientCapabilities;
     reply(msg.id, { protocolVersion: 1, agentCapabilities: { loadSession: true }, authMethods: [] });
     return;
   }
@@ -103,6 +111,15 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     // two-message replay was always won and a real conversation's was not.
     if (sessionId.includes('long')) {
       for (let i = 0; i < 300; i++) text(sessionId, 'REPLAYED LINE ' + i);
+    }
+    // A usage-limit failure from the stored history, which the real adapter re-publishes on load.
+    if (sessionId.includes('failrec')) {
+      failureRecord(sessionId, {
+        id: sessionId + ':history-error:u1',
+        severity: 'error',
+        category: 'limit',
+        title: 'OLD usage limit from the history',
+      });
     }
     reply(msg.id, {});
     return;
@@ -191,6 +208,65 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
       return;
     }
     if (asked.includes('HANG_SILENT')) return;          // never speaks, never answers
+    if (asked.includes('RETRY_THEN_ANSWER')) {
+      // The 2026-10-06 shape: the API fails and Claude Code retries. Each attempt is a warning
+      // record, spaced closer than the test's watchdog but adding up to well past it, and then the
+      // provider recovers. A timeout comes first (no HTTP status, so "connection"), then 5xx.
+      const steps = [
+        ['connection', 'Reconnecting to Claude, attempt 1 of 10.'],
+        ['service', 'Retrying Claude, attempt 2 of 10.'],
+        ['service', 'Retrying Claude, attempt 3 of 10.'],
+        ['service', 'Retrying Claude, attempt 4 of 10.'],
+      ];
+      steps.forEach(([category, title], i) =>
+        setTimeout(
+          () => failureRecord(sessionId, { id: 'p1:error', revision: i + 1, severity: 'warning', category, title }),
+          150 * i
+        )
+      );
+      setTimeout(() => {
+        text(sessionId, 'recovered and answered');
+        resultUsage(sessionId, 1000);
+        reply(msg.id, { stopReason: 'end_turn' });
+      }, 150 * steps.length);
+      return;
+    }
+    if (asked.includes('FAIL_TYPED')) {
+      // Retries ran out: the adapter settles the prompt as end_turn and puts the failure in _meta,
+      // instead of rejecting it, because the client asked for records.
+      text(sessionId, 'checking the deploy script. ');
+      failureRecord(sessionId, { id: 'p2:error', revision: 1, severity: 'warning', category: 'service', title: 'Retrying Claude, attempt 1 of 10.' });
+      setTimeout(
+        () =>
+          reply(msg.id, {
+            stopReason: 'end_turn',
+            _meta: {
+              quota: { token_count: {} },
+              ...recordMeta({ id: 'p2:error', revision: 2, severity: 'error', category: 'service', title: 'API Error: 503 no available channel' }),
+            },
+          }),
+        40
+      );
+      return;
+    }
+    if (asked.includes('BG_FAILURE')) {
+      // A background cycle that fails after the turn is over: no turn to attach it to, so the
+      // adapter publishes it as a session-scoped record.
+      text(sessionId, 'started it in the background');
+      resultUsage(sessionId, 1000);
+      reply(msg.id, { stopReason: 'end_turn' });
+      setTimeout(
+        () => failureRecord(sessionId, { id: 's1:session-error:e:1', severity: 'error', category: 'service', title: 'API Error: 500 Database error' }),
+        40
+      );
+      return;
+    }
+    if (asked.includes('ECHO_CAPS')) {
+      text(sessionId, initCaps && initCaps._meta ? 'asked for records' : 'did not ask');
+      resultUsage(sessionId, 1000);
+      reply(msg.id, { stopReason: 'end_turn' });
+      return;
+    }
     if (asked.includes('HANG_IN_TOOL')) {
       // Opens a tool and then goes quiet — indistinguishable from a long script.
       notify(sessionId, {
@@ -268,22 +344,26 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
 });
 `;
 
-/** Collects everything the runtime reports, in the two channels it can report on. */
+/** Collects everything the runtime reports, in the channels it can report on. */
 function collector(): {
   handlers: AgentStreamHandlers;
   turn: string[];
   tools: string[];
+  notices: string[];
 } {
   const turn: string[] = [];
   const tools: string[] = [];
+  const notices: string[] = [];
   return {
     turn,
     tools,
+    notices,
     handlers: {
       onText: (d) => void turn.push(d),
       onToolStart: (e) => void tools.push(e.name),
       onToolFinish: () => {},
       onSegmentBreak: () => {},
+      onNotice: (t) => void notices.push(t),
     },
   };
 }
@@ -332,18 +412,22 @@ function sinkSpy(): {
   facts: string[];
   /** How each tool bubble ended: true for ✓, false for ✗. */
   finishes: boolean[];
+  /** Notices sent while no turn was running. */
+  notices: string[];
   closes: () => number;
 } {
   const text: string[] = [];
   const tools: string[] = [];
   const facts: string[] = [];
   const finishes: boolean[] = [];
+  const notices: string[] = [];
   let closes = 0;
   return {
     text,
     tools,
     facts,
     finishes,
+    notices,
     closes: () => closes,
     install: (session) =>
       session.setFollowUpSink?.({
@@ -354,6 +438,7 @@ function sinkSpy(): {
           onSegmentBreak: () => {},
           onModel: (m) => void facts.push(`model:${m}`),
           onEffort: (e) => void facts.push(`effort:${e}`),
+          onNotice: (t) => void notices.push(t),
         }),
         close: () => void closes++,
       }),
@@ -609,6 +694,76 @@ describe('the silence watchdog distinguishes a hang from a long tool call', () =
     expect(Date.now() - started).toBeGreaterThanOrEqual(TIMEOUT * (1 + TOOL_SILENCE_FACTOR));
     // ...but the ceiling is finite, which is what keeps a wedged tool from pinning the
     // conversation in `running` forever.
+  });
+});
+
+/**
+ * claude-agent-acp's typed failure records (see session-failure.ts). Reported 2026-10-06: the API
+ * gateway failed, Claude Code retried for ten minutes without the gateway hearing a word, and the
+ * turn failed as "hung". Once records are asked for, each retry is an update, so the watchdog
+ * measures real silence again, and a failed turn arrives as end_turn and must still fail.
+ */
+describe('failure records from the harness', () => {
+  const TIMEOUT = 200;
+
+  it('keeps a retrying turn alive past the watchdog, and says so once per cause', async () => {
+    const { session } = rig({ turnTimeoutMs: TIMEOUT });
+    const turn = collector();
+    const started = Date.now();
+    await session.runTurn({ prompt: 'RETRY_THEN_ANSWER', sessionToken: 'tok' }, turn.handlers);
+
+    // Longer than the watchdog allows any silence, so it was the records that kept it alive.
+    expect(Date.now() - started).toBeGreaterThan(TIMEOUT * 2);
+    expect(turn.turn.join('')).toBe('recovered and answered');
+    // Four attempts, two causes: one notice each, never folded into the reply.
+    expect(turn.notices).toEqual([
+      '⚠️ fake: Reconnecting to Claude, attempt 1 of 10.',
+      '⚠️ fake: Retrying Claude, attempt 2 of 10.',
+    ]);
+  });
+
+  it('fails a turn the harness settled as end_turn with an error record', async () => {
+    const { session } = rig({ turnTimeoutMs: TIMEOUT });
+    const turn = collector();
+    await expect(session.runTurn({ prompt: 'FAIL_TYPED', sessionToken: 'tok' }, turn.handlers)).rejects.toThrow(
+      /^API Error: 503 no available channel$/
+    );
+    // What it said before failing is still the turn's; turn-runner delivers it ahead of the ❌.
+    expect(turn.turn.join('')).toBe('checking the deploy script. ');
+    expect(turn.notices).toEqual(['⚠️ fake: Retrying Claude, attempt 1 of 10.']);
+  });
+
+  it('announces a background failure without opening a follow-up message for it', async () => {
+    const { session } = rig();
+    const sink = sinkSpy();
+    sink.install(session);
+    await session.runTurn({ prompt: 'BG_FAILURE', sessionToken: 'tok' }, collector().handlers);
+    await settle();
+
+    expect(sink.notices).toEqual(['❌ fake: API Error: 500 Database error']);
+    expect(sink.text).toEqual([]);
+    await sealed();
+    expect(sink.closes()).toBe(0);
+  });
+
+  it('does not announce failures replayed from the history by session/load', async () => {
+    const { session } = rig({ resumeFrom: 'failrec-1' });
+    const sink = sinkSpy();
+    sink.install(session);
+    const turn = collector();
+    await session.runTurn({ prompt: 'an ordinary question', sessionToken: 'tok' }, turn.handlers);
+    await settle();
+
+    expect([...turn.notices, ...sink.notices].join('\n')).not.toContain('OLD usage limit');
+  });
+
+  it('asks only the claude harness for records', async () => {
+    // The rig's agent is a `custom` harness. Positive coverage of the shape it would send is the
+    // contract test in session-failure.test.ts, against the installed adapter.
+    const { session } = rig();
+    const turn = collector();
+    await session.runTurn({ prompt: 'ECHO_CAPS', sessionToken: 'tok' }, turn.handlers);
+    expect(turn.turn.join('')).toBe('did not ask');
   });
 });
 

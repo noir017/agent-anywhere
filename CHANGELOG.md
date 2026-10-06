@@ -5,6 +5,23 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **cc no longer reports "hung" while Claude Code is retrying a failing API.** On 2026-10-06 the
+  API gateway first left a request hanging for five minutes, then answered `500` and a run of
+  `503`s. Claude Code kept retrying the whole time, but said nothing over ACP, so after ten
+  minutes the turn failed with "sent no update for 600000ms; treating it as hung" and the agent
+  process was killed. claude-agent-acp does report every retry, as a typed failure record, but
+  only to a client that asks for those records when it connects, and the gateway never asked. It
+  now asks, for the `claude` harness only. A retrying turn stays alive, and the chat gets one
+  notice per cause (`⚠️ cc: Retrying Claude, attempt 2 of 10.`), not one per attempt. If the
+  retries run out, the turn fails with the provider's own error text instead of a guess about a
+  hang. Asking for the records also changes how the adapter reports a failed turn: it now ends
+  the turn normally and puts the failure in metadata. The gateway reads that, so a failed turn is
+  still reported as failed. A background task's failure, which the adapter used to write into the
+  agent's own text, is posted as a notice. Failures the adapter replays from a resumed session's
+  history are logged and not posted, since they are old news.
+
 ## [1.36.2] - 2026-10-03
 
 ### Fixed

@@ -204,6 +204,23 @@ describe('follow-up rendering (background work reporting after the turn)', () =>
     expect(h.sent.join('\n')).toContain('12k / 200k');
   });
 
+  // A background cycle that fails (or retries) has nothing to render, and its notice must still
+  // reach the chat: with typed failure records, the adapter no longer puts the error text into the
+  // agent's own message stream (see session-failure.ts).
+  it('posts a notice on its own, without opening a background-update message', async () => {
+    const h = rig();
+    h.reg.route(inbound('hello', 'm1'));
+    await drain();
+    h.sent.length = 0;
+    h.events.length = 0;
+
+    h.sink().handlers().onNotice?.('❌ oc: API Error: 500 Database error');
+    await drain();
+
+    expect(h.sent).toEqual(['❌ oc: API Error: 500 Database error']);
+    expect(h.events).not.toContain('typing on');
+  });
+
   // close() is called by every path that can end a burst (result, new turn, quiet timer, a child
   // going away), so it has to be safe to call twice and safe to call having rendered nothing.
   it('is idempotent and safe with nothing open', async () => {

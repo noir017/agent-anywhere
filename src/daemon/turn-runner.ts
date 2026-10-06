@@ -764,6 +764,21 @@ export class TurnRunner {
         const live = peek();
         if (live) live.ref.effort = effort;
       },
+      // A background cycle's own failure, or a retry inside one (see session-failure.ts). Sent
+      // straight to the lane rather than through open(): a notice is not output, and opening the
+      // burst's message for it would post a follow-up marker over nothing. Unordered against a
+      // burst that is rendering, for the reason the in-turn notice is (see buildStreamHandlers).
+      onNotice: (text) => {
+        const target = this.deps.followUpTarget?.(conversationId);
+        const platform = target && this.platforms.get(target.platformId);
+        if (!target || !platform) {
+          console.warn(`[follow-up] ${conversationId}: no lane for a notice; dropping: ${text}`);
+          return;
+        }
+        void platform
+          .sendMessage(target.address, text)
+          .catch((e) => console.warn('[follow-up] failed to deliver a notice:', e instanceof Error ? e.message : e));
+      },
     };
   }
 

@@ -21,6 +21,7 @@ session id, agy's conversation id). One conversation holds one session *per agen
 | `agent.ts` | `AgentFactory` / `AgentSession` / `AgentStreamHandlers` interfaces. Dependency-free. |
 | `agent-factory.ts` | Dispatch: which runtime serves which agent |
 | `agent-acp.ts` | ACP runtime (claude, codex, opencode, gemini, custom) |
+| `session-failure.ts` | claude-agent-acp's typed failure records: the capability that asks for them, and reading one off the wire |
 | `agent-agy.ts` | Antigravity CLI runtime — its own stream-json protocol |
 | `agy-statusline.ts` | The only channel agy reports context usage — and its default model — on: a shim installed into its `statusLine` setting, reporting back over fd 3 |
 | `agent-common.ts` | Protocol-agnostic helpers shared by both runtimes |
@@ -500,6 +501,29 @@ conversation's errors can be picked out of a log shared by all of them:
 It never ends a turn: a logged error is evidence something went wrong, not that the turn
 is lost — opencode often retries and wins. A missing file, a renamed field or an
 unparsable line yields nothing, which puts the message back to exactly its old text.
+
+Claude Code's equivalent is its API retry loop, and that one can be heard over ACP, but
+only if the client asks. Reported 2026-10-06: the API gateway failed for ten minutes, and
+Claude Code retried silently until the watchdog failed the turn as "hung".
+claude-agent-acp turns each retry into a typed failure record (its private AIR
+`sessionFailure` extension), and sends those records only to a client that advertised the
+capability at `initialize`. The runtime advertises it for the `claude` harness only (see
+`session-failure.ts`). Then:
+
+- Each retry is a `session_info_update`, so it re-arms the watchdog like any other update,
+  and is announced through `onNotice` once per cause, not once per attempt.
+- A turn that fails anyway **resolves** `end_turn` with the record in `_meta`, where the
+  old contract rejected the prompt. `runTurn` reads it and fails the turn with the
+  record's title, so a failure can never be reported as a success.
+- A failure with no turn (a background cycle's own) is announced through the follow-up
+  sink's `onNotice`, without opening a background-update message.
+- Records that `session/load` replays from history arrive before the first prompt and are
+  only logged.
+
+The before/after was reproduced against the real adapter and Claude Code with a fake API
+answering 503 (`project-scripts/aa-air-failure/`): without the capability the turn failed
+as hung while Claude Code was still retrying, and with it the turn ended with the
+provider's own error text.
 
 One more silence is not a hang at all: claude-agent-acp's **folded prompt** (upstream
 #1145, unfixed as of 0.84.0). A prompt sent while Claude Code is reporting a finished

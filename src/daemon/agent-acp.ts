@@ -34,6 +34,13 @@ import type {
 } from './agent.js';
 import { looksLikeCommand } from './routing.js';
 import { harnessLogProbe, readHarnessErrors } from './harness-log.js';
+import {
+  describeSessionFailure,
+  failureNoticeKey,
+  readSessionFailure,
+  SESSION_FAILURE_CAPABILITY_META,
+  type SessionFailure,
+} from './session-failure.js';
 import type { ConversationStore } from './conversation-store.js';
 import {
   buildAgentEnv,
@@ -1093,6 +1100,12 @@ function createAcpSession(
     // the session hangs in running. So race a real timer: on timeout, dispose the child + throw a
     // readable error so turn-runner sees a failure instead of a silent hang.
     let timer: ReturnType<typeof setTimeout> | undefined;
+    // Asks claude-agent-acp for typed failure records, through `_meta` in the capabilities below.
+    // Without them, an API retry loop reads as a hung agent (see session-failure.ts). Only the
+    // claude harness is asked: no other adapter is known to read the key, and opencode validates
+    // the capability object strictly (see `form: true` below), so sending it a key it never needed
+    // is all risk and no gain.
+    const failureRecords = def.harness === 'claude' ? { _meta: SESSION_FAILURE_CAPABILITY_META } : {};
     const startup = (async () => {
       const initResult = await ctx.request('initialize', {
         protocolVersion: ACP_PROTOCOL_VERSION,
@@ -1115,6 +1128,7 @@ function createAcpSession(
           fs: { readTextFile: false, writeTextFile: false },
           terminal: false,
           elicitation: { form: {} },
+          ...failureRecords,
         },
       });
       loadSessionSupported = initResult.agentCapabilities?.loadSession === true;
@@ -1242,6 +1256,8 @@ function createAcpSession(
    * rendered tools differently from an in-turn one would be a bug nobody would think to look for.
    */
   function newTranslationState(handlers: AgentStreamHandlers): TurnState {
+    /** Notice keys already sent from this turn or burst (see failureNoticeKey). */
+    const announced = new Set<string>();
     return {
       handlers,
       lastSegment: 'none',
@@ -1254,9 +1270,40 @@ function createAcpSession(
         liveConfigOptions = options;
         liveModel = liveModelName(options) ?? liveModel;
       },
+      onSessionFailure: (failure) => announceSessionFailure(failure, handlers, announced),
       // Local override for a harness that under-reports the window (e.g. claude-opus-5 → 200k fallback).
       contextWindow: def.contextWindow,
     };
+  }
+
+  /**
+   * Turn a failure record from a `session_info_update` into a notice: a retry in progress, an
+   * advisory, or a failure that has no turn to fail (see session-failure.ts).
+   *
+   * Every record is logged, and each piece of news is sent once per turn or burst. The adapter
+   * sends one warning per retry attempt, and that series is exactly the case that produces ten
+   * minutes of them.
+   *
+   * Nothing is sent before the session's first prompt. `session/load` re-publishes old usage-limit
+   * failures from the stored history at that point, and posting them would report an outage the
+   * user lived through days ago as if it were happening now. The replay fence makes this a sound
+   * test (see promptedYet).
+   */
+  function announceSessionFailure(
+    failure: SessionFailure,
+    handlers: AgentStreamHandlers,
+    announced: Set<string>
+  ): void {
+    const line = describeSessionFailure(failure);
+    if (!promptedYet) {
+      console.debug(`[acp] ${conversationId}: not announcing a failure record from before the first prompt: ${line}`);
+      return;
+    }
+    console.log(`[acp] ${conversationId}: ${def.harness} reported a ${failure.severity} (${failure.category}): ${line}`);
+    const key = failureNoticeKey(failure);
+    if (announced.has(key)) return;
+    announced.add(key);
+    handlers.onNotice?.(`${failure.severity === 'error' ? '❌' : '⚠️'} ${def.id}: ${trimReason(line)}`);
   }
 
   /**
@@ -1830,7 +1877,13 @@ function createAcpSession(
           flushPendingTools(state);
           return;
         }
-        await promptDone; // already resolved at stop; here only settles / rethrows an in-turn error
+        // Already resolved at stop; here only settles / rethrows an in-turn error.
+        const response = await promptDone;
+        // A failed turn, as an adapter that negotiated failure records reports one: `end_turn`
+        // with the failure in `_meta`, where an older contract rejected the prompt. Thrown before
+        // the tools are flushed, exactly as a rejection was, so the two read the same downstream.
+        const failure = readSessionFailure(response._meta);
+        if (failure?.severity === 'error') throw new Error(describeSessionFailure(failure));
         flushPendingTools(state);
       } catch (err) {
         if (aborting) return; // intentional abort is not an error
@@ -2136,6 +2189,13 @@ export interface TurnState {
    */
   onConfigOptions?(options: SessionConfigOption[] | null | undefined): void;
   /**
+   * Hand a failure record from a `session_info_update` to the session to announce (see
+   * session-failure.ts). A callback for the same reason as onConfigOptions: the notice needs the
+   * agent's id and the session's replay state, and translateUpdate sees neither. Optional, so the
+   * pure translation tests can omit it.
+   */
+  onSessionFailure?(failure: SessionFailure): void;
+  /**
    * Override for the context-window size (tokens) reported over `usage_update`. When set, ingestUsage
    * replaces the harness's `size` with this before forwarding — the local-config fix for a harness that
    * under-reports the window (see AgentDef.contextWindow). Absent = trust the harness's number.
@@ -2230,11 +2290,20 @@ export function translateUpdate(u: SessionUpdate, st: TurnState): void {
       reportConfigOptions(u, st);
       break;
 
-    // agent_thought_chunk / plan* / session_info_update / *_update etc.: not rendered.
+    // A failure record (retry, advisory, or a failure with no turn), when the session asked for them
+    // (see session-failure.ts). Its re-arming of the silence watchdog is the pump's doing, like any
+    // other update's. This case only decides what to say.
     //
-    // `session_info_update` carries the harness's own name for the conversation, and is ignored on
-    // purpose: the gateway names a conversation once from its opening message (see
-    // ConversationRegistry.nameConversation) rather than following a title that keeps moving.
+    // A `session_info_update` with no record carries the harness's own name for the conversation,
+    // and is ignored on purpose: the gateway names a conversation once from its opening message
+    // (see ConversationRegistry.nameConversation) rather than following a title that keeps moving.
+    case 'session_info_update': {
+      const failure = readSessionFailure(u._meta);
+      if (failure) st.onSessionFailure?.(failure);
+      break;
+    }
+
+    // agent_thought_chunk / plan* / *_update etc.: not rendered.
     default:
       break;
   }

@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.38.0] - 2026-10-08
+
 ### Added
 
 - **The web UI shows the agent's live status above the composer.** One line: agent, model and

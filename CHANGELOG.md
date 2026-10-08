@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.37.0] - 2026-10-08
+
 ### Added
 
 - **Web UI topics can be starred.** A ☆ sits beside each topic's `×`. A starred topic is never

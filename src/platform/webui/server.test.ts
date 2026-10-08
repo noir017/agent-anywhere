@@ -5,7 +5,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { createGunzip } from 'node:zlib';
-import { afterEach, beforeEach, describe, it, expect } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 
 import { WebuiConfigSchema } from '../config-schemas.js';
 import { WebAuth } from './auth.js';
@@ -29,6 +29,7 @@ beforeEach(() => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'webui-server-'));
 });
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(running.splice(0).map((s) => s.stop()));
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -583,6 +584,53 @@ describe('webui server: topics', () => {
     expect(fresh.id).toMatch(/^[0-9a-f]{8}$/);
     expect(room.topics.list().map((t) => t.id)).toEqual([fresh.id]);
     expect(room.topics.has(topic)).toBe(false);
+  });
+
+  it('answers a clear with the list as it stands, so the page knows which caches to keep', async () => {
+    const { base, room, topic } = await boot();
+    const cookie = await signIn(base);
+    room.createTopic('gone');
+    room.starTopic(topic, true);
+
+    const res = await fetch(`${base}/api/topics/clear`, { method: 'POST', headers: { ...JSON_HEADERS, cookie }, body: '{}' });
+
+    const body = (await res.json()) as { topic: { id: string }; topics: Array<{ id: string }> };
+    expect(body.topics.map((t) => t.id).sort()).toEqual([topic, body.topic.id].sort());
+  });
+
+  it('stars and unstars a topic, and says 404 for one that is not there', async () => {
+    const { base, room, topic } = await boot();
+    const cookie = await signIn(base);
+    const star = (body: unknown): Promise<Response> =>
+      fetch(`${base}/api/topics/star`, { method: 'POST', headers: { ...JSON_HEADERS, cookie }, body: JSON.stringify(body) });
+
+    expect((await star({ topic, starred: true })).status).toBe(200);
+    expect(room.topics.get(topic)?.starred).toBe(true);
+    expect((await star({ topic, starred: false })).status).toBe(200);
+    expect(room.topics.get(topic)?.starred).toBeUndefined();
+    expect((await star({ topic: 'deadbeef', starred: true })).status).toBe(404);
+    // A toggle with no stated value is refused rather than guessed at: a retried toggle flips back.
+    expect((await star({ topic })).status).toBe(400);
+  });
+
+  it('makes room in a full list, and when it cannot, says why in the 409 and in the log', async () => {
+    const { base, room } = await boot();
+    const cookie = await signIn(base);
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    while (!room.topics.full()) room.createTopic();
+    const create = (): Promise<Response> =>
+      fetch(`${base}/api/topics`, { method: 'POST', headers: { ...JSON_HEADERS, cookie }, body: '{}' });
+
+    // Full is no longer a refusal: the oldest topic goes and the new one is made.
+    expect((await create()).status).toBe(201);
+
+    for (const t of room.topics.list()) room.starTopic(t.id, true);
+    const res = await create();
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toMatch(/^every one of the 64 topics is starred or in use/);
+    // It used to leave no trace outside the browser's network panel.
+    expect(warn.mock.calls.flat().join('\n')).toMatch(/\[webui\] refused to open a topic: every one/);
   });
 });
 

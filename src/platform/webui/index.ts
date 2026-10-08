@@ -280,6 +280,7 @@ function lifecycle(
   | 'onCommand'
   | 'useWorkdirLookup'
   | 'useLivenessLookup'
+  | 'useScheduleLookup'
   | 'registerCommands'
   | 'start'
   | 'stop'
@@ -299,6 +300,11 @@ function lifecycle(
      * an hour ago still has an agent behind it.
      */
     useLivenessLookup: (lookup) => room.useLivenessLookup(lookup),
+    /**
+     * The only implementor because it is the only platform that throws topics away by itself:
+     * a chat app's list is the platform's, and this one evicts past its cap. Read only then.
+     */
+    useScheduleLookup: (lookup) => room.useScheduleLookup(lookup),
     /**
      * Accepted and never called.
      *

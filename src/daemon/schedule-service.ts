@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import type { Config } from '../config/schema.js';
-import type { ConversationAddress } from '../core/conversation.js';
+import type { ConversationAddress, ConversationRef } from '../core/conversation.js';
 import {
   agentRunPrompt,
   bashResultText,
@@ -144,6 +144,25 @@ export class ScheduleService {
   /** Every task, for `/setting schedule`. */
   tasks(): ScheduleTask[] {
     return this.scheduler.list();
+  }
+
+  /**
+   * Whether a task that can still run posts into the conversation at `ref` — what keeps the web
+   * UI from evicting that topic (`PlatformAdapter.useScheduleLookup`).
+   *
+   * Paused counts: resuming it would otherwise find its topic gone. Expired and done do not; an
+   * expired task has already posted its notice and runs no more.
+   */
+  targets(ref: ConversationRef): boolean {
+    return this.scheduler
+      .list()
+      .some(
+        (t) =>
+          (t.state === 'active' || t.state === 'paused') &&
+          t.target.platform === ref.platform &&
+          t.target.channel === ref.channel &&
+          t.target.thread === ref.thread
+      );
   }
 
   nextRun(task: ScheduleTask): number | undefined {

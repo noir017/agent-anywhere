@@ -136,7 +136,10 @@ async function rig() {
     { store: new ScheduleStore(path.join(dir, 'schedules.json')), runsDir: path.join(dir, 'runs') }
   );
   daemons.push(daemon);
-  const internals = daemon as unknown as { ipc: { start(): Promise<void> }; schedules: { scheduler: { start(): void } } };
+  const internals = daemon as unknown as {
+    ipc: { start(): Promise<void> };
+    schedules: { scheduler: { start(): void }; targets(ref: InboundMessage['conversation']): boolean };
+  };
   await internals.ipc.start();
   internals.schedules.scheduler.start();
 
@@ -154,7 +157,9 @@ async function rig() {
     (daemon as unknown as { onButton: (ev: unknown) => void }).onButton({ buttonId: button.id, conversation: WEB, messageId: 'menu' });
     await settle(20);
   };
-  return { dir, sent, turns, disposed, tg, web, menus, inbound, call, tap };
+  /** What the web UI asks before evicting a topic (`PlatformAdapter.useScheduleLookup`). */
+  const targets = (ref: InboundMessage['conversation']): boolean => internals.schedules.targets(ref);
+  return { dir, sent, turns, disposed, tg, web, menus, inbound, call, tap, targets };
 }
 
 const settle = (ms = 60): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -238,6 +243,20 @@ describe('schedule over IPC', () => {
     expect(turn.conversation).toMatch(new RegExp(`^schedule#${task.id}#`));
     expect(r.sent[0]).toMatchObject({ platform: 'tg', address: { channel: '586' } });
     expect(r.disposed).toContain(turn.conversation);
+  });
+
+  it('says which conversations a task can still post into, so the web UI will not evict them', async () => {
+    const r = await rig();
+    await r.inbound(WEB, 'hello');
+    const task = await added(r, { kind: 'schedule-add', cron: '*/30 * * * *', prompt: 'check the build' });
+    expect(r.targets(WEB)).toBe(true);
+    expect(r.targets({ ...WEB, thread: 't2' })).toBe(false);
+    expect(r.targets({ ...WEB, platform: 'tg' })).toBe(false);
+    // Paused still counts: resuming it must find its topic where it was left.
+    await r.call({ kind: 'schedule-op', id: task.id, op: 'pause' });
+    expect(r.targets(WEB)).toBe(true);
+    await r.call({ kind: 'schedule-op', id: task.id, op: 'remove' });
+    expect(r.targets(WEB)).toBe(false);
   });
 
   it('list, pause and rm answer with the task and post a card for each change', async () => {

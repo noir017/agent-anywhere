@@ -7,6 +7,7 @@ import {
   ClearTopicsRequestSchema,
   LoginRequestSchema,
   SendRequestSchema,
+  StarTopicRequestSchema,
   parseBody,
 } from './protocol.js';
 
@@ -112,5 +113,17 @@ describe('webui protocol: inbound validation', () => {
     ['an extra key', { confirm: true }, false],
   ])('clearing every topic with %s', (_label, body, want) => {
     expect(parseBody(ClearTopicsRequestSchema, body).ok).toBe(want);
+  });
+
+  it.each([
+    ['a stated state', { topic: TOPIC, starred: true }, true],
+    ['unstarring', { topic: TOPIC, starred: false }, true],
+    // Stated, never toggled: the page retries a dropped request, and a retried toggle flips back.
+    ['no state at all', { topic: TOPIC }, false],
+    ['a state that is not a boolean', { topic: TOPIC, starred: 'yes' }, false],
+    ['a malformed topic id', { topic: 'not-hex', starred: true }, false],
+    ['an extra key', { topic: TOPIC, starred: true, pin: true }, false],
+  ])('starring a topic with %s', (_label, body, want) => {
+    expect(parseBody(StarTopicRequestSchema, body).ok).toBe(want);
   });
 });

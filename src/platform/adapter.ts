@@ -146,6 +146,19 @@ export interface PlatformAdapter {
    */
   useLivenessLookup?(lookup: (ref: ConversationRef) => boolean): void;
 
+  /**
+   * Hand the platform a way to ask whether a scheduled task posts into the conversation at one of
+   * its addresses.
+   *
+   * Same seam as the two above, but not decoration: the web UI evicts its least recently active
+   * topic once it holds too many, and a task's target is a plain address that nothing rewrites
+   * when the topic behind it goes — so evicting a scheduled task's topic would turn every later
+   * run into a failure posted nowhere. A lookup rather than a pushed set because tasks come and
+   * go through four entry points (the agent's commands, `/setting schedule`, expiry, completion),
+   * and the question is only asked at the moment a topic has to be chosen.
+   */
+  useScheduleLookup?(lookup: (ref: ConversationRef) => boolean): void;
+
   /** Send a message with buttons (used by clarify). */
   sendButtons(
     address: ConversationAddress,

@@ -99,10 +99,31 @@ not, and nothing here reads that cache back.
 
 **Neither the per-topic `×` nor "Clear all topics" ends an agent session.** Both reach exactly as
 far as this module: the room goes, the list entry goes, and the daemon's binding under
-`<instance>#main#<topic id>` stays behind. That is the same trade the cap in `topics.ts` refuses
-to make automatically — it is a list being cleared, not sessions being killed. The sweep exists
-because a restart leaves a sidebar full of rows that open onto nothing (see `stale` below), and
-deleting a dozen of those one at a time is not a feature.
+`<instance>#main#<topic id>` stays behind — it is a list being cleared, not sessions being killed.
+The sweep exists because a restart leaves a sidebar full of rows that open onto nothing (see
+`stale` below), and deleting a dozen of those one at a time is not a feature.
+
+**Past 64 topics the oldest one goes, unless something is holding on to it.** `topics.ts` used to
+refuse the 65th outright, on the grounds that evicting a topic orphans its session. In use that
+reached 64 in two weeks (a new-session scheduled task adds a topic per run), after which `+` did
+nothing at all — the 409 never reached the screen — and every scheduled run fell back to posting
+into the chat. Orphaning costs exactly what a `×` costs, which people press all the time; so now
+`WebRoom.createTopic` evicts the least recently active topic first (`makeRoom`), logging its id and
+title, since that line is the only way left to find the session it leaves behind.
+
+A topic is passed over when evicting it would *break* something rather than merely orphan it:
+mid-turn, asking a question, an agent resident, a terminal attached, or the target of a scheduled
+task that can still run (`PlatformAdapter.useScheduleLookup` — a task posts to a plain address and
+nothing rewrites it when the topic goes). Otherwise the only thing that keeps a quiet topic is a
+**star** (☆ beside the `×`). A starred topic is never evicted, survives "Clear all topics" (which
+says "Clear unstarred topics" while any are starred), and is listed first. The `×` still deletes
+it: a star defers to the operator, not the other way round, and the confirmation says "starred".
+When every topic is starred or busy, `+` is refused, and the page shows the daemon's sentence
+saying so rather than doing nothing.
+
+The star is persisted beside the title, and only when true — a topic file from before stars, or
+from someone who never uses them, is unchanged. The page sends `{ starred: true|false }`, never a
+toggle, because `post` retries a dropped request and a retried toggle would flip back.
 
 **Each row also says which directory that topic works in**, which is the one thing a title does
 not tell you when several topics are open on different projects. It is not stored beside the
@@ -335,7 +356,8 @@ same reason. A few decisions here are not obvious:
   the paste or pick, and clicking another topic in between used to hand the file to the wrong
   conversation.
 - **A topic's view and draft go with it**, on a delete, on "Clear all topics", and whenever the list
-  stops carrying an id (`prune`).
+  stops carrying an id (`prune`). A clear that spared starred topics spares theirs too — `keepOnly`
+  works from the list the server answered with, not from the stars this tab last drew.
 
 Measured in Chromium on switches into a 250-message topic, 31 per run, compared with the code
 before the change. `saveView` costs at most 0.1ms, which is the resolution of Chrome's timer.

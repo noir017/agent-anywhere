@@ -6,7 +6,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { MessageNotEditableError } from '../../core/outbound-errors.js';
 import { WebuiConfigSchema } from '../config-schemas.js';
 import { CHANNEL, DIR_TTL_MS, inlineImageType, OWNER, WebRoom, type WebuiInstance } from './room.js';
-import { TopicStore } from './topics.js';
+import { MAX_TOPICS, TopicStore } from './topics.js';
 import type { InboundMessage } from '../../types.js';
 import type { WebEvent, WebMessage } from './protocol.js';
 
@@ -796,5 +796,122 @@ describe('WebRoom: what the switcher dot is saying', () => {
     expect(() => room.post(topic, { own: false, html: '<p>hi</p>' }, 'hi')).not.toThrow();
     expect(kinds(seen)).toContain('msg');
     expect(flagsOf(room, topic).live).toBe(false);
+  });
+});
+
+describe('WebRoom: a full topic list makes room instead of refusing', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  /**
+   * A room whose store is full: `n` topics whose `lastAt` counts up from 1, so `ids[0]` is the
+   * oldest. Built through the store so the timestamps are exact, then wrapped, which is how the
+   * adapter builds it too.
+   */
+  function full(): { room: WebRoom; store: TopicStore; ids: string[] } {
+    const store = new TopicStore(path.join(dir, `${Math.random()}.json`));
+    const ids: string[] = [];
+    for (let i = 0; i < MAX_TOPICS; i += 1) {
+      const t = store.create(`t${i}`);
+      store.touch(t.id, i + 1);
+      ids.push(t.id);
+    }
+    return { room: new WebRoom(instance(), store), store, ids };
+  }
+
+  it('gives up the least recently active topic, and says which in the log', () => {
+    // 64 topics was two weeks of ordinary use, after which + did nothing at all.
+    const { room, store, ids } = full();
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const seen: Seen[] = [];
+    room.subscribe(ids[5]!, (id, ev) => seen.push({ id, ev }));
+    seen.length = 0;
+
+    const fresh = room.createTopic('new');
+
+    expect(store.has(ids[0]!)).toBe(false);
+    expect(store.has(fresh.id)).toBe(true);
+    expect(store.list()).toHaveLength(MAX_TOPICS);
+    // The id and the title, because the daemon's binding for it outlives the row and this line
+    // is how its session can still be found.
+    expect(log.mock.calls.flat().join('\n')).toMatch(new RegExp(`evicted ${ids[0]} "t0"`));
+    // One list, not one for the eviction and another for the creation.
+    expect(kinds(seen).filter((k) => k === 'topics')).toHaveLength(1);
+  });
+
+  it('never gives up a starred topic', () => {
+    const { room, store, ids } = full();
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    room.starTopic(ids[0]!, true);
+    room.starTopic(ids[1]!, true);
+
+    room.createTopic();
+
+    expect(store.has(ids[0]!)).toBe(true);
+    expect(store.has(ids[1]!)).toBe(true);
+    expect(store.has(ids[2]!)).toBe(false);
+  });
+
+  it('passes over a topic that is mid-turn, asking, resident, has a terminal, or is a scheduled target', () => {
+    // Each is something eviction would break rather than merely orphan.
+    const { room, store, ids } = full();
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    room.setTyping(ids[0]!, true);
+    room.post(ids[1]!, { own: false, html: '', buttons: [{ id: 'ask:q:0', label: 'yes' }] }, 'Q');
+    room.useLivenessLookup((ref) => ref.thread === ids[2]);
+    room.useTerminalSessions({ has: (t) => t === ids[3], onChange: () => {} });
+    room.useScheduleLookup((ref) => ref.thread === ids[4]);
+    // post() and setTyping() touched two of them; put them back at the bottom of the list.
+    store.touch(ids[0]!, 1);
+    store.touch(ids[1]!, 2);
+
+    room.createTopic();
+
+    for (const busy of ids.slice(0, 5)) expect(store.has(busy)).toBe(true);
+    expect(store.has(ids[5]!)).toBe(false);
+  });
+
+  it('treats a schedule lookup that throws as "in use" — keeping a row is cheaper than losing a task', () => {
+    const { room, store, ids } = full();
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    room.useScheduleLookup(() => {
+      throw new Error('the scheduler is gone');
+    });
+
+    expect(() => room.createTopic()).toThrow(/starred or in use/);
+    expect(store.list().map((t) => t.id)).toEqual([...ids].reverse());
+  });
+
+  it('refuses with a sentence the page can show when every topic is starred', () => {
+    const { room, store, ids } = full();
+    for (const id of ids) room.starTopic(id, true);
+
+    expect(() => room.createTopic()).toThrow(/every one of the 64 topics is starred or in use; unstar or delete one/);
+    expect(store.list()).toHaveLength(MAX_TOPICS);
+  });
+
+  it('announces a star, and refuses one for a topic that does not exist', () => {
+    const { room, topic, seen } = attached();
+    seen.length = 0;
+    expect(room.starTopic(topic, true)).toBe(true);
+    expect((lastOf(seen, 'topics') as { topics: Array<{ id: string; starred?: boolean }> }).topics
+      .find((t) => t.id === topic)?.starred).toBe(true);
+    expect(room.starTopic('ffffffff', true)).toBe(false);
+  });
+
+  it('keeps starred topics and their transcripts through "Clear all topics", and lands in a fresh one', () => {
+    const { room, topic } = attached();
+    const plain = room.createTopic('plain');
+    room.post(topic, { own: false, html: '<p>keep</p>' }, 'keep');
+    room.starTopic(topic, true);
+
+    const fresh = room.clearTopics();
+
+    expect(room.topicList().map((t) => t.id).sort()).toEqual([topic, fresh.id].sort());
+    expect(room.topics.has(plain.id)).toBe(false);
+    // New, not the surviving star: landing in a starred topic would read as a sweep that did nothing.
+    expect(fresh.id).not.toBe(topic);
+    // Its room went untouched — the messages are still there to sync.
+    expect(room.history(topic, {}).map((m) => m.content)).toEqual(['keep']);
   });
 });

@@ -60,6 +60,7 @@ const PACING = {
   // rendering a topic list, which is not traffic the platform meters.
   useWorkdirLookup: 'unpaced',
   useLivenessLookup: 'unpaced',
+  useScheduleLookup: 'unpaced',
   measureRendered: 'unpaced',
   registerCommands: 'unpaced',
   onMessage: 'unpaced',

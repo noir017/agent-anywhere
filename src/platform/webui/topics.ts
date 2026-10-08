@@ -33,6 +33,15 @@ export interface Topic {
   /** Epoch ms of the last message either way; the switcher orders by it. */
   lastAt: number;
   /**
+   * The operator starred it: never given up to make room, and spared by "Clear all topics".
+   *
+   * Persisted, unlike every flag below it, because it is the operator's decision rather than a
+   * reading of the daemon — and written only when true, so the file of someone who never stars
+   * anything is byte-for-byte what it was before this existed. Starring is the ONLY way to keep a
+   * quiet topic past the cap; see `evictable` for everything else that holds one.
+   */
+  starred?: boolean;
+  /**
    * True while the agent is working in this topic: a turn, or background work reporting in after
    * one. Both hold the typing indicator, which is what this is read from (see daemon TurnRunner).
    */
@@ -81,11 +90,18 @@ export interface Topic {
 /**
  * Ceiling on concurrent topics.
  *
- * A refusal rather than an eviction, deliberately: dropping the oldest topic would orphan a
- * live agent session exactly the way losing this file would, and 64 rooms is already far past
- * the point where a one-line switcher is readable.
+ * `create` still refuses past it; what changed is that the caller makes room first (`evictable`,
+ * driven from `WebRoom.createTopic`). It used to be a refusal and nothing else, on the grounds
+ * that dropping the oldest topic orphans its agent session the way losing this file would. That
+ * held up in theory and failed in use: two weeks of ordinary work (plus a topic per new-session
+ * scheduled run) reached 64, after which the + button did nothing at all — the 409 never reached
+ * the screen — and every scheduled run fell back to posting into the chat. What orphaning costs
+ * is the same as the × costs, which people press all the time; a topic worth keeping is starred.
+ *
+ * 64 rooms is already far past the point where a one-line switcher is readable, so the number
+ * did not move.
  */
-const MAX_TOPICS = 64;
+export const MAX_TOPICS = 64;
 
 /** How much of a first message becomes the placeholder name before the harness names it. */
 const SEED_CHARS = 32;
@@ -126,8 +142,32 @@ export class TopicStore {
     return this.list()[0] ?? this.create();
   }
 
+  /** Whether `create` would refuse, i.e. whether the caller has to make room first. */
+  full(): boolean {
+    return this.topics.size >= MAX_TOPICS;
+  }
+
+  /**
+   * The topic to give up to make room for a new one: the least recently active that is neither
+   * starred nor claimed by `inUse`. Undefined when every topic is one or the other.
+   *
+   * Only CHOOSES — the caller deletes, because the caller also holds the topic's live state
+   * (`WebRoom`'s room, its hold timer) and that has to go with it. `inUse` is the caller's for the
+   * same reason: whether an agent is mid-turn, asking, resident, or the target of a scheduled task
+   * is nothing this file can see. Starred is checked here rather than left to it, because it is
+   * this file's own field and no caller should be able to forget it.
+   */
+  evictable(inUse: (topic: Topic) => boolean): Topic | undefined {
+    let oldest: Topic | undefined;
+    for (const topic of this.topics.values()) {
+      if (topic.starred || (oldest && topic.lastAt >= oldest.lastAt)) continue;
+      if (!inUse(topic)) oldest = topic;
+    }
+    return oldest;
+  }
+
   create(title = ''): Topic {
-    if (this.topics.size >= MAX_TOPICS) {
+    if (this.full()) {
       throw new Error(`[webui] this instance already has ${MAX_TOPICS} topics; close one before opening another`);
     }
     // Hex, and never a character `formatAddress` gives meaning to: the id travels as the lane
@@ -147,6 +187,17 @@ export class TopicStore {
     return true;
   }
 
+  /** Star or unstar a topic. False when there is no such topic. */
+  star(id: string, on: boolean): boolean {
+    const topic = this.topics.get(id);
+    if (!topic) return false;
+    if (Boolean(topic.starred) === on) return true;
+    if (on) topic.starred = true;
+    else delete topic.starred;
+    this.flush();
+    return true;
+  }
+
   /** Delete a topic from the store and persist the list. */
   delete(id: string): boolean {
     const topic = this.topics.get(id);
@@ -157,20 +208,28 @@ export class TopicStore {
   }
 
   /**
-   * Forget every topic, in one write.
+   * Forget every topic that is not starred, in one write. Returns how many went.
    *
-   * Leaves the store EMPTY rather than seeding a replacement: `current()` already creates one
-   * when the list is empty, and having two places that decide "the page is never without a room
-   * to be in" is how they come to disagree. Note what this does not reach — the daemon's
-   * `conversations.json` still holds the agent binding and session id for every id dropped here,
-   * exactly as `delete` leaves them. This clears the list, it does not end the sessions.
+   * Starred ones stay because a star means "never clean this up", and the sweep is the most
+   * thorough cleaning there is — one that also took the starred topics would make the star a
+   * promise that holds against everything except the button labelled for it.
+   *
+   * Leaves the store EMPTY when nothing was starred rather than seeding a replacement: `current()`
+   * already creates one when the list is empty, and having two places that decide "the page is
+   * never without a room to be in" is how they come to disagree. Note what this does not reach —
+   * the daemon's `conversations.json` still holds the agent binding and session id for every id
+   * dropped here, exactly as `delete` leaves them. This clears the list, it does not end the
+   * sessions.
    */
   clear(): number {
-    const had = this.topics.size;
-    if (had === 0) return 0;
-    this.topics.clear();
-    this.flush();
-    return had;
+    let gone = 0;
+    for (const [id, topic] of this.topics) {
+      if (topic.starred) continue;
+      this.topics.delete(id);
+      gone += 1;
+    }
+    if (gone > 0) this.flush();
+    return gone;
   }
 
   /**
@@ -200,7 +259,9 @@ export class TopicStore {
 
   private flush(): void {
     const out: Record<string, Omit<Topic, 'id'>> = {};
-    for (const [id, t] of this.topics) out[id] = { title: t.title, lastAt: t.lastAt };
+    for (const [id, t] of this.topics) {
+      out[id] = { title: t.title, lastAt: t.lastAt, ...(t.starred ? { starred: true } : {}) };
+    }
     try {
       fs.mkdirSync(dirOf(this.file), { recursive: true });
       fs.writeFileSync(this.file, JSON.stringify(out, null, 2));
@@ -220,8 +281,10 @@ function dirOf(file: string): string {
 /** Validate one persisted entry; anything malformed is dropped rather than trusted. */
 function toTopic(id: string, value: unknown): Topic | undefined {
   if (!/^[0-9a-f]{8}$/.test(id) || typeof value !== 'object' || value === null) return undefined;
-  const rec = value as { title?: unknown; lastAt?: unknown };
+  const rec = value as { title?: unknown; lastAt?: unknown; starred?: unknown };
   const title = typeof rec.title === 'string' ? rec.title : '';
   const lastAt = typeof rec.lastAt === 'number' && Number.isFinite(rec.lastAt) ? rec.lastAt : 0;
-  return { id, title, lastAt };
+  // `=== true` and nothing looser: a star is what exempts a topic from every sweep, so a file
+  // that says `"starred": "no"` must not be read as one.
+  return { id, title, lastAt, ...(rec.starred === true ? { starred: true } : {}) };
 }

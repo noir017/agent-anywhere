@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 
-import { TopicStore } from './topics.js';
+import { MAX_TOPICS, TopicStore } from './topics.js';
 
 let dir = '';
 let file = '';
@@ -110,10 +110,76 @@ describe('TopicStore', () => {
     expect(new TopicStore(file).list().map((t) => t.id)).toEqual([fresh.id]);
   });
 
-  it('refuses past its cap instead of evicting, because evicting orphans a live session', () => {
+  it('still refuses past its cap on its own — making room is the caller' + "'s decision", () => {
+    // The store cannot see whether a topic is mid-turn, asking, or a scheduled task's target, so it
+    // never evicts by itself; `WebRoom.createTopic` asks `evictable` and deletes first.
     const store = new TopicStore(file);
-    for (let i = 0; i < 64; i += 1) store.create();
+    for (let i = 0; i < MAX_TOPICS; i += 1) store.create();
+    expect(store.full()).toBe(true);
     expect(() => store.create()).toThrow(/already has 64 topics/);
+  });
+
+  it('remembers a star across a restart, and writes nothing for a topic without one', () => {
+    const store = new TopicStore(file);
+    const a = store.create('keep me');
+    const b = store.create('plain');
+    expect(store.star(a.id, true)).toBe(true);
+    expect(store.star('ffffffff', true)).toBe(false);
+
+    const reopened = new TopicStore(file);
+    expect(reopened.get(a.id)?.starred).toBe(true);
+    // Absent rather than false, on disk and in memory: a file from someone who never stars
+    // anything is exactly what it was before stars existed.
+    expect(reopened.get(b.id)).not.toHaveProperty('starred');
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, Record<string, unknown>>;
+    expect(raw[b.id]).not.toHaveProperty('starred');
+
+    expect(reopened.star(a.id, false)).toBe(true);
+    expect(new TopicStore(file).get(a.id)).not.toHaveProperty('starred');
+  });
+
+  it('trusts only a literal true as a star, since a star exempts a topic from every sweep', () => {
+    fs.writeFileSync(file, JSON.stringify({ aaaaaaaa: { title: 'x', lastAt: 1, starred: 'yes' }, bbbbbbbb: { title: 'y', lastAt: 1, starred: true } }));
+    const store = new TopicStore(file);
+    expect(store.get('aaaaaaaa')).not.toHaveProperty('starred');
+    expect(store.get('bbbbbbbb')?.starred).toBe(true);
+  });
+
+  it('offers the least recently active topic for eviction, never a starred one, never one in use', () => {
+    const store = new TopicStore(file);
+    const oldest = store.create('oldest');
+    const older = store.create('older');
+    const old = store.create('old');
+    const recent = store.create('recent');
+    store.touch(oldest.id, 1);
+    store.touch(older.id, 2);
+    store.touch(old.id, 3);
+    store.touch(recent.id, 4);
+
+    expect(store.evictable(() => false)?.id).toBe(oldest.id);
+    store.star(oldest.id, true);
+    expect(store.evictable(() => false)?.id).toBe(older.id);
+    // `inUse` is the caller's: a topic it claims is skipped, and the next oldest is offered.
+    expect(store.evictable((t) => t.id === older.id)?.id).toBe(old.id);
+    // Nothing is offered when every topic is starred or claimed — the caller refuses then.
+    expect(store.evictable(() => true)).toBeUndefined();
+    // And choosing deletes nothing; that is the caller's too.
+    expect(store.list()).toHaveLength(4);
+  });
+
+  it('leaves starred topics behind when the rest are cleared', () => {
+    const store = new TopicStore(file);
+    const kept = store.create('kept');
+    store.create('gone');
+    store.create('gone too');
+    store.star(kept.id, true);
+
+    expect(store.clear()).toBe(2);
+    expect(new TopicStore(file).list().map((t) => t.id)).toEqual([kept.id]);
+    // A list that is all stars has nothing to clear, and writes nothing.
+    const before = fs.statSync(file).mtimeMs;
+    expect(store.clear()).toBe(0);
+    expect(fs.statSync(file).mtimeMs).toBe(before);
   });
 
   it('starts empty on a corrupt file rather than taking the daemon down', () => {

@@ -76,6 +76,11 @@ export const SendRequestSchema = z
 export const CreateTopicRequestSchema = z.object({ title: z.string().max(200).optional() }).strict();
 export const DeleteTopicRequestSchema = z.object({ topic: TopicId }).strict();
 /**
+ * Star or unstar a topic. The state is stated rather than toggled, so a retried request — `post`
+ * retries on a dropped link — lands where it was meant to instead of flipping back.
+ */
+export const StarTopicRequestSchema = z.object({ topic: TopicId, starred: z.boolean() }).strict();
+/**
  * End one topic's terminal session.
  *
  * Same shape as deleting a topic and deliberately a schema of its own rather than a shared
@@ -104,6 +109,7 @@ export type SendRequest = z.infer<typeof SendRequestSchema>;
 export type ClickRequest = z.infer<typeof ClickRequestSchema>;
 export type CreateTopicRequest = z.infer<typeof CreateTopicRequestSchema>;
 export type DeleteTopicRequest = z.infer<typeof DeleteTopicRequestSchema>;
+export type StarTopicRequest = z.infer<typeof StarTopicRequestSchema>;
 export type EndTerminalRequest = z.infer<typeof EndTerminalRequestSchema>;
 export type ClearTopicsRequest = z.infer<typeof ClearTopicsRequestSchema>;
 

@@ -46,7 +46,7 @@ import type { WebuiPlatformConfig } from '../config-schemas.js';
 import { escapeHtml, renderWebMarkdown } from '../web-markdown.js';
 import type { ClickRequest, SendRequest, WebEvent, WebMessage } from './protocol.js';
 import type { TerminalSessions } from './terminal-sessions.js';
-import { TopicStore, type Topic } from './topics.js';
+import { MAX_TOPICS, TopicStore, type Topic } from './topics.js';
 
 /** A `platforms.<id>` entry of type `webui`, plus its map key. */
 export type WebuiInstance = WebuiPlatformConfig & { id: string };
@@ -187,6 +187,8 @@ export class WebRoom {
   private workdir: ((ref: ConversationRef) => string | undefined) | null = null;
   /** Likewise, and read the same way — see `useLivenessLookup`. */
   private liveness: ((ref: ConversationRef) => boolean) | null = null;
+  /** Likewise — see `useScheduleLookup`. Only ever read when the store is full. */
+  private scheduled: ((ref: ConversationRef) => boolean) | null = null;
   /** The poll that keeps `liveness` honest; only ever running once a lookup exists. */
   private liveTimer: NodeJS.Timeout | null = null;
   /**
@@ -209,11 +211,71 @@ export class WebRoom {
 
   // ── Topics ─────────────────────────────────────────────────────────────────
 
-  /** Create a topic and tell every client about it. Throws past the store's cap. */
+  /**
+   * Create a topic and tell every client about it, giving up the oldest topic first when the
+   * store is full.
+   *
+   * Throws only when nothing can be given up — every topic starred or in use — and the message
+   * says so, because the server hands it to the page verbatim and it is the only explanation the
+   * operator will get for a + that did nothing.
+   */
   createTopic(title = ''): Topic {
+    if (this.topics.full()) this.makeRoom();
     const topic = this.topics.create(title);
     this.announceTopics();
     return topic;
+  }
+
+  /**
+   * Evict the least recently active topic nothing is holding on to.
+   *
+   * Not announced here: the caller is about to create a topic and announce the list once, and two
+   * lists a millisecond apart would only redraw the switcher twice.
+   */
+  private makeRoom(): void {
+    const victim = this.topics.evictable((t) => this.inUse(t.id));
+    if (!victim) {
+      // No `[webui]` prefix, unlike the store's own refusal: this sentence is shown to the operator
+      // as it is (server.ts → the page's alert), and the server's log line adds the prefix.
+      throw new Error(
+        `every one of the ${MAX_TOPICS} topics is starred or in use; unstar or delete one before opening another`
+      );
+    }
+    this.disposeRoom(victim.id);
+    this.topics.delete(victim.id);
+    // The one record of which topic went, and what it was called. The daemon's binding for it
+    // stays in conversations.json (as it does for a ×), so this line is how its session id can
+    // still be found by hand.
+    console.log(
+      `[webui] topic limit (${MAX_TOPICS}) reached: evicted ${victim.id} "${victim.title}", last active ${new Date(victim.lastAt).toISOString()}`
+    );
+  }
+
+  /**
+   * Whether a topic is busy enough that evicting it would cost something it is in the middle of.
+   *
+   * Each condition is something an eviction would break, not just orphan: a turn would keep
+   * writing into a topic nobody can open, a question would be left unanswerable, a resident agent
+   * would be cut off from the context it is holding in memory, an attached terminal window would
+   * vanish under the person typing in it, and a scheduled task would fail every run from then on
+   * — its target is an address, and nothing renames that address when the topic goes.
+   */
+  private inUse(topicId: string): boolean {
+    const room = this.rooms.get(topicId);
+    return (
+      Boolean(room?.typing) ||
+      Boolean(room?.awaiting.size) ||
+      this.liveOf(topicId) ||
+      Boolean(this.terminal?.has(topicId)) ||
+      this.scheduledOf(topicId)
+    );
+  }
+
+  /** Star or unstar a topic and announce it. False when there is no such topic. */
+  starTopic(id: string, on: boolean): boolean {
+    if (!this.topics.star(id, on)) return false;
+    this.announceTopics();
+    return true;
   }
 
   /** Name a topic — what `renameThread` lands on, i.e. what the harness decided it is about. */
@@ -232,19 +294,24 @@ export class WebRoom {
   }
 
   /**
-   * Forget every topic and open a fresh one, announcing once rather than once per topic.
+   * Forget every topic that is not starred and open a fresh one, announcing once rather than once
+   * per topic.
    *
    * The sweep for a sidebar left full of dead rows: a transcript lives in memory only, so every
    * topic older than this process opens onto nothing (see `syncEvent`'s `stale`). Deliberately
    * the same reach as `deleteTopic` repeated — the rooms go, the daemon's conversation bindings
    * for those ids do not. It clears the list; it does not end the agent sessions behind it.
    *
-   * Returns the replacement topic, which `current()` mints because the store is now empty.
+   * Returns the replacement topic, which is always a NEW one even when starred topics survive:
+   * the page lands in it, and landing in a starred topic would read as though the sweep had not
+   * happened. The exception is a list that is all stars, where there is no room to open one.
    */
   clearTopics(): Topic {
-    for (const id of [...this.rooms.keys()]) this.disposeRoom(id);
+    for (const id of [...this.rooms.keys()]) {
+      if (!this.topics.get(id)?.starred) this.disposeRoom(id);
+    }
     this.topics.clear();
-    const fresh = this.topics.current();
+    const fresh = this.topics.full() ? this.topics.current() : this.topics.create();
     this.announceTopics();
     return fresh;
   }
@@ -294,6 +361,30 @@ export class WebRoom {
     const flags = flagsOf(topics);
     if (flags === this.lastFlags) return;
     this.sendTopics(topics, flags);
+  }
+
+  /**
+   * Accept the daemon's way of asking whether a scheduled task posts into a topic, which is what
+   * keeps that topic from being evicted (see `inUse`).
+   *
+   * Not drawn anywhere and not polled, unlike its two siblings: it is read only at the moment a
+   * full store has to choose a topic to give up, which is the one moment the answer matters.
+   */
+  useScheduleLookup(lookup: (ref: ConversationRef) => boolean): void {
+    this.scheduled = lookup;
+  }
+
+  /** `scheduled`, swallowing a failing lookup for the same reason `liveOf` does. */
+  private scheduledOf(topicId: string): boolean {
+    if (!this.scheduled) return false;
+    try {
+      return this.scheduled(this.conversation(topicId));
+    } catch (e) {
+      // Read as "in use": a lookup that failed cannot say this topic is safe to throw away, and
+      // keeping one topic too many costs a row where guessing wrong costs a task.
+      console.warn('[webui] could not resolve whether a topic has scheduled tasks:', e instanceof Error ? e.message : e);
+      return true;
+    }
   }
 
   /**

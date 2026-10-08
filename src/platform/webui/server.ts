@@ -56,6 +56,7 @@ import {
   LoginRequestSchema,
   MAX_BODY_BYTES,
   SendRequestSchema,
+  StarTopicRequestSchema,
   parseBody,
   type WebEvent,
 } from './protocol.js';
@@ -298,6 +299,7 @@ const GUARDED: Route[] = [
   { method: 'POST', path: '/api/topics', run: createTopic },
   { method: 'POST', path: '/api/topics/clear', run: clearTopics },
   { method: 'POST', path: '/api/topics/delete', run: deleteTopic },
+  { method: 'POST', path: '/api/topics/star', run: starTopic },
   { method: 'DELETE', path: '/api/topics', run: deleteTopic },
   { method: 'POST', path: '/api/logout', run: logout },
   { method: 'GET', path: '/f/', prefix: true, run: ({ req, res, rest }, ctx) => download(req, res, ctx.room, rest) },
@@ -566,10 +568,20 @@ async function createTopic({ req, res }: Req, ctx: Ctx): Promise<void> {
   try {
     send(req, res, 201, { topic: ctx.room.createTopic(parsed.title ?? '') });
   } catch (e) {
-    // The store refuses past its cap rather than evicting, because evicting a topic would
-    // orphan a live agent session. Say so instead of failing anonymously.
-    send(req, res, 409, { error: e instanceof Error ? e.message : 'could not create a topic' });
+    // The room evicts the oldest topic to make room, so reaching this means every topic is starred
+    // or in use. The message says which and what to do; the page shows it. Logged as well, since a
+    // refusal used to leave no trace anywhere but the browser's network panel.
+    const error = e instanceof Error ? e.message : 'could not create a topic';
+    console.warn(`[webui] refused to open a topic: ${error}`);
+    send(req, res, 409, { error });
   }
+}
+
+async function starTopic({ req, res }: Req, ctx: Ctx): Promise<void> {
+  const parsed = await readBody(req, res, StarTopicRequestSchema);
+  if (!parsed) return;
+  if (!ctx.room.starTopic(parsed.topic, parsed.starred)) return send(req, res, 404, { error: 'no such topic' });
+  send(req, res, 200, { ok: true });
 }
 
 async function deleteTopic({ req, res }: Req, ctx: Ctx): Promise<void> {
@@ -582,16 +594,20 @@ async function deleteTopic({ req, res }: Req, ctx: Ctx): Promise<void> {
 }
 
 /**
- * Forget every topic and answer with the fresh one that replaced them.
+ * Forget every unstarred topic and answer with the fresh one that replaced them, plus the list as
+ * it now stands.
  *
- * The new topic comes back in the response rather than being left for the broadcast `topics`
- * event to reveal: the page has to drop its own per-topic caches and then land somewhere, and
- * racing a POST against an SSE frame to find out where is a worse contract than being told.
+ * Both come back in the response rather than being left for the broadcast `topics` event to
+ * reveal: the page has to drop its own per-topic caches and then land somewhere, and racing a
+ * POST against an SSE frame to find out where is a worse contract than being told. The list is
+ * what tells it which caches to KEEP — the starred topics survive the sweep, and their
+ * transcripts, drafts and terminal windows have to survive it on the page too.
  */
 async function clearTopics({ req, res }: Req, ctx: Ctx): Promise<void> {
   const parsed = await readBody(req, res, ClearTopicsRequestSchema);
   if (!parsed) return;
-  send(req, res, 200, { topic: ctx.room.clearTopics() });
+  const topic = ctx.room.clearTopics();
+  send(req, res, 200, { topic, topics: ctx.room.topicList() });
 }
 
 async function download(req: IncomingMessage, res: ServerResponse, room: WebRoom, token: string): Promise<void> {

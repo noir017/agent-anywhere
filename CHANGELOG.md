@@ -5,6 +5,36 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Web UI topics can be starred.** A ☆ sits beside each topic's `×`. A starred topic is never
+  removed to make room (see below), survives "Clear all topics" (the button reads "Clear unstarred
+  topics" while any are starred), and is listed first in the sidebar. Its transcript cache, draft
+  and terminal window survive the sweep on the page as well. The `×` still deletes a starred topic,
+  and its confirmation says the topic is starred. The star is saved in the topic file only when it
+  is set, so existing files are unchanged.
+
+### Changed
+
+- **A full web UI topic list now makes room instead of refusing.** The list holds 64 topics. The
+  65th used to be refused, on the grounds that removing a topic leaves its agent session behind.
+  On 2026-10-08 that limit was reached after two weeks of normal use, and `+` silently stopped
+  working: the server answered `409 Conflict` and the page ignored it. Scheduled tasks that open a
+  new topic per run had been falling back to posting into the chat for the same reason. Now the
+  topic that has been quiet longest is removed first, and the log names it with its id and title,
+  because that line is the only remaining way to find the session it leaves behind (in
+  `conversations.json`, exactly as after a `×`). A topic is skipped if removing it would break
+  something: a turn is running, a question is waiting for an answer, an agent process is still
+  resident, a terminal is attached, or a scheduled task that can still run posts into it. Starred
+  topics are always skipped.
+
+### Fixed
+
+- **The web UI says why a new topic could not be opened.** A refused `+` now shows the daemon's
+  own explanation ("every one of the 64 topics is starred or in use; unstar or delete one before
+  opening another"), and the daemon logs the refusal. Before, the page dropped the error and the
+  daemon logged nothing, so the only trace was a 409 in the browser's network panel.
+
 ## [1.36.3] - 2026-10-06
 
 ### Fixed

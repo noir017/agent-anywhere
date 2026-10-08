@@ -828,6 +828,10 @@ export class Daemon {
       // same best-effort reading: a turn ending is not the agent ending, and nothing else tells
       // the topic switcher that apart from a conversation whose child was reclaimed hours ago.
       adapter.useLivenessLookup?.((ref) => this.registry.liveForRef(ref));
+      // …and one that can throw its own topics away (the web UI evicts past its cap) gets a way to
+      // ask which of them a scheduled task still posts into. Not decoration, unlike the two above:
+      // a task whose topic was evicted fails every run after it.
+      adapter.useScheduleLookup?.((ref) => this.schedules?.targets(ref) ?? false);
       await adapter.start();
       console.log(`[daemon] platform instance "${id}" (${adapter.platformType}) started`);
     }

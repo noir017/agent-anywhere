@@ -79,6 +79,8 @@ interface Harness {
   clipboard: string[];
   /** Everything the page raised in an `alert()`. */
   alerts: string[];
+  /** Every question the page put to `confirm()`, whatever it was answered. */
+  confirms: string[];
   /** Every MediaRecorder the page constructed (only with the `mic` option), oldest first. */
   recorders: FakeRecorder[];
   el: (id: string) => HTMLElement;
@@ -260,6 +262,7 @@ async function open(
   const calls: Call[] = [];
   const clipboard: string[] = [];
   const alerts: string[] = [];
+  const confirms: string[] = [];
 
   const dom = new JSDOM(renderPage('Chat', terminal, password, terminalEnd), {
     url,
@@ -296,7 +299,10 @@ async function open(
         }
       }
       (w as any).EventSource = FakeEventSource;
-      (w as any).confirm = () => confirm;
+      (w as any).confirm = (s: string) => {
+        confirms.push(String(s));
+        return confirm;
+      };
       // jsdom has no alert, and the page uses one to report a refused "end session". Recorded
       // rather than ignored: "the button failed and said nothing" is the bug worth catching.
       (w as any).alert = (s: string) => {
@@ -333,6 +339,7 @@ async function open(
     idb,
     clipboard,
     alerts,
+    confirms,
     recorders,
     cached: (topic) => readCache(idb, topic),
     emit: async (ev) => {
@@ -918,6 +925,138 @@ function onTop(log: HTMLElement): { text: string | null | undefined; hidden: num
   const row = log.children[Math.floor(log.scrollTop / ROW)];
   return { text: row?.querySelector('.b')?.textContent, hidden: log.scrollTop % ROW };
 }
+
+describe('webui page: a full topic list, and the topics worth keeping', () => {
+  const A = 'a1b2c3d4';
+  const B = 'b2c3d4e5';
+  const C = 'c3d4e5f6';
+  const field = (h: Harness): HTMLTextAreaElement => h.el('input') as HTMLTextAreaElement;
+  /** The topic rows in the order they are painted. */
+  const order = (h: Harness): Array<string | null> =>
+    Array.from(h.el('topics').querySelectorAll('[data-topic]')).map((r) => r.getAttribute('data-topic'));
+
+  it('says why a new topic could not be opened, instead of doing nothing', async () => {
+    // What 1.36.3 did at 64 topics: the 409 was dropped on the floor and + simply did nothing.
+    const refusal = 'every one of the 64 topics is starred or in use; unstar or delete one before opening another';
+    const h = await open({
+      url: `http://localhost:8787/?t=${A}`,
+      status: { 'api/topics': 409 },
+      replies: { 'api/topics': { error: refusal } },
+    });
+    await h.emit(sync(A, [], [A]));
+
+    await h.click('#new-topic');
+    await until('the refusal is on screen', () => h.alerts.length > 0);
+
+    expect(h.alerts[0]).toBe(`Could not open a new topic: ${refusal}`);
+    expect(h.live().url).toBe(`api/events?t=${A}`);
+  });
+
+  it('stars a topic from its row without opening it, and lists it first', async () => {
+    const h = await open({ url: `http://localhost:8787/?t=${A}` });
+    await h.emit(sync(A, [], [A, B, C]));
+    expect(h.el('clear-topics').textContent).toBe('Clear all topics');
+
+    await h.click(`[data-star="${C}"]`);
+
+    expect(h.calls.find((c) => c.path === 'api/topics/star')?.body).toEqual({ topic: C, starred: true });
+    // Drawn at once rather than on the broadcast, so a tap on a slow link does not look ignored.
+    expect(order(h)).toEqual([C, A, B]);
+    expect(h.doc.querySelector(`[data-star="${C}"]`)?.getAttribute('aria-pressed')).toBe('true');
+    expect(h.doc.querySelector(`[data-topic="${A}"]`)?.classList.contains('after-stars')).toBe(true);
+    // Starring is not a reason to switch to it.
+    expect(h.live().url).toBe(`api/events?t=${A}`);
+    // And the sweep now says it spares what was starred.
+    expect(h.el('clear-topics').textContent).toBe('Clear unstarred topics');
+
+    // The daemon's order is still the page's order underneath: when the topic on screen goes, the
+    // page lands in the most RECENT one, not in whatever is starred at the top.
+    await h.emit({
+      t: 'topics',
+      topics: [
+        { id: B, title: 'b', lastAt: 999, msgCount: 0 },
+        { id: C, title: 'c', lastAt: 998, msgCount: 0, starred: true },
+      ],
+    });
+    expect(h.live().url).toBe(`api/events?t=${B}`);
+  });
+
+  it('puts the star back and says so when the daemon refuses it', async () => {
+    const h = await open({ url: `http://localhost:8787/?t=${A}`, status: { 'api/topics/star': 404 } });
+    await h.emit(sync(A, [], [A, B]));
+
+    await h.click(`[data-star="${B}"]`);
+    await until('the refusal is on screen', () => h.alerts.length > 0);
+
+    expect(h.doc.querySelector(`[data-star="${B}"]`)?.getAttribute('aria-pressed')).toBe('false');
+    expect(order(h)).toEqual([A, B]);
+  });
+
+  it('keeps a starred topic' + "'s transcript and draft through a clear, and drops the rest", async () => {
+    const fresh = { id: 'deadbeef', title: '', lastAt: 2000, msgCount: 0 };
+    const h = await open({
+      url: `http://localhost:8787/?t=${A}`,
+      replies: { 'api/topics/clear': { topic: fresh, topics: [fresh, { id: B, title: 'kept', lastAt: 900, msgCount: 1, starred: true }] } },
+    });
+    await h.emit(sync(A, [message('m1', '<p>in A</p>')], [A, B]));
+    await h.click(`[data-topic="${B}"]`);
+    await h.emit(sync(B, [message('m2', '<p>in B</p>')], [A, B]));
+    field(h).value = 'half-written in B';
+    await h.click(`[data-topic="${A}"]`);
+    await h.emit(sync(A, [message('m1', '<p>in A</p>')], [A, B]));
+    await h.emit({
+      t: 'topics',
+      topics: [
+        { id: A, title: 'gone', lastAt: 1000, msgCount: 1 },
+        { id: B, title: 'kept', lastAt: 900, msgCount: 1, starred: true },
+      ],
+    });
+    await saved();
+    expect(await h.cached(A)).toHaveLength(1);
+    expect(await h.cached(B)).toHaveLength(1);
+
+    await h.click('#clear-topics');
+
+    expect(h.confirms.at(-1)).toBe('Delete 1 topic? The 1 starred one is kept. This cannot be undone.');
+    expect(h.live().url).toBe('api/events?t=deadbeef');
+    expect(h.rows()).toBe(2);
+    await untilAsync('the cleared topic' + "'s cache is gone", async () => (await h.cached(A)) === null);
+    expect(await h.cached(B)).toHaveLength(1);
+    expect(JSON.parse(h.window.localStorage.getItem('aa_drafts') ?? 'null')).toEqual({ [B]: 'half-written in B' });
+
+    // And the draft is still THERE, not just on disk.
+    await h.click(`[data-topic="${B}"]`);
+    expect(field(h).value).toBe('half-written in B');
+  });
+
+  it('has nothing to clear when every topic is starred, and says so instead of asking', async () => {
+    const h = await open({ url: `http://localhost:8787/?t=${A}` });
+    await h.emit(sync(A, [], [A]));
+    await h.emit({ t: 'topics', topics: [{ id: A, title: 'a', lastAt: 1000, msgCount: 0, starred: true }] });
+
+    await h.click('#clear-topics');
+
+    expect(h.confirms).toEqual([]);
+    expect(h.alerts[0]).toMatch(/Every topic is starred/);
+    expect(h.calls.map((c) => c.path)).not.toContain('api/topics/clear');
+  });
+
+  it('names a starred topic as starred before deleting it', async () => {
+    const h = await open({ url: `http://localhost:8787/?t=${A}`, confirm: false });
+    await h.emit(sync(A, [], [A, B]));
+    await h.emit({
+      t: 'topics',
+      topics: [
+        { id: A, title: 'a', lastAt: 1000, msgCount: 0 },
+        { id: B, title: 'b', lastAt: 999, msgCount: 0, starred: true },
+      ],
+    });
+
+    await h.click(`[data-del="${B}"]`);
+
+    expect(h.confirms.at(-1)).toBe('Delete starred topic "b"?');
+  });
+});
 
 describe('webui page: coming back to a topic', () => {
   const A = 'a1b2c3d4';

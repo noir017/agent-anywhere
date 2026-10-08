@@ -148,6 +148,19 @@ body{background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,-apple-system,
 #topics .topic-item:hover .topic-del,#topics .topic-item:focus-within .topic-del{opacity:1}
 .topic-del:hover{color:#f87171;background:rgba(248,113,113,.15)}
 @media(hover:none){.topic-del{opacity:.7}}
+/* The star sits beside the × and behaves like it until it is ON: then it stays lit on every row,
+   because a starred row is the one thing in the list the operator asked to be able to find, and
+   a marker that only appears under the pointer finds nothing. Amber like the waiting dot, but
+   still — a star is a standing decision, not something happening. */
+.topic-star{opacity:0;background:none;border:0;color:var(--dim);font:inherit;font-size:13px;line-height:1;padding:3px 4px;cursor:pointer;border-radius:3px;flex-shrink:0;transition:opacity .15s,color .15s,background .15s}
+#topics .topic-item:hover .topic-star,#topics .topic-item:focus-within .topic-star{opacity:1}
+.topic-star:hover{color:#fbbf24;background:rgba(251,191,36,.12)}
+.topic-star.on,#topics .topic-item .topic-star.on{opacity:1;color:#fbbf24}
+@media(hover:none){.topic-star{opacity:.45}}
+/* Starred rows are listed first; this line is where they end. A pseudo-element on the first row
+   after them rather than a node of its own, so #topics holds rows and nothing else. */
+#topics .topic-item.after-stars{margin-top:5px}
+#topics .topic-item.after-stars::before{content:'';position:absolute;left:9px;right:9px;top:-5px;border-top:1px solid var(--line)}
 /* Pinned under the list rather than beside the + in the header, and that is the whole reason it
    is a footer: this throws away every room at once, and a one-character icon sitting next to
    "new topic" is a misclick away from it. Down here it is out of the way, has room for words
@@ -547,7 +560,19 @@ const SCRIPT = `
   }
 
   function cacheDrop(tId){ cacheTx('readwrite', function(store){ store.delete(tId); return null; }); }
-  function cacheClear(){ cacheTx('readwrite', function(store){ store.clear(); return null; }); }
+  /** Drop every cached topic not in keep — over KEYS, for the same reason evict walks keys. */
+  function cacheKeep(keep){
+    cacheTx('readwrite', function(store){
+      var cur = store.index('at').openKeyCursor();
+      cur.onsuccess = function(){
+        var at = cur.result;
+        if(!at) return;
+        if(!keep[at.primaryKey]) store.delete(at.primaryKey);
+        at.continue();
+      };
+      return null;
+    });
+  }
 
   /**
    * What is on screen, in the order it is on screen, as the cache should hold it.
@@ -1036,8 +1061,16 @@ const SCRIPT = `
   function paintTopics(){
     var h='';
     var cur=null;
-    for(var i=0;i<topics.length;i++){
-      var t=topics[i];
+    // Starred first, each half in the daemon's order (most recently active first). Only the
+    // painting is reordered: topics itself keeps the daemon's order, because topics[0] is read
+    // elsewhere as "the most recent topic" — where to land when the one on screen goes away.
+    var order=[], rest=[], stars=0;
+    for(var j=0;j<topics.length;j++){
+      if(topics[j].starred){ order.push(topics[j]); stars++; } else rest.push(topics[j]);
+    }
+    order=order.concat(rest);
+    for(var i=0;i<order.length;i++){
+      var t=order[i];
       var isCur=(t.id===topic);
       if(isCur) cur=t;
       var isRunning=Boolean(t.running);
@@ -1056,7 +1089,8 @@ const SCRIPT = `
         saveReads();
       }
       var unread=isCur?0:Math.max(0, count - readCounts[t.id]);
-      var cls='topic-item '+(isCur?'on ':'')+(isRunning?'running':'idle')+(isLive?' live':'');
+      var cls='topic-item '+(isCur?'on ':'')+(isRunning?'running':'idle')+(isLive?' live':'')
+        +(stars && i===stars?' after-stars':'');
       var dotCls='topic-dot'+(isAsking?' asking':(isRunning?' running':(isLive?' live':'')));
       var badge=unread>0?'<span class="topic-badge">'+(unread>99?'99+':unread)+'</span>':'';
       // Not "a shell is alive over there" — the daemon only sees the connection, so this says a
@@ -1065,6 +1099,12 @@ const SCRIPT = `
       // The full path on the title attribute rather than in the row: two checkouts of one
       // project have the same last segment, and the column is 240px wide.
       var dir=t.dir?'<span class="topic-dir" title="'+text(t.dir.path)+'">'+text(t.dir.name)+'</span>':'';
+      // aria-pressed rather than two different buttons: it is one control with a state, and the
+      // state is what a screen reader should announce.
+      var star='<button type="button" class="btn-icon topic-star'+(t.starred?' on':'')+'" data-star="'+text(t.id)+'"'
+         + ' aria-pressed="'+(t.starred?'true':'false')+'"'
+         + ' title="'+(t.starred?'Unstar':'Star: never removed to make room, and kept by Clear')+'">'
+         + (t.starred?'★':'☆')+'</button>';
       h += '<div class="'+cls+'" data-topic="'+text(t.id)+'" role="button" tabindex="0">'
          + '<span class="'+dotCls+'"></span>'
          + '<span class="topic-main">'
@@ -1073,10 +1113,14 @@ const SCRIPT = `
          + '</span>'
          + term
          + badge
+         + star
          + '<button type="button" class="btn-icon topic-del" data-del="'+text(t.id)+'" title="Delete topic">×</button>'
          + '</div>';
     }
     bar.innerHTML=h;
+    // Says what it will do: with stars in the list it no longer clears all of them.
+    clearBtn.textContent = stars ? 'Clear unstarred topics' : 'Clear all topics';
+    clearBtn.title = stars ? 'Forget every topic except the starred ones and start a new one' : 'Forget every topic and start a new one';
     if(cur){
       chatTitle.textContent=cur.title || 'Untitled';
       // Same order as the dot, and the same reason: during an ask the turn is still open, so
@@ -1264,7 +1308,9 @@ const SCRIPT = `
       if(topics[i].id===delId){ target=topics[i]; break; }
     }
     var title = (target && target.title) ? target.title : 'Untitled';
-    if(!confirm('Delete topic "' + title + '"?')) return;
+    // A star protects a topic from everything automatic, not from this: the × is the operator
+    // deciding about one row, which is exactly what a star defers to. The question says so.
+    if(!confirm('Delete '+(target && target.starred ? 'starred ' : '')+'topic "' + title + '"?')) return;
     post('api/topics/delete',{topic:delId},1).then(function(r){
       return r.ok ? r.json() : null;
     }).then(function(d){
@@ -1431,6 +1477,14 @@ const SCRIPT = `
       if(delId) deleteTopic(delId);
       return;
     }
+    // Before the row's own click, like the ×: starring a topic is not a reason to switch to it.
+    var star = e.target.closest ? e.target.closest('[data-star]') : null;
+    if(star){
+      e.stopPropagation();
+      var starId = star.getAttribute('data-star');
+      if(starId) starTopic(starId);
+      return;
+    }
     var b = e.target.closest ? e.target.closest('[data-topic]') : null;
     if(!b) return;
     var id = b.getAttribute('data-topic');
@@ -1441,7 +1495,7 @@ const SCRIPT = `
 
   bar.addEventListener('keydown', function(e){
     if(e.key==='Enter' || e.key===' '){
-      if(e.target.closest && e.target.closest('[data-del]')) return;
+      if(e.target.closest && e.target.closest('[data-del],[data-star]')) return;
       var b = e.target.closest ? e.target.closest('[data-topic]') : null;
       if(!b) return;
       e.preventDefault();
@@ -1452,11 +1506,48 @@ const SCRIPT = `
   });
 
   function createTopic(){
-    post('api/topics',{},1).then(function(r){ return r.ok ? r.json() : null; }).then(function(d){
+    post('api/topics',{},1).then(function(r){
+      if(r.ok) return r.json();
+      // Never swallowed again. A refusal used to vanish here, so the + simply did nothing and the
+      // only trace was a 409 in the network panel. The daemon now gives up its oldest topic to
+      // make room by itself, which leaves one reason to refuse — every topic is starred or busy —
+      // and its own sentence says which and what to do about it.
+      return r.json().then(function(d){ return {error:(d && d.error) || ('HTTP '+r.status)}; },
+        function(){ return {error:'HTTP '+r.status}; });
+    }, function(){
+      return {error:'the daemon could not be reached'};
+    }).then(function(d){
+      if(d && d.error){ alert('Could not open a new topic: '+d.error); return; }
       if(!d || !d.topic) return;
       switchTopic(d.topic.id);
       if(narrow()) setSidebar(false);
     });
+  }
+
+  /**
+   * Star or unstar a topic. Drawn at once rather than on the broadcast that confirms it — a tap
+   * on a slow link should not look ignored — and put back if the daemon refused, in which case
+   * the broadcast that would have corrected it is not coming.
+   */
+  function starTopic(id){
+    var t = topicById(id);
+    if(!t) return;
+    var on = !t.starred;
+    t.starred = on;
+    paintTopics();
+    post('api/topics/star',{topic:id, starred:on},1).then(function(r){ return r.ok; }, function(){ return false; }).then(function(ok){
+      if(ok) return;
+      // Looked up again: a broadcast in between replaces the array, and the object held above
+      // would no longer be the one on screen.
+      var now = topicById(id);
+      if(now){ now.starred = !on; paintTopics(); }
+      alert('Could not '+(on?'star':'unstar')+' that topic.');
+    });
+  }
+
+  function topicById(id){
+    for(var i=0;i<topics.length;i++){ if(topics[i].id===id) return topics[i]; }
+    return null;
   }
 
   newTopicBtn.addEventListener('click', createTopic);
@@ -1477,39 +1568,64 @@ const SCRIPT = `
   }
 
   clearBtn.addEventListener('click', function(){
-    if(!confirm('Delete all ' + topics.length + ' topics? This cannot be undone.')) return;
+    var stars = topics.filter(function(t){ return t.starred; }).length;
+    var gone = topics.length - stars;
+    if(stars && !gone){ alert('Every topic is starred, so there is nothing to clear. Unstar one first.'); return; }
+    if(!confirm(stars
+      ? 'Delete '+gone+' topic'+(gone===1?'':'s')+'? The '+stars+' starred one'+(stars===1?' is':'s are')+' kept. This cannot be undone.'
+      : 'Delete all ' + topics.length + ' topics? This cannot be undone.')) return;
     post('api/topics/clear',{},1).then(function(r){ return r.ok ? r.json() : null; }).then(function(d){
       if(!d || !d.topic) return;
-      // Every local record of the old rooms goes with them. Leaving the caches would put
-      // messages on screen for ids the daemon has forgotten, and leaving the read marks would
-      // badge the replacement topic against a count from a room that no longer exists.
-      cacheClear();
-      readCounts={};
-      saveReads();
-      // And what was being read and typed in them. topic is cleared below before the switch, so
-      // nothing of the old room is written back on the way out either.
-      views={};
-      drafts={};
-      try { localStorage.removeItem(DRAFTS); } catch(x){}
-      // Same as deleting one, for every row at once: the windows belonged to topics that no
-      // longer exist, so they are unmounted here rather than left pointing at ids the daemon
-      // has forgotten.
-      for(var id in termFrames){
-        if(Object.prototype.hasOwnProperty.call(termFrames, id)) dropTerm(id);
-      }
+      // What the daemon kept: the starred topics and the fresh one. Read from its answer rather
+      // than from the stars on this page, which another tab may have changed since they were drawn.
+      var list = d.topics || [d.topic];
+      var keep = {};
+      for(var i=0;i<list.length;i++) keep[list[i].id] = 1;
+      // Every local record of the rooms that went goes with them. Leaving the caches would put
+      // messages on screen for ids the daemon has forgotten, leaving the read marks would badge
+      // the replacement topic against a count from a room that no longer exists, and a draft or a
+      // terminal window would belong to nothing. The kept topics keep all of theirs.
+      keepOnly(keep);
       // The list is replaced with what the server just told us rather than left to the broadcast
       // that is also on its way: paintTopics re-seeds a read mark for every topic it renders, so
       // painting the OLD list once more would write the ids we are here to forget straight back
       // into storage.
-      topics=[d.topic];
-      // Cleared rather than handed straight to switchTopic, which answers an unchanged id by
-      // doing nothing: the replacement id is four random bytes and may repeat the one being
-      // read, and that one-in-4-billion case would leave a wiped transcript on screen.
-      topic='';
+      topics=list;
+      // Cleared rather than handed straight to switchTopic when the topic on screen went too:
+      // nothing of a deleted room should be written back on the way out of it, and the
+      // replacement id is four random bytes and may repeat the one being read — a one-in-4-billion
+      // case where switchTopic would do nothing and leave a wiped transcript on screen. A starred
+      // topic on screen is left alone, so its view and draft are saved like any other switch.
+      if(!keep[topic]) topic='';
       switchTopic(d.topic.id);
       if(narrow()) setSidebar(false);
     });
   });
+
+  /**
+   * Forget everything local about every topic NOT in keep: cached transcript, read mark, reading
+   * position, draft, terminal window. With nothing starred, keep holds only the fresh topic and
+   * this is the whole-page wipe a clear always was.
+   */
+  function keepOnly(keep){
+    var id;
+    cacheKeep(keep);
+    for(id in readCounts) if(!keep[id]) delete readCounts[id];
+    saveReads();
+    for(id in views) if(!keep[id]) delete views[id];
+    for(id in drafts) if(!keep[id]) delete drafts[id];
+    // One read-modify-write of the stored drafts, for the same reason writeDraft is one: a second
+    // tab's drafts for the kept topics are on disk and not in this tab's map.
+    try {
+      var all = JSON.parse(localStorage.getItem(DRAFTS) || 'null') || {};
+      var left = 0;
+      for(id in all){ if(!keep[id]) delete all[id]; else left++; }
+      if(left) localStorage.setItem(DRAFTS, JSON.stringify(all)); else localStorage.removeItem(DRAFTS);
+    } catch(x){}
+    for(id in termFrames){
+      if(Object.prototype.hasOwnProperty.call(termFrames, id) && !keep[id]) dropTerm(id);
+    }
+  }
 
   $('gate').addEventListener('submit', function(e){
     e.preventDefault();

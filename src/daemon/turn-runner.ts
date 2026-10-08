@@ -1045,8 +1045,8 @@ export class TurnRunner {
    * needs a name right now and there is nothing to summarise it with; this one is summarised by a
    * model, and handing it a pre-cut seed would cap the result at a rewording of the first line.
    *
-   * Identity prefixes are left out for the same reason mergePrompt's are: `[Alice]` is context for
-   * the agent, and a summariser fed it will put the speaker's name in the topic title.
+   * Sender names are left out, as they are everywhere else in the prompt now. A summariser
+   * given `[Alice] …` puts the speaker's name in the topic title.
    */
   private buildTitleSeed(batch: InboundMessage[]): string {
     return batch
@@ -1056,48 +1056,48 @@ export class TurnRunner {
   }
 
   /**
-   * Merge multiple user messages into one prompt segment, injecting quoted context and — only
-   * where it distinguishes anybody — sender identity.
+   * Merge multiple user messages into one prompt segment, injecting quoted context.
    *
    * Rules:
-   *  - `[<authorName>] ` prefixes each message in a GROUP or THREAD, where several people can
-   *    speak and the agent has to tell them apart. A direct message carries no prefix: there is
-   *    exactly one human in a DM, so naming them every turn tells the model nothing it cannot see
-   *    and spends the opening of each turn on chat-transcript formatting rather than the question.
-   *    (Absent authorName degrades to plain text, so no empty brackets either.)
+   *  - The message text goes in as typed. No sender name is added, in any kind of conversation.
    *  - If a message has quotedContent, prepend a quote-context line:
-   *    `(replying to <quotedAuthor||someone>: "<quotedContent truncated to 120 chars>")`.
+   *    `(replying to: "<quotedContent truncated to 120 chars>")`. It carries no author either.
    *  - Multiple messages joined by newlines.
    *
-   * Keyed on the conversation KIND rather than on "does this batch have two speakers": a batch is
-   * one merge window wide, so in a busy group two people usually land in different batches, and a
-   * per-batch test would drop the names in exactly the conversation that needs them.
+   * Sender names used to be added as a `[<authorName>] ` prefix wherever the conversation kind was
+   * not `direct`, so that an agent in a busy group could tell speakers apart. Removed on 2026-10-08
+   * because nobody here is in that situation: `access.allowFrom` admits a single person, so the
+   * name never told two speakers apart. It only put that person's handle at the start of every
+   * turn. And `direct` was the wrong test anyway. A Telegram private chat with topics enabled
+   * reports `kind: 'thread'` (see `telegramConversation`), so the user's own DMs reached the agent
+   * as `[<their handle>] …`, as did their one-person Lark topic group. The quoted author went for the
+   * same reason: in a one-person chat the quoted message is either theirs or the bot's.
+   *
+   * `InboundMessage.authorName` and `quotedAuthor` are still filled in by the platforms. This was
+   * the only place that read them.
    */
   private mergePrompt(batch: InboundMessage[]): string {
     const QUOTE_LIMIT = 120;
-    const multiParty = batch.some((m) => m.conversation.kind !== 'direct');
     return batch
       .map((m) => {
         // Slash commands must reach the agent starting with `/cmd` (the SDK decides command execution by
-        // whether the first block starts with `/`), so output as-is with no identity/quote prefix;
-        // otherwise `[author] /cmd` would be treated as plain chat text.
+        // whether the first block starts with `/`), so output as-is with no quote line; a
+        // `(replying to …)` line in front would turn the command into plain chat text.
         if (looksLikeCommand(m.content)) return m.content;
         const lines: string[] = [];
         if (m.quotedContent) {
-          const who = m.quotedAuthor && m.quotedAuthor.length > 0 ? m.quotedAuthor : 'someone';
           const flat = m.quotedContent.replace(/\s+/g, ' ').trim();
           const quoted = flat.length <= QUOTE_LIMIT ? flat : flat.slice(0, QUOTE_LIMIT - 1) + '…';
-          lines.push(`(replying to ${who}: "${quoted}")`);
+          lines.push(`(replying to: "${quoted}")`);
         }
-        const body = multiParty && m.authorName ? `[${m.authorName}] ${m.content}` : m.content;
-        lines.push(body);
+        lines.push(m.content);
         return lines.join('\n');
       })
       .join('\n');
   }
 
   /**
-   * Assemble the final turn prompt: after mergePrompt (identity/quote), best-effort append injected text
+   * Assemble the final turn prompt: after mergePrompt (quote context), best-effort append injected text
    * from inbound attachments (readable text inlined + binary/image saved-path lines).
    *
    * Any attachment-processing error is swallowed and logged — never blocks the turn (the agent still

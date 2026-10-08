@@ -86,8 +86,7 @@ export function parseTextCommand(text: string): { name: string; rest: string } |
  *
  * Rationale: whether the agent (claude-code-acp / SDK) executes input as a native slash command depends
  * on whether the first text block starts with `/`. So when agent-anywhere assembles the prompt, a message
- * matching this must stay clean `/cmd args` — no `[author]` identity prefix, no quote prefix, no
- * reverse-command hint.
+ * matching this must stay clean `/cmd args` — no quote prefix, no reverse-command hint.
  */
 export function looksLikeCommand(text: string): boolean {
   return parseTextCommand(text) !== null;

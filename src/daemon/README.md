@@ -426,17 +426,15 @@ the footer.
 
 Two mechanisms worth understanding before editing:
 
-**What the prompt actually contains.** `mergePrompt` joins the batch, and it adds only
-what distinguishes something. The `[<authorName>] ` identity prefix goes on in a **group
-or thread**, where several people can speak and the agent has to tell them apart, and is
-omitted in a DM — naming the only human present, every turn, opens each turn with
-chat-transcript formatting instead of the question. The test is the conversation KIND, not
-"does this batch have two speakers": a batch is one merge window wide, so in a busy group
-two people usually land in different batches and a per-batch test would drop the names in
-exactly the conversation that needs them. A quoted reply prepends one
-`(replying to X: "…")` line, attachments append a block, and a slash command is passed
-through bare (the SDK decides native-command execution by the leading `/`). That is the
-whole list — plus the one-line reverse hint on a session's first turn.
+**What the prompt actually contains.** `mergePrompt` joins the batch and adds nothing
+about who sent it. No sender name is added in any kind of conversation. The `[<authorName>] `
+prefix that used to go on outside DMs was removed because `access.allowFrom` admits one
+person here, so it never told two speakers apart. And a Telegram private chat in topic mode
+reports `kind: 'thread'`, so that one person's own DMs carried their handle on every turn. A
+quoted reply prepends one `(replying to: "…")` line, with no author for the same reason.
+Attachments append a block. A slash command is passed through bare, since the SDK decides
+native-command execution by the leading `/`. That is the whole list, plus the one-line
+reverse hint on a session's first turn.
 
 **The effects chain.** All stream-event side effects are serialized into one promise
 chain (`enqueue`), so "text push → tool-boundary flush → tool bubble → trailing text"

@@ -7,12 +7,13 @@ import type { ConversationKind } from '../core/conversation.js';
 import type { InboundMessage } from '../types.js';
 
 /**
- * What the model actually receives as its prompt — specifically, the `[author]` identity prefix.
+ * What the model actually receives as its prompt: specifically, that no sender name gets into it.
  *
- * The prefix exists so an agent in a busy group can tell two speakers apart. In a DM it names the
- * only human present, every single turn, which buys nothing and opens each turn with chat-
- * transcript formatting instead of the question. These pin both halves so neither can be
- * "simplified" back into the other.
+ * A `[author]` prefix used to be added in every conversation whose kind was not `direct`. That
+ * missed this deployment's actual shape. `access.allowFrom` admits one person, and their Telegram
+ * private chat runs in topic mode, which reports `kind: 'thread'`. So every turn opened with their
+ * own handle. These pin that no kind brings it back, and that the quote line carries no name
+ * either.
  *
  * Driven through the real ConversationRegistry rather than by calling mergePrompt (which is
  * private): the prompt is assembled several layers down from routing, and a direct unit test
@@ -87,12 +88,17 @@ function rig(kind: ConversationKind) {
   } as never);
 
   let n = 0;
-  const send = async (content: string, authorName: string, user = 'u1'): Promise<void> => {
+  const send = async (
+    content: string,
+    authorName: string,
+    quote?: { quotedContent: string; quotedAuthor: string }
+  ): Promise<void> => {
     reg.route({
-      conversation: { platform: 'discord', channel: 'c1', kind, user },
+      conversation: { platform: 'discord', channel: 'c1', kind, user: 'u1' },
       messageId: `m${++n}`,
       content,
       authorName,
+      ...quote,
       timestamp: 0,
     } as InboundMessage);
     await drain();
@@ -101,28 +107,25 @@ function rig(kind: ConversationKind) {
   return { send, prompts };
 }
 
-describe('identity prefix in the prompt', () => {
-  it('a DM reaches the model as the bare message', async () => {
-    const { send, prompts } = rig('direct');
-    await send('把这个文件发我', '张三');
-    expect(prompts).toEqual(['把这个文件发我']);
-  });
+describe('sender names in the prompt', () => {
+  it.each<ConversationKind>(['direct', 'group', 'thread'])(
+    'a %s message reaches the model as the bare text',
+    async (kind) => {
+      const { send, prompts } = rig(kind);
+      await send('把这个文件发我', '张三');
+      expect(prompts).toEqual(['把这个文件发我']);
+    }
+  );
 
-  it('a group keeps the names, which is the only place they distinguish anyone', async () => {
-    const { send, prompts } = rig('group');
-    await send('把这个文件发我', '张三');
-    expect(prompts).toEqual(['[张三] 把这个文件发我']);
-  });
-
-  it('a thread keeps them too (several people can post in one)', async () => {
+  it('the quote line names nobody', async () => {
     const { send, prompts } = rig('thread');
-    await send('把这个文件发我', '张三');
-    expect(prompts).toEqual(['[张三] 把这个文件发我']);
+    await send('这个再改一下', '张三', { quotedContent: '已经改好了，\n  见 diff', quotedAuthor: 'cc_bot' });
+    expect(prompts).toEqual(['(replying to: "已经改好了， 见 diff")\n这个再改一下']);
   });
 
-  it('a slash command stays bare in a group as well (the SDK reads the leading /)', async () => {
+  it('a slash command stays bare, with no quote line either (the SDK reads the leading /)', async () => {
     const { send, prompts } = rig('group');
-    await send('/compact', '张三');
+    await send('/compact', '张三', { quotedContent: 'earlier reply', quotedAuthor: 'cc_bot' });
     expect(prompts).toEqual(['/compact']);
   });
 });

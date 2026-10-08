@@ -31,6 +31,17 @@ All notable changes to this project are documented here. The format is based on
   changes, the strip loses its cache segment and shows nothing wrong. `doctor` reports whether each
   claude agent's transcript directory exists.
 
+### Changed
+
+- **No sender name reaches the agent anymore, in any conversation.** Messages from groups and
+  threads used to arrive as `[<name>] text`, so that an agent could tell speakers apart. That
+  never applied here: `access.allowFrom` admits one person, so the name only put their own
+  handle at the start of every turn. It also reached further than intended. The prefix was
+  skipped only for conversations of kind `direct`, and a Telegram private chat with topics
+  enabled reports `thread`, so ordinary DMs carried the name too, as did a one-person Lark topic
+  group. A quoted reply now reads `(replying to: "…")` without the quoted author, for the same
+  reason. Group chats themselves still work exactly as before. Only the names are gone.
+
 ### Fixed
 
 - **agy's status line is now set up on a machine where agy was first used after the daemon

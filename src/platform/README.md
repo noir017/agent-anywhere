@@ -90,7 +90,7 @@ as a Telegram forum topic, which is also why it is the second platform after Tel
 rename one — `retitleLane` refuses any address without a lane, so a design that gave each topic
 a channel of its own would have left `renameThread` permanently inert.
 
-**Three adapter methods are not in the matrix, because they are not capabilities.**
+**Four adapter methods are not in the matrix, because they are not capabilities.**
 `useWorkdirLookup` hands an adapter a way to *ask* the daemon which directory the conversation
 at one of its addresses works in, and only the web UI implements it: a chat platform has
 nowhere to put the answer, while the page's topic switcher has a second line per row and,
@@ -109,6 +109,15 @@ in a conversation by definition nobody is touching — and a child can also exit
 still post into this conversation? The web UI evicts its least recently active topic once it holds
 64, and a task's target is a plain address nothing rewrites when the topic behind it goes — so the
 answer decides what may be evicted, not what a row looks like. It is read only at that moment.
+
+`setStatus` is the fourth, and runs the other way: the daemon *pushes* the agent's live status
+(model, context, cost, cache expiry, quota) for a conversation, and only the web UI shows it — in a
+strip above its composer. Push rather than pull, the reverse of the three lookups and for the
+reverse reason: every value changes at a moment the daemon already sees (a `usage_update`, a status
+frame, a turn ending) and nothing changes it in between, so a lookup would have to be polled
+forever for an answer that only moves while an agent is talking. The daemon's
+`status-board.ts` drops repeats and throttles before calling it; an implementation may treat every
+call as a change. It may throw on a bad address — the caller swallows that.
 
 **`menuPageSize` is a declaration, not a preference.** It says how many items one page of
 a button menu (`/cd`, `/model`, `/setting`) may hold here, and the limits are nowhere near

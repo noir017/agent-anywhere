@@ -166,6 +166,28 @@ for Stop mid-reply has in there. The power button does not wait out the poll to 
 daemon ends the child synchronously before it sends the ack (`answerDaemonCommand`), and the ack
 is a posted message, which announces the list.
 
+**The strip above the composer is the agent's live status** — what the footer says once per reply,
+kept current: agent, model and effort; a context meter; session cost; claude's prompt-cache
+countdown; agy's quota pools. The daemon pushes it (`PlatformAdapter.setStatus`, from
+`daemon/status-board.ts`, which drops repeats and sends at most one per topic per 2 s), and three
+things about how it travels are deliberate:
+
+- **It is state, not history.** A `status` event carries no sequence number and never enters the
+  backlog, so a busy turn's stream of them cannot push the messages a reconnect needs out of it. A
+  full sync carries the current one; a *resumed* stream is handed it after the replay, since none
+  of the ones it missed were kept.
+- **Times are absolute and the page counts.** The daemon says when a cache expires or a pool
+  refills once; `paintStatus` works out "41m" against the browser's clock. Its timer runs only
+  while a countdown is on screen and the tab is visible, twice a minute — minutes are the finest
+  unit shown — and a repaint that would change nothing writes no DOM.
+- **Absent means unknown.** A topic whose agent has not reported since the daemon started has no
+  status, and the strip is hidden rather than drawn with zeros. Switching topics clears it until
+  the incoming sync says what the new one's is.
+
+Closed, the strip is one line, shows only the quota pools the serving model spends from, and on a
+narrow screen drops the token counts beside the meter (the percentage says the same). A tap opens
+it: it wraps, and the other pools appear, dimmed.
+
 **`access.allowFrom` identity is `<instance id>:owner`**, the same for every topic. An existing
 config that already lists other identities will silently ignore every message typed into this
 page until that entry is added — `doctor` checks for exactly this.

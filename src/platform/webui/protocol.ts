@@ -17,7 +17,7 @@
 import { z } from 'zod';
 
 import type { ButtonSpec } from '../adapter.js';
-import type { SlashCommandSpec } from '../../types.js';
+import type { AgentStatus, SlashCommandSpec } from '../../types.js';
 import type { Topic } from './topics.js';
 
 /**
@@ -177,11 +177,21 @@ export type WebEvent =
        * spoken in; both are honestly described as "older than this process, nothing here".
        */
       stale?: boolean;
+      /** The topic's agent status as of this sync; absent when there is none to show. */
+      status?: AgentStatus;
     }
   | { t: 'msg'; msg: WebMessage }
   | { t: 'del'; id: string }
   | { t: 'react'; id: string; emoji: string; on: boolean }
   | { t: 'typing'; on: boolean }
+  /**
+   * The topic's agent status changed — the strip above the composer. Absent `status` clears it.
+   *
+   * STATE, not history, and sent like it: never sequenced or kept in the backlog, so a busy turn's
+   * stream of them cannot push the messages a reconnect needs out of it. A resumed stream is handed
+   * the current one after its replay instead (see `WebRoom.subscribe`) — the only one it needs.
+   */
+  | { t: 'status'; status?: AgentStatus }
   | { t: 'commands'; commands: SlashCommandSpec[] }
   /**
    * The topic list changed — one was created, renamed, or spoken in.

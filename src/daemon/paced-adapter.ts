@@ -61,6 +61,10 @@ const PACING = {
   useWorkdirLookup: 'unpaced',
   useLivenessLookup: 'unpaced',
   useScheduleLookup: 'unpaced',
+  // Not chat traffic at all: the one implementor draws it in its own page, and the status board
+  // already throttles it. Queueing a status behind a platform's flood pause would only show a
+  // stale one later.
+  setStatus: 'unpaced',
   measureRendered: 'unpaced',
   registerCommands: 'unpaced',
   onMessage: 'unpaced',

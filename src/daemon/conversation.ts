@@ -97,6 +97,8 @@ import { InboundMerger, type SoloOutcome } from '../core/inbound-merger.js';
 import { fallbackTitle, generateTitle } from '../core/title-namer.js';
 import { shouldRespond, type GateConfig } from '../core/inbound-gate.js';
 import { TurnRunner } from './turn-runner.js';
+import { StatusBoard } from './status-board.js';
+import { claudeProjectsDir, readCacheExpiry, type CacheReading } from './claude-transcript.js';
 import type { ConversationStore } from './conversation-store.js';
 import { buildChannelList } from '../core/channel-list.js';
 import type { ListChannelsResult } from '../ipc/protocol.js';
@@ -403,6 +405,12 @@ export class ConversationRegistry {
   /** Single-turn orchestrator; buildMerger's runTurn delegates to it (see class doc). */
   private readonly turnRunner: TurnRunner;
   /**
+   * Each conversation's live agent status, for a platform that shows one (the web UI's status
+   * strip). Fed by the same reports as `lastUsage`, from the same TurnRunner deps — see
+   * status-board.ts for why it is its own object.
+   */
+  private readonly status: StatusBoard;
+  /**
    * The `/setting` writer: validates a value, patches config.yaml, applies it to this live Config.
    *
    * Owned here rather than by the daemon because the registry is the side that holds the Config and
@@ -576,6 +584,15 @@ export class ConversationRegistry {
   ) {
     // Inject only the capabilities TurnRunner needs (read-only views + activeAddress write entry),
     // rather than passing the whole registry and creating a circular dependency.
+    this.status = new StatusBoard({
+      laneOf: (id) => this.laneOf(id),
+      platforms: this.platforms,
+      agentOf: (id) => this.agentIdOf(id),
+      configuredModel: (id) =>
+        this.conversations.get(id)?.modelOverride ?? findAgent(this.config, this.agentIdOf(id))?.model,
+      cacheReading: (id) => this.claudeCacheReading(id),
+      clock: this.clock,
+    });
     this.turnRunner = new TurnRunner(
       this.config,
       this.platforms,
@@ -591,10 +608,15 @@ export class ConversationRegistry {
           if (!state) return;
           state.lastUsage = usage;
           if (usage.cost) state.lastCost = usage.cost;
+          this.status.usage(id, usage);
         },
+        recordModel: (id, model) => this.status.model(id, model),
+        recordEffort: (id, effort) => this.status.effort(id, effort),
+        recordQuota: (id, pools) => this.status.quota(id, pools),
         recordTurnComplete: (id) => {
           const state = this.conversations.get(id);
           if (state) state.turnCompleted = true;
+          this.status.settled(id);
         },
         // During an active turn the state must exist, but handle absence robustly anyway.
         setLane: (id, address, platformId) => {
@@ -1318,7 +1340,7 @@ export class ConversationRegistry {
     // Same reasoning for the context snapshot, and it matters more: `/context` labels the numbers
     // with the bound agent's name, so keeping the outgoing agent's usage would attribute one
     // harness's context to another. The incoming agent reports its own on its next turn.
-    this.forgetUsage(state);
+    this.forgetUsage(key, state);
     this.store?.bind(key, agentId);
     const name = agentDisplayName(findAgent(this.config, agentId), agentId);
     const resuming = this.store?.agentSession(key, agentId) != null;
@@ -1971,10 +1993,31 @@ export class ConversationRegistry {
     reply(formatAgyCliOutput(name, result.output));
   }
 
-  /** Drop this conversation's context snapshot; the pair moves together or the answer lies. */
-  private forgetUsage(state: ConversationState): void {    state.lastUsage = undefined;
+  /**
+   * Drop this conversation's context snapshot; the pair moves together or the answer lies. The
+   * status strip goes with it, for the same reason: it describes the context just discarded.
+   */
+  private forgetUsage(id: ConversationId, state: ConversationState): void {
+    state.lastUsage = undefined;
     state.lastCost = undefined;
     state.turnCompleted = false;
+    this.status.reset(id);
+  }
+
+  /**
+   * The prompt-cache reading for a conversation whose agent runs on the claude harness, from that
+   * session's transcript (see claude-transcript.ts) — undefined for every other harness, and for a
+   * conversation with no session yet. Read on the agent's own home and directory, since that is
+   * where its Claude Code wrote it.
+   */
+  private async claudeCacheReading(id: ConversationId): Promise<CacheReading | undefined> {
+    const agentId = this.agentIdOf(id);
+    const def = findAgent(this.config, agentId);
+    if (def?.harness !== 'claude') return undefined;
+    const sessionId = this.store?.agentSession(id, agentId);
+    const cwd = this.workdirOf(id, agentId);
+    if (!sessionId || !cwd) return undefined;
+    return readCacheExpiry(claudeProjectsDir(def), cwd, sessionId);
   }
 
   /**
@@ -2496,7 +2539,7 @@ ${formatTokens(left)} left before compaction — ${name}`;
     const state = this.conversations.get(id);
     if (state) {
       state.headerSent = false;
-      this.forgetUsage(state);
+      this.forgetUsage(id, state);
     }
     console.log(`[workdir] ${id} → ${path} (agent ${agentId}; every session id dropped)`);
     return { kind: 'applied', path };
@@ -2866,7 +2909,7 @@ ${formatTokens(left)} left before compaction — ${name}`;
       state.headerSent = false;
       // The context this snapshot measured is exactly what was just destroyed; reporting it back
       // would make /context contradict the reset the user just asked for.
-      this.forgetUsage(state);
+      this.forgetUsage(id, state);
     }
     if (agentId) {
       this.store?.bind(id, agentId);
@@ -2938,6 +2981,7 @@ ${formatTokens(left)} left before compaction — ${name}`;
   dispose(): void {
     this.cancelSweep?.();
     this.cancelSweep = null;
+    this.status.dispose();
     for (const key of [...this.conversations.keys()]) {
       this.releaseState(key);
       this.agents.dispose(key);

@@ -156,6 +156,7 @@ type Outbound = Pick<
   | 'removeReaction'
   | 'startTyping'
   | 'stopTyping'
+  | 'setStatus'
   | 'createThread'
   | 'renameThread'
   | 'measureRendered'
@@ -238,6 +239,13 @@ function outbound(room: WebRoom, instance: WebuiInstance): Outbound {
     },
     async stopTyping(address) {
       room.setTyping(topicOf(address, 'stopTyping'), false);
+    },
+    /**
+     * The strip above the composer. The only platform with one, because it is the only one that
+     * draws its own chrome: a chat app's composer belongs to the chat app.
+     */
+    setStatus(address, status) {
+      room.setStatus(topicOf(address, 'setStatus'), status);
     },
     /**
      * Open a topic.

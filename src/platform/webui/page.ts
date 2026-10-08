@@ -325,6 +325,25 @@ button:disabled{opacity:.5;cursor:default}
 #input{flex:1;resize:none;max-height:40vh;max-height:40dvh;padding:8px 10px;background:var(--field);color:var(--fg);border:1px solid var(--line);border-radius:4px;font:inherit;overflow-y:auto}
 #input:focus,#login input:focus{outline:none;border-color:#3d3d3d}
 #note{color:var(--dim);font-size:12px;padding:0 16px 8px;max-width:860px;width:100%;margin:0 auto}
+/* The agent's live status, above the composer: what the footer says once per reply, kept current
+   between replies. One line until tapped; the global [hidden] rule at the top is what lets this
+   set display and still be hidden while there is nothing to show. */
+#status{display:flex;align-items:center;margin:-3px 0 7px;font-size:11.5px;line-height:1.5;color:var(--dim);white-space:nowrap;overflow:hidden;font-variant-numeric:tabular-nums;cursor:pointer;user-select:none;-webkit-user-select:none}
+#status.open{flex-wrap:wrap;white-space:normal;row-gap:1px;column-gap:14px}
+.st{flex:0 0 auto;display:inline-flex;align-items:center;gap:5px}
+.st+.st::before{content:'\\00b7';margin:0 7px;color:#4a4a4a}
+/* Open, the line wraps, and a separator belonging to the first segment of a wrapped line would
+   lead it with a stray dot (seen in Chromium at 390px). Spacing does the separating instead. */
+#status.open .st+.st::before{content:none}
+.st-who{color:#a8a8a8}
+.st-meter{display:inline-block;width:32px;height:4px;border-radius:2px;background:var(--line);overflow:hidden}
+.st-meter i{display:block;height:100%;background:var(--dim)}
+.st.warn{color:#fbbf24}
+.st.warn .st-meter i{background:#fbbf24}
+.st.bad{color:#f87171}
+.st.bad .st-meter i{background:#f87171}
+/* A pool the serving model is not spending from: shown only when the strip is open, and quieter. */
+.st.off{opacity:.55}
 /* Phones and tablets held upright. Everything here is about the parts of a handset a desktop
    layout has no concept of: a URL bar that eats viewport height, a home indicator under the
    composer, Safari's zoom-on-focus, and a finger instead of a pointer. */
@@ -378,6 +397,10 @@ button:disabled{opacity:.5;cursor:default}
   #term-bar{padding:2px 4px 2px 12px;gap:8px}
   #term-min,#term-end{display:inline-flex;align-items:center;justify-content:center;
     min-width:44px;height:44px;font-size:18px}
+  /* The status strip's token counts, on a screen with no room for them: the percentage beside the
+     meter says the same thing in four characters, and a tap brings the counts back. Without this
+     the line clipped before the cache and quota — the parts that change. */
+  #status:not(.open) .st-x{display:none}
 }
 `;
 
@@ -392,7 +415,7 @@ const SCRIPT = `
       chat=$('chat'), termBtn=$('term-toggle'), termHost=$('term-frames'),
       termName=$('term-name'), termMinBtn=$('term-min'), termEndBtn=$('term-end'),
       lightbox=$('lightbox'), lightboxImg=$('lightbox-img'),
-      killBtn=$('kill-agent'), stopBtn=$('stop-turn');
+      killBtn=$('kill-agent'), stopBtn=$('stop-turn'), statusEl=$('status');
   var data={}, els={}, files=[], commands=[], stream=null, done=false;
   // Last markup written per message, so a sync that re-sends an unchanged message touches no DOM.
   var sig={};
@@ -1289,6 +1312,8 @@ const SCRIPT = `
     emptyEl=null;
     dividerEl=null;
     syncingEl=null;
+    // The strip describes the topic being left; the incoming sync says what the new one's is.
+    setStatus(null);
     entering=true;
     synced=false;
     view = views[id] || null;
@@ -1337,6 +1362,125 @@ const SCRIPT = `
     });
   }
 
+  // ── The status strip ─────────────────────────────────────────────────────────
+  // What the daemon last pushed about this topic's agent (see status-board.ts), or null. Every time
+  // in it is absolute, so a countdown is worked out here against the clock rather than re-sent:
+  // the server says when a cache expires once, and this page counts to it.
+  var agentStatus = null, statusTimer = null, statusHtml = '';
+  // How often a countdown on screen is redrawn. Minutes are its finest unit, so twice a minute is
+  // as often as it can visibly change; and only while one is on screen and the tab is visible.
+  var STATUS_TICK_MS = 30000;
+
+  function setStatus(s){
+    agentStatus = s || null;
+    paintStatus();
+    armStatusTick();
+  }
+
+  function hasCountdown(s){
+    if(!s) return false;
+    if(s.cacheExpiresAt) return true;
+    var q = s.quota || [];
+    for(var i=0;i<q.length;i++) if(q[i].resetsAt) return true;
+    return false;
+  }
+
+  function armStatusTick(){
+    var want = hasCountdown(agentStatus) && document.visibilityState !== 'hidden';
+    if(want && !statusTimer) statusTimer = setInterval(paintStatus, STATUS_TICK_MS);
+    else if(!want && statusTimer){ clearInterval(statusTimer); statusTimer = null; }
+  }
+
+  // The same units as the footer (core/runtime-footer.ts formatTokens / formatWindow), so a number
+  // read here and one read under a reply can be compared.
+  function stTokens(n){
+    return n >= 1e6 ? (n/1e6).toFixed(1).replace(/\\.0$/,'')+'M' : Math.round(n/1000)+'k';
+  }
+  function stWindow(n){
+    return n >= 1e6 ? (Math.floor(n/1e5)/10).toFixed(1).replace(/\\.0$/,'')+'M' : Math.floor(n/1000)+'k';
+  }
+  function stLeft(ms){
+    var m = Math.floor(ms/60000);
+    if(m < 1) return '<1m';
+    var d = Math.floor(m/1440), h = Math.floor((m%1440)/60), mm = m%60;
+    if(d > 0) return d+'d'+(h ? ' '+h+'h' : '');
+    if(h > 0) return h+'h'+(mm ? ' '+mm+'m' : '');
+    return m+'m';
+  }
+  function stClock(at){
+    var t = new Date(at);
+    return (t.getHours()<10?'0':'')+t.getHours()+':'+(t.getMinutes()<10?'0':'')+t.getMinutes();
+  }
+  // agy's pool ids, made readable: gemini-5h → Gemini 5h, 3p-weekly → 3P wk. An id of any other
+  // shape is shown as it came, rather than dropped for not being one of the four known today.
+  function poolLabel(id){
+    var cut = id.lastIndexOf('-');
+    var fam = cut > 0 ? id.slice(0, cut) : id, win = cut > 0 ? id.slice(cut+1) : '';
+    fam = fam === '3p' ? '3P' : (fam === 'gemini' ? 'Gemini' : fam);
+    win = win === 'weekly' ? 'wk' : (win === 'daily' ? 'day' : win);
+    return win ? fam+' '+win : fam;
+  }
+  function seg(cls, title, html){
+    return '<span class="st'+(cls ? ' '+cls : '')+'"'+(title ? ' title="'+text(title)+'"' : '')+'>'+html+'</span>';
+  }
+
+  function statusSegments(s, now, open){
+    var out = [];
+    out.push(seg('st-who', '', text(s.agent)+(s.model ? ' \\u00b7 '+text(s.model) : '')+(s.effort ? ' \\u00b7 '+text(s.effort) : '')));
+    if(s.context && s.context.size > 0){
+      var pct = Math.min(100, Math.max(0, Math.round(s.context.used / s.context.size * 100)));
+      out.push(seg(pct >= 80 ? 'bad' : (pct >= 50 ? 'warn' : ''),
+        s.context.used.toLocaleString()+' of '+s.context.size.toLocaleString()+' tokens in context',
+        '<i class="st-meter"><i style="width:'+pct+'%"></i></i>'+pct+'%'
+          +'<span class="st-x">'+stTokens(s.context.used)+'/'+stWindow(s.context.size)+'</span>'));
+    }
+    if(s.cost){
+      var c = s.cost;
+      out.push(seg('', 'Session cost so far, as the harness reports it ('+c.amount.toFixed(4)+' '+c.currency+')',
+        c.currency === 'USD' ? '$'+c.amount.toFixed(2) : text(c.amount.toFixed(2)+' '+c.currency)));
+    }
+    if(s.cacheExpiresAt){
+      var left = s.cacheExpiresAt - now;
+      out.push(left > 0
+        ? seg(left < 5*60000 ? 'warn' : '', 'Prompt cache expires at '+stClock(s.cacheExpiresAt)+'; after that the next message re-reads the whole context at full price', text('cache '+stLeft(left)))
+        : seg('', 'Prompt cache expired at '+stClock(s.cacheExpiresAt)+'; the next message re-reads the whole context at full price', 'cache expired'));
+    }
+    var pools = s.quota || [], anyActive = false;
+    for(var i=0;i<pools.length;i++) if(pools[i].active) anyActive = true;
+    for(var j=0;j<pools.length;j++){
+      var p = pools[j], off = anyActive && !p.active;
+      // Closed, only the pools being spent from: the others are context, and the line is short.
+      if(off && !open) continue;
+      var rp = Math.round(p.remaining * 100);
+      // A reset time is only worth the room while something has been spent.
+      var reset = p.resetsAt && rp < 100 ? ' ('+stLeft(p.resetsAt - now)+')' : '';
+      out.push(seg((rp <= 15 ? 'bad' : (rp <= 40 ? 'warn' : ''))+(off ? ' off' : ''),
+        p.resetsAt ? 'Refills '+new Date(p.resetsAt).toLocaleString() : '',
+        text(poolLabel(p.id)+' '+rp+'%'+reset)));
+    }
+    return out.join('');
+  }
+
+  function paintStatus(){
+    var s = agentStatus;
+    var html = s ? statusSegments(s, Date.now(), statusEl.classList.contains('open')) : '';
+    // Compared before writing: the tick redraws twice a minute, and most of those change nothing.
+    if(html === statusHtml) return;
+    statusHtml = html;
+    statusEl.innerHTML = html;
+    statusEl.hidden = !html;
+  }
+
+  statusEl.addEventListener('click', function(){
+    statusEl.classList.toggle('open');
+    paintStatus();
+  });
+  // A countdown is redrawn the moment the page is looked at again, rather than up to a tick late.
+  document.addEventListener('visibilitychange', function(){
+    if(document.visibilityState !== 'hidden') paintStatus();
+    armStatusTick();
+  });
+
   function handle(ev){
     if(ev.t==='sync'){
       // Only a sync for a topic we have since left is stale enough to drop. A first visit has
@@ -1384,6 +1528,9 @@ const SCRIPT = `
       topics = ev.topics || [];
       paintTopics();
       prune();
+      // Absent when the topic's agent has reported nothing since the daemon started, which clears
+      // whatever a previous connection had put up.
+      setStatus(ev.status);
       note.textContent='';
       if(arriving) land(); else if(stick) toBottom();
       view = null;
@@ -1427,6 +1574,7 @@ const SCRIPT = `
       paintTopics();
     }
     else if(ev.t==='commands'){ commands = ev.commands || []; }
+    else if(ev.t==='status'){ setStatus(ev.status); }
     else if(ev.t==='topics'){
       topics = ev.topics || [];
       paintTopics();
@@ -2266,6 +2414,9 @@ __GATE__
       <div id="term-frames"></div>
     </div>
     <div id="bar">
+      <!-- The agent's live status. Inside #bar rather than above it so it goes away with the
+           composer in terminal mode, and so it reads as part of the place you type. -->
+      <div id="status" hidden title="Tap for details"></div>
       <div id="hints" hidden></div>
       <div id="chips"></div>
       <form id="composer">

@@ -305,3 +305,55 @@ export interface EffortSelector {
   /** Selectable levels with the display names the harness gave them. */
   options: Array<{ value: string; name: string }>;
 }
+
+/**
+ * One usage-quota pool a harness reports, e.g. agy's `gemini-5h` or `3p-weekly`.
+ *
+ * Kept in the harness's own vocabulary (`id` is its key, verbatim) rather than mapped onto a fixed
+ * set of windows here: agy names four pools today and has renamed them before (`gemini-daily` is
+ * in the shim's fallbacks for that reason), and a gateway that only understood the four would drop
+ * a fifth on the floor instead of showing it.
+ */
+export interface QuotaPool {
+  /** The harness's pool key, verbatim. */
+  id: string;
+  /** Fraction of the pool still available, 0…1. */
+  remaining: number;
+  /** When the pool refills, epoch ms. Absent when the harness did not say. */
+  resetsAt?: number;
+  /**
+   * Whether the model serving the session spends from this pool. agy keeps separate pools for
+   * Gemini and for third-party models, and only one of them moves on any given turn.
+   */
+  active?: boolean;
+}
+
+/**
+ * What a status bar shows about the agent behind one conversation, continuously rather than once
+ * per reply (the footer's job).
+ *
+ * Every field but `agent` is optional because every harness reports a different subset, and an
+ * absent field is rendered as nothing rather than as a zero: claude reports cost and (through its
+ * transcript) a prompt-cache expiry but no quota on an API key, agy reports quota but no cost,
+ * codex reports context alone. A guessed value here would be read as a measurement.
+ */
+export interface AgentStatus {
+  /** Agent id as configured (`cc`, `agy`). */
+  agent: string;
+  /** Short model name, as the footer prints it. */
+  model?: string;
+  /** Reasoning effort the harness reports. */
+  effort?: string;
+  /** Tokens in context over the window — the same pair `/context` quotes. */
+  context?: { used: number; size: number };
+  /** Cumulative session cost, as the harness reports it. */
+  cost?: { amount: number; currency: string };
+  /**
+   * When the prompt cache written by the session's last request expires, epoch ms. Past this
+   * moment the next message re-reads the whole context at full price, which is the reason anyone
+   * wants to see it.
+   */
+  cacheExpiresAt?: number;
+  /** Usage-quota pools, in the order the harness listed them. */
+  quota?: QuotaPool[];
+}

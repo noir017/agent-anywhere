@@ -7,6 +7,7 @@ import { ConfigSchema, accessUnrestricted, platformInstances, type Config } from
 import { isLegacyConfig, migrateLegacyConfig } from '../config/migrate.js';
 import { resolveClaudeAdapterEntry } from '../daemon/agent-acp.js';
 import { AGY_COMMAND } from '../daemon/agent-agy.js';
+import { claudeProjectsDir } from '../daemon/claude-transcript.js';
 import { agentHome } from '../daemon/skills-scan.js';
 import { OWNER } from '../platform/webui/room.js';
 import { loadJwks } from '../platform/webui/sso.js';
@@ -446,10 +447,37 @@ export async function runDoctor(opts: { migrateConfig?: boolean } = {}): Promise
             lines.push(`${file} → agent-anywhere shim ✓`);
           } else {
             anyUnwired = true;
-            lines.push(`${file} → ${command ?? 'no statusLine'} (the daemon rewires this on start)`);
+            lines.push(`${file} → ${command ?? 'no statusLine'} (the daemon rewires this on start, and again before starting agy)`);
           }
         }
         return anyUnwired
+          ? { ok: true, level: 'warn', detail: lines.join('; ') }
+          : { ok: true, detail: lines.join('; ') };
+      },
+    },
+    {
+      /**
+       * Only meaningful for claude agents, and only for the web UI's status strip: its cache
+       * countdown is read from Claude Code's own transcripts (see daemon/claude-transcript.ts),
+       * because headless Claude Code runs no status line to ask. A missing directory costs that one
+       * segment and nothing else, hence a warning.
+       */
+      name: 'claude transcripts readable for the cache countdown',
+      run: async () => {
+        if (!cfg) return { ok: false, detail: 'config unavailable, cannot check agents' };
+        const claudeAgents = cfg.agents.filter((a) => a.harness === 'claude');
+        if (claudeAgents.length === 0) return { ok: true, detail: 'no claude agent configured' };
+        const lines: string[] = [];
+        let anyMissing = false;
+        for (const dir of new Set(claudeAgents.map((a) => claudeProjectsDir(a)))) {
+          if (fs.existsSync(dir)) {
+            lines.push(`${dir} ✓`);
+          } else {
+            anyMissing = true;
+            lines.push(`${dir} missing (created by Claude Code on its first session)`);
+          }
+        }
+        return anyMissing
           ? { ok: true, level: 'warn', detail: lines.join('; ') }
           : { ok: true, detail: lines.join('; ') };
       },

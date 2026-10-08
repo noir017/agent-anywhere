@@ -8,6 +8,7 @@ import {
   AGY_STATUS_FD_ENV,
   ensureAgyStatusLine,
   installStatusLine,
+  markActivePools,
   parseAgyStatusFrame,
 } from './agy-statusline.js';
 
@@ -169,12 +170,43 @@ describe('ensureAgyStatusLine', () => {
 });
 
 describe('the installed shim', () => {
-  it('reports the window and the model to the daemon over fd 3', () => {
+  it('reports the window, the model and the quota pools to the daemon over fd 3', () => {
     const { home } = rig({});
     installStatusLine(home);
+    const before = Date.now();
     const { reported } = runShim(JSON.stringify(FRAME));
-    expect(reportedFrames(reported)).toEqual([
-      { usage: { used: 22087, size: 1048576 }, model: 'gemini-3.8-flash-high' },
+    const after = Date.now();
+    const [frame] = reportedFrames(reported);
+    expect(frame?.usage).toEqual({ used: 22087, size: 1048576 });
+    expect(frame?.model).toBe('gemini-3.8-flash-high');
+    // agy 1.2.0 gave only a relative reset, so the shim anchors it to the moment it ran.
+    expect(frame?.quota?.map((p) => [p.id, p.remaining])).toEqual([
+      ['3p-5h', 1],
+      ['3p-weekly', 0.9389305],
+      ['gemini-5h', 0.9835127],
+      ['gemini-weekly', 0.9972521],
+    ]);
+    const weekly = frame?.quota?.[3]?.resetsAt ?? 0;
+    expect(weekly).toBeGreaterThanOrEqual(before + 603831 * 1000);
+    expect(weekly).toBeLessThanOrEqual(after + 603831 * 1000);
+  });
+
+  it('takes the absolute reset time agy 1.3.0 sends over the relative one', () => {
+    // Verbatim `quota` from agy 1.3.0 (2026-10-08). The absolute time is exact; the relative one is
+    // relative to a moment nobody recorded, so it is only the fallback.
+    const { home } = rig({});
+    installStatusLine(home);
+    const frame = {
+      ...FRAME,
+      version: '1.3.0',
+      quota: {
+        '3p-5h': { remaining_fraction: 1, reset_time: '2026-10-08T11:21:59Z', reset_in_seconds: 17996 },
+        '3p-weekly': { remaining_fraction: 0.7486224, reset_time: '2026-10-10T08:15:54Z', reset_in_seconds: 179631 },
+      },
+    };
+    expect(reportedFrames(runShim(JSON.stringify(frame)).reported)[0]?.quota).toEqual([
+      { id: '3p-5h', remaining: 1, resetsAt: Date.parse('2026-10-08T11:21:59Z') },
+      { id: '3p-weekly', remaining: 0.7486224, resetsAt: Date.parse('2026-10-10T08:15:54Z') },
     ]);
   });
 
@@ -279,5 +311,48 @@ describe('parseAgyStatusFrame', () => {
     // A name is printed on every reply, so an absurd one is refused rather than truncated.
     expect(parseAgyStatusFrame(JSON.stringify({ model: 'x'.repeat(500) }))).toBeUndefined();
     expect(parseAgyStatusFrame('{"model":"  gemini-3.8-flash-high  "}')).toEqual({ model: 'gemini-3.8-flash-high' });
+  });
+
+  it('reads quota alone, and keeps only the pools that are whole', () => {
+    expect(parseAgyStatusFrame('{"quota":[{"id":"gemini-5h","remaining":0.5,"resetsAt":1791459045263}]}')).toEqual({
+      quota: [{ id: 'gemini-5h', remaining: 0.5, resetsAt: 1791459045263 }],
+    });
+    const mixed = JSON.stringify({
+      quota: [
+        { id: '3p-weekly', remaining: 1.7 }, // clamped, not dropped: "full" is still true
+        { id: 'gemini-5h', remaining: 0.2, resetsAt: 'tomorrow' }, // keeps its fraction, loses the time
+        { id: '../../etc', remaining: 1 }, // not an id agy would send
+        { id: 'gemini-weekly', remaining: 'lots' },
+        'not a pool',
+      ],
+    });
+    expect(parseAgyStatusFrame(mixed)).toEqual({
+      quota: [
+        { id: '3p-weekly', remaining: 1 },
+        { id: 'gemini-5h', remaining: 0.2 },
+      ],
+    });
+    // A pipe anyone can write to does not get to grow the status strip without bound.
+    const many = JSON.stringify({ quota: Array.from({ length: 50 }, (_, i) => ({ id: `p${i}`, remaining: 1 })) });
+    expect(parseAgyStatusFrame(many)?.quota).toHaveLength(8);
+    expect(parseAgyStatusFrame('{"quota":[]}')).toBeUndefined();
+  });
+});
+
+describe('markActivePools', () => {
+  const pools = [
+    { id: 'gemini-5h', remaining: 1 },
+    { id: '3p-5h', remaining: 1 },
+    { id: 'tokens', remaining: 1 },
+  ];
+
+  it('marks the third-party pools for a Claude or GPT model, the Gemini ones otherwise', () => {
+    expect(markActivePools(pools, 'Claude Opus 5.5 (Medium)').map((p) => p.active)).toEqual([false, true, undefined]);
+    expect(markActivePools(pools, 'claude-opus-5-5-medium').map((p) => p.active)).toEqual([false, true, undefined]);
+    expect(markActivePools(pools, 'Gemini 3.8 Flash (High)').map((p) => p.active)).toEqual([true, false, undefined]);
+  });
+
+  it('marks nothing when the model is not known — a guess would be highlighted as fact', () => {
+    expect(markActivePools(pools, undefined)).toEqual(pools);
   });
 });

@@ -1,5 +1,6 @@
 import type { ConversationAddress, ConversationRef } from '../core/conversation.js';
 import type {
+  AgentStatus,
   ButtonInteraction,
   CommandInteraction,
   InboundMessage,
@@ -158,6 +159,25 @@ export interface PlatformAdapter {
    * and the question is only asked at the moment a topic has to be chosen.
    */
   useScheduleLookup?(lookup: (ref: ConversationRef) => boolean): void;
+
+  /**
+   * Show the agent's live status for the conversation at an address — model, context, cost, cache
+   * expiry, quota — somewhere that is not a message. `undefined` clears it.
+   *
+   * Optional, and the web UI is the only implementor, for the reason useWorkdirLookup gives: a chat
+   * app has nowhere persistent to put a status line, and the footer already appends the stable part
+   * of it to every reply. The page has a strip above its composer that exists only for this.
+   *
+   * PUSHED, unlike the three lookups above, and for the opposite reason: every one of these values
+   * changes at a moment the daemon already sees — a `usage_update`, a status-line frame, a turn
+   * ending — and nothing changes it in between. Polling would mean asking every topic, forever, a
+   * question whose answer only moves while its agent is talking. The caller throttles and drops
+   * repeats (see daemon/status-board.ts), so an implementation may treat each call as a change.
+   *
+   * Synchronous and best-effort: the caller swallows a throw, and nothing about a turn may depend on
+   * it having been shown.
+   */
+  setStatus?(address: ConversationAddress, status: AgentStatus | undefined): void;
 
   /** Send a message with buttons (used by clarify). */
   sendButtons(

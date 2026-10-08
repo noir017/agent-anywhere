@@ -107,6 +107,16 @@ describe('webui adapter: topics', () => {
     expect((await a.fetchHistory(one, {})).map((m) => m.content)).toEqual(['in one']);
     expect(await a.fetchHistory(two, {})).toEqual([]);
   });
+
+  it('shows a status strip, and refuses one for an address that is not its topic', async () => {
+    // The one platform that implements setStatus. It throws on a bad address like every outbound
+    // method here; the daemon's status board is what swallows that.
+    const a = adapter();
+    expect(typeof a.setStatus).toBe('function');
+    const address = await somewhere(a);
+    expect(() => a.setStatus!(address, { agent: 'cc' })).not.toThrow();
+    expect(() => a.setStatus!({ channel: CHANNEL, thread: 'deadbeef' }, { agent: 'cc' })).toThrow(/no such topic/);
+  });
 });
 
 describe('webui adapter: outbound', () => {

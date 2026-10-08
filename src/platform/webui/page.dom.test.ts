@@ -27,7 +27,7 @@
  * the same way, as a `fake-indexeddb` factory the harness can hand to a SECOND page so a reload,
  * or a daemon restart under a page that is still open, can be driven end to end.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { JSDOM, type DOMWindow } from 'jsdom';
 import { IDBFactory } from 'fake-indexeddb';
 
@@ -2363,5 +2363,131 @@ describe('webui page: recording a voice message', () => {
     await tick();
     expect(h.el('note').textContent).toContain('Could not record: Permission denied');
     expect(h.recorders).toHaveLength(0);
+  });
+});
+
+describe('webui page: the agent status strip', () => {
+  const T = 'a1b2c3d4';
+  const OTHER = 'b2c3d4e5';
+  const CC = {
+    agent: 'cc',
+    model: 'claude-opus-5-5',
+    effort: 'high',
+    context: { used: 230_000, size: 1_000_000 },
+    cost: { amount: 1.2391, currency: 'USD' },
+  };
+  const strip = (h: Harness): HTMLElement => h.el('status');
+
+  it('stays hidden until the daemon has something to say, and shows what it says', async () => {
+    const h = await open();
+    await h.emit(sync(T, [], [T]));
+    // A topic whose agent has not reported since the daemon started: nothing, not a row of zeros.
+    expect(strip(h).hidden).toBe(true);
+
+    await h.emit({ t: 'status', status: CC });
+    expect(strip(h).hidden).toBe(false);
+    const text = strip(h).textContent ?? '';
+    expect(text).toContain('cc · claude-opus-5-5 · high');
+    expect(text).toContain('23%');
+    // The same units as the footer under every reply, so the two can be compared.
+    expect(text).toContain('230k/1M');
+    expect(text).toContain('$1.24');
+  });
+
+  it('colours the context as it fills, at the same thresholds as the agy status line', async () => {
+    const h = await open();
+    await h.emit(sync(T, [], [T]));
+    const ctx = (used: number) => ({ ...CC, context: { used, size: 1000 } });
+    const cls = () => strip(h).querySelectorAll('.st')[1]?.className;
+    await h.emit({ t: 'status', status: ctx(100) });
+    expect(cls()).toBe('st');
+    await h.emit({ t: 'status', status: ctx(600) });
+    expect(cls()).toBe('st warn');
+    await h.emit({ t: 'status', status: ctx(850) });
+    expect(cls()).toBe('st bad');
+  });
+
+  it('counts the cache down here, from the one expiry the daemon sent', async () => {
+    const h = await open();
+    const now = Date.now();
+    await h.emit(sync(T, [], [T], { status: { ...CC, cacheExpiresAt: now + 41 * 60_000 + 30_000 } }));
+    expect(strip(h).textContent).toContain('cache 41m');
+
+    await h.emit({ t: 'status', status: { ...CC, cacheExpiresAt: now + 3 * 60_000 } });
+    const cache = [...strip(h).querySelectorAll('.st')].find((s) => s.textContent?.startsWith('cache'));
+    // Under five minutes is the moment it is worth sending the next message to keep it.
+    expect(cache?.className).toBe('st warn');
+
+    await h.emit({ t: 'status', status: { ...CC, cacheExpiresAt: now - 1000 } });
+    expect(strip(h).textContent).toContain('cache expired');
+  });
+
+  it('shows the pools being spent from, and every pool once tapped open', async () => {
+    const h = await open();
+    const agy = {
+      agent: 'agy',
+      model: 'Claude Opus 5.5 (Medium)',
+      quota: [
+        { id: '3p-5h', remaining: 1, resetsAt: Date.now() + 5 * 3600_000, active: true },
+        { id: '3p-weekly', remaining: 0.3, resetsAt: Date.now() + 2 * 86_400_000 + 3 * 3600_000 + 60_000, active: true },
+        { id: 'gemini-weekly', remaining: 1, active: false },
+      ],
+    };
+    await h.emit(sync(T, [], [T], { status: agy }));
+    const text = () => strip(h).textContent ?? '';
+    expect(text()).toContain('3P 5h 100%');
+    // A reset time only once something has been spent; colour once it runs low.
+    expect(text()).not.toContain('3P 5h 100% (');
+    expect(text()).toContain('3P wk 30% (2d 3h)');
+    expect(text()).not.toContain('Gemini');
+
+    await h.click('#status');
+    expect(strip(h).classList.contains('open')).toBe(true);
+    expect(text()).toContain('Gemini wk 100%');
+    expect(strip(h).querySelector('.st.off')?.textContent).toBe('Gemini wk 100%');
+  });
+
+  it('escapes what it is sent — a model name is the agent’s to choose', async () => {
+    const h = await open();
+    await h.emit(sync(T, [], [T], { status: { agent: 'cc', model: '<img src=x onerror=alert(1)>' } }));
+    expect(strip(h).querySelector('img')).toBeNull();
+    expect(strip(h).textContent).toContain('<img src=x onerror=alert(1)>');
+  });
+
+  it('clears when the daemon clears it, and on the way into another topic', async () => {
+    const h = await open();
+    await h.emit(sync(T, [], [T, OTHER], { status: CC }));
+    expect(strip(h).hidden).toBe(false);
+    await h.emit({ t: 'status' });
+    expect(strip(h).hidden).toBe(true);
+
+    await h.emit({ t: 'status', status: CC });
+    // Switching: the strip described the topic being left, and must not sit over the next one
+    // while its sync is on the way.
+    await h.click(`[data-topic="${OTHER}"]`);
+    expect(strip(h).hidden).toBe(true);
+    await h.emit(sync(OTHER, [], [T, OTHER], { status: { agent: 'agy' } }));
+    expect(strip(h).textContent).toBe('agy');
+  });
+
+  it('runs its countdown timer only while there is a countdown on screen', async () => {
+    const h = await open();
+    const set = vi.spyOn(h.window, 'setInterval');
+    const clear = vi.spyOn(h.window, 'clearInterval');
+    await h.emit(sync(T, [], [T], { status: CC }));
+    expect(set).not.toHaveBeenCalled();
+    await h.emit({ t: 'status', status: { ...CC, cacheExpiresAt: Date.now() + 3_600_000 } });
+    expect(set).toHaveBeenCalledTimes(1);
+    expect(set.mock.calls[0]?.[1]).toBe(30_000);
+    await h.emit({ t: 'status', status: CC });
+    expect(clear).toHaveBeenCalledTimes(1);
+  });
+
+  it('drops the token counts on a narrow screen until tapped open', () => {
+    const html = renderPage('Chat', false);
+    const at = html.indexOf('@media(max-width:640px){');
+    expect(html.slice(at)).toContain('#status:not(.open) .st-x{display:none}');
+    // …and not on the desktop, where there is room.
+    expect(html.slice(0, at)).not.toContain('.st-x{display:none}');
   });
 });

@@ -40,7 +40,7 @@ import {
   type ConversationRef,
 } from '../../core/conversation.js';
 import { MessageNotEditableError } from '../../core/outbound-errors.js';
-import type { ButtonInteraction, InboundMessage, SlashCommandSpec } from '../../types.js';
+import type { AgentStatus, ButtonInteraction, InboundMessage, SlashCommandSpec } from '../../types.js';
 import type { ButtonSpec } from '../adapter.js';
 import type { WebuiPlatformConfig } from '../config-schemas.js';
 import { escapeHtml, renderWebMarkdown } from '../web-markdown.js';
@@ -164,6 +164,13 @@ interface Room {
    * per keystroke of a streamed reply. Maintained wherever buttons appear or are stripped.
    */
   awaiting: Set<string>;
+  /**
+   * The agent status the daemon last pushed for this topic (see `setStatus`), and its serialized
+   * form for the repeat check. Lives and dies with the room, like the transcript: after a restart
+   * there is nothing to show until the agent next reports, which is what an absent status says.
+   */
+  status?: AgentStatus;
+  statusKey?: string;
 }
 
 export class WebRoom {
@@ -493,7 +500,10 @@ export class WebRoom {
     const room = this.roomOf(topicId);
     const missed = this.replayFrom(room, topicId, lastEventId);
     const ok = missed
-      ? missed.every((entry) => this.deliver(client, entry.ev, entry.seq))
+      ? missed.every((entry) => this.deliver(client, entry.ev, entry.seq)) &&
+        // Status is state and is not in the backlog (see the `status` event), so a resumed stream
+        // is told the current one outright — it may have changed, or been cleared, during the gap.
+        this.deliver(client, { t: 'status', ...(room.status ? { status: room.status } : {}) })
       : this.deliver(client, this.syncEvent(topicId, room));
     if (ok) {
       console.log(
@@ -535,6 +545,7 @@ export class WebRoom {
       // `w3` are indistinguishable to it — see the field's comment in `protocol.ts`.
       epoch: this.startedAt,
       ...(this.isStale(topicId, room) ? { stale: true } : {}),
+      ...(room.status ? { status: room.status } : {}),
     };
   }
 
@@ -761,6 +772,27 @@ export class WebRoom {
     this.flush(room, topicId);
     this.emit(topicId, { t: 'typing', on });
     this.announceTopics();
+  }
+
+  /**
+   * Replace a topic's agent status, and tell whoever is reading that topic.
+   *
+   * Delivered rather than emitted: it bypasses the backlog and its sequence numbers (see the
+   * `status` event for why), so it reaches the clients on this topic and nobody else — a status is
+   * as per-topic as a message, and only the topic LIST crosses rooms. A repeat is dropped here as
+   * well as by the daemon's board, because a topic can be re-pushed the same status by a reset that
+   * found nothing to clear.
+   */
+  setStatus(topicId: string, status: AgentStatus | undefined): void {
+    const room = this.roomOf(topicId);
+    const key = status ? JSON.stringify(status) : undefined;
+    if (key === room.statusKey) return;
+    room.status = status;
+    room.statusKey = key;
+    const ev: WebEvent = { t: 'status', ...(status ? { status } : {}) };
+    for (const client of [...this.clients]) {
+      if (client.topic === topicId) this.deliver(client, ev);
+    }
   }
 
   /** The registered slash vocabulary, for the page's autocomplete. Not per topic. */

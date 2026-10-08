@@ -5,6 +5,40 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **The web UI shows the agent's live status above the composer.** One line: agent, model and
+  effort; a context meter with tokens used; the session's cost; for claude, when the prompt cache
+  expires; for agy, its quota pools with time to refill. The footer appended to each reply has the
+  stable part of this, but only once per reply. The strip stays current between replies, which is
+  when you decide whether to send the next message before the cache goes cold. Tap the strip to
+  see the details: it wraps, and agy's pools that the current model is not using appear, dimmed.
+  Fields a harness does not report are left out, not shown as zero. On a phone the token counts
+  are hidden until the strip is tapped.
+
+  Nothing is polled. The daemon pushes a status only when something it already handles changes it:
+  an ACP `usage_update`, a frame from agy's status line, the end of a turn. Repeats are dropped and
+  each topic gets at most one update every 2 seconds. Conversations on other platforms do none of
+  this work. The browser counts down from absolute times with a timer that runs twice a minute,
+  and only while a countdown is on screen and the tab is visible. Status events are not numbered
+  and are not kept in the reconnect backlog, so a long turn cannot push the messages a reconnect
+  needs out of it.
+
+  claude's cache expiry is read from Claude Code's own session transcript, once per finished model
+  cycle. That is the only source: headless Claude Code (which is how claude-agent-acp runs it)
+  never runs a `statusLine` command. On 2.1.291 a whole turn produced zero calls. ACP does not carry
+  the cache's 5-minute/1-hour TTL either. The transcript is Claude Code's private format, so if it
+  changes, the strip loses its cache segment and shows nothing wrong. `doctor` reports whether each
+  claude agent's transcript directory exists.
+
+### Fixed
+
+- **agy's status line is now set up on a machine where agy was first used after the daemon
+  started.** The daemon points agy's `statusLine` at its own script, but it used to do that only at
+  startup, and it skips any home where agy has never run. On a new machine the container starts the
+  daemon before anyone logs agy in, so every agy turn reported no context usage until the next
+  restart. The check now runs again before each agy process is started.
+
 ## [1.37.0] - 2026-10-08
 
 ### Added

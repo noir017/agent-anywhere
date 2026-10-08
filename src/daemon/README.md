@@ -23,7 +23,9 @@ session id, agy's conversation id). One conversation holds one session *per agen
 | `agent-acp.ts` | ACP runtime (claude, codex, opencode, gemini, custom) |
 | `session-failure.ts` | claude-agent-acp's typed failure records: the capability that asks for them, and reading one off the wire |
 | `agent-agy.ts` | Antigravity CLI runtime — its own stream-json protocol |
-| `agy-statusline.ts` | The only channel agy reports context usage — and its default model — on: a shim installed into its `statusLine` setting, reporting back over fd 3 |
+| `agy-statusline.ts` | The only channel agy reports context usage — and its default model and quota pools — on: a shim installed into its `statusLine` setting, reporting back over fd 3 |
+| `status-board.ts` | Each conversation's live agent status, pushed (deduped, throttled) to a platform that can show one — the web UI's strip |
+| `claude-transcript.ts` | claude's prompt-cache expiry, read off Claude Code's own transcript (headless Claude Code runs no status line) |
 | `agent-common.ts` | Protocol-agnostic helpers shared by both runtimes |
 | `conversation-store.ts` | Persisted per conversation: the bound agent, each agent's own session id, and the directory it works in |
 | `workdir-scan.ts` | The `/cd` option list: an agent's configured root plus the projects one level inside it |
@@ -538,6 +540,42 @@ still arrives, as a background update. The abandoned prompt is settled by the ad
 the next prompt, so a turn only ends on a `stop` carrying **its own** prompt's response —
 otherwise that late settlement would end the next turn before its reply was read.
 
+## The status strip (`status-board.ts`)
+
+What the footer says once per reply, kept current between replies, for a platform with somewhere to
+put it — `PlatformAdapter.setStatus`, which only the web UI implements (the strip above its
+composer). The registry owns a `StatusBoard` and feeds it from the same `TurnRunnerDeps` that feed
+`/context`: `recordUsage` (context and cost), `recordModel`, `recordEffort`, `recordQuota`, and
+`recordTurnComplete`. `forgetUsage` — `/new`, `/cd`, a rebind — resets it, which clears the strip.
+
+The constraint it is built around is cost, because the user asked for exactly that:
+
+- **Nothing is polled.** Every value arrives on an event the daemon was already handling.
+- **Repeats are dropped and changes throttled**: at most one status per conversation per 2 s,
+  leading and trailing, so a turn emitting a `usage_update` per API call costs the page a few
+  updates and the last one always lands.
+- **A lane on a platform without `setStatus` does no work at all** — in particular no file reads.
+
+Each harness reports a different subset, and an absent field is shown as nothing, never as a zero:
+
+| Field | Source |
+|---|---|
+| model, effort | `onModel` / `onEffort` (ACP config options; agy's `init` or status line) |
+| context | `onUsage` — ACP `usage_update`, agy's status line |
+| cost | `onUsage.cost` — claude and opencode; kept across the mid-stream snapshots that carry none |
+| cache expiry | claude only: `claude-transcript.ts`, read once a moment after each model cycle ends |
+| quota | agy only: its status line, via `onQuota` |
+
+**Why the cache expiry comes off a transcript.** Headless Claude Code runs no status line at all
+(probed on 2.1.291: zero invocations in a whole turn), so the `prompt_cache` its TUI status line is
+handed never exists here, and ACP carries no TTL. The transcript keeps the API's own
+`cache_creation` 5m/1h split and every entry's timestamp; the expiry is the time the last request
+went out plus the TTL its prefix was written with. That file is Claude Code's private format —
+the module header carries the Hyrum's Law warning, and the failure mode is a missing segment, not a
+wrong one. Between reads, a `usage_update` (a request just happened) projects the expiry forward
+with the TTL the last read established, so a long turn does not show a cache expiring that it is
+renewing on every call.
+
 ## Agent runtimes
 
 ```
@@ -818,6 +856,14 @@ is undocumented and carries a Hyrum's Law warning. At the end of a turn `runTurn
 for the post-turn frame, because agy refreshes the count only after `result`, then feeds the same
 `onUsage` the ACP runtimes call. Read that file's header before touching it — it writes to another
 product's config, and it carries `isCliEntry` for the reason the reverse-CLI shim does.
+
+The same frame carries agy's quota pools (`gemini-5h`, `3p-weekly`, …), passed on as `onQuota` with
+the pools the serving model spends from marked `active`. Frames that arrive mid-turn are passed on
+as they land too, for the web UI's status strip; the footer is unaffected, because the settled
+reading reported in the turn's `finally` overwrites them. The status line is wired again before
+every spawn, not only at construction: on a new machine the daemon starts before anyone has logged
+agy in, the construction-time install finds no config directory and skips, and without the
+spawn-time check that home stayed unwired until the next restart.
 
 ### `agent-common.ts`
 

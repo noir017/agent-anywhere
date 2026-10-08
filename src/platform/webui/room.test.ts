@@ -915,3 +915,78 @@ describe('WebRoom: a full topic list makes room instead of refusing', () => {
     expect(room.history(topic, {}).map((m) => m.content)).toEqual(['keep']);
   });
 });
+
+describe('WebRoom: the agent status strip', () => {
+  const STATUS = { agent: 'cc', model: 'claude-opus-5-5', context: { used: 1000, size: 200_000 } };
+
+  it('tells the clients reading that topic, unnumbered, and nobody else', () => {
+    const { room, topic, seen } = attached();
+    const other = room.createTopic('other').id;
+    const elsewhere: Seen[] = [];
+    room.subscribe(other, (id, ev) => elsewhere.push({ id, ev }));
+    seen.length = 0;
+    elsewhere.length = 0;
+
+    room.setStatus(topic, STATUS);
+    expect(seen.map((s) => [s.ev.t, s.id])).toEqual([['status', '']]);
+    expect(last(seen)).toEqual({ t: 'status', status: STATUS });
+    expect(elsewhere).toEqual([]);
+  });
+
+  it('drops a repeat, and says "cleared" with an empty status', () => {
+    const { room, topic, seen } = attached();
+    seen.length = 0;
+    room.setStatus(topic, STATUS);
+    room.setStatus(topic, { ...STATUS });
+    expect(kinds(seen)).toEqual(['status']);
+    room.setStatus(topic, undefined);
+    expect(last(seen)).toEqual({ t: 'status' });
+    room.setStatus(topic, undefined);
+    expect(kinds(seen)).toEqual(['status', 'status']);
+  });
+
+  it('hands the current status to a page that syncs, and none once it is cleared', () => {
+    const { room, topic } = attached();
+    room.setStatus(topic, STATUS);
+    const first: Seen[] = [];
+    room.subscribe(topic, (id, ev) => first.push({ id, ev }));
+    expect(first[0]?.ev).toMatchObject({ t: 'sync', status: STATUS });
+
+    room.setStatus(topic, undefined);
+    const second: Seen[] = [];
+    room.subscribe(topic, (id, ev) => second.push({ id, ev }));
+    expect(second[0]?.ev.t).toBe('sync');
+    expect('status' in (second[0]?.ev ?? {})).toBe(false);
+  });
+
+  it('keeps status out of the backlog, so a busy turn cannot push the messages a resume needs out of it', () => {
+    // A turn can report usage hundreds of times. Were each status numbered and kept, a client that
+    // dropped mid-turn would find its resume point evicted and be re-sent the whole conversation.
+    const { room, topic, seen, off } = attached();
+    room.post(topic, { own: false, html: '<p>one</p>' }, 'one');
+    const lastId = seen.filter((s) => s.id !== '').at(-1)?.id ?? '';
+    off();
+    for (let i = 0; i < 400; i++) room.setStatus(topic, { ...STATUS, context: { used: i, size: 200_000 } });
+    room.post(topic, { own: false, html: '<p>two</p>' }, 'two');
+
+    const resumed: Seen[] = [];
+    room.subscribe(topic, (id, ev) => resumed.push({ id, ev }), lastId);
+    expect(kinds(resumed)).not.toContain('sync');
+    expect(resumed.filter((s) => s.ev.t === 'msg')).toHaveLength(1);
+    // …and since none of those 400 were replayed, the resumed page is told the current one.
+    expect(last(resumed)).toEqual({ t: 'status', status: { ...STATUS, context: { used: 399, size: 200_000 } } });
+  });
+
+  it('tells a resumed page the status was cleared while it was away', () => {
+    const { room, topic, seen, off } = attached();
+    room.setStatus(topic, STATUS);
+    room.post(topic, { own: false, html: '<p>one</p>' }, 'one');
+    const lastId = seen.filter((s) => s.id !== '').at(-1)?.id ?? '';
+    off();
+    room.setStatus(topic, undefined);
+
+    const resumed: Seen[] = [];
+    room.subscribe(topic, (id, ev) => resumed.push({ id, ev }), lastId);
+    expect(last(resumed)).toEqual({ t: 'status' });
+  });
+});

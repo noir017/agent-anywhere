@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { configDir } from '../config/load.js';
 import { isCliEntry } from './reverse-cli-shim.js';
+import type { QuotaPool } from '../types.js';
 import type { AgentUsage } from './agent.js';
 
 /**
@@ -73,11 +74,21 @@ import type { AgentUsage } from './agent.js';
 export const AGY_STATUS_FD = 3;
 export const AGY_STATUS_FD_ENV = 'AGENT_ANYWHERE_AGY_STATUS_FD';
 
-/** What one status-line frame told the daemon. Either half may be missing from any given frame. */
+/** What one status-line frame told the daemon. Any part may be missing from any given frame. */
 export interface AgyStatus {
   usage?: AgentUsage;
   /** The model agy is serving, in whichever spelling its status line used (id or display name). */
   model?: string;
+  /**
+   * agy's usage-quota pools. The snapshot has carried them all along — the operator's own status
+   * line drew them before the daemon took the setting over — but only the TUI ever saw them until
+   * the web UI grew somewhere to show them. Captured on agy 1.3.0 (2026-10-08), four pools:
+   *
+   *   "quota": { "3p-5h":     { "remaining_fraction": 1,         "reset_time": "2026-10-08T11:21:59Z", "reset_in_seconds": 17996 },
+   *              "3p-weekly": { "remaining_fraction": 0.7486224, "reset_time": "2026-10-10T08:15:54Z", … },
+   *              "gemini-5h": { … }, "gemini-weekly": { … } }
+   */
+  quota?: QuotaPool[];
 }
 
 /**
@@ -85,6 +96,12 @@ export interface AgyStatus {
  * commands included, so a frame is parsed as untrusted input — and a name is printed on every reply.
  */
 const MAX_MODEL_CHARS = 120;
+
+/** At most this many quota pools per frame (agy sends four); the rest of a longer list is dropped. */
+const MAX_QUOTA_POOLS = 8;
+
+/** What a pool id may look like — agy's are `gemini-5h`-shaped. Anything else is not from the shim. */
+const POOL_ID = /^[A-Za-z0-9._-]{1,40}$/;
 
 /**
  * Parse one line the shim wrote to the status pipe. Undefined for anything that is not a frame.
@@ -101,7 +118,7 @@ export function parseAgyStatusFrame(line: string): AgyStatus | undefined {
     return undefined;
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
-  const { used, size, model } = parsed as { used?: unknown; size?: unknown; model?: unknown };
+  const { used, size, model, quota } = parsed as { used?: unknown; size?: unknown; model?: unknown; quota?: unknown };
 
   const status: AgyStatus = {};
   if (
@@ -118,8 +135,52 @@ export function parseAgyStatusFrame(line: string): AgyStatus | undefined {
     const name = model.trim();
     if (name && name.length <= MAX_MODEL_CHARS) status.model = name;
   }
-  return status.usage || status.model ? status : undefined;
+  const pools = parseQuota(quota);
+  if (pools) status.quota = pools;
+  return status.usage || status.model || status.quota ? status : undefined;
 }
+
+/**
+ * The frame's quota list, keeping only pools that are whole. A pool with a bad reset time keeps
+ * its fraction and loses the time, because "75% left" is still true without "resets in 2d".
+ */
+function parseQuota(raw: unknown): QuotaPool[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const pools: QuotaPool[] = [];
+  for (const entry of raw.slice(0, MAX_QUOTA_POOLS)) {
+    if (!entry || typeof entry !== 'object') continue;
+    const { id, remaining, resetsAt } = entry as { id?: unknown; remaining?: unknown; resetsAt?: unknown };
+    if (typeof id !== 'string' || !POOL_ID.test(id)) continue;
+    if (typeof remaining !== 'number' || !Number.isFinite(remaining)) continue;
+    const pool: QuotaPool = { id, remaining: Math.min(1, Math.max(0, remaining)) };
+    if (typeof resetsAt === 'number' && Number.isFinite(resetsAt) && resetsAt > 0) pool.resetsAt = resetsAt;
+    pools.push(pool);
+  }
+  return pools.length ? pools : undefined;
+}
+
+/**
+ * Mark the pools the serving model spends from.
+ *
+ * agy meters Gemini and third-party models (Claude, GPT) separately, and names its pools after
+ * which: `gemini-*` and `3p-*`. The test for "is this a third-party model" is the one the shim's
+ * own renderer uses for its `*` marker, so the terminal and the page never disagree about which
+ * pool is live. A pool of neither family, or a turn with no known model, is left unmarked — the
+ * page then shows every pool alike rather than highlighting a guess.
+ */
+export function markActivePools(pools: QuotaPool[], model: string | undefined): QuotaPool[] {
+  if (!model) return pools;
+  const thirdParty = THIRD_PARTY_MODEL.test(model);
+  return pools.map((p) => {
+    const family = p.id.split('-')[0]?.toLowerCase();
+    if (family === '3p' || family === 'claude') return { ...p, active: thirdParty };
+    if (family === 'gemini') return { ...p, active: !thirdParty };
+    return p;
+  });
+}
+
+/** Keep in step with `is3p` in the shim below — see markActivePools. */
+const THIRD_PARTY_MODEL = /claude|gpt|sonnet|haiku|opus|o1|o3|3p/i;
 
 /**
  * Where the shim used to park usage, one file per conversation, before the pipe replaced it. Kept
@@ -310,8 +371,32 @@ function report(d) {
   const m = d.model;
   const model = m && typeof m === 'object' ? (m.id || m.display_name) : m;
   if (typeof model === 'string' && model) frame.model = model;
-  if (frame.size === undefined && frame.model === undefined) return;
+  const quota = quotaFrame(d.quota);
+  if (quota.length) frame.quota = quota;
+  if (frame.size === undefined && frame.model === undefined && frame.quota === undefined) return;
   fs.writeSync(STATUS_FD, JSON.stringify(frame) + '\\n');
+}
+
+// agy's map of pool id → {remaining_fraction, reset_time, reset_in_seconds}, flattened to a list.
+// The absolute reset_time wins over reset_in_seconds, which is relative to a moment nobody wrote
+// down; the fraction is normalised the way render() reads it (a value above 1 is a percentage).
+function quotaFrame(q) {
+  const out = [];
+  if (!q || typeof q !== 'object') return out;
+  for (const id of Object.keys(q)) {
+    const p = q[id];
+    if (!p || typeof p !== 'object') continue;
+    let r = Number(p.remaining_fraction);
+    if (!isFinite(r)) continue;
+    if (r > 1) r = r / 100;
+    const pool = { id: id, remaining: Math.max(0, Math.min(1, r)) };
+    const at = Date.parse(p.reset_time);
+    const secs = Number(p.reset_in_seconds);
+    if (isFinite(at)) pool.resetsAt = at;
+    else if (p.reset_in_seconds !== null && p.reset_in_seconds !== undefined && isFinite(secs)) pool.resetsAt = Date.now() + secs * 1000;
+    out.push(pool);
+  }
+  return out;
 }
 
 function render(d) {
@@ -336,6 +421,7 @@ function modelName(d) {
 }
 
 // The active pool is marked because the two refill independently and only one is being spent.
+// The same test as markActivePools in agy-statusline.ts, so the terminal and the web UI agree.
 function quota(d, model) {
   const q = (d && d.quota) || {};
   const is3p = /claude|gpt|sonnet|haiku|opus|o1|o3|3p/i.test(model);

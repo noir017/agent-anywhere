@@ -65,6 +65,17 @@ export function formatWindow(size: number): string {
   return `${Math.floor(size / 1000)}k`;
 }
 
+/**
+ * A model's short name: the vendor prefix dropped at the last `/`, the name as-is without one.
+ * Undefined when nothing is left (`anthropic/`). Shared with the web UI's status bar, so the same
+ * model reads the same in the footer and above the composer.
+ */
+export function shortModelName(model: string): string | undefined {
+  const slash = model.lastIndexOf('/');
+  const short = slash >= 0 ? model.slice(slash + 1) : model;
+  return short || undefined;
+}
+
 /** Whether both context numbers are usable (a non-positive window can't yield a percentage). */
 function hasContext(input: FooterInput): boolean {
   const { contextTokens, contextLength } = input;
@@ -97,14 +108,8 @@ export function formatRuntimeFooter(input: FooterInput, fields: FooterField[]): 
       }
 
       case 'model': {
-        // Short name: drop the vendor prefix at the last `/`; use as-is without `/`.
-        const model = input.model;
-        if (model) {
-          const slash = model.lastIndexOf('/');
-          const short = slash >= 0 ? model.slice(slash + 1) : model;
-          // Last segment may be empty (e.g. `anthropic/`); only output if non-empty.
-          if (short) parts.push(short);
-        }
+        const short = input.model ? shortModelName(input.model) : undefined;
+        if (short) parts.push(short);
         break;
       }
 

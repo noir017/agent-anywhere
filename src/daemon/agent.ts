@@ -4,6 +4,7 @@ import type {
   EffortSelector,
   ElicitAnswer,
   ModelSelector,
+  QuotaPool,
   ToolEvent,
   ToolFinishEvent,
 } from '../types.js';
@@ -57,6 +58,12 @@ export interface AgentStreamHandlers {
    * undefined when the update no longer carries a level, so a stale one is cleared, not kept.
    */
   onEffort?(effort: string | undefined): void;
+  /**
+   * The harness's usage-quota pools (agy, through its status line — see agy-statusline.ts). A full
+   * snapshot each time, like onUsage. Optional: no ACP harness reports quota in a form the gateway
+   * reads, so for them the status bar simply has no quota segment.
+   */
+  onQuota?(pools: QuotaPool[]): void;
   /**
    * The agent stopped mid-turn to ask the user something (ACP `elicitation/create`), and is
    * blocked on the answer. Resolve with the user's choice, `decline`, or `cancel`.

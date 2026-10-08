@@ -8,6 +8,7 @@ import type {
   ConversationId,
   ElicitAnswer,
   InboundMessage,
+  QuotaPool,
 } from '../types.js';
 import type { PlatformAdapter } from '../platform/adapter.js';
 import type { AgentFactory, AgentStreamHandlers, AgentUsage, FollowUpSink } from './agent.js';
@@ -96,6 +97,18 @@ export interface TurnRunnerDeps {
    * writer: the harness's own `usage_update`, never a guess.
    */
   recordUsage?(id: ConversationId, usage: AgentUsage): void;
+  /**
+   * Record what the harness reported about the session that is not usage — the serving model, its
+   * effort, its quota pools — for a surface that shows them between replies (the web UI's status
+   * strip, via the registry's StatusBoard).
+   *
+   * The footer reads the same facts off the per-turn ref and needs none of these. They exist because
+   * the ref dies with the turn, and a status strip is read after it — the same reason recordUsage
+   * does. Optional, so a test runner that records nothing needs no stubs.
+   */
+  recordModel?(id: ConversationId, model: string): void;
+  recordEffort?(id: ConversationId, effort: string | undefined): void;
+  recordQuota?(id: ConversationId, pools: QuotaPool[]): void;
   /**
    * Record that a turn ran to completion here.
    *
@@ -454,10 +467,14 @@ export class TurnRunner {
       // Same for the live model name (see TurnRef.model for why it beats the configured value).
       onModel: (model) => {
         ref.model = model;
+        this.deps.recordModel?.(conversationId, model);
       },
       onEffort: (effort) => {
         ref.effort = effort;
+        this.deps.recordEffort?.(conversationId, effort);
       },
+      // Nothing per-turn reads quota — the footer has no field for it — so it goes straight through.
+      onQuota: (pools) => this.deps.recordQuota?.(conversationId, pools),
       /**
        * An aside about this turn — the harness logged an error and is retrying.
        *
@@ -756,14 +773,17 @@ export class TurnRunner {
       },
       onModel: (model) => {
         facts.model = model;
+        this.deps.recordModel?.(conversationId, model);
         const live = peek();
         if (live) live.ref.model = model;
       },
       onEffort: (effort) => {
         facts.effort = effort;
+        this.deps.recordEffort?.(conversationId, effort);
         const live = peek();
         if (live) live.ref.effort = effort;
       },
+      onQuota: (pools) => this.deps.recordQuota?.(conversationId, pools),
       // A background cycle's own failure, or a retry inside one (see session-failure.ts). Sent
       // straight to the lane rather than through open(): a notice is not output, and opening the
       // burst's message for it would post a follow-up marker over nothing. Unordered against a

@@ -12,6 +12,7 @@ import type {
   ReclaimState,
   RunTurnInput,
 } from './agent.js';
+import type { QuotaPool } from '../types.js';
 import type { ConversationStore } from './conversation-store.js';
 import {
   buildAgentEnv,
@@ -21,7 +22,13 @@ import {
   resolveConversationCwd,
   truncateToolName,
 } from './agent-common.js';
-import { AGY_STATUS_FD, AGY_STATUS_FD_ENV, ensureAgyStatusLine, parseAgyStatusFrame } from './agy-statusline.js';
+import {
+  AGY_STATUS_FD,
+  AGY_STATUS_FD_ENV,
+  ensureAgyStatusLine,
+  markActivePools,
+  parseAgyStatusFrame,
+} from './agy-statusline.js';
 import { agentHome } from './skills-scan.js';
 
 const execFile = promisify(execFileCb);
@@ -49,7 +56,8 @@ const execFile = promisify(execFileCb);
  *   event:"result"                 ↔ turn end (status SUCCESS, else an error for the upper layer)
  *   init.conversation_id           ↔ SessionStore entry, replayed via --conversation after a restart
  *   init.model                     ↔ onModel (stored at spawn, replayed at the start of every turn)
- *   status line, over fd 3         ↔ onUsage, and onModel when `init` named none (agy-statusline.ts)
+ *   status line, over fd 3         ↔ onUsage and onQuota (live, and settled at turn end), and onModel
+ *                                    when `init` named none (agy-statusline.ts)
  *   SIGINT                         ↔ abort (agy has no in-band cancel message)
  *
  * agy pushes no command list over the wire, so onAvailableCommands is never called and no native
@@ -368,8 +376,27 @@ export function createAgyAgentFactory(
   // Point agy's status line at this daemon's shim, once per distinct home among the agy agents —
   // it is the only channel through which agy reports context usage (see agy-statusline.ts).
   const wiredHomes = new Set<string>();
+  /**
+   * Wire one home's status line unless it already is, and say whether it is now.
+   *
+   * Asked again before every spawn rather than only here at construction, because the install
+   * deliberately skips a home where agy has never run (agy-statusline.ts `installStatusLine`) — and
+   * on a new machine that is the normal state when the daemon comes up: the container starts the
+   * daemon, and only afterwards does the operator log agy in, which is what creates the directory.
+   * Checked once, that home stayed unwired until the next daemon restart and every agy turn in
+   * between reported no context at all. A spawn is rare (one per conversation per child) and the
+   * check is an existsSync when there is nothing to do, so asking each time costs nothing.
+   */
+  function wireStatusLine(home: string): boolean {
+    if (wiredHomes.has(home)) return true;
+    if (ensureAgyStatusLine(home) === 'skipped') return false;
+    wiredHomes.add(home);
+    return true;
+  }
+  // Still done eagerly as well: the operator's own interactive agy reads the same setting, and
+  // should find the shim drawing its status line from the moment the daemon is up.
   for (const home of new Set(cfg.agents.filter((a) => a.harness === 'agy').map((a) => agentHome(a)))) {
-    if (ensureAgyStatusLine(home) !== 'skipped') wiredHomes.add(home);
+    wireStatusLine(home);
   }
 
   /**
@@ -407,7 +434,7 @@ export function createAgyAgentFactory(
           },
           awaitModels,
           fetchModels,
-          wiredHomes.has(agentHome(def)) ? statusSilence : undefined
+          () => (wireStatusLine(agentHome(def)) ? statusSilence : undefined)
         );
         sessions.set(sessionId, s);
       }
@@ -455,11 +482,15 @@ function createAgySession(
   /** Re-run `agy models` into the factory's cache (see AgentSession.refreshModels). */
   refreshModels?: () => Promise<void>,
   /**
-   * Called when a turn succeeded without this child's status line reporting once. Undefined when
-   * no frames are expected (see the factory), which is what keeps a deliberate opt-out quiet.
+   * Make sure the status line is wired for this agent's home, and get back what to call when a
+   * turn finishes without a single frame — undefined when no frames are expected (the opt-out, or
+   * agy still has no config there), which is what keeps a deliberate opt-out quiet. Asked at every
+   * spawn; see the factory's `wireStatusLine` for why not once.
    */
-  onStatusSilence?: () => void
+  statusLineAtSpawn?: () => (() => void) | undefined
 ): AgentSession {
+  /** What statusLineAtSpawn answered for the current child. */
+  let onStatusSilence: (() => void) | undefined;
   /**
    * The directory this session's child runs in — and, through `--add-dir`, the one it is allowed to
    * write to. Resolved per SPAWN rather than once per session so a `/cd` that disposed the child
@@ -500,6 +531,16 @@ function createAgySession(
    */
   let statusModel: string | undefined;
   let statusUsage: AgentUsage | undefined;
+  /**
+   * The quota pools the status line last reported. Per CONVERSATION like usage, and for a stronger
+   * reason: a pool belongs to the account, so a respawn changes nothing about it.
+   */
+  let statusQuota: QuotaPool[] | undefined;
+  /**
+   * The running turn's handlers, so a frame that arrives mid-turn can be passed on as it lands
+   * (see handleStatusLine). Undefined between turns.
+   */
+  let liveHandlers: AgentStreamHandlers | undefined;
   /** Frames this child's status line delivered; zero after a whole turn is the "channel broke" signal. */
   let statusFrames = 0;
   /** A settle wait on this child already ran its full bound without a frame; don't pay it every turn. */
@@ -561,11 +602,35 @@ function createAgySession(
     statusFrames++;
     if (status.usage) statusUsage = status.usage;
     if (status.model) statusModel = status.model;
+    if (status.quota) statusQuota = status.quota;
+    // Passed on as it lands, for a surface that shows the numbers while the turn runs (the web UI's
+    // status bar) — the footer is unaffected, because it is built from the settled reading the
+    // turn's `finally` reports, which overwrites these. A frame here can be one model step stale
+    // (see settleUsage); for a live readout that is still the newest thing known.
+    if (liveHandlers) {
+      if (status.usage) liveHandlers.onUsage?.(status.usage);
+      if (status.quota) liveHandlers.onQuota?.(markActivePools(status.quota, servingModel()));
+    }
     wakeStatusWaiters();
   }
 
   function wakeStatusWaiters(): void {
     for (const wake of statusWaiters.splice(0)) wake();
+  }
+
+  /**
+   * Context numbers, quota and — when `init` named none — the model, read at the end of the turn
+   * they describe (on success, once settleUsage has seen the post-turn frame). agy publishes all of
+   * them only through its status line (see agy-statusline.ts), so they arrive out of band on the
+   * fd-3 pipe; the footer is built after this returns. Called from the turn's `finally`, because a
+   * turn that failed still consumed the window, and the footer of the message reporting the
+   * failure should say so.
+   */
+  function reportSettled(handlers: AgentStreamHandlers): void {
+    if (statusUsage) handlers.onUsage?.(statusUsage);
+    const model = servingModel();
+    if (model) handlers.onModel?.(model);
+    if (statusQuota) handlers.onQuota?.(markActivePools(statusQuota, model));
   }
 
   /**
@@ -654,6 +719,9 @@ function createAgySession(
     // Re-read the conversation's directory: a `/cd` since the last child disposed it, and this is
     // the only point at which the new one can be honored (agy takes its cwd at spawn).
     cwd = resolveConversationCwd(def, conversationId, store);
+    // Before the spawn, because agy reads its settings at startup: a status line wired after this
+    // line would not be drawn by this child at all.
+    onStatusSilence = statusLineAtSpawn?.();
 
     // Replay this session's prior conversation so a daemon restart keeps the context (the ACP
     // runtime's session/load equivalent). agy owns the history on its own disk; we only remember which.
@@ -817,6 +885,7 @@ function createAgySession(
       };
 
       // Install the sink BEFORE writing the prompt, so no event can arrive unclaimed.
+      liveHandlers = handlers;
       const done = new Promise<void>((resolve, reject) => {
         currentTurn = makeTurnSink(state, {
           done: () => {
@@ -848,15 +917,8 @@ function createAgySession(
         if (aborting) return; // intentional abort/dispose is not an error
         throw err;
       } finally {
-        // Context numbers and — when `init` named none — the model, read at the end of the turn
-        // they describe (on success, once settleUsage has seen the post-turn frame). agy publishes
-        // both only through its status line (see agy-statusline.ts), so they arrive out of band on
-        // the fd-3 pipe; the footer is built after this returns. In `finally`, because a turn that
-        // failed still consumed the window, and the footer of the message reporting the failure
-        // should say so.
-        if (statusUsage) handlers.onUsage?.(statusUsage);
-        const model = servingModel();
-        if (model) handlers.onModel?.(model);
+        liveHandlers = undefined;
+        reportSettled(handlers);
       }
     },
 

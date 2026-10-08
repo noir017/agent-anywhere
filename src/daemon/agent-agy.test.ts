@@ -19,7 +19,8 @@ import {
 import { buildInputPreview } from './agent-common.js';
 import { AGY_STATUS_FD, AGY_STATUS_FD_ENV, ensureAgyStatusLine } from './agy-statusline.js';
 import { AgentDefSchema, type Config } from '../config/schema.js';
-import type { AgentStreamHandlers } from './agent.js';
+import type { AgentStreamHandlers, AgentUsage } from './agent.js';
+import type { QuotaPool } from '../types.js';
 
 // Pass-throughs by default, so every test that never spawns is untouched; the session tests at the
 // bottom swap in a scripted child. The status-line install is stubbed so no test can reach the
@@ -637,7 +638,7 @@ describe('agy session — what the status pipe tells the footer', () => {
   }
 
   function recordingHandlers() {
-    const seen: { models: string[]; usage: unknown[] } = { models: [], usage: [] };
+    const seen: { models: string[]; usage: AgentUsage[]; quota: QuotaPool[][] } = { models: [], usage: [], quota: [] };
     const handlers: AgentStreamHandlers = {
       onText: () => {},
       onToolStart: () => {},
@@ -645,6 +646,7 @@ describe('agy session — what the status pipe tells the footer', () => {
       onSegmentBreak: () => {},
       onModel: (m) => seen.models.push(m),
       onUsage: (u) => seen.usage.push(u),
+      onQuota: (q) => seen.quota.push(q),
     };
     return { seen, handlers };
   }
@@ -710,7 +712,12 @@ describe('agy session — what the status pipe tells the footer', () => {
 
     await session.runTurn({ prompt: 'hi', sessionToken: 'sess_x' }, handlers);
 
-    expect(seen.usage).toEqual([{ used: 16926, size: 1048576 }]);
+    // The footer is built from the LAST reading, so that is the one that must be the fresh frame.
+    // Earlier readings are the live ones passed on mid-turn for the web UI's status strip — and if
+    // the settle wait were skipped, the fresh frame would land after the turn had stopped
+    // listening, leaving the stale one last.
+    expect(seen.usage.at(-1)).toEqual({ used: 16926, size: 1048576 });
+    expect(seen.usage.slice(0, -1).every((u) => u.used === 0 || u.used === 16926)).toBe(true);
     expect(seen.models.at(-1)).toBe('gemini-3.8-flash-high');
     factory.dispose('conv-1');
   });
@@ -775,6 +782,68 @@ describe('agy session — what the status pipe tells the footer', () => {
     await session.runTurn({ prompt: 'one', sessionToken: 'sess_x' }, recordingHandlers().handlers);
 
     expect(warn.mock.calls.filter((c) => String(c[0]).includes(`fd ${AGY_STATUS_FD}`))).toEqual([]);
+    factory.dispose('conv-1');
+  });
+
+  it('wires a home at spawn that had no agy config when the daemon started', async () => {
+    // A new machine: the daemon comes up before anyone has logged agy in, so the construction-time
+    // install finds no directory and skips. Logging in creates it; the next spawn must wire it,
+    // rather than leave every agy turn without numbers until the daemon happens to restart.
+    vi.mocked(ensureAgyStatusLine).mockReset().mockReturnValueOnce('skipped').mockReturnValue('installed');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    scriptSpawn(INIT_DEFAULT);
+    const factory = makeFactory();
+    expect(ensureAgyStatusLine).toHaveBeenCalledTimes(1);
+    const session = factory.getOrCreate('conv-1', 'ag');
+
+    await session.runTurn({ prompt: 'one', sessionToken: 'sess_x' }, recordingHandlers().handlers);
+
+    expect(ensureAgyStatusLine).toHaveBeenCalledTimes(2);
+    // Wired now, so silence on the pipe is a finding again — the proof the spawn-time answer is
+    // the one the session acts on, not the one from construction.
+    expect(warn.mock.calls.filter((c) => String(c[0]).includes(`fd ${AGY_STATUS_FD}`))).toHaveLength(1);
+    factory.dispose('conv-1');
+    vi.mocked(ensureAgyStatusLine).mockReset().mockReturnValue('skipped');
+  });
+
+  it('passes the quota pools on, marking the ones the serving model spends from', async () => {
+    const quota = [
+      { id: '3p-5h', remaining: 1, resetsAt: 1791459045263 },
+      { id: '3p-weekly', remaining: 0.75, resetsAt: 1791627354000 },
+      { id: 'gemini-weekly', remaining: 1 },
+    ];
+    const frame = JSON.stringify({ used: 100, size: 1000, model: 'Claude Opus 5.5 (Medium)', quota });
+    scriptSpawn(INIT_DEFAULT, { boot: [frame], after: [JSON.stringify({ used: 200, size: 1000, quota })] });
+    const factory = makeFactory();
+    const session = factory.getOrCreate('conv-1', 'ag');
+    const { seen, handlers } = recordingHandlers();
+
+    await session.runTurn({ prompt: 'hi', sessionToken: 'sess_x' }, handlers);
+
+    expect(seen.quota.at(-1)).toEqual([
+      { id: '3p-5h', remaining: 1, resetsAt: 1791459045263, active: true },
+      { id: '3p-weekly', remaining: 0.75, resetsAt: 1791627354000, active: true },
+      { id: 'gemini-weekly', remaining: 1, active: false },
+    ]);
+    factory.dispose('conv-1');
+  });
+
+  it('passes a reading on while the turn is still running, not only at its end', async () => {
+    // For the web UI's status strip: a long turn's context grows step by step, and a strip that
+    // moved only when the turn ended would show the start of the turn for its whole length. The
+    // mid-turn reading differs from the settled one, so only live forwarding can produce it.
+    scriptSpawn(INIT_DEFAULT, {
+      during: [JSON.stringify({ used: 50, size: 1000 })],
+      after: [JSON.stringify({ used: 60, size: 1000 })],
+    });
+    const factory = makeFactory();
+    const session = factory.getOrCreate('conv-1', 'ag');
+    const { seen, handlers } = recordingHandlers();
+
+    await session.runTurn({ prompt: 'hi', sessionToken: 'sess_x' }, handlers);
+
+    expect(seen.usage[0]).toEqual({ used: 50, size: 1000 });
+    expect(seen.usage.at(-1)).toEqual({ used: 60, size: 1000 });
     factory.dispose('conv-1');
   });
 });

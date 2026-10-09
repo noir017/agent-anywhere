@@ -1,7 +1,7 @@
 import type { Config } from '../config/schema.js';
 import { findAgent } from '../config/schema.js';
 import { looksLikeCommand } from './routing.js';
-import type { AgentCommand, InboundMessage, SessionId } from '../types.js';
+import type { AgentCommand, AgentElicitation, ElicitAnswer, InboundMessage, SessionId } from '../types.js';
 import type { PlatformAdapter } from '../platform/adapter.js';
 import type { AgentFactory, AgentStreamHandlers } from './agent.js';
 import { StreamBuffer } from '../core/stream-buffer.js';
@@ -31,6 +31,25 @@ export interface TurnRunnerDeps {
   deleteActiveChannel(sessionId: SessionId): void;
 }
 
+/** Callbacks a turn raises to the daemon. Shared with SessionRegistry, which only passes them through. */
+export interface TurnRunnerHooks {
+  onAvailableCommands?(sessionId: SessionId, cmds: AgentCommand[]): void;
+  /**
+   * The agent asked the user a question mid-turn and is blocked on it (ACP elicitation).
+   * Resolves with what the user picked, or a cancel when nobody did.
+   *
+   * Takes the turn's platform and channel rather than resolving them from the session: the
+   * question belongs in the lane this turn is already answering in — which on autoThread is a
+   * thread that did not exist when the session was created.
+   */
+  onElicitRequest?(
+    sessionId: SessionId,
+    platform: PlatformAdapter,
+    channelId: string,
+    request: AgentElicitation
+  ): Promise<ElicitAnswer>;
+}
+
 /**
  * Single-turn orchestrator: all timing logic for running one turn — register the TurnContext
  * (channel/token), wire StreamBuffer / ToolRenderer, drive the agent turn, and preserve observable
@@ -49,12 +68,11 @@ export class TurnRunner {
     private readonly clock: { now(): number; schedule(fn: () => void, ms: number): () => void },
     private readonly deps: TurnRunnerDeps,
     /**
-     * Optional callback hooks. onAvailableCommands: fired when a session's agent reports its command
-     * list (daemon aggregates and dynamically registers native slash). Absent = don't care (test/no-slash).
+     * Optional callback hooks (see TurnRunnerHooks). onAvailableCommands: fired when a session's agent
+     * reports its command list (daemon aggregates and dynamically registers native slash);
+     * onElicitRequest: the agent asked the user a question. Absent = don't care (test/no-slash).
      */
-    private readonly hooks?: {
-      onAvailableCommands?(sessionId: SessionId, cmds: AgentCommand[]): void;
-    }
+    private readonly hooks?: TurnRunnerHooks
   ) {}
 
   /**
@@ -144,7 +162,7 @@ export class TurnRunner {
     try {
       await agent.runTurn(
         { prompt, sessionToken, model: this.deps.getModelOverride(sessionId) },
-        this.buildStreamHandlers(sessionId, ref, makeStream, tools, enqueue)
+        this.buildStreamHandlers(sessionId, ref, makeStream, tools, enqueue, platform, channelId)
       );
       await effects;                       // wait for all queued side effects to land
       if (signal?.aborted) {
@@ -200,7 +218,10 @@ export class TurnRunner {
     ref: { stream: StreamBuffer; producedOutput: boolean },
     makeStream: () => StreamBuffer,
     tools: ToolRenderer,
-    enqueue: (fn: () => Promise<void> | void) => void
+    enqueue: (fn: () => Promise<void> | void) => void,
+    /** Where a question to the user is posted — the lane this turn is already writing to. */
+    platform: PlatformAdapter,
+    channelId: string
   ): AgentStreamHandlers {
     return {
       onText: (delta) => {
@@ -229,6 +250,29 @@ export class TurnRunner {
           this.hooks?.onAvailableCommands?.(sessionId, cmds);
         } catch (e) {
           console.error('[turn] onAvailableCommands hook failed:', e instanceof Error ? e.message : e);
+        }
+      },
+      /**
+       * The agent stopped to ask the user something. Post it as buttons and block this ACP request
+       * until they answer.
+       *
+       * NOT enqueued onto the effects chain, unlike the rendering handlers above: that chain is what
+       * serializes rendering, and parking a minutes-long wait in it would freeze the reply text
+       * behind the question — including the sentence that explains why the question is being
+       * asked. The question is its own message in the same channel, so nothing it does can
+       * interleave with the body stream.
+       *
+       * With no hook wired (tests, a daemon built without one) the answer is `cancel`: the agent
+       * learns nobody answered, rather than waiting on a promise that never settles.
+       */
+      onElicit: async (request) => {
+        const ask = this.hooks?.onElicitRequest;
+        if (!ask) return { action: 'cancel' };
+        try {
+          return await ask(sessionId, platform, channelId, request);
+        } catch (e) {
+          console.error('[turn] onElicitRequest hook failed:', e instanceof Error ? e.message : e);
+          return { action: 'cancel' };
         }
       },
     };

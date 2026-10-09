@@ -157,6 +157,11 @@ agent-anywhere ask "Deploy to production?" -o Deploy -o "Dry run" -o Cancel
 `ask` blocks until the user taps a button and prints the chosen label. Also:
 `send-message`, `reply`, `edit-message`, `delete`.
 
+On Claude Code the agent doesn't need `ask` to get buttons: its own
+`AskUserQuestion` tool reaches the chat the same way (over ACP elicitation),
+with each option's reasoning shown above the buttons. Harnesses without a
+question tool of their own keep using `ask`.
+
 A per-turn hint lets any agent discover these commands; the bundled
 [skill](skill/SKILL.md) provides the full playbook:
 

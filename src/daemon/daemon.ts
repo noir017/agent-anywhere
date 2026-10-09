@@ -3,8 +3,11 @@ import type { Config } from '../config/schema.js';
 import type { PlatformAdapter } from '../platform/adapter.js';
 import type {
   AgentCommand,
+  AgentElicitation,
   ButtonInteraction,
   CommandInteraction,
+  ElicitAnswer,
+  ElicitQuestion,
   InboundMessage,
   MessageRef,
   SessionId,
@@ -72,6 +75,17 @@ const DEDUP_TTL_MS = 15_000;
 /** Default timeout for an unclicked ask/clarify button (fallback when action.timeoutMs is absent). */
 const DEFAULT_ASK_TIMEOUT_MS = 120_000;
 
+/**
+ * How long one round of an agent's own question (ACP elicitation) waits for a tap.
+ *
+ * Longer than the CLI `ask` default, because nothing else can set it: `ask` takes `--timeout` from
+ * the agent that runs it, while an elicitation carries no deadline at all. The agent is blocked
+ * mid-turn on a person who may be away from the chat, and a question that times out is cancelled
+ * and its turn carries on without the answer — so too short a wait spends the whole point of
+ * asking, while too long a one only keeps a turn that is already waiting open a little longer.
+ */
+const ELICIT_TIMEOUT_MS = 600_000;
+
 /** ask button custom_id prefix. Format `ask:<reqId>:<index>` (must not start with `input`). */
 const ASK_PREFIX = 'ask:';
 
@@ -91,6 +105,28 @@ export function parseAskButtonId(
   // Accept only a non-negative integer string (reject empty/non-digit; Number('') would be 0).
   if (!reqId || !/^\d+$/.test(indexStr)) return null;
   return { reqId, index: Number(indexStr) };
+}
+
+/**
+ * The message body posted above one elicitation round's buttons (pure, testable).
+ *
+ * Two things a button row cannot carry, so they go here:
+ *  - the option rationales, which are often the most useful part of the question ("you already
+ *    run pgvector here, so reusing it costs nothing") and are why asking with buttons beats
+ *    asking in prose;
+ *  - a position marker, so a multi-question form reads as 2-of-3 rather than as three unrelated
+ *    questions arriving in a row.
+ *
+ * Options with no rationale contribute no line at all, rather than a label followed by an empty
+ * dash — a form where none of them has one then renders as a bare question, which is right.
+ */
+export function composeElicitPrompt(q: ElicitQuestion, index: number, total: number): string {
+  const heading = total > 1 ? `(${index + 1}/${total}) ${q.prompt}` : q.prompt;
+  const detail = q.options
+    .filter((o) => o.description)
+    .map((o) => `**${o.label}** — ${o.description}`)
+    .join('\n');
+  return detail ? `${heading}\n\n${detail}` : heading;
 }
 
 /**
@@ -208,6 +244,9 @@ export class Daemon {
     this.registry = new SessionRegistry(config, platforms, agents, clock, {
       // A session's agent reported available commands → record and debounce re-registration of the union.
       onAvailableCommands: (sessionId, cmds) => this.onAgentCommands(sessionId, cmds),
+      // The agent stopped mid-turn to ask the user something (ACP elicitation) → buttons.
+      onElicitRequest: (sessionId, platform, channelId, request) =>
+        this.onElicitRequest(sessionId, platform, channelId, request),
     }, store);
     this.ipc = new IpcServer(socketPath, {
       // resolveChannel is also the sole capture point for the session owning this reverse command:
@@ -386,43 +425,117 @@ export class Daemon {
     action: Extract<IpcAction, { kind: 'ask' }>,
     channelId: string
   ): Promise<{ chosen: string | null }> {
-    const labels = action.options;
     // Anchor session: read the stash before any await (later awaits yield, allowing a subsequent
     // dispatch to overwrite the value).
     const sessionId = this.lastResolvedSessionId;
     // Empty-options fast path: protocol options has no min(1), so an empty array would post a
     // "no buttons" message and idle until timeoutMs. With nothing to pick, return "no selection" now.
-    if (labels.length === 0) {
+    if (action.options.length === 0) {
       return { chosen: null };
     }
+    const chosen = await this.askButtons(
+      platform,
+      channelId,
+      action.prompt,
+      action.options,
+      action.timeoutMs ?? DEFAULT_ASK_TIMEOUT_MS,
+      sessionId
+    );
+    return { chosen };
+  }
+
+  /**
+   * Post one question as buttons and resolve with the label the user tapped (null on timeout).
+   *
+   * Shared by the two ways a question reaches the user: the `ask` reverse command, and the agent's
+   * own ACP elicitation. One implementation because the mechanics are identical — the difference is
+   * only who asked and how the answer travels back — and two copies would drift on the details
+   * (editing the posted message on resolve, stripping its buttons, the eviction-guard anchor).
+   */
+  private async askButtons(
+    platform: PlatformAdapter,
+    channelId: string,
+    prompt: string,
+    labels: string[],
+    timeoutMs: number,
+    sessionId: SessionId | undefined
+  ): Promise<string | null> {
     const reqId = randomUUID().slice(0, 8);
     // custom_id: `ask:` prefix + index (≤100 chars; must not start with `input`).
     const buttons = labels.map((label, i) => ({
       id: `${ASK_PREFIX}${reqId}:${i}`,
       label,
     }));
-    const ref = await platform.sendButtons(channelId, action.prompt, buttons);
+    const ref = await platform.sendButtons(channelId, prompt, buttons);
 
-    const timeoutMs = action.timeoutMs ?? DEFAULT_ASK_TIMEOUT_MS;
-    return new Promise<{ chosen: string | null }>((resolve) => {
+    return new Promise<string | null>((resolve) => {
       const timer = setTimeout(() => {
         this.pendingAsks.delete(reqId);
         // best-effort: strip buttons and mark timed out (editMessage with text only drops components).
         void platform
-          .editMessage(ref, `${action.prompt}\n\n(timed out)`)
+          .editMessage(ref, `${prompt}\n\n(timed out)`)
           .catch(() => undefined);
-        resolve({ chosen: null });
+        resolve(null);
       }, timeoutMs);
       this.pendingAsks.set(reqId, {
-        resolve: (label) => resolve({ chosen: label }),
+        resolve,
         timer,
         ref,
         labels,
-        prompt: action.prompt,
+        prompt,
         adapter: platform,
         sessionId,
       });
     });
+  }
+
+  /**
+   * The agent stopped mid-turn to ask the user something (ACP elicitation) — put each question to
+   * them as buttons, in order, and hand back what they picked.
+   *
+   * ── Why this exists at all ────────────────────────────────────────────────────────────────────
+   * Because the alternative is the model guessing. The `claude` harness keeps its AskUserQuestion
+   * tool disabled unless the client advertises `elicitation.form` (see agent-acp's initialize), so
+   * before this hook a model that needed a decision either picked for you or asked in prose and
+   * ended its turn. Now it asks, and waits.
+   *
+   * Rounds are sequential and abandoned on the first unanswered one: a form is a set of questions
+   * the agent needs ALL of, so carrying on to ask question three after question two timed out
+   * would collect an answer it cannot use, having already made the user tap twice for nothing.
+   */
+  private async onElicitRequest(
+    sessionId: SessionId,
+    platform: PlatformAdapter,
+    channelId: string,
+    request: AgentElicitation
+  ): Promise<ElicitAnswer> {
+    // Same capability gate as `ask`, but the answer is a cancel rather than a throw: the asker is
+    // the harness, not a CLI that can print the reason, and a cancel is what the model is told.
+    if (!platform.capabilities.buttons) {
+      console.log(`[elicit] ${sessionId}: platform "${platform.platformType}" has no buttons; cancelling`);
+      return { action: 'cancel' };
+    }
+    const content: Record<string, string | string[]> = {};
+    for (const [i, q] of request.questions.entries()) {
+      const label = await this.askButtons(
+        platform,
+        channelId,
+        composeElicitPrompt(q, i, request.questions.length),
+        q.options.map((o) => o.label),
+        ELICIT_TIMEOUT_MS,
+        sessionId
+      );
+      if (label === null) {
+        console.log(`[elicit] ${sessionId}: question ${i + 1} went unanswered; cancelling`);
+        return { action: 'cancel' };
+      }
+      // Send back the option's `value`, not the label the button carried: ACP separates display
+      // text from the answer, and an MCP server that made them differ must get what it offered.
+      const picked = q.options.find((o) => o.label === label);
+      if (!picked) return { action: 'cancel' }; // unreachable: labels come from these very options
+      content[q.key] = q.multi ? [picked.value] : picked.value;
+    }
+    return { action: 'accept', content };
   }
 
   /** Button click: resolve the matching pending ask; otherwise ignore (reserved for future interactions). */

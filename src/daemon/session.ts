@@ -1,12 +1,12 @@
 import type { Config } from '../config/schema.js';
 import { SessionTokenRegistry } from './session-token-registry.js';
 import { parseTextCommand, resolveRoute, routeInputFromMessage, sessionKey } from './routing.js';
-import type { AgentCommand, InboundMessage, SessionId } from '../types.js';
+import type { InboundMessage, SessionId } from '../types.js';
 import type { PlatformAdapter } from '../platform/adapter.js';
 import type { AgentFactory } from './agent.js';
 import { InboundMerger } from '../core/inbound-merger.js';
 import { shouldRespond, type GateConfig } from '../core/inbound-gate.js';
-import { TurnRunner } from './turn-runner.js';
+import { TurnRunner, type TurnRunnerHooks } from './turn-runner.js';
 import type { SessionStore } from './session-store.js';
 
 /** Daemon-level context-control commands (intercepted in route(), never forwarded to the agent). */
@@ -66,12 +66,11 @@ export class SessionRegistry {
     private readonly agents: AgentFactory,
     private readonly clock: { now(): number; schedule(fn: () => void, ms: number): () => void },
     /**
-     * Optional callback hooks. onAvailableCommands: fired when a session's agent reports its command
-     * list (daemon aggregates and dynamically registers native slash). Absent = don't care (test/no-slash).
+     * Optional callback hooks, passed straight through to TurnRunner (see TurnRunnerHooks).
+     * onAvailableCommands: fired when a session's agent reports its command list (daemon aggregates
+     * and dynamically registers native slash). Absent = don't care (test/no-slash).
      */
-    private readonly hooks?: {
-      onAvailableCommands?(sessionId: SessionId, cmds: AgentCommand[]): void;
-    },
+    private readonly hooks?: TurnRunnerHooks,
     /** Persistent sessionKey → ACP sessionId map; /new deletes the entry so context doesn't resurrect after restart. */
     private readonly store?: SessionStore
   ) {

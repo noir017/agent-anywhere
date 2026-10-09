@@ -11,6 +11,9 @@ import type {
 } from '@agentclientprotocol/sdk';
 import type {
   ContentBlock,
+  CreateElicitationRequest,
+  CreateElicitationResponse,
+  ElicitationFormMode,
   McpServer,
   PermissionOption,
   RequestPermissionRequest,
@@ -19,6 +22,7 @@ import type {
 } from '@agentclientprotocol/sdk';
 import type { AgentDef, Config } from '../config/schema.js';
 import { findAgent } from '../config/schema.js';
+import type { AgentElicitation, ElicitOption, ElicitQuestion } from '../types.js';
 import type { AgentFactory, AgentSession, AgentStreamHandlers, RunTurnInput } from './agent.js';
 import { REVERSE_COMMANDS } from '../ipc/commands.js';
 import { looksLikeCommand } from './routing.js';
@@ -41,6 +45,7 @@ import { ensureReverseCliShim } from './reverse-cli-shim.js';
  *   text↔tool block boundary   ↔ onSegmentBreak
  *   session/cancel             ↔ abort
  *   session/request_permission ↔ permission policy (bypass/deny implemented; ask/acceptEdits see seam)
+ *   elicitation/create (form)  ↔ onElicit (the agent asks the user; rendered as buttons by the daemon)
  *
  * TOKEN model (per-session): ACP is a resident process, env fixed at spawn. So the daemon gives each
  * session a stable token (RunTurnInput.sessionToken, same every turn), injected as AGENT_ANYWHERE_TURN_TOKEN.
@@ -75,12 +80,28 @@ export function acpMcpServers(_def: AgentDef, _socketPath: string): McpServer[] 
   return [];
 }
 
-/** Reverse-command usage hint (single source REVERSE_COMMANDS, kept in sync with CLI registration). */
-function buildReverseHint(): string {
+/**
+ * Harnesses that can put a question to the user themselves, over ACP `elicitation/create`.
+ *
+ * Probed live on 2026-09-11 by advertising `clientCapabilities.elicitation.form` and prompting for
+ * a decision: `claude` sends a real elicitation; `opencode` 1.18.27 sends no reverse request of any
+ * kind (not even `session/request_permission`), and its model asks in prose and ends the turn
+ * instead. `gemini`, `codex` and `custom` are unprobed and therefore treated as "cannot" — the cost
+ * of being wrong that way is one extra hint line, while the other way costs the user their buttons.
+ */
+const NATIVE_ASK_HARNESSES: ReadonlySet<AgentDef['harness']> = new Set(['claude']);
+
+/**
+ * Reverse-command usage hint (single source REVERSE_COMMANDS, kept in sync with CLI registration).
+ * Commands a harness's own question tool supersedes are left out for that harness (see
+ * ReverseCommandSpec.supersededByNativeAsk).
+ */
+export function buildReverseHint(harness?: AgentDef['harness']): string {
+  const nativeAsk = harness !== undefined && NATIVE_ASK_HARNESSES.has(harness);
   return [
     '<system-reminder>',
     'You are running inside the Agent Anywhere daemon; your plain-text replies stream back to the current IM conversation automatically — just reply normally. For actions beyond text, use Bash to call `agent-anywhere` (on PATH, defaults to the current conversation):',
-    ...REVERSE_COMMANDS.map((c) => `  - ${c.hint}`),
+    ...REVERSE_COMMANDS.filter((c) => !(nativeAsk && c.supersededByNativeAsk)).map((c) => `  - ${c.hint}`),
     'Pass --channel <id> only to push proactively to a different channel.',
     '</system-reminder>',
   ].join('\n');
@@ -185,6 +206,56 @@ function createAcpSession(
   let hintInjected = false;
   /** Intentional-abort flag: set by abort(); used to return silently when prompt ends as cancelled. */
   let aborting = false;
+  /**
+   * Handlers of the turn currently running, if any. An `elicitation/create` arrives as a request on
+   * the connection, not as an update inside the turn's loop, so this is how it finds the turn it
+   * belongs to.
+   */
+  let turnHandlers: AgentStreamHandlers | undefined;
+  /**
+   * How many elicitations are currently in front of the user, waiting to be answered.
+   *
+   * Read by the turn's silence watchdog: an agent blocked on `elicitation/create` is silent BY
+   * DESIGN, and the person it is waiting for may be reading the options on a phone. Without this
+   * the watchdog would reach its deadline mid-decision and abort the turn as hung — killing the very
+   * question it was asked to relay, and doing it more reliably the more carefully the user thought.
+   */
+  let awaitingUser = 0;
+
+  /**
+   * Answer an ACP `elicitation/create`: put the agent's question to the user and block until they
+   * pick (see AgentStreamHandlers.onElicit).
+   *
+   * Routed through the RUNNING TURN's handlers, because the question needs a lane to be asked in
+   * and only the turn knows which platform and channel the session is currently answering on.
+   * Anything that leaves no such lane — no turn open, a url-mode request, a form with nothing
+   * tappable in it — is `cancel`led rather than answered. Cancelling is the honest outcome: it tells
+   * the harness the question went unanswered, which the model then has to deal with, whereas
+   * inventing an accept would hand it a decision the user never made.
+   */
+  async function answerElicitation(params: CreateElicitationRequest): Promise<CreateElicitationResponse> {
+    const ask = turnHandlers?.onElicit;
+    if (!ask) {
+      console.warn(`[acp] ${sessionId}: elicitation arrived with no turn able to ask it; cancelling`);
+      return { action: 'cancel' };
+    }
+    const parsed = parseFormElicitation(params);
+    if (!parsed) {
+      console.warn(`[acp] ${sessionId}: cannot render this elicitation (mode=${params.mode}); cancelling`);
+      return { action: 'cancel' };
+    }
+    awaitingUser++;
+    try {
+      const answer = await ask(parsed);
+      return answer.action === 'accept' ? { action: 'accept', content: answer.content } : { action: answer.action };
+    } catch (e) {
+      // A renderer failure must not leave the agent blocked forever on a reply that will never come.
+      console.error(`[acp] ${sessionId}: failed to put an elicitation to the user:`, e instanceof Error ? e.message : e);
+      return { action: 'cancel' };
+    } finally {
+      awaitingUser--;
+    }
+  }
 
   /**
    * Reset the three connection handles to undefined (without killing the process). Shared by the child
@@ -282,10 +353,15 @@ function createAcpSession(
       Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>
     );
 
-    const app = client().onRequest(
-      'session/request_permission',
-      ({ params }): RequestPermissionResponse => decidePermission(params)
-    );
+    const app = client()
+      .onRequest(
+        'session/request_permission',
+        ({ params }): RequestPermissionResponse => decidePermission(params)
+      )
+      .onRequest(
+        'elicitation/create',
+        ({ params }): Promise<CreateElicitationResponse> => answerElicitation(params)
+      );
     const connection = app.connect(stream);
     conn = connection; // assign early so start-failure dispose can close the connection (active stays the sole readiness signal)
     const ctx = connection.agent;
@@ -300,7 +376,23 @@ function createAcpSession(
       const initResult = await ctx.request('initialize', {
         protocolVersion: ACP_PROTOCOL_VERSION,
         // Don't advertise fs/terminal: let the agent use its own tools (Bash → agent-anywhere); the client only receives the stream + answers permission.
-        clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+        //
+        // `elicitation.form` IS advertised, and it is load-bearing rather than decorative: the
+        // claude adapter gates the model's own AskUserQuestion tool on it
+        // (`disallowedTools = elicitationSupport.form ? [] : ["AskUserQuestion"]`), so without this
+        // the model cannot ask the user anything — it guesses, or asks in prose and ends the turn.
+        //
+        // The value MUST be an object, not `true`. ACP types this as `ElicitationFormCapabilities`,
+        // claude reads it as a truthy check so `{}` satisfies it, and opencode validates it strictly —
+        // `form: true` is rejected with `-32602 Invalid params` ("expected object, received
+        // boolean"), which fails initialize and takes down EVERY opencode session, not just its
+        // elicitations. `url` is deliberately left out: a browser hand-off has no sensible rendering
+        // in a chat message (see parseFormElicitation).
+        clientCapabilities: {
+          fs: { readTextFile: false, writeTextFile: false },
+          terminal: false,
+          elicitation: { form: {} },
+        },
       });
 
       // Resume persisted context first: the harness keeps conversation history on its own disk, so a
@@ -396,7 +488,7 @@ function createAcpSession(
       // execution by whether the first text block starts with `/`, and a leading hint block would break
       // it. This turn doesn't consume the hint (hintInjected unchanged), deferring it to a later normal turn.
       const isCommand = looksLikeCommand(input.prompt);
-      const hint = hintInjected || isCommand ? '' : buildReverseHint();
+      const hint = hintInjected || isCommand ? '' : buildReverseHint(def.harness);
       if (!isCommand) hintInjected = true;
 
       const state: TurnState = {
@@ -424,15 +516,22 @@ function createAcpSession(
           return await Promise.race([
             active!.nextUpdate(),
             new Promise<never>((_, reject) => {
-              timer = setTimeout(
-                () =>
-                  reject(
-                    new TurnTimeoutError(
-                      `agent "${def.id}" sent no update for ${turnTimeoutMs}ms; treating it as hung and aborting this turn (raise session.turnTimeoutMs, or set 0 to disable)`
-                    )
-                  ),
-                turnTimeoutMs
-              );
+              const onSilence = (): void => {
+                // Blocked on a person, not hung: an elicitation stops the agent by design and the
+                // answer arrives at human speed. Re-arm rather than abort — the wait is already
+                // bounded by the question's own timeout, which resolves to `cancel` and lets the
+                // agent carry on, so nothing here can hang forever.
+                if (awaitingUser > 0) {
+                  timer = setTimeout(onSilence, turnTimeoutMs);
+                  return;
+                }
+                reject(
+                  new TurnTimeoutError(
+                    `agent "${def.id}" sent no update for ${turnTimeoutMs}ms; treating it as hung and aborting this turn (raise session.turnTimeoutMs, or set 0 to disable)`
+                  )
+                );
+              };
+              timer = setTimeout(onSilence, turnTimeoutMs);
             }),
           ]);
         } finally {
@@ -441,6 +540,7 @@ function createAcpSession(
       };
 
       // ActiveSession.prompt resolves at turn end and enqueues 'stop'; meanwhile iterate nextUpdate for streaming updates.
+      turnHandlers = handlers;
       const promptDone = active!.prompt(decorate(input, hint));
       try {
         for (;;) {
@@ -461,6 +561,9 @@ function createAcpSession(
         // (otherwise the lingering nextUpdate waiter on the live queue would steal a future update).
         if (err instanceof TurnTimeoutError) dispose();
         throw err;
+      } finally {
+        // A question arriving after this point has no lane to be asked in, and is cancelled.
+        turnHandlers = undefined;
       }
     },
 
@@ -524,6 +627,85 @@ export function decidePermission(req: RequestPermissionRequest): RequestPermissi
     opts.find(pred)?.optionId;
   const allow = pick((o) => o.kind === 'allow_once') ?? pick((o) => o.kind.startsWith('allow'));
   return allow ? { outcome: { outcome: 'selected', optionId: allow } } : { outcome: { outcome: 'cancelled' } };
+}
+
+// ───────────────────────── elicitation/create → question rounds ─────────────────────────
+
+/**
+ * The choosable options of one elicitation form field.
+ *
+ * Single-select fields carry them under `oneOf`, multi-select under `items.anyOf`; both hold
+ * ACP `EnumOption`s. An option with no usable `const` is dropped rather than guessed at: the
+ * answer has to carry that exact value, and sending one the agent never listed is worse than
+ * offering one button fewer.
+ *
+ * Takes `unknown` because `ElicitationPropertySchema` is a union over every primitive type, and
+ * the number/boolean arms carry no enum at all — narrowing here rather than at the call site
+ * keeps the "no options, skip this question" answer in one place.
+ */
+function parseElicitOptions(prop: unknown): ElicitOption[] {
+  const p = prop as { oneOf?: unknown; items?: { anyOf?: unknown } };
+  const raw = Array.isArray(p.oneOf) ? p.oneOf : Array.isArray(p.items?.anyOf) ? p.items.anyOf : [];
+  const options: ElicitOption[] = [];
+  for (const o of raw) {
+    const opt = o as { const?: unknown; title?: unknown; description?: unknown };
+    // `const` is the answer, `title` is display only; a missing title falls back to the value, but
+    // with no value there is nothing to send back.
+    const value = typeof opt.const === 'string' ? opt.const : undefined;
+    const label = typeof opt.title === 'string' && opt.title.length > 0 ? opt.title : value;
+    if (value === undefined || label === undefined) continue;
+    const description = typeof opt.description === 'string' ? opt.description.trim() : '';
+    options.push(description ? { label, value, description } : { label, value });
+  }
+  return options;
+}
+
+/**
+ * Translate an ACP `elicitation/create` into the platform-agnostic question rounds the daemon
+ * renders as buttons. Returns null for anything this client cannot put in front of a user, in
+ * which case the caller cancels rather than guessing an answer.
+ *
+ * ── What the wire shape actually is ───────────────────────────────────────────────────────────
+ * A form elicitation carries a JSON Schema, not a question list, so the questions have to be read
+ * back out of it. The layout is claude-agent-acp's `askUserQuestionsToCreateRequest` (verified
+ * against a live payload, see the fixture in agent-acp.test.ts): one `question_<n>` property per
+ * question — `oneOf` of `{const, title, description}` for single-select, `items.anyOf` for
+ * multi-select — each followed by a `question_<n>_custom` free-text "Other" field. The question
+ * text lives in `message` when there is exactly one question, and in each property's
+ * `description` when there are several.
+ *
+ * `_custom` fields are skipped: they are the CLI's "type your own answer instead" box, and a
+ * button row cannot collect free text. Dropping them is safe because the adapter marks them
+ * optional — an accept that omits them is a complete answer, not a partial one.
+ *
+ * A question left with no usable options is dropped, and a form where every question drops
+ * yields null.
+ */
+export function parseFormElicitation(params: CreateElicitationRequest): AgentElicitation | null {
+  // `url` mode points the user at a browser to finish something out of band. There is no useful
+  // rendering of that in a chat message the daemon can then correlate an answer to, so it is
+  // cancelled rather than half-supported (the client advertises only `form` for the same reason).
+  if (params.mode !== 'form') return null;
+
+  const message = typeof params.message === 'string' ? params.message.trim() : '';
+  // The request type ends in a catch-all arm (`mode: string`) for forward compatibility, which
+  // stops the `mode` check above from narrowing — so read the schema through the form arm's type.
+  const properties = (params as ElicitationFormMode).requestedSchema?.properties ?? {};
+
+  const questions: ElicitQuestion[] = [];
+  for (const [key, prop] of Object.entries(properties)) {
+    if (key.endsWith('_custom')) continue;
+    const p = prop as { type?: string; title?: string | null; description?: string | null };
+    const options = parseElicitOptions(prop);
+    if (options.length === 0) continue;
+    // Single-question forms carry the question in `message` and leave `description` unset; the
+    // title is a short header, so it is the last resort rather than the first.
+    const prompt = p.description?.trim() || message || p.title?.trim() || key;
+    questions.push({ key, prompt, options, multi: p.type === 'array' });
+  }
+
+  if (questions.length === 0) return null;
+  return { message: message || questions[0]!.prompt, questions };
 }
 
 // ───────────────────────── session/update → handlers translation (core) ─────────────────────────

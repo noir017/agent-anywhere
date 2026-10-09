@@ -30,6 +30,16 @@ export interface ReverseCommandSpec {
   build(positionals: string[], opts: Record<string, unknown>): IpcAction;
   /** One-line usage hint for the agent (rendered by buildSkillHint). */
   hint: string;
+  /**
+   * Left out of the hint for harnesses that can ask the user on their own, over ACP
+   * `elicitation/create` (see NATIVE_ASK_HARNESSES in agent-acp.ts).
+   *
+   * Exists for `ask`: on claude the model's own AskUserQuestion tool now reaches the user as
+   * buttons, and advertising the CLI as well would offer it a second, worse way to do the same
+   * thing. Everywhere else the command is still the only way to get buttons in front of the user,
+   * so the hint stays. The command itself stays registered either way.
+   */
+  supersededByNativeAsk?: boolean;
 }
 
 /** The "target channel" option shared by all reverse commands; empty = current session. */
@@ -219,5 +229,6 @@ export const REVERSE_COMMANDS: ReverseCommandSpec[] = [
       channelId: str(opts.channel),
     }),
     hint: 'Ask a clarifying question (blocks until the user chooses): agent-anywhere ask "question" -o optionA -o optionB (writes the chosen label to stdout; empty on timeout)',
+    supersededByNativeAsk: true,
   },
 ];

@@ -1,4 +1,4 @@
-import type { AgentCommand, ToolEvent, ToolFinishEvent } from '../types.js';
+import type { AgentCommand, AgentElicitation, ElicitAnswer, ToolEvent, ToolFinishEvent } from '../types.js';
 
 /**
  * Thin wrapper over the agent runtime (ACP implementation in agent-acp.ts). One AgentSession per session
@@ -22,6 +22,19 @@ export interface AgentStreamHandlers {
    * The daemon registers native platform slash from it.
    */
   onAvailableCommands?(cmds: AgentCommand[]): void;
+  /**
+   * The agent stopped mid-turn to ask the user something (ACP `elicitation/create`), and is
+   * blocked on the answer. Resolve with the user's choice, `decline`, or `cancel`.
+   *
+   * Turn-scoped rather than session-scoped because the question needs somewhere to be asked: the
+   * turn is what knows the platform and channel the session is currently answering in. A question
+   * arriving with no turn open has no such lane, and is cancelled by the runtime.
+   *
+   * Optional, and absent means "cancel it": a client that cannot render the question must say so
+   * rather than answer for the user. On the `claude` harness the model then reports the question
+   * as unanswered instead of proceeding on a guess.
+   */
+  onElicit?(request: AgentElicitation): Promise<ElicitAnswer>;
 }
 
 export interface RunTurnInput {

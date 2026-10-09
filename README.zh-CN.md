@@ -153,6 +153,10 @@ agent-anywhere ask "部署到生产？" -o 部署 -o 演练 -o 取消
 `ask` 阻塞等待用户点击按钮，并把所选标签写到 stdout。此外还有：
 `send-message`、`reply`、`edit-message`、`delete`。
 
+在 Claude Code 上，智能体不需要 `ask` 也能发按钮：它自带的 `AskUserQuestion`
+工具会经 ACP elicitation 以同样的按钮送到聊天里，每个选项的理由显示在按钮上方。
+没有自带提问工具的 harness 继续用 `ask`。
+
 守护进程每轮注入一行提示，任何智能体都能自行发现这些命令；完整用法见内置
 [skill](skill/SKILL.md)：
 

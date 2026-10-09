@@ -5,6 +5,26 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+- **The agent can ask you a question, and wait.** The daemon now advertises ACP's
+  `elicitation.form` capability at `initialize` and renders the resulting `elicitation/create`
+  requests as buttons in the chat, through the same machinery as `agent-anywhere ask`.
+  This was less a missing feature than one the handshake had been switching off: the claude
+  adapter gates the model's own `AskUserQuestion` tool on that capability
+  (`disallowedTools = elicitationSupport.form ? [] : ["AskUserQuestion"]`), so every session ran
+  with the model's question tool disabled. Each option's rationale is shown above the buttons,
+  because that text is often the most useful part of the question and no button label can hold a
+  sentence. Multi-question forms are asked one round at a time and abandoned on the first
+  unanswered round (10 minutes per round); the silence watchdog no longer counts the time spent
+  waiting on a person. The capability value is `{ form: {} }`, not `true` — opencode validates it
+  strictly and rejects a boolean with `-32602`, which would fail every opencode `initialize`.
+
+### Changed
+- **`ask` is advertised only where it is the fallback.** On `claude` the per-session hint no
+  longer lists `ask`, since the model's own question tool now does the same thing natively; every
+  other harness keeps it — `opencode` sends no elicitations at all, so there `ask` is still the
+  only way to put buttons in front of the user. The command itself is unchanged everywhere.
+
 ## [0.3.2] - 2026-09-28
 
 ### Changed

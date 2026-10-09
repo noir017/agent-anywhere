@@ -9,18 +9,50 @@ import type { AttachmentIngestDeps } from '../core/attachment-ingest.js';
 
 /**
  * Build attachment IO deps (daemon layer does real IO; core's attachment-ingest stays pure).
- *  - download: Node global fetch with AbortController timeout; early-exit on the content-length header
- *    over maxDownloadBytes; returns bytes and the content-type header.
+ *  - download: the platform's own fetcher when it claims the URL, else Node global fetch with an
+ *    AbortController timeout and a content-length early-exit over maxDownloadBytes; returns bytes
+ *    plus whatever was learned about them (content-type header, filename).
  *  - save: write to the cache dir (config.cacheDir defaults to ~/.config/agent-anywhere/attachments); filename
  *    sanitized against traversal, short hash prefix to avoid overwrite; mkdir recursive + writeFile.
+ *
+ * `fetchPlatform` is the adapter's `fetchAttachment` (absent for platforms whose media URLs are
+ * public https links, which is seven of the eight). See PlatformProfile.fetchAttachment.
  */
-export function createAttachmentIngestDeps(config: Config): AttachmentIngestDeps {
+export function createAttachmentIngestDeps(
+  config: Config,
+  fetchPlatform?: (
+    url: string
+  ) => Promise<{ bytes: Uint8Array; mime?: string; name?: string } | undefined>
+): AttachmentIngestDeps {
   const maxDownloadBytes = config.attachments.maxDownloadBytes;
   const cacheDir =
     config.attachments.cacheDir ?? path.join(homedir(), '.config/agent-anywhere/attachments');
 
   return {
     download: async (url) => {
+      // A platform whose inbound media lives behind its own API (Lark hands out
+      // `internal:lark/…` resource addresses) fetches through its authenticated client. Tried
+      // FIRST, and only for URLs it recognizes — `undefined` means "not mine" and falls through.
+      //
+      // Security: this does NOT weaken the SSRF invariant below. That guard exists because a
+      // message can name any host it likes; here the message names only a path segment (validated
+      // against the id alphabet in the profile) and the request goes to the vendor endpoint the
+      // operator configured, with the bot's own token. What the guard *does* still owe us is the
+      // size cap, enforced here: this route reports no content-length to pre-check, so the bytes
+      // are already in memory when we can measure them.
+      if (fetchPlatform) {
+        const got = await fetchPlatform(url);
+        if (got) {
+          if (got.bytes.length > maxDownloadBytes) {
+            throw new Error(`download size ${got.bytes.length} exceeds maxDownloadBytes`);
+          }
+          return {
+            bytes: got.bytes,
+            ...(got.mime ? { contentType: got.mime } : {}),
+            ...(got.name ? { name: got.name } : {}),
+          };
+        }
+      }
       // SSRF block: the url comes from an inbound IM attachment (user-controlled), so validate scheme and
       // target before fetch and reject internal/loopback/cloud-metadata endpoints. On hit, throw (caught
       // upstream, attachment skipped). Normal platform CDNs (public https domains) are unaffected.

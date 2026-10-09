@@ -25,8 +25,15 @@ export interface AttachmentIngestConfig {
 }
 
 export interface AttachmentIngestDeps {
-  /** Download; returns bytes and the actual content-type (HTTP header). Throws on failure. */
-  download(url: string): Promise<{ bytes: Uint8Array; contentType?: string }>;
+  /**
+   * Download; returns the bytes plus whatever the transport learned about them. Throws on failure.
+   *
+   * `contentType` is the HTTP header where there is one. `name` is a filename discovered during
+   * the fetch, which only a platform-specific fetcher can supply — the platforms that need one
+   * (Lark) are exactly those whose message elements declare no name and no mime, so for them
+   * this is the ONLY chance to learn either. Both are fallbacks: what the element declared wins.
+   */
+  download(url: string): Promise<{ bytes: Uint8Array; contentType?: string; name?: string }>;
   /** Persist to the cache dir; returns the final absolute path. */
   save(name: string, bytes: Uint8Array): Promise<string>;
 }
@@ -96,7 +103,8 @@ function displayName(att: AttachmentInput): string {
  *
  * Rules:
  *  - Readable text with size (or downloaded length) ≤ maxInjectBytes: inline as a
- *    fenced block with language tag, labeled with the filename.
+ *    fenced block with language tag, labeled with the filename. Re-decided after the download
+ *    when the transport reported a name/mime the element did not carry (Lark).
  *  - Otherwise (binary/image/oversized text):
  *    - size unknown or ≤ maxDownloadBytes: download and save, append a "saved to <path>" line.
  *    - size > maxDownloadBytes: don't download, append an "too large, not downloaded" line.
@@ -137,8 +145,31 @@ export async function ingestAttachments(
         continue;
       }
       // size unknown or ≤ maxDownloadBytes: download and persist.
-      const { bytes } = await deps.download(att.url);
-      await saveAndRecord(att, name, bytes, deps, files, lines);
+      const got = await deps.download(att.url);
+      // Name and mime may arrive WITH the bytes rather than with the element: a Feishu image
+      // declares neither, so before this the agent got a path ending in a bare resource key.
+      // Knowing them changes two decisions — what the saved file is called, and whether this was
+      // readable text after all — so both are re-taken here rather than only logged.
+      const resolvedName = att.name ?? got.name;
+      const resolvedMime = att.mime ?? got.contentType;
+      const display = resolvedName ?? name;
+      if (
+        !readable &&
+        isReadableText(resolvedMime, resolvedName) &&
+        got.bytes.length <= cfg.maxInjectBytes
+      ) {
+        const text = decoder.decode(got.bytes);
+        lines.push(`Attachment ${display}:\n\`\`\`${fenceLang(resolvedName)}\n${text}\n\`\`\``);
+        continue;
+      }
+      await saveAndRecord(
+        { ...att, ...(resolvedName ? { name: resolvedName } : {}), ...(resolvedMime ? { mime: resolvedMime } : {}) },
+        display,
+        got.bytes,
+        deps,
+        files,
+        lines
+      );
     } catch {
       // Single failure degrades to a line, doesn't affect the rest.
       lines.push(`[Attachment ${name} failed to download. URL: ${att.url}]`);

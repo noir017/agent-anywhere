@@ -178,6 +178,282 @@ export function extractCardAction(body: unknown): {
 }
 
 /**
+ * Insert into a Map with an insertion-ordered cap, refreshing recency on rewrite.
+ *
+ * The attachment-name cache this profile keeps is keyed by ids a chat can mint without limit,
+ * so an unbounded Map is a slow leak in a daemon that runs for weeks. Map iterates in insertion order, so deleting before setting makes a rewrite count
+ * as "recently touched" and `keys().next()` yields the least recently touched entry.
+ */
+export function rememberBounded<K, V>(map: Map<K, V>, key: K, value: V, limit: number): void {
+  map.delete(key);
+  map.set(key, value);
+  if (map.size > limit) {
+    const oldest = map.keys().next();
+    if (!oldest.done) map.delete(oldest.value);
+  }
+}
+
+/** How many attachment names the profile remembers before evicting the oldest. */
+const LARK_CACHE_LIMIT = 500;
+
+/**
+ * Rebuild the content of a rich-text (富文本, `msg_type: 'post'`) message as Satori elements, or
+ * undefined when the event is not one. Pure — the resource-URL builder is injected.
+ *
+ * ⚠️ Why this exists: adapter-lark's `adaptMessage` switches on `message_type` and handles
+ * text/image/audio/media/file **only** (lib/index.cjs, 2026-09). A `post` falls off the end of
+ * that switch, so `session.content` comes out empty — and an empty message is dropped by the
+ * inbound gate as `empty` before anything else looks at it. The visible symptom is the worst kind:
+ * the bot ignores a message that plainly @-mentioned it, with nothing in the log to say why.
+ * Feishu clients send `post` whenever the message mixes formatting or embeds an image, so this is
+ * not a rare shape.
+ *
+ * Element mapping is aimed at what an AGENT reads, not at round-tripping Feishu's model:
+ *  - `a` becomes a markdown link, `code_block` a fenced block — an agent reads both natively;
+ *  - `at` becomes a real `h.at(open_id)`, which is the load-bearing one. A post's `at` carries a
+ *    PLACEHOLDER (`@_user_1`, `@_all`), not an id, and the real open_id sits in the message's
+ *    `mentions` array — so a placeholder passed through verbatim would never equal the bot's
+ *    selfId and `detectMention` would report no mention (hermes-agent's adapter resolves the same
+ *    map for the same reason). `@_all` has no id to carry and degrades to the text `@all`;
+ *  - `img`/`media` become media elements addressed exactly like a standalone image message, so
+ *    fetchAttachment downloads them by the same route.
+ *
+ * Still empty on purpose: `sticker` (Feishu's resource API excludes 表情包 outright),
+ * `share_chat`, and `merge_forward` (a forwarded bundle needs another API call to read).
+ */
+export function larkPostElements(
+  rawBody: unknown,
+  resourceUrl: (type: 'image' | 'file', messageId: string, fileKey: string) => string
+): h[] | undefined {
+  const msg = (
+    rawBody as
+      | {
+          type?: string;
+          event?: {
+            message?: {
+              message_type?: unknown;
+              message_id?: unknown;
+              content?: unknown;
+              mentions?: unknown;
+            };
+          };
+        }
+      | undefined
+  )?.type === 'im.message.receive_v1'
+    ? (rawBody as { event: { message?: Record<string, unknown> } }).event.message
+    : undefined;
+  if (!msg || msg.message_type !== 'post') return undefined;
+  const messageId = typeof msg.message_id === 'string' ? msg.message_id : '';
+  if (typeof msg.content !== 'string' || messageId === '') return undefined;
+
+  let post: { title?: unknown; content?: unknown };
+  try {
+    post = JSON.parse(msg.content) as typeof post;
+  } catch {
+    // Not our shape after all: leave the session as the adapter left it rather than guessing.
+    return undefined;
+  }
+
+  // mentions: [{ key: '@_user_1', id: { open_id }, name }] — the placeholder → identity map.
+  const mentions = new Map<string, { id: string; name: string }>();
+  if (Array.isArray(msg.mentions)) {
+    for (const m of msg.mentions as Array<Record<string, unknown>>) {
+      const key = m['key'];
+      const id = (m['id'] as { open_id?: unknown } | undefined)?.open_id;
+      if (typeof key === 'string' && typeof id === 'string') {
+        mentions.set(key, { id, name: typeof m['name'] === 'string' ? m['name'] : '' });
+      }
+    }
+  }
+
+  const out: h[] = [];
+  const text = (t: string): void => {
+    if (t !== '') out.push(h.text(t));
+  };
+  const str = (v: unknown): string => (typeof v === 'string' ? v : '');
+
+  if (typeof post.title === 'string' && post.title !== '') text(`${post.title}\n`);
+
+  // content is an array of PARAGRAPHS, each an array of inline elements.
+  const paragraphs = Array.isArray(post.content) ? (post.content as unknown[]) : [];
+  paragraphs.forEach((para, i) => {
+    if (i > 0) text('\n');
+    for (const raw of Array.isArray(para) ? (para as unknown[]) : [para]) {
+      if (typeof raw === 'string') {
+        text(raw);
+        continue;
+      }
+      const el = raw as Record<string, unknown>;
+      switch (str(el['tag']).toLowerCase()) {
+        case 'text':
+        case 'md':
+          text(str(el['text']));
+          break;
+        case 'a': {
+          const href = str(el['href']);
+          const label = str(el['text']) || href;
+          text(href ? `[${label}](${href})` : label);
+          break;
+        }
+        case 'at': {
+          const placeholder = str(el['user_id']);
+          const known = mentions.get(placeholder);
+          if (known) out.push(h.at(known.id, known.name ? { name: known.name } : {}));
+          else if (placeholder === '@_all') text('@all');
+          else text(`@${str(el['user_name']) || 'user'}`);
+          break;
+        }
+        case 'img':
+        case 'image': {
+          const key = str(el['image_key']);
+          if (key) out.push(h.image(resourceUrl('image', messageId, key)));
+          break;
+        }
+        case 'media':
+        case 'file':
+        case 'audio':
+        case 'video': {
+          const key = str(el['file_key']);
+          if (key) out.push(h.file(resourceUrl('file', messageId, key)));
+          break;
+        }
+        case 'emotion':
+        case 'emoji':
+          text(`:${str(el['emoji_type']) || str(el['text'])}:`);
+          break;
+        case 'br':
+          text('\n');
+          break;
+        case 'hr':
+        case 'divider':
+          text('\n---\n');
+          break;
+        case 'code_block':
+          text(`\n\`\`\`${str(el['language'])}\n${str(el['text'])}\n\`\`\`\n`);
+          break;
+        default:
+          // An unknown inline tag contributes nothing rather than a guess at its meaning.
+          break;
+      }
+    }
+  });
+
+  return out.length > 0 ? out : undefined;
+}
+
+/**
+ * Parse an adapter-minted resource URL back into the three things the API call needs. Pure.
+ *
+ * adapter-lark decodes an inbound image/audio/media/file into
+ * `h.image(bot.getResourceUrl(type, message_id, file_key))`, and `getResourceUrl` builds
+ * `internal:lark/<selfId>/im/v1/messages/<message_id>/resources/<file_key>?type=<image|file>`
+ * (satori's Bot.getInternalUrl). That address is not fetchable by anything but the bot itself,
+ * which is why fetchAttachment exists.
+ *
+ * ⚠️ Both ids come off a user-sent event and are spliced into a request path, so they are
+ * validated against Feishu's id alphabet (`om_…`, `img_v2_…`, `file_v2_…`: word chars and
+ * hyphens). Anything else — a dot, a slash, an escape — is rejected as unparseable rather than
+ * concatenated into some other Feishu endpoint. `type` is likewise an allowlist of the two
+ * values the adapter emits, not free text.
+ */
+export function parseLarkResourceUrl(
+  url: string
+): { messageId: string; fileKey: string; type: 'image' | 'file' } | null {
+  const m = /^internal:lark\/[^/]+\/im\/v1\/messages\/([^/?]+)\/resources\/([^/?]+)(?:\?(.*))?$/.exec(url);
+  if (!m) return null;
+  const [, messageId = '', fileKey = '', query = ''] = m;
+  const ID = /^[A-Za-z0-9_-]+$/;
+  if (!ID.test(messageId) || !ID.test(fileKey)) return null;
+  // The adapter passes type=image for an image message and type=file for audio/media/file, which
+  // is exactly what Feishu's resource endpoint requires — so no retry across types is needed here
+  // (hermes-agent's Feishu adapter retries audio/media as 'file' because its type comes from the
+  // message rather than from the URL that fetched it).
+  const type = new URLSearchParams(query).get('type');
+  if (type !== 'image' && type !== 'file') return null;
+  return { messageId, fileKey, type };
+}
+
+/**
+ * Sniff a mime type and file extension from the first bytes of a downloaded resource. Pure.
+ *
+ * Why sniff at all: the adapter's binary route returns `response.data` and drops the response
+ * headers, so the Content-Type Feishu sent is unreachable — and a Feishu IMAGE message carries no
+ * filename whatsoever (only an `image_key`). Without this, an inbound screenshot reached the agent
+ * as an extension-less blob it could not open. hermes-agent reads the header instead (its SDK
+ * exposes it) and falls back to `.jpg`; guessing jpg for a png is worse than looking.
+ *
+ * Only the formats Feishu actually delivers as message resources are listed. Unknown ⇒ undefined,
+ * and the caller falls back to the file's own name (which a `file` message does carry). Text is
+ * deliberately NOT sniffed: a name-less text blob is rare, and misreading binary as text would
+ * inline garbage into the prompt.
+ */
+export function sniffLarkMedia(bytes: Uint8Array): { mime: string; ext: string } | undefined {
+  const starts = (...sig: number[]): boolean => sig.every((b, i) => bytes[i] === b);
+  const ascii = (offset: number, text: string): boolean =>
+    [...text].every((c, i) => bytes[offset + i] === c.charCodeAt(0));
+
+  if (starts(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)) return { mime: 'image/png', ext: '.png' };
+  if (starts(0xff, 0xd8, 0xff)) return { mime: 'image/jpeg', ext: '.jpg' };
+  if (ascii(0, 'GIF8')) return { mime: 'image/gif', ext: '.gif' };
+  if (ascii(0, 'RIFF') && ascii(8, 'WEBP')) return { mime: 'image/webp', ext: '.webp' };
+  if (ascii(0, 'RIFF') && ascii(8, 'WAVE')) return { mime: 'audio/wav', ext: '.wav' };
+  if (starts(0x42, 0x4d)) return { mime: 'image/bmp', ext: '.bmp' };
+  if (ascii(0, '%PDF')) return { mime: 'application/pdf', ext: '.pdf' };
+  // ZIP container: also every OOXML document (docx/xlsx/pptx). The extension stays .zip because
+  // the real one is in the message's own file_name, which the caller prefers over this guess.
+  if (starts(0x50, 0x4b, 0x03, 0x04)) return { mime: 'application/zip', ext: '.zip' };
+  if (starts(0x1f, 0x8b)) return { mime: 'application/gzip', ext: '.gz' };
+  if (ascii(4, 'ftyp')) return { mime: 'video/mp4', ext: '.mp4' };
+  // Feishu voice notes are opus in an Ogg container.
+  if (ascii(0, 'OggS')) return { mime: 'audio/ogg', ext: '.ogg' };
+  if (ascii(0, 'ID3') || starts(0xff, 0xfb)) return { mime: 'audio/mpeg', ext: '.mp3' };
+  return undefined;
+}
+
+/**
+ * The `<file_key, file_name>` pairs a raw inbound event declares. Pure, for tests.
+ *
+ * A Feishu `file` or `media` message states its real filename in the message content JSON
+ * (`{"file_key":"file_v2_…","file_name":"季度报告.pdf"}`), but adapter-lark's decode drops it:
+ * `h.file(url)` carries no title. The name is the most useful thing about a document — it is what
+ * the agent reads before deciding to open it — so the profile recovers it from the raw body
+ * the adapter stashes on the session, and fetchAttachment prefers it over any sniffed extension.
+ */
+export function extractResourceNames(rawBody: unknown): Array<{ key: string; name: string }> {
+  const b = rawBody as
+    | { type?: string; event?: { message?: { content?: unknown } } }
+    | undefined;
+  if (!b || b.type !== 'im.message.receive_v1') return [];
+  const content = b.event?.message?.content;
+  if (typeof content !== 'string') return [];
+  let json: { file_key?: unknown; file_name?: unknown; content?: unknown };
+  try {
+    json = JSON.parse(content) as typeof json;
+  } catch {
+    return [];
+  }
+
+  const found: Array<{ key: string; name: string }> = [];
+  const take = (key: unknown, name: unknown): void => {
+    if (typeof key === 'string' && key !== '' && typeof name === 'string' && name !== '') {
+      found.push({ key, name });
+    }
+  };
+  // A file/media message states its name at the top level.
+  take(json.file_key, json.file_name);
+  // A rich-text (post) message states it on each embedded element instead — same treatment, since
+  // those elements become attachments too (see larkPostElements).
+  for (const para of Array.isArray(json.content) ? (json.content as unknown[]) : []) {
+    for (const raw of Array.isArray(para) ? (para as unknown[]) : []) {
+      if (!raw || typeof raw !== 'object') continue;
+      const el = raw as Record<string, unknown>;
+      take(el['file_key'] ?? el['image_key'], el['file_name']);
+    }
+  }
+  return found;
+}
+
+/**
  * Infer Lark receive_id_type from channelId (matches adapter's extractIdType).
  * ou→open_id / on→union_id / oc→chat_id / contains @→email / else→user_id.
  */
@@ -243,6 +519,12 @@ export function createLarkProfile(): PlatformProfile<LarkPlatformConfig> {
     slashCommands: false,
   };
 
+  /**
+   * file_key → the filename its message declared (see extractResourceNames). Filled from the raw
+   * event in the 'internal/session' hook, read when fetchAttachment downloads that key.
+   */
+  const resourceNames = new Map<string, string>();
+
   return {
     type: 'lark',
     // Always 'lark': fixed by LarkBot's super(...,'lark'), independent of config.
@@ -293,6 +575,36 @@ export function createLarkProfile(): PlatformProfile<LarkPlatformConfig> {
         protocol: platform.protocol,
         ...httpExtra,
       });
+
+      // Learn, from every inbound event, what the adapter's decode drops on the floor: the declared
+      // filename of any attachment, and the content of a rich-text message. Hooked on
+      // 'internal/session' (as mountButtonEvents is): adaptSession has already stashed the raw
+      // event body there via setInternal('lark', body).
+      ctx.on('internal/session', (session: Session) => {
+        const body = (session.event as { _data?: unknown } | undefined)?._data;
+        for (const { key, name } of extractResourceNames(body)) {
+          rememberBounded(resourceNames, key, name, LARK_CACHE_LIMIT);
+        }
+
+        // Rich text: the adapter decodes no content for `msg_type: 'post'`, so give the session
+        // the elements it should have had (see larkPostElements for what and why).
+        //
+        // ⚠️ This is the one place this profile WRITES to a session rather than reading it, and it
+        // works for one reason: @satorijs/core's `dispatch` emits 'internal/session' BEFORE the
+        // typed events (lib/index.cjs, 2026-09 — `emit('internal/session')`, then the `for (const
+        // event of events)` loop). `elements` is a Session accessor over `event.message.elements`,
+        // exactly where satori-core's inbound normalization reads it from, so the message reaches
+        // core as if the adapter had decoded it. Assigning `content` instead would be wrong: that
+        // setter clears `event.message.quote`, which adaptMessage may have just filled in.
+        const bot = session.bot as unknown as
+          | { getResourceUrl?(type: string, messageId: string, fileKey: string): string }
+          | undefined;
+        if (!bot?.getResourceUrl) return;
+        const rebuilt = larkPostElements(body, (type, messageId, fileKey) =>
+          bot.getResourceUrl!(type, messageId, fileKey)
+        );
+        if (rebuilt) session.elements = rebuilt;
+      });
     },
 
     detectMention(session, selfId) {
@@ -313,9 +625,35 @@ export function createLarkProfile(): PlatformProfile<LarkPlatformConfig> {
     },
 
     attachmentMeta() {
-      // Lark image/audio/media/file elements carry only an internal resource url,
-      // no mime/size ⇒ return {}, download layer falls back to HTTP content-type.
+      // Lark image/audio/media/file elements carry only an internal resource url, no mime and no
+      // size ⇒ return {}. Both are recovered at fetch time instead (sniffed from the bytes,
+      // filename from the raw body) — see fetchAttachment.
       return {};
+    },
+
+    async fetchAttachment(bot, url) {
+      // Lark is the only adapter here that hands out an `internal:` media URL (the other seven
+      // emit public https links), so this is also the only fetchAttachment override. Anything
+      // that is not one of those URLs is not ours: return undefined and let the generic,
+      // SSRF-guarded HTTP downloader have it.
+      const res = parseLarkResourceUrl(url);
+      if (!res) return undefined;
+      const resource = (
+        bot.internal as { im?: { message?: { resource?: LarkInternalResource } } }
+      )?.im?.message?.resource;
+      if (!resource) {
+        throw new Error(
+          `[lark] im.message.resource.get is unavailable; cannot fetch attachment ${res.fileKey}`
+        );
+      }
+      // `type` is required by Feishu and is already correct in the URL the adapter minted.
+      const raw = await resource.get(res.messageId, res.fileKey, { type: res.type });
+      const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+      const sniffed = sniffLarkMedia(bytes);
+      // Prefer the name the sender's client stated (a `file`/`media` message has one) over a
+      // key + sniffed extension (all an `image`/`audio` message can offer).
+      const name = resourceNames.get(res.fileKey) ?? `${res.fileKey}${sniffed?.ext ?? ''}`;
+      return { bytes, name, ...(sniffed ? { mime: sniffed.mime } : {}) };
     },
 
     // Override send/edit ONLY to pre-render CommonMark → Feishu subset; same
@@ -452,6 +790,19 @@ interface LarkReactionItem {
   reaction_id?: string;
   operator?: { operator_id?: string; operator_type?: 'app' | 'user' };
   reaction_type?: { emoji_type?: string };
+}
+
+/**
+ * The one im.message.resource method fetchAttachment calls (bot.internal is built at runtime from a
+ * route table, so it is narrowed at the call site like the others here). Binary route: resolves to
+ * the body alone, headers dropped — which is why sniffLarkMedia exists.
+ */
+interface LarkInternalResource {
+  get(
+    messageId: string,
+    fileKey: string,
+    query: { type: 'image' | 'file' }
+  ): Promise<ArrayBuffer | Uint8Array>;
 }
 
 interface LarkInternalReaction {

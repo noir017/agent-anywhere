@@ -19,7 +19,7 @@ function bytesOf(s: string): Uint8Array {
 
 /** Mock deps: download returns by url→content map; save returns a fake path and records the call. */
 function makeDeps(opts: {
-  contents?: Record<string, { text: string; contentType?: string }>;
+  contents?: Record<string, { text: string; contentType?: string; name?: string }>;
   downloadError?: Record<string, boolean>;
 } = {}): AttachmentIngestDeps & { saveCalls: Array<{ name: string; bytes: Uint8Array }> } {
   const saveCalls: Array<{ name: string; bytes: Uint8Array }> = [];
@@ -29,7 +29,7 @@ function makeDeps(opts: {
       if (opts.downloadError?.[url]) throw new Error('network error');
       const c = opts.contents?.[url];
       if (!c) throw new Error(`mock not configured for url: ${url}`);
-      return { bytes: bytesOf(c.text), contentType: c.contentType };
+      return { bytes: bytesOf(c.text), contentType: c.contentType, name: c.name };
     }),
     save: vi.fn(async (name: string, bytes: Uint8Array) => {
       saveCalls.push({ name, bytes });
@@ -145,5 +145,53 @@ describe('ingestAttachments', () => {
     expect(res.promptText).toContain('a.txt');
     expect(res.promptText).toContain('b.png saved to');
     expect(res.files).toHaveLength(1); // only b persisted
+  });
+});
+
+/**
+ * A name/mime the TRANSPORT reports rather than the element.
+ *
+ * Lark is why this exists: its media elements declare neither, so before the platform fetch
+ * override an inbound Feishu file was saved under the tail of an `internal:` URL — a bare
+ * resource key with no extension — and a text file was never inlined at all.
+ */
+describe('ingestAttachments · metadata discovered during the download', () => {
+  const url = 'internal:lark/cli_x/im/v1/messages/om_1/resources/file_v2_z?type=file';
+
+  it('names the saved file after what the transport reported', async () => {
+    const deps = makeDeps({ contents: { [url]: { text: 'PDFDATA', name: 'report.pdf' } } });
+    const atts: AttachmentInput[] = [{ type: 'file', url }];
+    const res = await ingestAttachments(atts, CFG, deps);
+    expect(deps.saveCalls[0]!.name).toBe('report.pdf');
+    expect(res.promptText).toContain('report.pdf saved to /cache/report.pdf');
+    // The old behavior: the URL tail, query string and all.
+    expect(res.promptText).not.toContain('file_v2_z?type=file');
+  });
+
+  it('inlines text the element said nothing about, once the name reveals it', async () => {
+    const deps = makeDeps({ contents: { [url]: { text: '# hi', name: 'notes.md' } } });
+    const res = await ingestAttachments([{ type: 'file', url }], CFG, deps);
+    expect(res.promptText).toBe('Attachment notes.md:\n```md\n# hi\n```');
+    expect(deps.saveCalls).toHaveLength(0);
+  });
+
+  it('a reported mime alone is enough to inline it', async () => {
+    const deps = makeDeps({ contents: { [url]: { text: 'plain', contentType: 'text/plain' } } });
+    const res = await ingestAttachments([{ type: 'file', url }], CFG, deps);
+    expect(res.promptText).toContain('```\nplain\n```');
+  });
+
+  it('what the element declared still wins', async () => {
+    const deps = makeDeps({ contents: { [url]: { text: 'x'.repeat(5), name: 'transport.bin' } } });
+    await ingestAttachments([{ type: 'file', url, name: 'element.bin' }], CFG, deps);
+    expect(deps.saveCalls[0]!.name).toBe('element.bin');
+  });
+
+  it('a reported name does not defeat the inject cap', async () => {
+    // Readable and named, but over maxInjectBytes ⇒ saved, not inlined (the pre-existing rule).
+    const deps = makeDeps({ contents: { [url]: { text: 'y'.repeat(200), name: 'big.md' } } });
+    const res = await ingestAttachments([{ type: 'file', url }], CFG, deps);
+    expect(deps.saveCalls[0]!.name).toBe('big.md');
+    expect(res.promptText).toContain('saved to');
   });
 });

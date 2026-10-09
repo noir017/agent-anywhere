@@ -3,7 +3,13 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // Mock DNS resolution so the domain-path SSRF tests are deterministic and offline.
 vi.mock('node:dns/promises', () => ({ lookup: vi.fn() }));
 import { lookup } from 'node:dns/promises';
-import { isPrivateAddress, sanitizeFilename, assertSafeAttachmentUrl } from './attachment-io.js';
+import {
+  isPrivateAddress,
+  sanitizeFilename,
+  assertSafeAttachmentUrl,
+  createAttachmentIngestDeps,
+} from './attachment-io.js';
+import type { Config } from '../config/schema.js';
 
 const mockLookup = vi.mocked(lookup);
 
@@ -122,5 +128,73 @@ describe('assertSafeAttachmentUrl', () => {
 
   it('rejects a malformed URL', async () => {
     await expect(assertSafeAttachmentUrl('not a url')).rejects.toThrow(/invalid attachment URL/i);
+  });
+});
+
+/**
+ * The platform fetch override (`fetchAttachment`).
+ *
+ * The generic downloader speaks http(s) only — by design, since it re-validates every hop of a
+ * user-controlled URL — and Lark's media elements are `internal:lark/…` addresses only the bot
+ * can resolve. So the platform gets first refusal on each URL, and what it hands back still has
+ * to obey the one guard that is about bytes rather than about hosts: the size cap.
+ */
+describe('createAttachmentIngestDeps · platform fetch first', () => {
+  const config = {
+    attachments: { maxDownloadBytes: 100, cacheDir: '/tmp/agent-anywhere-test' },
+  } as unknown as Config;
+  const LARK_URL = 'internal:lark/cli_x/im/v1/messages/om_1/resources/img_v2_a?type=image';
+
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn());
+  });
+
+  it('uses the platform fetch for a URL it claims, and never touches HTTP', async () => {
+    const bytes = new Uint8Array([1, 2, 3]);
+    const deps = createAttachmentIngestDeps(config, async () => ({
+      bytes,
+      mime: 'image/png',
+      name: 'img_v2_a.png',
+    }));
+    await expect(deps.download(LARK_URL)).resolves.toEqual({
+      bytes,
+      contentType: 'image/png',
+      name: 'img_v2_a.png',
+    });
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+
+  it('falls through to HTTP when the platform declines the URL', async () => {
+    mockLookup.mockResolvedValue([{ address: '8.8.8.8', family: 4 }] as never);
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(new Uint8Array([9]), { status: 200, headers: { 'content-type': 'image/gif' } })
+    );
+    const declined = vi.fn(async () => undefined);
+    const deps = createAttachmentIngestDeps(config, declined);
+    const got = await deps.download('https://cdn.example.com/a.gif');
+    expect(declined).toHaveBeenCalledWith('https://cdn.example.com/a.gif');
+    expect(got.contentType).toBe('image/gif');
+  });
+
+  it('enforces maxDownloadBytes on what the platform returns', async () => {
+    // This route reports no content-length to pre-check, so the cap can only be applied after the
+    // bytes are in hand — but it must still be applied.
+    const deps = createAttachmentIngestDeps(config, async () => ({
+      bytes: new Uint8Array(101),
+    }));
+    await expect(deps.download(LARK_URL)).rejects.toThrow(/exceeds maxDownloadBytes/);
+  });
+
+  it('a platform fetch that fails is not retried over HTTP (nothing there can serve it)', async () => {
+    const deps = createAttachmentIngestDeps(config, async () => {
+      throw new Error('[lark] resource gone');
+    });
+    await expect(deps.download(LARK_URL)).rejects.toThrow('[lark] resource gone');
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+
+  it('with no platform fetch at all, an internal: URL is still refused by scheme', async () => {
+    const deps = createAttachmentIngestDeps(config);
+    await expect(deps.download(LARK_URL)).rejects.toThrow(/non-http\(s\)/);
   });
 });

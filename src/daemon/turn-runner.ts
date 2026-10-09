@@ -132,7 +132,7 @@ export class TurnRunner {
     };
 
     const agent = this.agents.getOrCreate(sessionId, agentId);
-    const prompt = await this.buildPrompt(batch);
+    const prompt = await this.buildPrompt(batch, platform);
     console.log(`[turn] ${sessionId} starting turn (${batch.length} message(s))`);
 
     // producedOutput (whether the turn emitted visible output) lives in the ref above. Used for the
@@ -428,7 +428,7 @@ export class TurnRunner {
    * Any attachment-processing error is swallowed and logged — never blocks the turn (the agent still
    * runs, just without attachment context). The attachment block is separated by `---\nAttachments:`.
    */
-  private async buildPrompt(batch: InboundMessage[]): Promise<string> {
+  private async buildPrompt(batch: InboundMessage[], platform: PlatformAdapter): Promise<string> {
     const base = this.mergePrompt(batch);
     if (!this.config.attachments.enabled) return base;
 
@@ -448,7 +448,12 @@ export class TurnRunner {
           maxInjectBytes: this.config.attachments.maxInjectBytes,
           maxDownloadBytes: this.config.attachments.maxDownloadBytes,
         },
-        createAttachmentIngestDeps(this.config)
+        // The platform fetches its own private media (Lark `internal:` URLs); everything else
+        // goes over plain HTTP. Bound per turn because the adapter is resolved per turn.
+        createAttachmentIngestDeps(
+          this.config,
+          platform.fetchAttachment ? (url) => platform.fetchAttachment!(url) : undefined
+        )
       );
       if (!promptText) return base;
       return `${base}\n\n---\nAttachments:\n${promptText}`;

@@ -5,6 +5,46 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+- **Telegram forum topics: replies land in the topic that asked.** A topic message's inbound
+  channel id was the bare `message_thread_id` (the adapter keeps the chat id in `guild.id`), so
+  replies went to the group's General while the topic stayed silent. Inbound now builds the same
+  `<chatId>:<topicId>` key outbound already decoded, on every inbound path (message, button,
+  slash command).
+- **Telegram private-chat topics (Bot API 9.4) work.** Topics inside a 1-on-1 DM all shared one
+  session and were answered in the DM root: the adapter's private-chat branch never reads
+  `message_thread_id`. It is read back from the raw update instead. General (thread 1) and
+  ordinary reply chains (`message_thread_id` without `is_topic_message`) stay on the chat.
+- **Buttons, replies and files reach the topic too.** `sendButtons`, `reply`, and the generic
+  `deleteMessage` / `fetchHistory` / `sendFile` paths handed the whole `<chat>:<topic>` key to the
+  Bot API as `chat_id` — silently posting to the DM root in a private chat, and failing with
+  `400 chat not found` in a group (so an `ask` hung until it timed out). A profile can now declare
+  `decodeChannelKey`, and satori-core decodes once for every generic outbound path; Slack's
+  `<channel>:<thread_ts>` implements it too.
+- **Telegram images, documents and voice notes reach the agent.** Every one was dropped with a
+  single `TypeError: Invalid URL … '/photos/file_10.jpg'` in the log: adapter-telegram asks for
+  the file by an API-relative path, and `@satorijs/core`'s `http/file` listener runs `new URL()` on
+  it before plugin-http resolves it. A listener prepended to the same event resolves relative paths
+  first, pinned by a contract test that reproduces the upstream bug. Behind it, the adapter hands
+  over the bytes as a `data:` URL, which the downloader now accepts directly (size cap still
+  enforced; there is no host for the SSRF guard to act on).
+- **Feishu/Lark images and files reach the agent** instead of a "failed to download" line. The
+  adapter addresses inbound media as `internal:lark/…` resource URLs, which the http(s)-only,
+  SSRF-guarded downloader rightly refuses. A profile can now fetch its own media
+  (`fetchAttachment`) through its authenticated client; Lark is the only one that needs to. The
+  filename comes from the raw event, and an image's type is sniffed from its bytes, since Feishu
+  declares neither where the adapter surfaces it.
+- **A Feishu rich-text message is no longer ignored.** The adapter decodes no content for
+  `msg_type: 'post'` — what a client sends whenever a message mixes formatting or embeds an image —
+  so it reached the gateway empty and was dropped, even when it @-mentioned the bot. The profile
+  rebuilds it, resolving `@` placeholders to real open_ids so mention detection still works.
+
+### Changed
+- **Telegram topic ids in config are now `<chatId>:<topicId>`.** That is the id a topic message
+  routes under, so it is what `freeResponseChannels`, `ignoredChannels` and routing's
+  `when.channelId` match against; a bare topic id written there before no longer matches. In
+  `chat.channels` (the listen allowlist), the chat id alone covers all of that chat's topics.
+
 ## [0.3.2] - 2026-09-28
 
 ### Changed

@@ -38,7 +38,8 @@ session id, agy's conversation id). One conversation holds one session *per agen
 | `schedule-store.ts` | `<configDir>/schedules.json`: 0600, atomic writes, a bad entry dropped loudly |
 | `schedule-service.ts` | Scheduled tasks wired to the rest: a run as a bash process or a turn, the agent's `schedule` commands, the cards |
 | `schedule-bash.ts` | One `--bash` run: its own process group, a bounded output tail, the full log on disk |
-| `reverse-cli-shim.ts` | Guarantees `agent-anywhere` is on the agent's PATH |
+| `reverse-cli-shim.ts` | Guarantees `agent-anywhere` is on the agent's PATH; `selfInvocation` — how to re-run this CLI, shared with the tool server entry |
+| `skill-link.ts` | Links the bundled skill into the skill directories the harnesses read (`~/.claude/skills`, `~/.agents/skills`, `~/.gemini/config/skills`) |
 
 ## Inbound flow
 
@@ -432,9 +433,10 @@ prefix that used to go on outside DMs was removed because `access.allowFrom` adm
 person here, so it never told two speakers apart. And a Telegram private chat in topic mode
 reports `kind: 'thread'`, so that one person's own DMs carried their handle on every turn. A
 quoted reply prepends one `(replying to: "…")` line, with no author for the same reason.
-Attachments append a block. A slash command is passed through bare, since the SDK decides
-native-command execution by the leading `/`. That is the whole list, plus the one-line
-reverse hint on a session's first turn.
+Attachments append a block: readable text inlined, anything else as one
+`[Attachment <name>: <path> (<mime>)]` line — where it is, not how to open it. A slash command is
+passed through bare, since the SDK decides native-command execution by the leading `/`. That is
+the whole list: the runtimes add nothing to it, on any turn (see "What a session is given").
 
 **The effects chain.** All stream-event side effects are serialized into one promise
 chain (`enqueue`), so "text push → tool-boundary flush → tool bubble → trailing text"
@@ -867,17 +869,42 @@ spawn-time check that home stayed unwired until the next restart.
 
 Protocol-agnostic pieces both runtimes must behave *identically* on: the child
 environment, working-directory resolution (`agents[].cwd`, or an auto-created
-`~/.agent-anywhere/agents/<id>`), the reverse-command hint, tool-preview formatting, and
-child termination (SIGTERM, then SIGKILL after `KILL_GRACE_MS` — harness CLIs may ignore
-SIGTERM mid-turn).
+`~/.agent-anywhere/agents/<id>`), tool-preview formatting, and child termination (SIGTERM, then
+SIGKILL after `KILL_GRACE_MS` — harness CLIs may ignore SIGTERM mid-turn).
 
-`buildReverseHint(harness)` generates the per-turn `<system-reminder>` from the specs in
-`REVERSE_COMMANDS` marked `inject`. `send-file` is `'always'`; `ask` is `'no-native-ask'`,
-so it reaches only the harnesses that cannot ask over ACP (see below). One more line follows: the
-pointer to `agent-anywhere help`, carrying the few capabilities an agent could not guess the gateway
-has (a schedule that survives restarts first of all). On `claude` the hint is those two lines. It
-cannot drift from the actual CLI. See
-[`src/ipc/README.md`](../ipc/README.md) for why the rest is loaded on demand.
+`buildAgentEnv` runs at every spawn in both runtimes, which makes it the one place that provisions
+what the reverse CLI depends on: the shim at the front of `PATH`, and the skill link
+(`skill-link.ts`) under the home this agent runs as.
+
+### What a session is given: the user's words, two tools, a skill
+
+Neither runtime adds text of its own to a turn. `promptBlocks` sends the user's text as the only
+block on every turn; agy gets the same string. Until 1.40 a `<system-reminder>` went in front of
+each session's first turn — see [`src/ipc/README.md`](../ipc/README.md#how-it-got-here) for its
+history and why it went.
+
+What replaced it:
+
+- **Native tools**, ACP only. `acpMcpServers` lists `agent-anywhere mcp` — named `chat`, so Claude
+  Code shows `mcp__chat__send_file` — in `session/new` *and* `session/load`, as a stdio server the
+  harness starts per session. Stdio because every ACP agent must support it (2026-10-09: cc, cx and
+  oc also advertise http, which would mean a listening port where there is only a 0600 socket).
+  Its environment is spelled out — token, socket, and the session's cwd for relative paths —
+  because a harness may not pass its own on (codex gives MCP servers an allowlist), and ACP's stdio
+  entry has no `cwd`. It is re-invoked through `selfInvocation`, so a test worker, which is not the
+  CLI, gets no server at all rather than a broken one.
+- **The skill**, every harness that has a known skill directory (`skill-link.ts`): `~/.claude/skills`
+  for claude, `~/.agents/skills` for codex and opencode, `~/.gemini/config/skills` for agy — each
+  probed by asking the model what it sees, because a directory a harness documents is not
+  necessarily one it reads (agy's own help names `~/.gemini/antigravity-cli/skills`, and a skill
+  there never reached the model). The evidence is in the file header. A symlink into the installed package, so it is only on machines that run the
+  daemon and always the running version's own. Linked only once the harness's own config
+  directory exists; a real directory by that name is the operator's and is left alone.
+  `AGENT_ANYWHERE_NO_SKILL_LINK=1` turns it off — set it on a test daemon run from a checkout, or
+  it repoints the live daemon's link at the checkout until the live one next spawns an agent.
+- **agy has no tools.** It does not speak ACP, and its MCP servers live in a global config
+  (`agy mcp add`) the gateway will not edit — an entry there would appear in the operator's own
+  interactive agy too. It gets the skill, whose CLI covers the same two commands.
 
 ### `session/load` replay must not reach the chat
 
@@ -1137,7 +1164,7 @@ registered token rather than a `Map.get`, so a timing side-channel cannot reveal
 leading characters of a guess are correct. Defense in depth — tokens are 122-bit UUIDs
 and the socket is `0600` — but cheap, since the live set is small.
 
-**`reverse-cli-shim.ts`** guarantees the hint's promise that `agent-anywhere` is on PATH.
+**`reverse-cli-shim.ts`** guarantees the skill's promise that `agent-anywhere` is on PATH.
 Whether it actually is depends on how the daemon was launched: a global npm install puts
 it there, `node dist/cli.js start` or a `tsx` dev run does not, and a service manager may
 strip PATH entirely. So the daemon writes a two-line shim re-executing *exactly* the

@@ -62,9 +62,9 @@ agent-anywhere start    # 给机器人发消息即可
 
 ```text
 Set up https://github.com/noir017/agent-anywhere for me: install the CLI
-(npm i -g agent-anywhere-cli) and its skill (npx skills add
-https://github.com/noir017/agent-anywhere/tree/main/skill -g), then follow
-the skill to configure and start it.
+(npm i -g agent-anywhere-cli), then follow the skill bundled in the installed
+package (skill/SKILL.md, under `npm root -g`/agent-anywhere-cli) to configure
+and start it.
 ```
 
 </details>
@@ -516,8 +516,8 @@ config.yaml。
 无论点按钮还是打字，提问那条消息都会被就地编辑：按钮撤掉，并写上你的回答。
 实在不想回答，用 `/stop`（或 `/new`）把问题撤掉。
 
-不实现 elicitation 的 harness——`opencode` 1.18.27 与 `dsh` 0.1.2-rc.1——提示里改为保留
-`ask` 这条 CLI，模型照样能给你弹按钮；再不行就用纯文本把问题问出来并结束这一轮，
+不实现 elicitation 的 harness——`opencode` 1.18.27 与 `dsh` 0.1.2-rc.1——可以用 `ask` 这条
+CLI 给你弹按钮，模型通过内置 skill 找到它；再不行就用纯文本把问题问出来并结束这一轮，
 你在下一条消息里回答即可。
 
 ## 定时任务
@@ -542,24 +542,24 @@ harness 自带的定时工具做不到的。
 
 ## 在聊天中行动
 
-纯文本回答自动流式返回。智能体被告知的，只有文本通道唯一做不到的那一件事：
+纯文本回答自动流式返回。网关**不往**智能体读到的内容里加任何东西——没有开场白，也不提醒它
+自己跑在哪里；它拿到的就是你的话和你的附件。回答之外它还能做的事，和别的能力一样，经由它
+自己的 harness 送到它面前：
 
-```bash
-agent-anywhere send-file ./report.pdf --caption "Q3 数据"
-```
+- **两个原生工具** `send_file` 和 `schedule`，所有走 ACP 的智能体（Claude Code、Codex、
+  OpenCode……）都有：守护进程给每个会话挂一个小的 MCP server，它们就和别的工具一样出现在
+  智能体的工具列表里。
+- **一个 skill** 管其余的——发到别的聊天、读聊天记录、回复、编辑、话题、按钮提问、语音转写。
+  守护进程把内置的 [skill](skill/SKILL.md) 软链到各 harness 读 skill 的地方——Claude Code 是
+  `~/.claude/skills`，Codex 和 OpenCode 是 `~/.agents/skills`，Antigravity 是 `~/.gemini/config/skills`
+  ——只给在这台机器上跑过的 harness。
+  用到之前，它只占每个 skill 都占的那一行描述；正文指向 `agent-anywhere help <主题>`——`files`、
+  `schedule`、`channels`、`history`、`messages`、`threads`、`ask`、`voice`——打印该主题的命令
+  和规则。
 
-外加一行指向 `agent-anywhere help` 的提示，点出它猜不到网关能做的事——定时任务、发到别的
-聊天、读聊天记录。其余命令都**按需加载**：智能体需要时运行 `agent-anywhere help <主题>`，
-才读到那个主题的命令和规则，在模型读到你第一个字之前，不占它任何注意力。主题有：`files`、
-`schedule`、`channels`、`history`、`messages`（`send-message`、`reply`、`edit-message`、
-`react`、`delete`）、`threads`、`ask`、`voice`。为什么注入部分这么小，见
-[`src/ipc/README.md`](src/ipc/README.md)。
-
-内置的 [skill](skill/SKILL.md) 以 skill 的形式带着同一套用法，给会加载 skill 的 harness 用：
-
-```bash
-npx skills add https://github.com/noir017/agent-anywhere/tree/main/skill -g
-```
+Antigravity（`agy`）只有 skill：它没有按会话添加工具的途径，而网关不会去改它的全局 MCP 配置；
+同样的两件事在它的 skill 里以 CLI 命令的形式提供。为什么正好两个工具、被它替换掉的提示词注入
+是怎么退场的，见 [`src/ipc/README.md`](src/ipc/README.md)。
 
 ## CLI
 

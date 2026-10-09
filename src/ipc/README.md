@@ -8,18 +8,20 @@ a unix socket, and the daemon resolves "which conversation is this?" from the tu
 and executes on the right adapter.
 
 ```
-agent (Bash)
-  └─ agent-anywhere send-file ./report.pdf
-        │  commands/reverse.ts  → builds an IpcAction
-        │  ipc/client.ts        → connects, sends {token, action} as one JSON line
-        ▼
+agent (Bash)                                  agent (native tool, via MCP)
+  └─ agent-anywhere send-file ./report.pdf      └─ send_file {path: "./report.pdf"}
+        │  commands/reverse.ts                        │  commands/mcp.ts (agent-anywhere mcp)
+        │    → builds an IpcAction                    │    → ipc/tools.ts → the same spec's build
+        └──────────────┬──────────────────────────────┘
+                       │  ipc/client.ts → connects, sends {token, action} as one JSON line
+                       ▼
     unix socket  (<configDir>/daemon.sock, umask 0o077 + chmod 0600)
         │
         ▼  ipc/server.ts  → parseIpcRequest (zod, strict)
     daemon.resolveChannel(token)  → token → session → activeChannel
     daemon.handleReverse(action, address)    → platform.sendFile(...)
         │
-        ▼  {ok: true, data} back as one JSON line → CLI prints TOON to stdout
+        ▼  {ok: true, data} back as one JSON line → rendered as TOON (stdout, or the tool result)
 ```
 
 This module imports nothing from the project except `types.ts`.
@@ -29,6 +31,7 @@ This module imports nothing from the project except `types.ts`.
 | File | Role |
 |---|---|
 | `commands.ts` | `REVERSE_COMMANDS` — the single source of truth for the command catalog |
+| `tools.ts` | `NATIVE_TOOLS` — the commands an agent also gets as native tools, as views of their specs |
 | `protocol.ts` | The `IpcAction` union + its zod validation schema |
 | `server.ts` | Daemon-side socket server |
 | `client.ts` | CLI-side client used by short-lived reverse-command processes |
@@ -38,72 +41,82 @@ This module imports nothing from the project except `types.ts`.
 One spec array drives four places, so they cannot drift:
 
 - `cli.ts` registers commander subcommands from it (usage string, options, `build`).
-- `agent-common.ts` `buildReverseHint()` generates the per-turn `<system-reminder>` the
-  agent sees, from the `hint` of each spec **marked `inject`**.
 - `agent-anywhere help <topic>` renders each spec's usage and options onto the page its
   `topic` names (see below).
+- `tools.ts` builds the native tools from the specs they name: a tool's parameters are the
+  command's positionals and options, its parameter descriptions are the option descriptions, and
+  its arguments go through the spec's own `build` — a tool call is validated exactly as the same
+  command typed into a shell.
 - `daemon.ts` `handleReverse` dispatches, with an exhaustive `never` guard.
 
 **Adding a reverse command is two edits**: one arm in the `IpcAction` union
 (`protocol.ts`) and one entry in `REVERSE_COMMANDS`, whose `topic` is required — a command
-has to say which help page an agent will find it on. CLI registration, the help page and the
-agent-facing hint follow automatically, and a missing `handleReverse` arm **fails to compile**.
-Do not add a command by hand-registering it in `cli.ts`. (`help` itself is the one command
-registered there by hand: it is local, and never reaches the daemon.)
+has to say which help page an agent will find it on. CLI registration and the help page
+follow automatically, and a missing `handleReverse` arm **fails to compile**.
+Do not add a command by hand-registering it in `cli.ts`. (`help` and `mcp` are the commands
+registered there by hand: `help` is local and never reaches the daemon, and `mcp` is the tools'
+front door rather than a command of its own.)
 
 The catalog: `send-message`, `reply`, `edit-message`, `send-file`, `react`, `delete`,
 `fetch-messages`, `create-thread`, `ask`, `voice-log`, `channels`, `schedule`.
 
-## Loaded on demand: the injected hint is a pointer
+## What an agent is told: nothing. What it can find
 
-`inject` is set on two specs — `send-file` as `'always'` and `ask` as `'no-native-ask'` —
-and the hint adds exactly one more line: a pointer to `agent-anywhere help`, carrying the
-`pointer` phrases of the topics in `HELP_TOPICS` that have one (scheduled tasks that survive
-restarts, posting to other chats, chat history). Everything else costs nothing until the model
-runs `agent-anywhere help <topic>`, which prints that topic's commands — rendered from the specs
-— and its `notes`: the rules, the traps, the defaults. The flag governs one thing: what is
-spent from the model's attention before it has read the user's first word.
+The gateway puts no text of its own into the agent's prompt — no preamble, no reminder (see
+"Nothing of the gateway's in the agent's prompt" in [AGENTS.md](../../AGENTS.md)). What an
+agent can do here reaches it through its harness's own mechanisms, in three layers:
 
-It is the skill pattern — a line of description in context, the body loaded when relevant —
-done in the CLI, because every harness here has a shell and not every harness has skills (the
-ones that do keep them in different places). MCP tools were the other candidate and lose where
-it matters: only Claude Code defers MCP tool definitions, and only past a size threshold;
-opencode, codex and agy would carry every schema in every request. Verified 2026-09-30 against a
-test daemon: asked in plain Chinese to "run this command in two minutes", claude ran
-`agent-anywhere help`, then `help schedule`, then a correct `schedule add` — having been told
-nothing but the pointer line.
+1. **Two native tools**, `send_file` and `schedule` (`tools.ts`). `agent-anywhere mcp`
+   (`commands/mcp.ts`) serves them over MCP on stdio, and the daemon lists that server in every
+   ACP session's `session/new` (`daemon/agent-acp.ts` `acpMcpServers`), so the harness starts one
+   per session. Same socket, same session token, same TOON answer as the shell command.
+2. **The bundled skill** (`skill/SKILL.md`), whose one-line description is the only thing in
+   context until an agent needs it. Its body sends the agent to `agent-anywhere help`. The daemon
+   links it into the skill directories the harnesses read (`daemon/skill-link.ts`).
+3. **`agent-anywhere help <topic>`**, the reference: each topic's commands rendered from the
+   specs, plus its `notes` — the rules, the traps, the defaults.
 
-The pointer's phrases are a budget, not a list: a topic earns one only when an agent could not
-guess the gateway does it. `schedule` is the case the whole design exists for — without the
-line, a model asked for "every morning at 8" reaches for its own harness's session-bound cron
-tool and the task dies with the process.
+### Why exactly two tools
 
-The hint used to carry all nine commands with full usage — about 350 tokens of chat-bot
-operating manual in the **first text block** of every session's opening turn. The cost was
-the framing more than the tokens: a model that opens by reading how to react with emoji
-and page through message history has been told what kind of job this is before it sees the
-job.
+A tool's definition is context the agent pays for whether or not it is used. Measured 2026-10-09
+(`project-scripts/aa-native-tools/probe-tokens.mjs`): on Claude Code these two add about 1,030 input
+tokens to every request — cached after the first, but every request; the `<system-reminder>` they
+replace was about 80. Codex 0.159.2 lazy-loads MCP tools behind its own `tool_search` and OpenCode
+2.0.26 exposes them inside its code tool, so there they cost less. So a tool has to be something an
+agent can neither do without nor guess exists:
 
-Most of it was redundant anyway:
+- `send_file` is the one act a text reply cannot perform: a file has to be uploaded, not
+  described.
+- `schedule` is the one capability agents reliably get wrong without being told. Asked for "every
+  morning at 8", a model reaches for its own harness's scheduler, which lives inside the agent
+  process and dies with it — the gateway stops idle sessions after an hour, and on every restart.
 
-| Command | Why it is not injected |
+The skill documents these two as CLI commands as well, and an agent that does not see the tools up
+front takes that route: in the 2026-10-09 end-to-end run, Claude Code called `mcp__chat__send_file`
+and `mcp__chat__schedule`, OpenCode called `tools.chat.send_file`, and Codex — whose tool list
+starts without them — read the skill and ran `agent-anywhere send-file`. Same command, same result.
+
+The rest stay CLI commands behind the skill:
+
+| Command | Why it is not a tool |
 |---|---|
 | `send-message`, `reply` | The agent's plain text already streams into the chat. A command to send text is a slower way to do what happens by itself. |
 | `edit-message` | The daemon already live-edits the turn's message. |
 | `react`, `delete`, `create-thread`, `fetch-messages` | Chat-client chrome, not the work the agent was asked to do. |
 | `channels` | Only needed to post somewhere other than here, which is rare and always deliberate. |
-| `schedule` | Not injected, but advertised by the pointer — see above for why it is the one that has to be. |
-| `voice-log` | A confirmed voice transcript reaches the agent as the user's own typed words — the user read and approved them — so telling every session that some messages were spoken would only invite second-guessing text that was already checked. It exists for the rare turn where a message reads like a mishearing. |
+| `voice-log` | A confirmed voice transcript reaches the agent as the user's own typed words — the user read and approved them — so advertising that some messages were spoken would only invite second-guessing text that was already checked. It exists for the rare turn where a message reads like a mishearing. |
+| `ask` | On `claude` the model asks with its own question tool over ACP `elicitation/create`, rendered as the same buttons. `opencode` and `dsh` have no such tool (probed 2026-09-11: neither sends any reverse request); their models find `ask` through the skill, or ask in prose. |
 
-`send-file` stays because it is the one act the text channel cannot perform: a file has to
-be uploaded, not described.
+### How it got here
 
-`ask` is conditional because its replacement is. On `claude` the model asks over ACP
-`elicitation/create` and the daemon renders that as the same buttons, so advertising the
-CLI would offer a second, worse route to one destination. On `opencode` and `dsh` — probed
-2026-09-11, neither sends any reverse request — there is no such tool, and without the
-hint their models can only ask in prose. Unprobed harnesses are treated as unable to ask:
-being wrong that way costs one hint line, the other way costs the user their buttons.
+Until 1.40 a `<system-reminder>` went in front of the first turn of every session. It started as
+all nine commands with full usage — about 350 tokens of chat-bot operating manual ahead of what
+the user asked — was cut to `send-file`, `ask` where needed, and one line pointing at
+`agent-anywhere help` (2026-09-11 and 2026-09-30), and was removed on 2026-10-09. The pointer had
+worked — asked in plain Chinese to "run this command in two minutes", claude ran `help`, `help
+schedule` and a correct `schedule add` — but three lines opening with "your replies reach the user
+automatically" still told the model what kind of job this was before it read the job. Any text
+the gateway puts there does that; the harness's own tool list and skill list do not.
 
 `CHANNEL_OPTION` (`-c, --channel <id>`) is appended to every command. Empty means "the
 current conversation", which is the default an agent should almost always use — the
@@ -192,7 +205,8 @@ If you add an action, pick one of these three and say why in a comment.
 ## Output format
 
 Reverse commands print **TOON** (`@toon-format/toon`) to **stdout**, never stderr —
-stdout is the agent's only data channel. `cli.ts` reroutes commander's usage and
+stdout is the agent's only data channel. A tool call gets the same text as its result: `commands/reverse.ts`
+renders an answer once (`renderResult`) and both front doors print it. `cli.ts` reroutes commander's usage and
 validation errors to stdout for the same reason, and the top-level catch emits
 `{ error }` structured rather than throwing a stack.
 
@@ -202,6 +216,7 @@ history dump token-bounded.
 ## Tests
 
 `protocol.test.ts` — the validation schema, with an enforced coverage threshold
-(`vitest.config.ts`) because it is the trust boundary. `server.ts` and `client.ts` are
+(`vitest.config.ts`) because it is the trust boundary. `tools.test.ts` — that a tool's schema says what its
+command accepts and that a call builds the action the shell command would. `server.ts` and `client.ts` are
 exercised indirectly through the daemon tests; the socket paths themselves have no
 integration harness.

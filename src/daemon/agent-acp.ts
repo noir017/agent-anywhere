@@ -32,7 +32,6 @@ import type {
   ReclaimState,
   RunTurnInput,
 } from './agent.js';
-import { looksLikeCommand } from './routing.js';
 import { harnessLogProbe, readHarnessErrors } from './harness-log.js';
 import {
   describeSessionFailure,
@@ -45,13 +44,13 @@ import type { ConversationStore } from './conversation-store.js';
 import {
   buildAgentEnv,
   buildInputPreview,
-  buildReverseHint,
   isNonEmptyObject,
   killChildProcess,
   resolveConversationCwd,
   stripCode,
   truncateToolName,
 } from './agent-common.js';
+import { selfInvocation } from './reverse-cli-shim.js';
 
 /**
  * AgentFactory's ACP (Agent Client Protocol) implementation on the official @agentclientprotocol/sdk.
@@ -78,29 +77,62 @@ import {
 /** ACP protocol version: taken from the installed SDK's PROTOCOL_VERSION, auto-aligning on upgrade (no hardcoded drift). */
 const ACP_PROTOCOL_VERSION = PROTOCOL_VERSION;
 
-// ───────────────────────── Replaceable seams (two switches for plan A → B) ─────────────────────────
+// ───────────────────────── What the agent is given: tools, not text ─────────────────────────
 
 /**
- * Seam ①: inject reverse-command (agent-anywhere) usage as a text block in the prompt (plan A).
- * Injected only on the first turn (when hint is non-empty); later turns send user input only.
- * For plan B (MCP): make this always return user input only, and register the agent-anywhere MCP server in acpMcpServers().
+ * The prompt of a turn: what the user sent, as the only block. The gateway adds nothing of its own
+ * — no preamble, no reminder — so that what the agent reads is what it was asked (see
+ * ipc/commands.ts HELP_TOPICS for what replaced the `<system-reminder>` that used to go first).
  */
-export type PromptDecorator = (turn: RunTurnInput, hint: string) => ContentBlock[];
-
-export const defaultPromptDecorator: PromptDecorator = (turn, hint) => {
-  const blocks: ContentBlock[] = [];
-  if (hint) blocks.push({ type: 'text', text: hint });
-  blocks.push({ type: 'text', text: turn.prompt });
-  return blocks;
-};
+export function promptBlocks(turn: RunTurnInput): ContentBlock[] {
+  return [{ type: 'text', text: turn.prompt }];
+}
 
 /**
- * Seam ②: MCP servers handed to the agent on `session/new` (plan B landing point).
- * Plan A returns []. For plan B: return the local agent-anywhere reverse-command MCP server so the agent treats
- * reverse capabilities as native schema-typed tools — agent-agnostic, executed by the daemon without a token.
+ * The name the agent's tools are filed under — Claude Code shows `mcp__chat__send_file`. Neutral on
+ * purpose: the name is part of what the model reads, and "this is how you send the user a file"
+ * says everything it needs, where the gateway's own name would only say where it is running.
  */
-export function acpMcpServers(_def: AgentDef, _socketPath: string): McpServer[] {
-  return [];
+export const NATIVE_TOOLS_SERVER = 'chat';
+
+/**
+ * MCP servers handed to the agent in `session/new` and `session/load`: `agent-anywhere mcp`, which
+ * serves `send_file` and `schedule` as native tools (commands/mcp.ts, ipc/tools.ts).
+ *
+ * Stdio, because it is the one transport every ACP agent MUST support — probed 2026-10-09, the
+ * agents here additionally advertise http (claude-agent-acp 0.81.2, codex-acp 2.1.1, opencode
+ * 2.0.26), but serving HTTP would mean a listening port where today there is only a 0600 socket.
+ * The harness starts the server as its own child, once per session.
+ *
+ * Its environment is spelled out rather than inherited, because inheritance is the harness's call
+ * and codex, for one, passes its MCP servers an allowlist: the session's token (the server is a
+ * reverse-command client like any other, with the same rights), the socket, and the session's
+ * working directory, which relative paths are resolved against — ACP gives a stdio server no `cwd`,
+ * so where it starts is up to the harness.
+ *
+ * Empty when this process is not the CLI (a test worker): the server is re-invoked through the
+ * daemon's own entry, and there is no entry to re-invoke. The agent then simply has no tools, which
+ * is the pre-1.40 state, and the CLI behind the skill still works.
+ */
+export function acpMcpServers(
+  sessionToken: string,
+  socketPath: string,
+  cwd: string,
+  self = selfInvocation()
+): McpServer[] {
+  if (!self) return [];
+  return [
+    {
+      name: NATIVE_TOOLS_SERVER,
+      command: self.command,
+      args: [...self.args, 'mcp'],
+      env: [
+        { name: 'AGENT_ANYWHERE_TURN_TOKEN', value: sessionToken },
+        { name: 'AGENT_ANYWHERE_SOCKET', value: socketPath },
+        { name: 'AGENT_ANYWHERE_CWD', value: cwd },
+      ],
+    },
+  ];
 }
 
 // ───────────────────────── harness preset → launch command ─────────────────────────
@@ -690,7 +722,6 @@ function createAcpSession(
   turnTimeoutMs: number,
   store?: ConversationStore
 ): AgentSession {
-  const decorate: PromptDecorator = defaultPromptDecorator;
   /**
    * The directory this session's child runs in. Resolved per SPAWN, not once per session, so a
    * `/cd` that disposed the child takes effect on the next turn (see resolveConversationCwd).
@@ -754,8 +785,6 @@ function createAcpSession(
    * per session (see ensureStarted). Undefined whenever no startup is running.
    */
   let starting: Promise<void> | undefined;
-  /** Whether the reverse-command hint was injected on the first turn (inject once, see seam ①). */
-  let hintInjected = false;
   /** Intentional-abort flag: set by abort(); used to return silently when prompt ends as cancelled. */
   let aborting = false;
   /**
@@ -995,7 +1024,6 @@ function createAcpSession(
     }
     if (child) killChildProcess(child);
     resetHandles();
-    hintInjected = false;
   }
 
   /**
@@ -1072,8 +1100,6 @@ function createAcpSession(
       if (proc !== child) return; // already replaced/cleared by dispose; stale callback no-ops
       console.debug(`[acp] child process exited (${def.id}): code=${code} signal=${signal}; resetting connection handles to rebuild next turn`);
       resetHandles();
-      // Next turn is a fresh child/session, so re-inject the reverse-command hint (new session doesn't know agent-anywhere usage).
-      hintInjected = false;
     });
 
     const stream = ndJsonStream(
@@ -1152,7 +1178,7 @@ function createAcpSession(
           const loaded = await ctx.request('session/load', {
             sessionId: persistedId,
             cwd,
-            mcpServers: acpMcpServers(def, socketPath),
+            mcpServers: acpMcpServers(sessionToken, socketPath, cwd),
           });
           active = resumed;
           // session/load reports the resumed session's config the same way session/new does.
@@ -1181,7 +1207,7 @@ function createAcpSession(
         const session = await ctx
           .buildSession({
             cwd,
-            mcpServers: acpMcpServers(def, socketPath), // seam ②: empty for plan A
+            mcpServers: acpMcpServers(sessionToken, socketPath, cwd),
             // model passed best-effort via _meta; whether it takes effect depends on the harness
             // (claude/gemini differ). dsh's bridge ignores _meta entirely — it reads provider/model
             // only from its own profile config (verified in @deepseek-ai/dsh-acp newSession, which
@@ -1720,13 +1746,6 @@ function createAcpSession(
       aborting = false;
       await ensureStarted(input.sessionToken);
 
-      // Slash-command turns don't prepend the reverse hint: the agent SDK decides native-command
-      // execution by whether the first text block starts with `/`, and a leading hint block would break
-      // it. This turn doesn't consume the hint (hintInjected unchanged), deferring it to a later normal turn.
-      const isCommand = looksLikeCommand(input.prompt);
-      const hint = hintInjected || isCommand ? '' : buildReverseHint(def.harness);
-      if (!isCommand) hintInjected = true;
-
       // Whatever background output was still rendering belongs to the previous exchange. AWAITED,
       // not fired and forgotten: in the default `once` delivery mode the burst's whole body is
       // sent by this call, and the new turn is about to start sending through a different buffer —
@@ -1841,7 +1860,7 @@ function createAcpSession(
         // long conversation is guaranteed to lose).
         if (replayFence) await replayFence;
         promptedYet = true; // from here on, renderable output is this session's own (see promptedYet)
-        promptDone = active!.prompt(decorate(input, hint));
+        promptDone = active!.prompt(promptBlocks(input));
         // Attached straight after the SDK's own callback (which enqueues the `stop`), so this runs
         // before the pump can read that `stop` — see endTurnWait above.
         void promptDone.then(

@@ -549,14 +549,6 @@ export function taskView(task: ScheduleTask, now: number, opts: { detail?: boole
   };
 }
 
-/**
- * The one line an agent run's prompt is prefixed with. Short on purpose — the agent needs to know
- * nobody typed this, and nothing more (the gateway keeps what it injects to the minimum).
- */
-export function agentRunPrompt(task: ScheduleTask, planned: number): string {
-  return `[⏰ scheduled task "${task.name}" #${task.id} · ${formatInZone(planned, task.when.tz)} ${task.when.tz}]\n${(task.run as { prompt: string }).prompt}`;
-}
-
 /** How much of a bash task's output is shown inline; the rest is in the attached log. */
 export const BASH_INLINE_LIMIT = 3_000;
 

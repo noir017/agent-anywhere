@@ -17,7 +17,6 @@ import type { ConversationStore } from './conversation-store.js';
 import {
   buildAgentEnv,
   buildInputPreview,
-  buildReverseHint,
   killChildProcess,
   resolveConversationCwd,
   truncateToolName,
@@ -552,8 +551,6 @@ function createAgySession(
    * Kept in the session closure across child respawns (same pattern as ACP runtime's modelPreference).
    */
   let modelPreference: string | undefined;
-  /** Whether the reverse-command hint was injected (once per child, like the ACP runtime). */
-  let hintInjected = false;
   /** Intentional-abort flag: set by abort()/dispose() so a killed turn resolves silently. */
   let aborting = false;
 
@@ -703,7 +700,6 @@ function createAgySession(
     const pending = currentTurn;
     resetHandles();
     currentTurn = undefined;
-    hintInjected = false; // a fresh child won't know the reverse-CLI usage
     wakeStatusWaiters(); // a settle wait on this child has nothing left to wait for
     if (child) {
       closeStatusPipe(child);
@@ -789,8 +785,6 @@ function createAgySession(
     const pending = currentTurn;
     currentTurn = undefined;
     resetHandles();
-    // A fresh child means a fresh conversation, so the hint must be re-injected.
-    hintInjected = false;
     pending?.fail(
       new Error(`agy exited unexpectedly (code=${code} signal=${signal}) — see the log above for its stderr output`)
     );
@@ -870,13 +864,6 @@ function createAgySession(
       const known = servingModel();
       if (known) handlers.onModel?.(known);
 
-      // Reverse-command hint: injected once per child, prepended to the first turn's text. Unlike the
-      // ACP runtime there is no slash-command carve-out — slash expansion is disabled for this
-      // harness, so a leading `/…` is just text and a preceding hint block can't break anything.
-      const hint = hintInjected ? '' : buildReverseHint(def.harness);
-      hintInjected = true;
-      const content = hint ? `${hint}\n${input.prompt}` : input.prompt;
-
       const state: AgyTurnState = {
         handlers,
         lastSegment: 'none',
@@ -901,7 +888,10 @@ function createAgySession(
 
       // One NDJSON line = one turn. Only `text` content blocks are permitted by the protocol; any
       // other shape terminates agy's session, so the merged prompt is always sent as a plain string.
-      proc!.stdin.write(JSON.stringify({ event: 'user', message: { content } }) + '\n');
+      // It is what the user sent and nothing of the gateway's. agy also gets no native tools — it does
+      // not speak ACP, and its MCP servers live in a global config the gateway will not edit — so what
+      // it can do here reaches it through the bundled skill alone (see daemon/skill-link.ts).
+      proc!.stdin.write(JSON.stringify({ event: 'user', message: { content: input.prompt } }) + '\n');
 
       try {
         await done;

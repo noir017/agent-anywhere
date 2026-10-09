@@ -14,44 +14,55 @@ import type { InboundMessage } from '../types.js';
  */
 const CONTENT_LIMIT = 500;
 
-/** Encode a plain JS value to TOON and write it to stdout (the agent's only data channel). */
-function emit(value: unknown): void {
-  console.log(encode(value));
+/** Encode a plain JS value to TOON — the format of everything a reverse command prints. */
+function toon(value: unknown): string {
+  return encode(value);
+}
+
+/**
+ * What a reverse command answers with: `stdout` is what the agent reads, `stderr` a note that must
+ * not corrupt it (see `ask`). Returned rather than printed so the same answer reaches an agent that
+ * ran the command in a shell and one that called it as a native tool (commands/mcp.ts).
+ */
+export interface ReverseOutput {
+  stdout: string;
+  stderr?: string;
 }
 
 /**
  * Normalize a user/agent-supplied path to absolute: expand a leading `~`, then
- * path.resolve against the current CWD. This process's CWD is the agent's working dir
- * (set by the daemon when spawning the agent), so the resolved absolute path is the
- * real file as the agent sees it. The daemon's CWD may differ, and the path is later
- * turned into a file:// URL — a relative path or `~` would become a malformed/wrong
- * address like `file://./x.png` on the daemon side, so we must resolve to absolute here.
+ * path.resolve against `base` — the agent's working directory. For a shell command that is this
+ * process's CWD (the agent spawned it); for a tool call it is the session's directory, handed to the
+ * MCP server by the daemon, because a harness starts its MCP servers wherever it likes. The daemon's
+ * CWD may differ from both, and the path is later turned into a file:// URL — a relative path or `~`
+ * would become a malformed/wrong address like `file://./x.png` on the daemon side, so we must
+ * resolve to absolute here.
  */
-function resolvePathArg(p: string): string {
+function resolvePathArg(p: string, base: string): string {
   let expanded = p;
   if (p === '~') expanded = os.homedir();
   else if (p.startsWith('~/')) expanded = path.join(os.homedir(), p.slice(2));
-  return path.resolve(expanded);
+  return path.resolve(base, expanded);
 }
 
 /**
  * Normalize the relative/`~` path in a send-file action to absolute (see resolvePathArg).
  * Other actions are returned unchanged.
  */
-function normalizeActionPaths(action: IpcAction): IpcAction {
+export function normalizeActionPaths(action: IpcAction, base = process.cwd()): IpcAction {
   if (action.kind === 'send-file') {
-    return { ...action, path: resolvePathArg(action.path) };
+    return { ...action, path: resolvePathArg(action.path, base) };
   }
   // Same reason: a schedule's --cwd is read by the daemon, whose own CWD is not the agent's.
   if (action.kind === 'schedule-add' && action.cwd !== undefined) {
-    return { ...action, cwd: resolvePathArg(action.cwd) };
+    return { ...action, cwd: resolvePathArg(action.cwd, base) };
   }
   return action;
 }
 
 /**
  * Unified execution for reverse commands: connect back to the daemon. Reused by the
- * cli.ts subcommands. Reached when the agent (via a skill) runs `agent-anywhere send-file ./out.png`.
+ * cli.ts subcommands. Reached when the agent runs `agent-anywhere send-file ./out.png` in a shell.
  *
  * This function is the AXI output boundary: the daemon speaks plain JSON over IPC, and we
  * convert it to token-efficient TOON on stdout here (errors included, so the agent can read them).
@@ -74,66 +85,63 @@ export async function runReverse(rawAction: IpcAction): Promise<void> {
   const resp = await callDaemon(socket, action, undefined, clientTimeout);
   if (!resp.ok) {
     // AXI §6: errors go to stdout in the same structured format as data, with an actionable hint.
-    emit(friendlyError(resp.error, socket));
+    console.log(toon(friendlyError(resp.error, socket)));
     process.exitCode = 1;
     return;
   }
 
-  printResult(action, resp.data);
+  const out = renderResult(action, resp.data);
+  console.log(out.stdout);
+  if (out.stderr) console.error(out.stderr);
 }
 
 /**
- * Render a successful response as TOON on stdout, shaped per command (AXI §1/§2/§9).
+ * Render a successful response as TOON, shaped per command (AXI §1/§2/§9).
  * `ask` is the one exception: its result is the user's chosen label, printed verbatim so
  * the agent can branch on it directly (an empty line means timeout/no-selection).
  */
-function printResult(action: IpcAction, data: unknown): void {
+export function renderResult(action: IpcAction, data: unknown): ReverseOutput {
   // Commands whose answer depends only on the data, not on the options that asked for it.
   const tabular = DATA_PRINTERS[action.kind];
-  if (tabular) {
-    tabular(data);
-    return;
-  }
+  if (tabular) return { stdout: tabular(data) };
   switch (action.kind) {
     case 'ask': {
       const chosen = (data as { chosen?: string | null } | undefined)?.chosen ?? null;
-      console.log(chosen ?? '');
       // An empty stdout line is a legitimate answer shape, which makes it a poor way to learn that
       // nobody answered at all — the agent sees the same blank either way and reasonably concludes
       // the command is broken. Say so on stderr, where it cannot corrupt the label on stdout.
-      if (chosen === null) {
-        const waited = Math.round((action.timeoutMs ?? DEFAULT_ASK_TIMEOUT_MS) / 1000);
-        console.error(
+      if (chosen !== null) return { stdout: chosen };
+      const waited = Math.round((action.timeoutMs ?? DEFAULT_ASK_TIMEOUT_MS) / 1000);
+      return {
+        stdout: '',
+        stderr:
           `ask: no option was chosen within ${waited}s (the buttons have been withdrawn). ` +
-            `The question was delivered — nobody clicked. Ask again in plain text, or retry with ` +
-            `--timeout <ms> for longer.`
-        );
-      }
-      return;
+          `The question was delivered — nobody clicked. Ask again in plain text, or retry with ` +
+          `--timeout <ms> for longer.`,
+      };
     }
     case 'fetch-messages':
-      printFetchMessages(action, data);
-      return;
+      return { stdout: renderFetchMessages(action, data) };
     case 'create-thread': {
       const threadId = (data as { threadId?: string } | undefined)?.threadId;
       // Contextual disclosure (AXI §9): the next step is almost always sending into the thread.
-      emit({
-        threadId: threadId ?? '',
-        help: `Send into this thread by passing --channel ${threadId ?? '<threadId>'}.`,
-      });
-      return;
+      return {
+        stdout: toon({
+          threadId: threadId ?? '',
+          help: `Send into this thread by passing --channel ${threadId ?? '<threadId>'}.`,
+        }),
+      };
     }
     case 'send-message':
     case 'reply':
     case 'send-file': {
       // These return a MessageRef; surface messageId so the agent can react/reply/edit/delete it later.
       const messageId = (data as { messageId?: string } | undefined)?.messageId;
-      emit(messageId ? { ok: true, messageId } : { ok: true });
-      return;
+      return { stdout: toon(messageId ? { ok: true, messageId } : { ok: true }) };
     }
     default:
       // edit-message / react / delete return nothing actionable — a definitive ack is enough.
-      emit({ ok: true });
+      return { stdout: toon({ ok: true }) };
   }
 }
 
@@ -146,16 +154,15 @@ function printResult(action: IpcAction, data: unknown): void {
  *  - a definitive empty state;
  *  - a `count` aggregate plus paging/widening hints when relevant.
  */
-function printFetchMessages(
+function renderFetchMessages(
   action: Extract<IpcAction, { kind: 'fetch-messages' }>,
   data: unknown
-): void {
+): string {
   const messages = (data as { messages?: InboundMessage[] } | undefined)?.messages ?? [];
 
   // AXI §5: state the zero explicitly so the agent doesn't re-run with different flags to verify.
   if (messages.length === 0) {
-    emit({ count: 0, note: 'no messages found in this channel' });
-    return;
+    return toon({ count: 0, note: 'no messages found in this channel' });
   }
 
   const requested = action.fields?.length ? action.fields : [...DEFAULT_FETCH_FIELDS];
@@ -216,7 +223,7 @@ function printFetchMessages(
     }
   }
   if (help.length) out.help = help;
-  emit(out);
+  return toon(out);
 }
 
 /**
@@ -225,15 +232,13 @@ function printFetchMessages(
  * would defeat the command. A definitive empty state, and a different one when the feature is
  * off, so the agent does not go looking for transcripts that were never made.
  */
-function printVoiceLog(data: unknown): void {
+function renderVoiceLog(data: unknown): string {
   const result = (data as VoiceLogResult | undefined) ?? { enabled: false, entries: [] };
   if (!result.enabled) {
-    emit({ count: 0, note: 'voice transcription is not configured on this gateway (no voice: block in config.yaml)' });
-    return;
+    return toon({ count: 0, note: 'voice transcription is not configured on this gateway (no voice: block in config.yaml)' });
   }
   if (result.entries.length === 0) {
-    emit({ count: 0, note: 'no voice messages have been transcribed in this conversation' });
-    return;
+    return toon({ count: 0, note: 'no voice messages have been transcribed in this conversation' });
   }
   const rows = result.entries.map((e) => ({
     at: e.at,
@@ -245,7 +250,7 @@ function printVoiceLog(data: unknown): void {
     audio: e.audio,
     reason: e.reason ?? '',
   }));
-  emit({
+  return toon({
     count: rows.length,
     transcripts: rows,
     help: [
@@ -261,11 +266,10 @@ function printVoiceLog(data: unknown): void {
  * the next step is always "use one of these", and a cut list that looks complete sends an agent
  * looking for a topic it was never shown.
  */
-function printChannels(data: unknown): void {
+function renderChannels(data: unknown): string {
   const result = (data as ListChannelsResult | undefined) ?? { channels: [], totalTopics: 0, limit: 0 };
   if (result.channels.length === 0) {
-    emit({ count: 0, note: 'no chats or topics match; the list only holds places this gateway has answered in' });
-    return;
+    return toon({ count: 0, note: 'no chats or topics match; the list only holds places this gateway has answered in' });
   }
   const shown = result.channels.filter((c) => c.kind === 'topic').length;
   const help = [
@@ -275,57 +279,51 @@ function printChannels(data: unknown): void {
   if (result.totalTopics > shown) {
     help.push(`Showing the ${shown} most recent of ${result.totalTopics} topics; narrow with --query or raise --limit.`);
   }
-  emit({ count: result.channels.length, channels: result.channels, help });
+  return toon({ count: result.channels.length, channels: result.channels, help });
 }
 
 /**
  * schedule-add / schedule-op: the one task, in full, and the next step. The id is the thing to
  * keep, and the card the gateway posted is what the user sees — said so, so the agent does not
  * restate every field in its reply.
+ *
+ * The next step is worded for both ways in (`schedule pause <id>` in a shell, `action: pause` with
+ * `id` as a tool), since this exact text reaches both.
  */
-function printScheduleTask(data: unknown): void {
+function renderScheduleTask(data: unknown): string {
   const task = (data as { task?: ScheduleTaskView } | undefined)?.task;
-  if (!task) {
-    emit({ ok: true });
-    return;
-  }
-  emit({
+  if (!task) return toon({ ok: true });
+  return toon({
     task,
-    help: [
-      `The gateway posted this task's card in the chat. Manage it with: agent-anywhere schedule pause|resume|run|rm ${task.id}`,
-    ],
+    help: [`A card with this task was posted in the conversation. Manage it by its id (${task.id}): pause, resume, run (now, once) or rm.`],
   });
 }
 
 /** schedule-list: every task as one table, or one task in full for `show`. */
-function printScheduleList(data: unknown): void {
+function renderScheduleList(data: unknown): string {
   const tasks = (data as ScheduleListResult | undefined)?.tasks ?? [];
-  if (tasks.length === 0) {
-    emit({ count: 0, note: 'no scheduled tasks; add one with agent-anywhere schedule add (see agent-anywhere help schedule)' });
-    return;
-  }
+  if (tasks.length === 0) return toon({ count: 0, note: 'no scheduled tasks' });
   if (tasks.length === 1 && (tasks[0]!.prompt !== undefined || tasks[0]!.command !== undefined)) {
-    emit({ task: tasks[0] });
-    return;
+    return toon({ task: tasks[0] });
   }
-  emit({
+  return toon({
     count: tasks.length,
     tasks,
-    help: ['here=true: registered from, or running in, this conversation. `schedule show <id>` prints one task with its prompt or command.'],
+    help: ['here=true: registered from, or running in, this conversation. show <id> prints one task with its prompt or command.'],
   });
 }
 
 /**
  * Printers for the commands whose output is a function of the response alone. A table rather than
- * more switch arms: every gateway query added one, and the switch in printResult is about the
+ * more switch arms: every gateway query added one, and the switch in renderResult is about the
  * commands whose rendering also depends on what was asked (ask's timeout, fetch's columns).
  */
-const DATA_PRINTERS: Partial<Record<IpcAction['kind'], (data: unknown) => void>> = {
-  'voice-log': printVoiceLog,
-  'list-channels': printChannels,
-  'schedule-add': printScheduleTask,
-  'schedule-op': printScheduleTask,
-  'schedule-list': printScheduleList,
+const DATA_PRINTERS: Partial<Record<IpcAction['kind'], (data: unknown) => string>> = {
+  'voice-log': renderVoiceLog,
+  'list-channels': renderChannels,
+  'schedule-add': renderScheduleTask,
+  'schedule-op': renderScheduleTask,
+  'schedule-list': renderScheduleList,
 };
 
 /**
@@ -335,7 +333,7 @@ const DATA_PRINTERS: Partial<Record<IpcAction['kind'], (data: unknown) => void>>
  * (socket missing) / ECONNREFUSED (nobody listening) — and tell the agent how to recover. Other
  * errors pass through as the bare message.
  */
-function friendlyError(error: string, socket: string): { error: string; help?: string } {
+export function friendlyError(error: string, socket: string): { error: string; help?: string } {
   if (error.includes('ENOENT') || error.includes('ECONNREFUSED')) {
     return {
       error: `cannot reach the daemon (socket: ${socket}): ${error}`,

@@ -63,9 +63,9 @@ Paste into Claude Code (or any coding agent):
 
 ```text
 Set up https://github.com/noir017/agent-anywhere for me: install the CLI
-(npm i -g agent-anywhere-cli) and its skill (npx skills add
-https://github.com/noir017/agent-anywhere/tree/main/skill -g), then follow
-the skill to configure and start it.
+(npm i -g agent-anywhere-cli), then follow the skill bundled in the installed
+package (skill/SKILL.md, under `npm root -g`/agent-anywhere-cli) to configure
+and start it.
 ```
 
 </details>
@@ -599,8 +599,8 @@ way the question is edited in place: the buttons come off and what you answered 
 `/stop` (or `/new`) calls the question off if you would rather not answer it at all.
 
 Harnesses that do not implement elicitation — `opencode` and `dsh`, as of 1.18.27 and
-0.1.2-rc.1 — keep the `ask` CLI in their hint instead, so their models can still put
-buttons in front of you. Failing that, the model asks in plain text and ends its turn, and
+0.1.2-rc.1 — can still put buttons in front of you with the `ask` CLI, which their models find
+through the bundled skill. Failing that, the model asks in plain text and ends its turn, and
 you answer in the next message.
 
 ## Scheduled tasks
@@ -627,27 +627,25 @@ pause, resume and delete (delete asks twice). Where there are no buttons,
 
 ## Acting in the chat
 
-Plain text streams back automatically, and the agent is told about exactly one thing it
-cannot do that way:
+Plain text streams back automatically. The gateway adds **nothing** to what the agent reads — no
+preamble, no reminder about where it is running; it gets your words and your attachments. What
+it can do beyond answering reaches it the way any capability does, through its own harness:
 
-```bash
-agent-anywhere send-file ./report.pdf --caption "Q3 numbers"
-```
+- **Two native tools**, `send_file` and `schedule`, on every ACP agent (Claude Code, Codex,
+  OpenCode, …): the daemon hands each session a small MCP server, so they sit in the agent's tool
+  list like any other.
+- **A skill** for the rest — posting to other chats, reading history, replies, edits, threads,
+  button questions, voice transcripts. The daemon links the bundled [skill](skill/SKILL.md) where each harness
+  reads skills — `~/.claude/skills` for Claude Code, `~/.agents/skills` for Codex and OpenCode,
+  `~/.gemini/config/skills` for Antigravity — once that harness has been run on the machine. Until it is
+  needed, it costs the one line of description every skill costs. Its body points at
+  `agent-anywhere help <topic>` — `files`, `schedule`, `channels`, `history`, `messages`,
+  `threads`, `ask`, `voice` — which prints that topic's commands and rules.
 
-plus one line pointing at `agent-anywhere help`, which names what it could not guess the
-gateway does — scheduled tasks, posting to other chats, reading chat history. The rest of the
-CLI is loaded **on demand**: `agent-anywhere help <topic>` prints a topic's commands and rules
-when the agent needs them, so none of it costs attention before the model has read your first
-word. The topics: `files`, `schedule`, `channels`, `history`, `messages` (`send-message`,
-`reply`, `edit-message`, `react`, `delete`), `threads`, `ask`, `voice`. See
-[`src/ipc/README.md`](src/ipc/README.md) for why the injected part is this small.
-
-The bundled [skill](skill/SKILL.md) carries the same playbook as a skill, for harnesses that
-load those:
-
-```bash
-npx skills add https://github.com/noir017/agent-anywhere/tree/main/skill -g
-```
+Antigravity (`agy`) gets the skill only: it has no per-session way to add tools, and the gateway
+will not edit its global MCP config. The same two commands are in its skill as CLI commands. See
+[`src/ipc/README.md`](src/ipc/README.md) for why exactly two tools, and how the prompt injection
+this replaced was retired.
 
 ## CLI
 

@@ -40,7 +40,7 @@ export interface AttachmentIngestDeps {
 }
 
 export interface IngestedAttachments {
-  /** Text block appended to the agent prompt (may be ''): inlined text + "saved to <path>" lines. */
+  /** Text block appended to the agent prompt (may be ''): inlined text + `[Attachment <name>: <path>]` lines. */
   promptText: string;
   /** Files persisted to disk (for logging / future use). */
   files: Array<{ path: string; name: string; mime?: string }>;
@@ -141,7 +141,7 @@ function displayUrl(url: string): string {
  *    fenced block with language tag, labeled with the filename. Re-decided after the download
  *    when the transport reported a name/mime the element did not carry (Lark).
  *  - Otherwise (binary/image/oversized text):
- *    - size unknown or ≤ maxDownloadBytes: download and save, append a "saved to <path>" line.
+ *    - size unknown or ≤ maxDownloadBytes: download and save, append an `[Attachment <name>: <path>]` line.
  *    - size > maxDownloadBytes: don't download, append an "too large, not downloaded" line.
  *  - A single download error doesn't stop the rest; degrades to a "download failed" line.
  *  - Empty array → promptText is ''.
@@ -214,7 +214,13 @@ export async function ingestAttachments(
   return { promptText: lines.join('\n'), files };
 }
 
-/** Persist, append a "saved to <path>" line, record the file. download is done by the caller. */
+/**
+ * Persist, append an `[Attachment <name>: <path>]` line, record the file. download is done by the caller.
+ *
+ * The line states where the file is and nothing else. It used to add "use the Read tool to view it
+ * when needed", which is the gateway telling the agent how to work — and named a tool agy does not
+ * have. An agent handed a path knows what to do with one.
+ */
 async function saveAndRecord(
   att: AttachmentInput,
   name: string,
@@ -225,6 +231,6 @@ async function saveAndRecord(
 ): Promise<void> {
   const path = await deps.save(name, bytes);
   files.push({ path, name, mime: att.mime });
-  const mimeNote = att.mime ? `(${att.mime})` : '';
-  lines.push(`[Attachment ${name} saved to ${path}${mimeNote} — use the Read tool to view it when needed]`);
+  const mimeNote = att.mime ? ` (${att.mime})` : '';
+  lines.push(`[Attachment ${name}: ${path}${mimeNote}]`);
 }

@@ -37,7 +37,7 @@ it. Do not duplicate that content here.
 | `src/types.ts` | Domain data shapes shared across modules. Types only, no behavior. | — |
 | `src/cli.ts` | Commander wiring. `start` is lazy-imported to keep `--help`/`doctor` fast. | — |
 | `scripts/` | Dev utilities (`stop.mjs` kills stray daemons, `probe.mjs` Discord gateway probe) | [README](scripts/README.md) |
-| `skill/` | The bundled agent skill teaching an agent to use the reverse CLI | [SKILL.md](skill/SKILL.md) |
+| `skill/` | The bundled agent skill: how an agent finds the reverse CLI. The daemon links it into each harness's skill directory (`daemon/skill-link.ts`) | [SKILL.md](skill/SKILL.md) |
 
 ## Layering
 
@@ -86,8 +86,8 @@ get an explicit Hyrum's Law warning and a contract test.
 
 **Single sources of truth.** Several lists are deliberately defined once and consumed
 in many places. Extend the source, never a copy:
-- `ipc/commands.ts` `REVERSE_COMMANDS` → CLI registration, the agent-facing hint, the
-  `agent-anywhere help` pages (`HELP_TOPICS`), docs.
+- `ipc/commands.ts` `REVERSE_COMMANDS` → CLI registration, the `agent-anywhere help` pages
+  (`HELP_TOPICS`), the native tools' parameters and validation (`ipc/tools.ts`), docs.
 - `core/command-translate.ts` `GENERIC_COMMANDS` → the registered slash menu + translation.
 - `core/settings.ts` — the `/setting` table → the menu rows, the text list, value validation,
   the config path patched, and the ack sentence.
@@ -102,6 +102,16 @@ silently falling through (see `daemon/daemon.ts` `handleReverse`).
 to the closest sensible behavior (no edit → chunked sends; no buttons in the renderer →
 plain text) or throws a message written for the user. It never half-works. Truncation
 and dropped items are logged, never silent.
+
+**Nothing of the gateway's in the agent's prompt.** The agent reads what the user sent — the
+message, a quoted line, an attachment's path — and nothing the gateway wrote about itself: no
+preamble, no reminder, no instructions on how to work. What the agent can do here reaches it
+through its harness's own mechanisms instead: two native tools over MCP (`commands/mcp.ts`), and
+a skill (`skill/`) whose one-line description is all that sits in context. This was decided on
+2026-10-09, after the injected hint had already shrunk from thirteen lines to three: any text the
+gateway puts in front of the work tells the model what kind of job this is before it reads the
+job, and no wording avoids that. A change that adds text to what an agent receives needs to say
+why the harness could not carry it.
 
 **Best-effort side effects don't break turns.** Reactions, headers, receipts, and menu
 edits are `void`-and-`catch`: a failure is logged and the turn continues.
@@ -178,10 +188,10 @@ Do not weaken these without saying so explicitly in the PR:
   See [src/daemon/README.md](src/daemon/README.md).
 - **A reverse command** → an arm in the `IpcAction` union + an entry in
   `REVERSE_COMMANDS`, whose required `topic` puts it on an `agent-anywhere help` page; CLI
-  registration and the agent hint follow automatically, and a missing `handleReverse` arm fails
-  to compile. Do not add it to the injected hint: the hint is a pointer, and what an agent reads
-  up front is the one budget here that every session pays.
-  See [src/ipc/README.md](src/ipc/README.md).
+  registration and the help page follow automatically, and a missing `handleReverse` arm fails
+  to compile. Do not make it a native tool (`NATIVE_TOOLS` in `ipc/tools.ts`) by default: every
+  tool's schema rides along in every request on every harness, so a tool has to be something an
+  agent can neither do without nor guess exists. See [src/ipc/README.md](src/ipc/README.md).
 - **A config field** → `config/schema.ts`. But first ask whether it belongs in the
   frozen `EXPERIENCE` block instead: the user-facing surface is deliberately five
   sections, and tuning knobs nobody adjusts were removed on purpose.

@@ -216,7 +216,8 @@ describe('schedule over IPC', () => {
     await r.call({ kind: 'schedule-op', id: task.id, op: 'run' });
     await settle();
     expect(r.turns.at(-1)).toMatchObject({ conversation: 'web#main#t1', agent: 'cc' });
-    expect(r.turns.at(-1)!.prompt).toMatch(/^\[⏰ scheduled task "check the build" #\w+ · .*\]\ncheck the build/);
+    // The prompt reaches the agent exactly as registered; only the user's notice says it was scheduled.
+    expect(r.turns.at(-1)!.prompt).toBe('check the build');
     expect(r.sent[0]!.text).toMatch(/⏰ Scheduled task `#\w+` \*\*check the build\*\*/);
   });
 

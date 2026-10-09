@@ -3,8 +3,8 @@ import { join, resolve, delimiter } from 'node:path';
 import { mkdirSync, statSync } from 'node:fs';
 import type { ChildProcess } from 'node:child_process';
 import type { AgentDef } from '../config/schema.js';
-import { REVERSE_COMMANDS, helpPointer } from '../ipc/commands.js';
 import { ensureReverseCliShim } from './reverse-cli-shim.js';
+import { ensureSkillLink } from './skill-link.js';
 
 /**
  * Helpers shared by every agent-runtime implementation (agent-acp.ts, agent-agy.ts).
@@ -12,62 +12,12 @@ import { ensureReverseCliShim } from './reverse-cli-shim.js';
  * These were originally private to agent-acp.ts; they moved here when the agy harness arrived,
  * because agy does NOT speak ACP (it has its own bidirectional stream-json protocol) and therefore
  * needs a sibling runtime rather than another `resolveHarness` arm. Everything in this file is
- * protocol-agnostic: process environment, working directory, the reverse-command hint, tool-preview
- * formatting and child termination — i.e. the parts both runtimes must behave identically on.
+ * protocol-agnostic: process environment, working directory, tool-preview formatting and child
+ * termination — i.e. the parts both runtimes must behave identically on.
  */
 
 /** Grace window after SIGTERM; if still alive, SIGKILL fallback (harness CLIs may ignore SIGTERM mid-turn). */
 export const KILL_GRACE_MS = 2_000;
-
-/**
- * Harnesses that can put a question to the user themselves, over ACP `elicitation/create`.
- *
- * Probed live 2026-09-11 by advertising `clientCapabilities.elicitation.form` and prompting for a
- * decision: `claude` sends a real elicitation; `opencode` 1.18.27 and `dsh` 0.1.2-rc.1 send no
- * reverse request of any kind (not even `session/request_permission`), and their models ask in
- * prose and end the turn instead. `gemini`, `codex` and `custom` are unprobed and therefore
- * treated as "cannot" — the cost of being wrong that way is one extra hint line, while the other
- * way costs the user their buttons.
- */
-const NATIVE_ASK_HARNESSES: ReadonlySet<AgentDef['harness']> = new Set(['claude']);
-
-/**
- * The only thing the agent is told about running here (single source REVERSE_COMMANDS, filtered by
- * each spec's `inject` mode and this harness's ability to ask on its own).
- *
- * ── Why this is one line and not the command list it used to be ───────────────────────────────
- * It used to carry all nine reverse commands with their full usage — about 350 tokens of chat-bot
- * operating manual, sitting in the FIRST text block of every session's opening turn, ahead of
- * whatever the user actually asked. The cost was not the tokens; it was the framing. A model that
- * opens by reading how to react with emoji and fetch message history has been told what kind of
- * job this is before it sees the job, and it answers accordingly.
- *
- * Almost all of it was also redundant. Plain text already streams into the chat, so a command to
- * send text is a slower way to do nothing new, and the daemon already live-edits the turn's
- * message. What remains is the single act the text channel genuinely cannot perform — putting a
- * file in the chat — plus, on a harness with no question tool of its own, the one command that
- * gets buttons in front of the user. See ReverseCommandSpec.inject for the per-command reasoning.
- *
- * The other commands are still registered and still work when typed; they are simply not spent
- * from the model's attention up front. What IS spent is one pointer line (ipc/commands.ts
- * helpPointer): the few capabilities a model could not guess the gateway has — a schedule that
- * survives restarts above all, which it would otherwise build with its own harness's session-bound
- * tools and lose within the hour — and the command that loads their instructions on demand.
- */
-export function buildReverseHint(harness?: AgentDef['harness']): string {
-  const nativeAsk = harness !== undefined && NATIVE_ASK_HARNESSES.has(harness);
-  const injected = REVERSE_COMMANDS.filter(
-    (c) => c.inject === 'always' || (c.inject === 'no-native-ask' && !nativeAsk)
-  );
-  if (injected.length === 0) return '';
-  return [
-    '<system-reminder>',
-    'Your replies reach the user automatically — just answer normally. For anything text cannot carry, run these with Bash:',
-    ...injected.map((c) => `  - ${c.hint}`),
-    `  - ${helpPointer()}`,
-    '</system-reminder>',
-  ].join('\n');
-}
 
 /** Expand ${VAR} to its process.env value (missing → empty string, with one warn for diagnosis). */
 export function expandEnv(v: string): string {
@@ -164,7 +114,8 @@ export function buildHarnessEnv(def: AgentDef): Record<string, string | undefine
  * the per-session reverse-command wiring.
  *
  * Shared verbatim by both runtimes so the reverse CLI (`agent-anywhere …`) behaves the same
- * regardless of which harness is running.
+ * regardless of which harness is running. Called at every spawn, which also makes it the one place
+ * both runtimes provision what that CLI depends on: the shim on PATH, and the skill that names it.
  */
 export function buildAgentEnv(
   def: AgentDef,
@@ -174,10 +125,13 @@ export function buildAgentEnv(
   const env = buildHarnessEnv(def);
   env.AGENT_ANYWHERE_TURN_TOKEN = sessionToken;
   env.AGENT_ANYWHERE_SOCKET = socketPath;
-  // Guarantee the reverse CLI the hint promises: prepend the self-provisioned shim dir so
+  // Guarantee the reverse CLI the skill promises: prepend the self-provisioned shim dir so
   // `agent-anywhere` resolves to THIS daemon's own entry regardless of launch mode (see reverse-cli-shim).
   const shimDir = ensureReverseCliShim();
   if (shimDir) env.PATH = `${shimDir}${delimiter}${env.PATH ?? ''}`;
+  // The skill goes under the home THIS agent runs as — an `env.HOME` override included — because
+  // that is where its harness will look (see skill-link).
+  ensureSkillLink(def.harness, env.HOME || homedir());
   return env;
 }
 

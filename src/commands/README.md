@@ -1,6 +1,6 @@
 # `src/commands/` — CLI entry points
 
-The four things `agent-anywhere` can do. `cli.ts` (one level up) wires these into
+What `agent-anywhere` can do. `cli.ts` (one level up) wires these into
 commander; this module implements them.
 
 | Command | File | Purpose |
@@ -9,6 +9,7 @@ commander; this module implements them.
 | `doctor` | `doctor.ts` | Environment self-check — **the default command** |
 | `start` | `start.ts` | Run the daemon |
 | *(reverse)* | `reverse.ts` | The agent-facing chat actions |
+| `mcp` *(hidden)* | `mcp.ts` | The same actions as native tools: an MCP server on stdio, started by the agent's harness |
 
 ## `doctor` is the default
 
@@ -85,20 +86,44 @@ Executes one reverse command: load config → resolve the socket → `callDaemon
 the result as TOON on stdout. See [`src/ipc/README.md`](../ipc/README.md) for the
 protocol and for how the command catalog stays in sync.
 
+Rendering is separate from printing — `renderResult` returns `{ stdout, stderr? }` — because the
+same answer also goes back as a native tool's result (`mcp.ts`). Text that names a next step is
+worded for both front doors ("pause, resume, run or rm by its id"), not in shell syntax.
+
 Two details that exist for correctness, not style:
 
-- **`resolvePathArg`** expands a leading `~` and resolves against the current CWD. This
-  process's CWD is the *agent's* working directory (the daemon set it when spawning), so
-  the resolved absolute path is the file as the agent sees it. The daemon's CWD may
+- **`resolvePathArg`** expands a leading `~` and resolves against the agent's working
+  directory: this process's CWD for a shell command (the agent spawned it), the session's
+  directory for a tool call (`mcp.ts` gets it from the daemon). Either way the resolved absolute
+  path is the file as the agent sees it. The daemon's CWD may
   differ, and the path later becomes a `file://` URL — a relative path or `~` would
   produce a malformed address like `file://./x.png` on the daemon side. Resolve here, not
   there.
 - **Everything goes to stdout**, including errors. Stdout is the agent's only data
   channel; a message on stderr is a message the agent cannot read.
 
+## `mcp.ts`
+
+`agent-anywhere mcp` is an MCP server on stdio serving `send_file` and `schedule`
+([`src/ipc/README.md`](../ipc/README.md#why-exactly-two-tools) says why those two). The daemon
+lists it in every ACP session, and the harness starts one per session as its own child.
+
+- **Hand-rolled**, not `@modelcontextprotocol/sdk`: four stateless methods (`initialize`, `ping`,
+  `tools/list`, `tools/call`), and `handleMcpMessage` stays a pure function the tests drive.
+- **Configured by its environment only** — `AGENT_ANYWHERE_TURN_TOKEN`, `AGENT_ANYWHERE_SOCKET`,
+  `AGENT_ANYWHERE_CWD`, all written into the server's ACP entry by the daemon. It never loads
+  config.yaml: a harness may start MCP servers with an environment of its own choosing, so the
+  `${VAR}`s the config expands may simply not be there.
+- **No `instructions`** in `initialize`. Claude Code would put them in the system prompt, which is
+  the gateway text this server exists to avoid.
+- An unknown tool is a JSON-RPC error; bad arguments and daemon refusals are tool results with
+  `isError`, because those are for the model to read and correct.
+- stdout is the protocol stream; anything else goes to stderr.
+
 ## Tests
 
-This module has no test files. Its logic is thin dispatch over `config/`, `ipc/`, and
+`mcp.test.ts` drives `handleMcpMessage` with the daemon faked at the IpcAction boundary. The rest
+of the module has no test files: its logic is thin dispatch over `config/`, `ipc/`, and
 `daemon/`, all of which are tested directly, and the remainder (inquirer prompts, live
 credential probes, process signal handling) has no meaningful unit-test seam.
 `cli.ts` is excluded from coverage for the same reason.

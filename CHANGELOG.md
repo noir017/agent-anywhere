@@ -5,6 +5,45 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **Nothing of the gateway's goes into the agent's prompt any more.** Every session used to open
+  with a `<system-reminder>` in front of your first message — "Your replies reach the user
+  automatically — just answer normally", the `send-file` command, and a pointer to
+  `agent-anywhere help`. It had already been cut down from thirteen lines, but any text the gateway
+  puts there tells the model what kind of job this is before it has read the job, and no wording
+  avoids that. It is gone, and so are the two other places the gateway spoke to the agent in its own
+  voice. A scheduled prompt no longer arrives prefixed with `[⏰ scheduled task …]`: it is the
+  prompt the agent registered, sent as written, and the notice in your chat still says it ran. An
+  attachment the agent has to open is now `[Attachment name: path (mime)]`, without "use the Read
+  tool to view it when needed" — an instruction on how to work, naming a tool agy does not have.
+  OpenCode and dsh are no longer told about `ask` up front; their models find it through the skill
+  below, or ask in plain text.
+
+### Added
+
+- **`send_file` and `schedule` are native tools.** What the reminder used to teach now reaches the
+  agent the way any capability does: every ACP session — Claude Code, Codex, OpenCode — is handed a
+  small MCP server, `agent-anywhere mcp`, and the two tools sit in its tool list (Claude Code shows
+  `mcp__chat__send_file`). They are the CLI commands behind a different door: the same validation,
+  the same socket and session token, the same answers. Only these two, because a tool's definition is
+  context paid on every request — on Claude Code these two measure about 1,030 input tokens
+  (cached), where the reminder was about 80: one is the thing a text reply cannot carry, the other
+  the thing an agent gets wrong unless it knows — asked for "every morning at 8", it reaches for its
+  own scheduler, which dies with its process. Codex keeps MCP tools behind its own tool search, so
+  it tends to find the same commands through the skill instead; the result is the same.
+- **The bundled skill is linked for you.** The rest of the CLI — other chats, history, replies,
+  edits, threads, button questions, voice transcripts — is found through `skill/SKILL.md`, which
+  the daemon now symlinks where each configured harness that has been run on the machine reads
+  skills: `~/.claude/skills` for Claude Code, `~/.agents/skills` for Codex and OpenCode,
+  `~/.gemini/config/skills` for Antigravity. Each was checked by asking the model what it could
+  see — Antigravity, for one, does not read the directory its own help names. The link points into the installed
+  package, so the skill appears only where the daemon runs and is always the running version's own.
+  Antigravity gets the skill but not the tools: it has no per-session way to add them, and the
+  gateway will not edit its global MCP config. A real `agent-anywhere` directory already in one of
+  those places — from `npx skills add`, say — is left alone with a warning; delete it to get the
+  linked one. `AGENT_ANYWHERE_NO_SKILL_LINK=1` turns linking off.
+
 ## [1.39.0] - 2026-10-09
 
 ### Added

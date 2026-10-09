@@ -92,7 +92,7 @@ describe('ingestAttachments', () => {
     const res = await ingestAttachments([att], CFG, deps);
 
     expect(res.promptText).not.toContain('```');
-    expect(res.promptText).toContain('big.log saved to /cache/big.log');
+    expect(res.promptText).toContain('[Attachment big.log: /cache/big.log (text/plain)]');
     expect(deps.save).toHaveBeenCalledOnce();
     expect(res.files).toEqual([{ path: '/cache/big.log', name: 'big.log', mime: 'text/plain' }]);
   });
@@ -102,9 +102,9 @@ describe('ingestAttachments', () => {
     const deps = makeDeps({ contents: { u3: { text: 'PNGDATA' } } });
     const res = await ingestAttachments([att], CFG, deps);
 
-    expect(res.promptText).toContain('Attachment pic.png saved to /cache/pic.png');
-    expect(res.promptText).toContain('(image/png)');
-    expect(res.promptText).toContain('Read tool');
+    expect(res.promptText).toBe('[Attachment pic.png: /cache/pic.png (image/png)]');
+    // Where the file is, and nothing about how to work with it: no tool named, no instruction.
+    expect(res.promptText).not.toMatch(/Read tool|use the/i);
     expect(deps.save).toHaveBeenCalledOnce();
     expect(res.files[0]).toEqual({ path: '/cache/pic.png', name: 'pic.png', mime: 'image/png' });
   });
@@ -143,7 +143,7 @@ describe('ingestAttachments', () => {
     const res = await ingestAttachments([a, b], CFG, deps);
 
     expect(res.promptText).toContain('a.txt');
-    expect(res.promptText).toContain('b.png saved to');
+    expect(res.promptText).toContain('[Attachment b.png: ');
     expect(res.files).toHaveLength(1); // only b persisted
   });
 });
@@ -163,7 +163,7 @@ describe('ingestAttachments · metadata discovered during the download', () => {
     const atts: AttachmentInput[] = [{ type: 'file', url }];
     const res = await ingestAttachments(atts, CFG, deps);
     expect(deps.saveCalls[0]!.name).toBe('report.pdf');
-    expect(res.promptText).toContain('report.pdf saved to /cache/report.pdf');
+    expect(res.promptText).toContain('[Attachment report.pdf: /cache/report.pdf]');
     // The old behavior: the URL tail, query string and all.
     expect(res.promptText).not.toContain('file_v2_z?type=file');
   });
@@ -192,7 +192,7 @@ describe('ingestAttachments · metadata discovered during the download', () => {
     const deps = makeDeps({ contents: { [url]: { text: 'y'.repeat(200), name: 'big.md' } } });
     const res = await ingestAttachments([{ type: 'file', url }], CFG, deps);
     expect(deps.saveCalls[0]!.name).toBe('big.md');
-    expect(res.promptText).toContain('saved to');
+    expect(res.promptText).toContain('[Attachment big.md: ');
   });
 });
 

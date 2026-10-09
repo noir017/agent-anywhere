@@ -1,11 +1,14 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { HELP_TOPICS, REVERSE_COMMANDS, helpPointer, renderHelpIndex, renderHelpTopic } from './commands.js';
+import { HELP_TOPICS, REVERSE_COMMANDS, renderHelpIndex, renderHelpTopic } from './commands.js';
 import type { IpcAction } from './protocol.js';
 
 /**
  * The catalog as the agent meets it: through `agent-anywhere help`, and through commander parsing
- * `schedule …` into an action. The help pages are the only place the non-injected commands are
- * documented to the agent, so "every command is on a page" is a property worth pinning.
+ * `schedule …` into an action. The help pages are the only place the commands that are not native
+ * tools are documented to the agent (the skill points here), so "every command is on a page" is a
+ * property worth pinning.
  */
 
 const spec = (usage: string) => REVERSE_COMMANDS.find((c) => c.usage.startsWith(usage))!;
@@ -26,6 +29,19 @@ describe('help topics', () => {
     for (const t of HELP_TOPICS) expect(index).toMatch(new RegExp(`^  ${t.name}\\s+${t.summary.slice(0, 20)}`, 'm'));
   });
 
+  it('says nothing about where the agent is running — only what the commands do', () => {
+    // The framing the injected hint was removed for ("your replies reach the user automatically")
+    // must not come back through the page the skill sends an agent to.
+    expect(renderHelpIndex()).not.toMatch(/reach the user|gateway tools/i);
+  });
+
+  it('the bundled skill names every topic, since the skill is how an agent finds them', () => {
+    // skill/SKILL.md is static markdown, so its topic table is a copy; this keeps it whole.
+    const skill = readFileSync(fileURLToPath(new URL('../../skill/SKILL.md', import.meta.url)), 'utf8');
+    for (const t of HELP_TOPICS) expect(skill, t.name).toContain(`| \`${t.name}\` |`);
+    expect(skill).not.toMatch(/streams back|reach the user automatically|you are running inside/i);
+  });
+
   it('a topic page carries its commands, their flags and its rules', () => {
     const page = renderHelpTopic('schedule')!;
     expect(page).toContain('agent-anywhere schedule <action> [id]');
@@ -39,12 +55,6 @@ describe('help topics', () => {
   it('answers undefined for a page that does not exist (the CLI then tries a command name)', () => {
     expect(renderHelpTopic('nope')).toBeUndefined();
     expect(renderHelpTopic('SCHEDULE')).toBeDefined();
-  });
-
-  it('the pointer advertises what an agent could not guess the gateway does', () => {
-    expect(helpPointer()).toBe(
-      'More, loaded when you need them — scheduled/recurring tasks that survive restarts, posting to other chats, chat history: agent-anywhere help'
-    );
   });
 });
 

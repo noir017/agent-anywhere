@@ -194,7 +194,7 @@ describe('a voice message through the real inbound path', () => {
     await r.voice();
     await until('the turn runs', () => r.prompts.length === 1);
     expect(r.cards).toEqual([]);
-    expect(r.prompts[0]).toMatch(/Attachments:\n\[Attachment file\.opus saved to /);
+    expect(r.prompts[0]).toMatch(/Attachments:\n\[Attachment file\.opus: /);
     expect(r.prompts[0]).not.toContain(OGG_B64);
   });
 });

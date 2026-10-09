@@ -57,8 +57,8 @@ program
   .action((opts: { migrateConfig?: boolean }) => runDoctor({ migrateConfig: opts.migrateConfig }));
 program.command('start').description('Start the daemon').action(runStart);
 
-// --- Reverse commands (invoked by the agent via a skill; located by AGENT_ANYWHERE_TURN_TOKEN) ---
-// All derived from the single REVERSE_COMMANDS source, keeping cli, skill hints, and IPC protocol consistent.
+// --- Reverse commands (run by the agent in a shell; located by AGENT_ANYWHERE_TURN_TOKEN) ---
+// All derived from the single REVERSE_COMMANDS source, keeping cli, help pages, tools and IPC protocol consistent.
 for (const spec of REVERSE_COMMANDS) {
   const cmd = program.command(spec.usage).description(spec.description);
   for (const opt of [...spec.options, CHANNEL_OPTION]) {
@@ -74,13 +74,21 @@ for (const spec of REVERSE_COMMANDS) {
   });
 }
 
-// `help [topic]` replaces commander's implicit `help [command]`: it is the on-demand half of what an
-// agent is told (see HELP_TOPICS), so it answers by TOPIC — `help schedule` — and still falls back to
+// The same commands' native-tool front door: an MCP server on stdio, started by the agent's harness
+// because the daemon lists it in every ACP session (see commands/mcp.ts). Hidden — nobody types it —
+// and lazy-loaded like `start`, though for a lighter reason: it is spawned once per session.
+program
+  .command('mcp', { hidden: true })
+  .description('MCP server giving an agent session send_file and schedule as tools (started by the daemon)')
+  .action(() => import('./commands/mcp.js').then((m) => m.runMcp(version)));
+
+// `help [topic]` replaces commander's implicit `help [command]`: it is where the bundled skill sends an
+// agent (see HELP_TOPICS), so it answers by TOPIC — `help schedule` — and still falls back to
 // a command's own flags for `help send-file`. `--help` keeps commander's full list for humans.
 program.helpCommand(false);
 program
   .command('help [topic]')
-  .description('Gateway tools for agents, by topic (schedule, channels, …); `help <command>` for one command')
+  .description('agent-anywhere commands by topic (schedule, channels, …); `help <command>` for one command')
   .action((topic?: string) => {
     if (!topic) {
       console.log(renderHelpIndex());

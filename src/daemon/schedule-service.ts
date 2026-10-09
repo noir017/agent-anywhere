@@ -3,7 +3,6 @@ import path from 'node:path';
 import type { Config } from '../config/schema.js';
 import type { ConversationAddress, ConversationRef } from '../core/conversation.js';
 import {
-  agentRunPrompt,
   bashResultText,
   bashStatus,
   buildTask,
@@ -216,7 +215,11 @@ export class ScheduleService {
     platform: PlatformAdapter,
     planned: number
   ): Promise<ScheduleRunResult> {
-    const prompt = agentRunPrompt(task, planned);
+    // Sent exactly as it was registered, with nothing marking it as scheduled: the agent wrote this
+    // prompt itself when it added the task, so it already says what to do, and a gateway preamble
+    // would be the only text in the conversation the agent did not get from a person or itself.
+    // The user is told the run started by its own notice (runNoticeText), outside the agent's view.
+    const prompt = run.prompt;
     if (run.session === 'fixed') {
       const key = task.conversation!;
       const bound = this.registry.boundAgentOf(key);

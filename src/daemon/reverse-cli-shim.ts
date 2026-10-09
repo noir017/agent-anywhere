@@ -5,11 +5,11 @@ import { configDir } from '../config/load.js';
 /**
  * Self-provisioned `agent-anywhere` shim for agent subprocesses.
  *
- * The reverse-command hint promises the agent that `agent-anywhere` is on PATH, but whether that
+ * The bundled skill tells the agent that `agent-anywhere` is on PATH, but whether that
  * is true depends on how the daemon was launched: a global npm install puts it on PATH, while
  * `node dist/cli.js start` or a tsx dev run does not (and a service manager like launchd may strip
  * PATH entirely). Instead of gambling, the daemon writes a two-line shim that re-executes exactly
- * the runtime it is itself running as (execPath + execArgv + argv[1] — so a tsx dev daemon spawns
+ * the runtime it is itself running as (see selfInvocation — so a tsx dev daemon spawns
  * a tsx reverse CLI, a dist daemon spawns dist), and agent-acp prepends the shim dir to each agent
  * child's PATH. This also pins the agent to THIS daemon's version when a different global one exists.
  *
@@ -17,19 +17,13 @@ import { configDir } from '../config/load.js';
  */
 export function ensureReverseCliShim(): string | null {
   if (process.platform === 'win32') return null;
-  // `argv[1]` is the only clue to "how was I launched", and it is a good one ONLY when this
-  // process really is the CLI. It is not, for instance, in a vitest worker, whose argv[1] is
-  // tinypool's worker entry — and the shim is written to a SHARED user path, so a test run
-  // rewrote the shim of the daemon actually running on this machine to point at that entry.
-  // The shim dir leads PATH, so every send-message / ask / send-file from every live agent
-  // started failing instantly, with a stack from inside tinypool. Refuse to guess instead.
-  const entry = process.argv[1];
-  if (!entry || !isCliEntry(entry)) return null;
+  const self = selfInvocation();
+  if (!self) return null;
   const dir = path.join(configDir(), 'bin');
   const shim = path.join(dir, 'agent-anywhere');
   const script = [
     '#!/bin/sh',
-    `exec ${[process.execPath, ...process.execArgv, entry].filter(Boolean).map(shellQuote).join(' ')} "$@"`,
+    `exec ${[self.command, ...self.args].map(shellQuote).join(' ')} "$@"`,
     '',
   ].join('\n');
   try {
@@ -45,6 +39,24 @@ export function ensureReverseCliShim(): string | null {
     console.warn('[shim] failed to provision the reverse CLI shim:', e instanceof Error ? e.message : e);
     return null;
   }
+}
+
+/**
+ * How to run THIS CLI again, exactly as this process is running: execPath + execArgv + argv[1].
+ * Shared by the shim above and by the MCP server entry the daemon hands to every ACP session
+ * (agent-acp.ts acpMcpServers), so both reach the daemon's own version through the same runtime —
+ * a tsx dev daemon gets tsx children, a dist daemon dist ones. Null when this process is not the CLI.
+ */
+export function selfInvocation(): { command: string; args: string[] } | null {
+  // `argv[1]` is the only clue to "how was I launched", and it is a good one ONLY when this
+  // process really is the CLI. It is not, for instance, in a vitest worker, whose argv[1] is
+  // tinypool's worker entry — and the shim is written to a SHARED user path, so a test run
+  // rewrote the shim of the daemon actually running on this machine to point at that entry.
+  // The shim dir leads PATH, so every send-message / ask / send-file from every live agent
+  // started failing instantly, with a stack from inside tinypool. Refuse to guess instead.
+  const entry = process.argv[1];
+  if (!entry || !isCliEntry(entry)) return null;
+  return { command: process.execPath, args: [...process.execArgv, entry].filter(Boolean) };
 }
 
 /**

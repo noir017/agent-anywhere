@@ -1,16 +1,18 @@
 import type { IpcAction } from './protocol.js';
-import { DEFAULT_CHANNEL_LIMIT } from './protocol.js';
+import { DEFAULT_ASK_TIMEOUT_MS, DEFAULT_CHANNEL_LIMIT } from './protocol.js';
 
 /**
  * Reverse-command catalog: single source of truth.
  *
- * One spec drives three places, avoiding scattered lists and silent drift:
+ * One spec drives every place a command surfaces, avoiding scattered lists and silent drift:
  *  - `cli.ts`: registers commander subcommands from it.
- *  - `agent-acp.ts` buildReverseHint(): generates the usage hint shown to the agent.
+ *  - `agent-anywhere help <topic>`: renders each spec onto the page its `topic` names.
+ *  - `tools.ts`: the few commands an agent gets as native tools take their parameters and their
+ *    validation (`build`) from here.
  *  - Execution dispatch stays in `daemon.ts` handleReverse (with exhaustive type guard).
  *
  * Adding a reverse action = one arm in the IpcAction union + one entry here; cli
- * registration and skill text follow automatically, and missing handleReverse fails to compile.
+ * registration and the help page follow automatically, and missing handleReverse fails to compile.
  */
 
 export interface ReverseOption {
@@ -29,53 +31,30 @@ export interface ReverseCommandSpec {
   options: ReverseOption[];
   /** Build one IpcAction from positionals + options. */
   build(positionals: string[], opts: Record<string, unknown>): IpcAction;
-  /** One-line usage hint for the agent (rendered by buildReverseHint when `inject` is set). */
-  hint: string;
-  /**
-   * Whether — and where — this command's hint is injected into the agent's prompt.
-   *
-   * Omitted means never, which is most of the catalog, because each turned out to be a worse way
-   * to do something the gateway already does:
-   *  - the agent's plain text IS the reply — it streams into the chat on its own, so `send-message`
-   *    and `reply` ask the model to spend a tool call re-sending what was already sent;
-   *  - `edit-message` duplicates the live-edited message the daemon maintains for every turn;
-   *  - `react` / `delete` / `create-thread` / `fetch-messages` describe a chat client's chrome,
-   *    which is not what the model was asked to work on.
-   *
-   * They stay registered on the CLI (`agent-anywhere --help` lists them, scripts keep working) —
-   * this flag governs one thing only: what is spent from the model's attention before it has read
-   * the user's first word. The full block was ~350 tokens of "you are an IM bot" ahead of every
-   * session's opening question, which is a framing the work rarely needs and never asked for.
-   *
-   * `'always'` — every harness is told.
-   * `'no-native-ask'` — told only to harnesses that cannot ask over ACP `elicitation/create`.
-   *   Exists for `ask`, which is superseded by the model's own question tool where there is one
-   *   (claude) and is still the only way to get buttons where there is not (opencode, dsh).
-   */
-  inject?: 'always' | 'no-native-ask';
   /**
    * Which `agent-anywhere help <topic>` page documents this command. Required, so a new command
-   * cannot be added without deciding where an agent will find it — the help pages are how
-   * everything that is NOT injected gets discovered (see HELP_TOPICS).
+   * cannot be added without deciding where an agent will find it — the help pages, reached from the
+   * bundled skill, are how every command that is not a native tool gets discovered (see HELP_TOPICS).
    */
   topic: HelpTopicName;
 }
 
 /**
- * The pages of `agent-anywhere help`: the on-demand half of what the agent is told.
+ * The pages of `agent-anywhere help`: the reference an agent loads when it needs one.
  *
- * ── Why the catalog is loaded on demand ───────────────────────────────────────────────────────
- * The injected hint (agent-common.ts buildReverseHint) names send-file and — on harnesses that
- * cannot ask — ask, and one more line: a pointer here, carrying the few `pointer` phrases below so a
- * model can map "every morning at 8…" onto a page it has never read. Everything else costs nothing
- * until the model runs `agent-anywhere help <topic>`, which prints that topic's commands (from the
- * specs, so they cannot drift) and its rules. It is the skill pattern — a one-line description in
- * context, the body loaded when relevant — done in the CLI, because every harness here has a shell
- * and not every harness has skills (and the ones that do keep them in different places).
+ * ── Nothing about the gateway is put in the agent's prompt ────────────────────────────────────
+ * The gateway aims to be invisible to the agent: no text of its own in the conversation, ever. What
+ * an agent can do here reaches it through its harness's own mechanisms instead — the two commands it
+ * could not do without are native tools (`tools.ts`), and the rest are behind a skill whose one-line
+ * description is all that sits in context (`skill/SKILL.md`, linked into each harness's skill
+ * directory by `daemon/skill-link.ts`). The skill's body sends the agent here, so these pages stay
+ * the one place a command's usage and rules are written down — rendered from the specs, so they
+ * cannot drift from what the CLI accepts.
  *
- * MCP tools were the other candidate and lose on the harnesses that matter: only Claude Code defers
- * MCP tool definitions, and only past a size threshold; opencode, codex and agy would carry the full
- * schemas in every request, which is the opposite of the point.
+ * This replaced a `<system-reminder>` prepended to the first turn of every session (2026-10-09). It
+ * had already been cut from thirteen lines to three, but three lines opening with "your replies
+ * reach the user automatically" still told the model what kind of job this was before it read the
+ * job — and no wording of an injected block avoids that, because the injection is the framing.
  */
 export type HelpTopicName = 'files' | 'schedule' | 'channels' | 'history' | 'messages' | 'threads' | 'ask' | 'voice';
 
@@ -83,11 +62,6 @@ export interface HelpTopic {
   name: HelpTopicName;
   /** One line on the index page. */
   summary: string;
-  /**
-   * The phrase this topic contributes to the injected pointer line, if any. Only topics an agent
-   * could not guess exist belong there; three phrases is already the budget.
-   */
-  pointer?: string;
   /** What to know beyond each command's usage line: the rules, the traps, the defaults. */
   notes: string[];
 }
@@ -96,12 +70,14 @@ export const HELP_TOPICS: HelpTopic[] = [
   {
     name: 'files',
     summary: 'Send a file or image into the chat',
-    notes: ['Relative paths and ~ resolve against your working directory. --name overrides the displayed filename.'],
+    notes: [
+      'Relative paths and ~ resolve against your working directory. --name overrides the displayed filename.',
+      'Where you have a send_file tool, it is this same command.',
+    ],
   },
   {
     name: 'schedule',
     summary: 'Scheduled and recurring tasks that survive restarts — an agent prompt or a bash command, output to any chat',
-    pointer: 'scheduled/recurring tasks that survive restarts',
     notes: [
       'Use this rather than a scheduling tool built into your own harness: those live inside your process, which the gateway stops after an idle hour and on every restart. Tasks here are kept on disk by the gateway and run from it.',
       'When the time, the time zone, or where the output should go is not clear from what the user said, ask before adding. The gateway posts a card with the task\'s details when it is registered, changed or deleted; the user can list, pause and delete tasks with /setting schedule.',
@@ -112,12 +88,12 @@ export const HELP_TOPICS: HelpTopic[] = [
       '--channel is where output goes (ids from `agent-anywhere channels`); default this conversation.',
       'A run missed while the gateway was down is made once if it is less than an hour late, otherwise recorded as missed. A run that comes due while the previous one is still going is skipped.',
       '`add` and `show` print the task id; `list` shows every task with its next run and last result; pause / resume / run (run it now, once) / rm take the id.',
+      'Where you have a schedule tool, it is this same command.',
     ],
   },
   {
     name: 'channels',
     summary: 'Post to another chat or topic, on any platform',
-    pointer: 'posting to other chats',
     notes: [
       'Every command takes --channel <id>. A bare <channel>[/<thread>] stays on the platform you are answering on; <instance>:<channel>[/<thread>] (what `channels` prints) names any platform.',
       'The list only holds places the gateway has answered in — most platforms cannot enumerate a bot\'s chats. kind=channel rows are chat roots (where a new topic would be opened); current=true is this conversation.',
@@ -126,7 +102,6 @@ export const HELP_TOPICS: HelpTopic[] = [
   {
     name: 'history',
     summary: 'Read earlier messages in the chat',
-    pointer: 'chat history',
     notes: [
       'Use it when the user refers to something outside your context ("the file I sent above"). Content is cut at 500 characters per message; `--fields attachments` adds the attachment URLs.',
       'Page further back with --before <the oldest messageId you have>. count: 0 means the channel really is empty.',
@@ -136,7 +111,7 @@ export const HELP_TOPICS: HelpTopic[] = [
     name: 'messages',
     summary: 'Extra messages, quote-replies, edits, reactions and deletes',
     notes: [
-      'Your plain reply already streams into the chat — never re-send it with send-message, or the user reads it twice. These are for something extra: a completion notice from a background job, a status message you keep editing.',
+      'A normal reply already appears in the conversation, so re-sending it with send-message shows it twice. These are for something in addition to it: a completion notice from a background job, a status message you keep editing.',
       'send-message, reply and send-file print the messageId; keep it if you will edit, react to or delete that message.',
     ],
   },
@@ -162,17 +137,11 @@ export const HELP_TOPICS: HelpTopic[] = [
   },
 ];
 
-/** The injected pointer line's content: the topics worth advertising, in HELP_TOPICS order. */
-export function helpPointer(): string {
-  const phrases = HELP_TOPICS.flatMap((t) => (t.pointer ? [t.pointer] : []));
-  return `More, loaded when you need them — ${phrases.join(', ')}: agent-anywhere help`;
-}
-
 /** `agent-anywhere help`: one line per topic. */
 export function renderHelpIndex(): string {
   const width = Math.max(...HELP_TOPICS.map((t) => t.name.length));
   return [
-    'Gateway tools. Your plain replies reach the user on their own; these are for what text cannot do.',
+    'agent-anywhere commands, by topic.',
     'Run `agent-anywhere help <topic>` for a topic\'s commands and rules.',
     '',
     ...HELP_TOPICS.map((t) => `  ${t.name.padEnd(width)}  ${t.summary}`),
@@ -193,11 +162,16 @@ export function renderHelpTopic(name: string): string | undefined {
   return lines.join('\n');
 }
 
-/** The "target channel" option shared by all reverse commands; empty = current session. */
+/**
+ * The "target channel" option shared by all reverse commands; empty = current session.
+ *
+ * The description is short because it is paid for twice over: it is a parameter of both native
+ * tools, whose schemas ride along in every request. The id format it used to spell out here is on
+ * the `channels` help page, which is where an agent gets an id from anyway.
+ */
 export const CHANNEL_OPTION: ReverseOption = {
   flags: '-c, --channel <id>',
-  description:
-    'target channel: <channel>[/<thread>] on this platform, or <instance>:<channel>[/<thread>] on any (ids from `agent-anywhere channels`; defaults to the current conversation)',
+  description: 'where to post, as an id from `agent-anywhere channels` (default: this conversation)',
 };
 
 const str = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
@@ -341,7 +315,6 @@ export const REVERSE_COMMANDS: ReverseCommandSpec[] = [
     description: 'Send a message to the current session',
     options: [],
     build: (p, opts) => ({ kind: 'send-message', text: pos(p, 0, 'text'), channelId: str(opts.channel) }),
-    hint: 'Send a message: agent-anywhere send-message "text"',
   },
   {
     usage: 'reply <messageId> <text>',
@@ -354,7 +327,6 @@ export const REVERSE_COMMANDS: ReverseCommandSpec[] = [
       text: pos(p, 1, 'text'),
       channelId: str(opts.channel),
     }),
-    hint: 'Reply to a message: agent-anywhere reply <messageId> "text"',
   },
   {
     usage: 'edit-message <messageId> <text>',
@@ -367,15 +339,14 @@ export const REVERSE_COMMANDS: ReverseCommandSpec[] = [
       text: pos(p, 1, 'text'),
       channelId: str(opts.channel),
     }),
-    hint: 'Edit a message you sent: agent-anywhere edit-message <messageId> "new text"',
   },
   {
     usage: 'send-file <path>',
     topic: 'files',
     description: 'Send a file to the current session',
     options: [
-      { flags: '-n, --name <name>' },
-      { flags: '--caption <caption>' },
+      { flags: '-n, --name <name>', description: 'filename shown to the user (default: the file\'s own)' },
+      { flags: '--caption <caption>', description: 'text shown with the file' },
     ],
     build: (p, opts) => ({
       kind: 'send-file',
@@ -384,9 +355,6 @@ export const REVERSE_COMMANDS: ReverseCommandSpec[] = [
       caption: str(opts.caption),
       channelId: str(opts.channel),
     }),
-    hint: 'Send a file: agent-anywhere send-file <path> [--caption "caption"]',
-    // The one capability plain text cannot reach: a file has to be uploaded, not described.
-    inject: 'always',
   },
   {
     usage: 'react <messageId> <emoji>',
@@ -399,7 +367,6 @@ export const REVERSE_COMMANDS: ReverseCommandSpec[] = [
       emoji: pos(p, 1, 'emoji'),
       channelId: str(opts.channel),
     }),
-    hint: 'Add a reaction: agent-anywhere react <messageId> <emoji>',
   },
   {
     usage: 'delete <messageId>',
@@ -407,7 +374,6 @@ export const REVERSE_COMMANDS: ReverseCommandSpec[] = [
     description: 'Delete a message',
     options: [],
     build: (p, opts) => ({ kind: 'delete', messageId: pos(p, 0, 'messageId'), channelId: str(opts.channel) }),
-    hint: 'Delete a message: agent-anywhere delete <messageId>',
   },
   {
     usage: 'fetch-messages',
@@ -429,7 +395,6 @@ export const REVERSE_COMMANDS: ReverseCommandSpec[] = [
       before: str(opts.before),
       fields: Array.isArray(opts.fields) ? (opts.fields as string[]) : undefined,
     }),
-    hint: 'Fetch history context: agent-anywhere fetch-messages [--limit 20] [--before <messageId>] [--fields content,timestamp] (writes a TOON table to stdout)',
   },
   {
     usage: 'create-thread <messageId> <name>',
@@ -442,7 +407,6 @@ export const REVERSE_COMMANDS: ReverseCommandSpec[] = [
       name: pos(p, 1, 'name'),
       channelId: str(opts.channel),
     }),
-    hint: 'Create a thread: agent-anywhere create-thread <messageId> <threadName> (returns {threadId})',
   },
   {
     usage: 'ask <prompt>',
@@ -451,7 +415,7 @@ export const REVERSE_COMMANDS: ReverseCommandSpec[] = [
     options: [
       // -o is repeatable: one button per label, collected into an array.
       { flags: '-o, --option <label>', description: 'an available option (repeatable)', parse: collect },
-      { flags: '--timeout <ms>', description: 'wait timeout (milliseconds)', parse: intArg('--timeout') },
+      { flags: '--timeout <ms>', description: `wait timeout in milliseconds (default ${DEFAULT_ASK_TIMEOUT_MS})`, parse: intArg('--timeout') },
     ],
     build: (p, opts) => ({
       kind: 'ask',
@@ -460,20 +424,6 @@ export const REVERSE_COMMANDS: ReverseCommandSpec[] = [
       timeoutMs: typeof opts.timeout === 'number' ? opts.timeout : undefined,
       channelId: str(opts.channel),
     }),
-    // The hint is what reaches an agent's prompt, so it has to carry the two things that were
-    // learned the hard way: `--timeout` exists, and a blank answer is "nobody clicked", not
-    // "this command does not work". An agent that reads the blank as a malfunction stops using
-    // ask entirely — which is worse than the unanswered question it started with.
-    hint:
-      'Ask a clarifying question (blocks until the user chooses): agent-anywhere ask "question" ' +
-      '-o optionA -o optionB [--timeout <ms>, default 1h] (writes the chosen label to stdout; ' +
-      'empty stdout plus a stderr note means nobody clicked in time — the question WAS delivered, ' +
-      'so follow up in plain text instead of assuming the command is broken)',
-    // Only where the harness has no question tool of its own. On claude the model asks over ACP
-    // elicitation and this hint would advertise a second, worse way to do the same thing; on
-    // opencode and dsh (probed 2026-09-11: neither sends any reverse request) it is the only way
-    // to put buttons in front of the user, and without it they can only ask in prose.
-    inject: 'no-native-ask',
   },
   {
     usage: 'voice-log',
@@ -489,12 +439,10 @@ export const REVERSE_COMMANDS: ReverseCommandSpec[] = [
       }
       return { kind: 'voice-log', limit: typeof opts.limit === 'number' ? opts.limit : undefined };
     },
-    hint: "Check what a voice message actually said: agent-anywhere voice-log [--limit 10] (this conversation's transcripts, their outcome, and the saved audio path)",
-    // Deliberately never injected. A confirmed transcript reaches the agent as the user's own typed
-    // words — the user read and approved them — so telling every session that some messages were
-    // spoken would only invite second-guessing text that has already been checked. The command is
-    // for the rare turn where a message reads like a mishearing; `--help` and the bundled skill
-    // document it.
+    // Nothing tells an agent up front that some messages were spoken, and nothing should: a
+    // confirmed transcript reaches it as the user's own typed words — the user read and approved
+    // them — so saying so would only invite second-guessing text that has already been checked.
+    // The command is for the rare turn where a message reads like a mishearing.
   },
   {
     usage: 'channels',
@@ -522,7 +470,6 @@ export const REVERSE_COMMANDS: ReverseCommandSpec[] = [
         limit: typeof opts.limit === 'number' ? opts.limit : undefined,
       };
     },
-    hint: 'List places you can post to: agent-anywhere channels [--platform tg] [--query text] (ids for --channel)',
   },
   {
     usage: 'schedule <action> [id]',
@@ -542,6 +489,5 @@ export const REVERSE_COMMANDS: ReverseCommandSpec[] = [
       { flags: '--timeout <duration>', description: 'add: --bash time limit, e.g. 90s, 10m (default 10m, max 6h)', parse: durationArg },
     ],
     build: buildSchedule,
-    hint: 'Scheduled tasks that survive restarts: agent-anywhere schedule add --cron "0 8 * * *" --prompt "…" [--session new] (see agent-anywhere help schedule)',
   },
 ];

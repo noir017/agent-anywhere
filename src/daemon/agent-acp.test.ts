@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { CreateElicitationRequest, SessionConfigOption, SessionUpdate } from '@agentclientprotocol/sdk';
 import {
+  acpMcpServers,
   dshModelDisplayValue,
   dshModelSelectorValue,
   effortSelectorOf,
@@ -8,6 +9,7 @@ import {
   liveModelName,
   isResultUsage,
   parseFormElicitation,
+  promptBlocks,
   resolveHarness,
   translateUpdate,
   type TurnState,
@@ -808,5 +810,38 @@ describe('parseFormElicitation (agent asks the user, ACP elicitation/create)', (
         requestedSchema: { type: 'object', properties: { question_0_custom: { type: 'string', title: 'Other' } } },
       } as unknown as CreateElicitationRequest)
     ).toBeNull();
+  });
+});
+
+/**
+ * What a session is given besides the user's words: tools, and nothing in the prompt. These pin
+ * both halves — the prompt is the user's text alone, and every session gets the native-tool server
+ * with what it needs spelled out in its environment.
+ */
+describe('what the agent is given', () => {
+  it('sends the user\'s text as the only prompt block — no preamble on any turn', () => {
+    expect(promptBlocks({ prompt: 'fix the build', sessionToken: 't' })).toEqual([{ type: 'text', text: 'fix the build' }]);
+  });
+
+  it('hands every session the stdio tool server, with token, socket and cwd in its own env', () => {
+    const self = { command: '/usr/bin/node', args: ['--import', 'tsx', '/srv/aa/dist/cli.js'] };
+    expect(acpMcpServers('tok-1', '/run/aa.sock', '/work/p', self)).toEqual([
+      {
+        name: 'chat',
+        command: '/usr/bin/node',
+        args: ['--import', 'tsx', '/srv/aa/dist/cli.js', 'mcp'],
+        env: [
+          { name: 'AGENT_ANYWHERE_TURN_TOKEN', value: 'tok-1' },
+          { name: 'AGENT_ANYWHERE_SOCKET', value: '/run/aa.sock' },
+          { name: 'AGENT_ANYWHERE_CWD', value: '/work/p' },
+        ],
+      },
+    ]);
+  });
+
+  it('hands none when this process cannot re-invoke itself (a test worker), rather than a broken entry', () => {
+    expect(acpMcpServers('tok-1', '/run/aa.sock', '/work/p', null)).toEqual([]);
+    // And the default — this very process — is a vitest worker, so it must take the same path.
+    expect(acpMcpServers('tok-1', '/run/aa.sock', '/work/p')).toEqual([]);
   });
 });

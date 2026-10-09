@@ -1,0 +1,154 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import type { AgentDef } from '../config/schema.js';
+import { selfInvocation } from './reverse-cli-shim.js';
+
+/**
+ * Puts the bundled skill (`skill/` at the package root) where each harness looks for skills, as a
+ * symlink named `agent-anywhere`.
+ *
+ * ── Why the daemon does this ──────────────────────────────────────────────────────────────────
+ * The skill is how an agent learns what the gateway can do beyond its two native tools — posting to
+ * other chats, history, threads, buttons — at the cost of one line of skill description, delivered
+ * by the harness's own skill mechanism rather than by text the gateway writes into the conversation.
+ * Shipping it inside the package and linking it from here means:
+ *  - it appears only on machines that run this daemon (a shared skill repo would put it in front of
+ *    agents on every machine that syncs the repo, where the `agent-anywhere` command does not exist);
+ *  - its content is always the running daemon's own — the link points into the installed package,
+ *    so an upgrade updates the skill with nothing to re-copy.
+ *
+ * ── Where, per harness ────────────────────────────────────────────────────────────────────────
+ * Probed, not assumed:
+ *  - claude   — `<home>/.claude/skills` (its documented user-level location; skills-scan.ts).
+ *  - codex    — `<home>/.agents/skills` (marker-skill experiment on codex-acp 1.12.0, skills-scan.ts).
+ *  - agy      — `<home>/.gemini/config/skills`. Probed 2026-10-09 on agy 1.3.2 by asking the model
+ *               to list its skills: a symlinked skill there was listed; the same link under
+ *               `<home>/.gemini/antigravity-cli/skills` — the global directory agy's own help names —
+ *               was not, and neither was anything in `<home>/.agents/skills` from a working
+ *               directory outside home (skills-scan.ts reads that one only because a workspace that
+ *               IS home would). Linking to the cross-vendor directory alone left agy without the
+ *               skill: asked to send a picture, it wrote a markdown image of a local path instead.
+ *  - opencode — `<home>/.agents/skills`. Probed 2026-10-09 on opencode 2.0.26 by planting marker
+ *               skills under an isolated HOME and asking the model to list its skills: it named the
+ *               ones in `~/.claude/skills`, `~/.agents/skills` and `~/.config/opencode/skills`, plus
+ *               the project-level `.claude/`, `.agents/` and `.opencode/` ones. (Its `GET /api/skill`
+ *               answered an empty list even with skills configured — not a usable probe.)
+ *  - gemini, dsh, custom — none known; nothing is linked rather than a guess.
+ * `.agents/skills` is the cross-vendor location, so one link serves codex and opencode.
+ *
+ * Only for a harness that has been run here: the link is made when the harness's own config
+ * directory exists, never by creating one — the same rule agy-statusline.ts follows, for the same
+ * reason (that would be this daemon inventing configuration for a product the operator may not use).
+ * Called at every agent spawn, so a harness first logged in after the daemon started is picked up by
+ * its next session rather than the next restart.
+ *
+ * ── What it will and will not touch ───────────────────────────────────────────────────────────
+ * A symlink by that name is taken to be ours and is repointed when it points elsewhere — an older
+ * install, or a test daemon run from a checkout. A real directory or file by that name is the
+ * operator's, and is left alone with a warning: they may be maintaining their own copy on purpose.
+ * Like the reverse-CLI shim it writes to a SHARED path, so it carries the same guard: nothing happens
+ * unless this process really is the CLI (a vitest worker is not), and AGENT_ANYWHERE_NO_SKILL_LINK=1
+ * turns it off for a test daemon that must not repoint the live one's link.
+ */
+
+/** The link's name, which is also the name harnesses list the skill under. */
+export const SKILL_LINK_NAME = 'agent-anywhere';
+
+/** `skill/` at the package root: two levels above this file both in `dist/daemon/` and `src/daemon/`. */
+export function bundledSkillDir(): string {
+  return fileURLToPath(new URL('../../skill', import.meta.url));
+}
+
+/** A skills directory to link into, and the harness config directory that must exist first. */
+export interface SkillHome {
+  dir: string;
+  requires: string;
+}
+
+/** Where `harness` reads skills from under `home` (see the header for the evidence per arm). */
+export function skillHomes(harness: AgentDef['harness'], home: string): SkillHome[] {
+  const shared = path.join(home, '.agents', 'skills');
+  switch (harness) {
+    case 'claude':
+      return [{ dir: path.join(home, '.claude', 'skills'), requires: path.join(home, '.claude') }];
+    case 'codex':
+      return [{ dir: shared, requires: path.join(home, '.codex') }];
+    case 'agy':
+      return [{ dir: path.join(home, '.gemini', 'config', 'skills'), requires: path.join(home, '.gemini', 'antigravity-cli') }];
+    case 'opencode':
+      return [{ dir: shared, requires: path.join(home, '.config', 'opencode') }];
+    case 'gemini':
+    case 'dsh':
+    case 'custom':
+      return [];
+    default: {
+      const _exhaustive: never = harness;
+      return _exhaustive;
+    }
+  }
+}
+
+export type SkillLinkOutcome = 'linked' | 'relinked' | 'current' | 'occupied' | 'skipped' | 'failed';
+
+export interface SkillLinkResult {
+  link: string;
+  outcome: SkillLinkOutcome;
+  /** What was there before (`relinked`), what is in the way (`occupied`), or the error (`failed`). */
+  detail?: string;
+}
+
+/** Make `<home.dir>/agent-anywhere` a symlink to `source`. No guard — the tests drive this directly. */
+export function linkSkill(source: string, home: SkillHome): SkillLinkResult {
+  const link = path.join(home.dir, SKILL_LINK_NAME);
+  try {
+    if (!fs.existsSync(home.requires)) return { link, outcome: 'skipped', detail: `${home.requires} does not exist` };
+    let previous: string | undefined;
+    try {
+      const st = fs.lstatSync(link);
+      if (!st.isSymbolicLink()) return { link, outcome: 'occupied', detail: st.isDirectory() ? 'a directory' : 'a file' };
+      previous = fs.readlinkSync(link);
+      if (path.resolve(home.dir, previous) === source) return { link, outcome: 'current' };
+      fs.unlinkSync(link);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+    }
+    fs.mkdirSync(home.dir, { recursive: true });
+    fs.symlinkSync(source, link, 'dir');
+    return previous === undefined ? { link, outcome: 'linked' } : { link, outcome: 'relinked', detail: previous };
+  } catch (e) {
+    return { link, outcome: 'failed', detail: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/** Links already reported as occupied or failed, so a spawn-time call does not repeat the warning. */
+const warned = new Set<string>();
+
+/**
+ * Link the bundled skill for one agent's harness under `home`. Best-effort: every outcome is logged
+ * or silent, never thrown — an agent without the skill still has its tools and its shell.
+ */
+export function ensureSkillLink(harness: AgentDef['harness'], home: string): SkillLinkResult[] {
+  if (process.env.AGENT_ANYWHERE_NO_SKILL_LINK) return [];
+  if (!selfInvocation()) return [];
+  const source = bundledSkillDir();
+  if (!fs.existsSync(path.join(source, 'SKILL.md'))) {
+    if (!warned.has(source)) console.warn(`[skill] no bundled skill at ${source}; agents will not get it`);
+    warned.add(source);
+    return [];
+  }
+  const results = skillHomes(harness, home).map((h) => linkSkill(source, h));
+  for (const r of results) {
+    if (r.outcome === 'linked') console.log(`[skill] linked ${r.link} → ${source}`);
+    else if (r.outcome === 'relinked') console.log(`[skill] repointed ${r.link} → ${source} (was ${r.detail})`);
+    else if ((r.outcome === 'occupied' || r.outcome === 'failed') && !warned.has(r.link)) {
+      warned.add(r.link);
+      console.warn(
+        r.outcome === 'occupied'
+          ? `[skill] ${r.link} is ${r.detail}, not a link — leaving it alone; that copy is what agents will read`
+          : `[skill] could not link ${r.link}: ${r.detail}`
+      );
+    }
+  }
+  return results;
+}

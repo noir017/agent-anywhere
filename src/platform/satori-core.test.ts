@@ -143,3 +143,58 @@ describe('a profile without decodeChannelKey is unaffected', () => {
     expect(seen.sent).toEqual([{ channelId: 'C123:456' }]);
   });
 });
+
+/**
+ * The listen allowlist (`chat.channels`) against composite topic ids.
+ *
+ * A profile that widens a topic message's id to `<chat>:<topic>` (Telegram's inboundChannelId)
+ * changes what an exact-match allowlist sees. An entry naming the chat must keep admitting its
+ * topics — otherwise allowlisting a group by the only id an operator can find would silence every
+ * topic in it, and a private chat that was allowlisted before Bot API 9.4 topics would go quiet
+ * the moment its user opened a topic. A composite entry still names exactly one topic.
+ */
+describe('chat.channels allowlist and composite topic ids', () => {
+  async function delivered(channels: string[], key: string): Promise<boolean> {
+    let ctx: Context | undefined;
+    const profile = {
+      type: 'stub',
+      satoriPlatform: 'stub',
+      capabilities: { editMessage: true, reaction: false, typing: false, maxMessageLength: 4096,
+        reply: false, thread: false, buttons: false, slashCommands: false },
+      install(c: Context) { ctx = c; },
+      detectMention: () => false,
+      isDirect: () => false,
+      isThread: () => key.includes(':'),
+      attachmentMeta: () => ({}),
+      inboundChannelId: () => key,
+      decodeChannelKey(channelId: string) {
+        const i = channelId.indexOf(':');
+        return i < 0 ? { channelId } : { channelId: channelId.slice(0, i), lane: channelId.slice(i + 1) };
+      },
+    } as unknown as PlatformProfile;
+    const instance = {
+      id: 'stub1',
+      type: 'stub',
+      chat: { channels, requireMention: false, freeResponseChannels: [], ignoredChannels: [], allowBots: 'none' },
+    } as unknown as PlatformInstance;
+    const adapter = await createSatoriAdapter(profile, instance);
+    let got = false;
+    adapter.onMessage(() => { got = true; });
+    ctx!.emit('message', { userId: 'u', selfId: 'bot', channelId: 'raw', content: 'hi', elements: [] } as never);
+    return got;
+  }
+
+  it('an entry naming the chat admits its topics', async () => {
+    expect(await delivered(['-100123'], '-100123:7')).toBe(true);
+  });
+
+  it('a composite entry names exactly one topic', async () => {
+    expect(await delivered(['-100123:7'], '-100123:7')).toBe(true);
+    expect(await delivered(['-100123:7'], '-100123:8')).toBe(false);
+  });
+
+  it('other chats are still filtered out, topic or not', async () => {
+    expect(await delivered(['-100999'], '-100123:7')).toBe(false);
+    expect(await delivered(['-100999'], '-100123')).toBe(false);
+  });
+});

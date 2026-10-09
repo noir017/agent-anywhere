@@ -43,9 +43,17 @@ export async function createSatoriAdapter(
   instance: PlatformInstance
 ): Promise<PlatformAdapter> {
   // Channel allowlist (empty = allow all). Set for fast lookup.
+  //
+  // An entry naming a chat also admits that chat's topics. Where a profile widens a topic
+  // message's id to a composite (`<chat>:<topic>`, see inboundChannelId), an exact-only match
+  // would drop every topic message from a chat the operator allowlisted by its chat id — the only
+  // id most operators know — and would newly drop Telegram private-chat topics, which reported the
+  // bare chat id before. The composite itself still names exactly one topic.
   const allow = new Set(instance.chat.channels);
   const channelAllowed = (channelId: string | undefined): boolean =>
-    allow.size === 0 || (channelId != null && allow.has(channelId));
+    allow.size === 0 ||
+    (channelId != null &&
+      (allow.has(channelId) || allow.has(profile.decodeChannelKey?.(channelId).channelId ?? channelId)));
 
   let onMsg: ((m: InboundMessage) => void) | null = null;
   // Interaction callbacks may not be registered yet this round; safely ignore events until then.

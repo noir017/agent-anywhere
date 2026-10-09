@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.39.0] - 2026-10-09
+
 ### Added
 
 - **The web UI shows what you are about to send, and lets you take any of it back.** Until now an

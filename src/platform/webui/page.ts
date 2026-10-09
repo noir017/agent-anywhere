@@ -305,6 +305,13 @@ button:disabled{opacity:.5;cursor:default}
 #hints button{font-size:12px}
 #chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
 .chip{background:var(--field);border:1px solid var(--line);border-radius:3px;padding:1px 6px;font-size:12px;color:var(--dim)}
+/* What is about to be sent, in the composer: a picture is shown, and anything can be taken back
+   off. The thumbnail is a fixed square cropped to fit — a tall phone screenshot at its own aspect
+   ratio would be a sliver too thin to recognise. */
+#chips .chip{display:inline-flex;align-items:center;gap:6px;padding:2px 0 2px 6px}
+#chips .thumb{display:block;width:56px;height:56px;object-fit:cover;margin-left:-4px;border-radius:2px;cursor:zoom-in}
+.chip-x{background:none;border:0;padding:0 7px;font-size:15px;line-height:1;color:var(--dim)}
+.chip-x:hover{color:var(--fg)}
 .files{margin-top:6px;display:flex;flex-wrap:wrap;gap:6px}
 /* A picture the agent sent, drawn in the bubble. Capped in both directions: a screenshot of a
    4K display would otherwise push the timestamp and everything after it off the fold, and the
@@ -401,6 +408,9 @@ button:disabled{opacity:.5;cursor:default}
      meter says the same thing in four characters, and a tap brings the counts back. Without this
      the line clipped before the cache and quota — the parts that change. */
   #status:not(.open) .st-x{display:none}
+  /* The same 44px for taking an attachment back off. A miss lands on the thumbnail, which only
+     opens it — but a 15px glyph with no padding is a target a finger finds on the third try. */
+  .chip-x{min-width:44px;min-height:44px}
 }
 `;
 
@@ -1848,11 +1858,72 @@ const SCRIPT = `
   // media query won.
   function grow(){ input.style.height='auto'; input.style.height=input.scrollHeight+'px'; }
 
-  function renderChips(){
-    var h='';
-    for(var i=0;i<files.length;i++) h += '<span class="chip">'+text(files[i].name)+'</span>';
-    chips.innerHTML=h;
+  /**
+   * The composer's attachments, one chip each: the name, a thumbnail when it is a picture, and a ×
+   * that takes it back off the message. Before this a chip was a name and nothing else, so a
+   * screenshot could not be checked before it went, and one pasted by mistake could only be got
+   * rid of by sending it or by switching topics and back — which keeps it, since the draft does.
+   *
+   * Two constraints shape how the thumbnail is made:
+   *   - It is a data: URL, not URL.createObjectURL. The page's CSP (server.ts) is img-src 'self'
+   *     data:, so a blob: URL is refused and every thumbnail would be a broken frame. Widening the
+   *     CSP for a preview is the wrong way round.
+   *   - Each chip is built ONCE per file and moved, never rebuilt. The URL is the whole file again,
+   *     and pushing it through innerHTML (and text() before that) on every paste re-parses and
+   *     re-decodes every screenshot already there. The node lives in a WeakMap, not on the file
+   *     object, because that object IS the upload: api/send is .strict() and would refuse a
+   *     message carrying one more key.
+   */
+  var chipEls = new WeakMap();
+  function chipFor(f){
+    var el = chipEls.get(f);
+    if(el) return el;
+    el = document.createElement('span');
+    el.className = 'chip';
+    if(/^image\\//.test(f.mime) && f.data){
+      var img = document.createElement('img');
+      img.className = 'thumb';
+      img.alt = f.name;
+      img.src = 'data:'+f.mime+';base64,'+f.data;
+      el.appendChild(img);
+    }
+    var name = document.createElement('span');
+    name.className = 'chip-name';
+    name.textContent = f.name;
+    el.appendChild(name);
+    var x = document.createElement('button');
+    x.type = 'button';
+    x.className = 'chip-x';
+    x.title = 'Remove ' + f.name;
+    x.setAttribute('aria-label', 'Remove ' + f.name);
+    x.textContent = '\\u00d7';
+    el.appendChild(x);
+    chipEls.set(f, el);
+    return el;
   }
+  function renderChips(){
+    chips.textContent = '';
+    for(var i=0;i<files.length;i++){
+      var el = chipFor(files[i]);
+      // An index, re-stamped on every render: files only ever grows at the end or loses the one
+      // being removed, and either way this render follows it before another click can land.
+      el.lastChild.setAttribute('data-drop', String(i));
+      chips.appendChild(el);
+    }
+  }
+  chips.addEventListener('click', function(e){
+    var x = e.target.closest ? e.target.closest('button[data-drop]') : null;
+    if(x){ files.splice(Number(x.getAttribute('data-drop')), 1); renderChips(); return; }
+    var t = e.target.closest ? e.target.closest('img.thumb') : null;
+    if(t) openShot(t);
+  });
+  // A picture this browser cannot decode (HEIC on anything but Safari) keeps its name and loses
+  // the broken frame, the same answer #log gives one that 404s — and for the same reason in the
+  // capture phase: 'error' on an <img> does not bubble.
+  chips.addEventListener('error', function(e){
+    var t = e.target;
+    if(t && t.classList && t.classList.contains('thumb')) t.style.display='none';
+  }, true);
 
   // ── A composer per topic ───────────────────────────────────────────────────
   /**

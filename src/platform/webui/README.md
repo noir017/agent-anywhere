@@ -649,9 +649,23 @@ Tapping a picture fills the screen with it. Deliberately not a new tab: installe
 this page has no tab bar to come back from, and leaving the app to look at a screenshot is the
 same friction the feature exists to remove.
 
-The operator's *own* uploads are still shown as named chips, not thumbnails. They are base64 in
-the request body and deliberately never stored — see [the local transcript
-cache](#the-local-transcript-cache) for why that is the same reason a failed message cannot be
+**Before it is sent, the composer shows what is attached and lets any of it be taken back.** A
+picture is a 56px thumbnail that opens in the same full-screen view, and every attachment, picture
+or not, has a × (44px under the narrow-screen layout). Two things about it are not obvious:
+
+- **The thumbnail is a `data:` URL, not `URL.createObjectURL`.** The page's CSP (`server.ts`) has
+  `img-src 'self' data:`, which refuses `blob:`. An object URL looks like the cheaper choice and
+  would show every thumbnail as a broken frame. The fix is to use the scheme already admitted, not
+  to widen the CSP for a preview.
+- **A chip is built once per file and moved after that, never rebuilt.** Its URL is the whole file
+  again, so rebuilding through `innerHTML` on every paste would re-parse and re-decode every
+  screenshot already attached. The node is kept in a `WeakMap` rather than on the file object,
+  because that object is the upload itself: `api/send` is `.strict()` and would refuse a message
+  carrying one key too many. `page.dom.test.ts` pins both halves.
+
+Once sent, the operator's *own* uploads are shown in the transcript as named chips, not
+thumbnails. They are base64 in the request body and deliberately never stored. See [the local
+transcript cache](#the-local-transcript-cache): the same reason means a failed message cannot be
 retried after a reload.
 
 ### The other door: `sso.ts`

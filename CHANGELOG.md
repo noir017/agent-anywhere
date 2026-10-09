@@ -5,6 +5,24 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **The web UI shows what you are about to send, and lets you take any of it back.** Until now an
+  attachment in the composer was its file name and nothing else. You could not check a pasted
+  screenshot before it went, and you could only get rid of one pasted by mistake by sending it,
+  because switching topics keeps the draft along with its files. Now a picture appears as a
+  thumbnail that opens full-screen when tapped, and every attachment, picture or not, has a × that
+  removes it from the message. On a phone the × is a 44px target.
+
+  The thumbnail is a `data:` URL rather than an object URL. The page's CSP has `img-src 'self'
+  data:`, so a `blob:` URL would be refused and every thumbnail would show as a broken frame. Each
+  chip is built once per file and then moved. A thumbnail's URL is the whole file again in base64,
+  and rebuilding every chip on each paste would re-parse and re-decode every screenshot already
+  attached. A picture the browser cannot decode (HEIC outside Safari) keeps its name and loses the
+  broken frame. In the transcript, your sent message still shows its attachments as names. The
+  page does not keep the bytes once they are sent, for the reason a failed message cannot be retried
+  after a reload.
+
 ## [1.38.0] - 2026-10-08
 
 ### Added

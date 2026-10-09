@@ -126,6 +126,14 @@ async function untilAsync(what: string, ok: () => Promise<boolean>): Promise<voi
   throw new Error(`never happened: ${what}`);
 }
 
+/**
+ * The names on the composer's attachment chips, in order. Read off `.chip-name` rather than the
+ * chips' text, because a chip also carries its × — and a thumbnail's alt, which is not text.
+ */
+function chipNames(h: { el: (id: string) => HTMLElement }): string[] {
+  return Array.from(h.el('chips').querySelectorAll('.chip-name')).map((n) => n.textContent ?? '');
+}
+
 /** A sync in the shape `WebRoom.syncEvent` builds it. `extra` carries the optional flags. */
 function sync(
   topic: string,
@@ -1203,16 +1211,16 @@ describe('webui page: a composer per topic', () => {
     const h = await open();
     await h.emit(sync(A, [], [A, B]));
     paste(h);
-    await until('the chip is rendered', () => h.el('chips').textContent === 'pasted-1.png');
+    await until('the chip is rendered', () => chipNames(h).join() === 'pasted-1.png');
 
     await h.click(`[data-topic="${B}"]`);
-    expect(h.el('chips').textContent).toBe('');
+    expect(chipNames(h)).toEqual([]);
     input(h).value = 'nothing attached here';
     await h.click('#composer button[type="submit"]');
     expect(sends(h)[0]?.body.files).toBeUndefined();
 
     await h.click(`[data-topic="${A}"]`);
-    expect(h.el('chips').textContent).toBe('pasted-1.png');
+    expect(chipNames(h)).toEqual(['pasted-1.png']);
     await h.click('#composer button[type="submit"]');
     expect((sends(h)[1]?.body.files as unknown[]).length).toBe(1);
     expect(sends(h)[1]?.body.topic).toBe(A);
@@ -1226,10 +1234,10 @@ describe('webui page: a composer per topic', () => {
     paste(h);
     h.doc.querySelector<HTMLElement>(`[data-topic="${B}"]`)!.click();
     for (let i = 0; i < 20; i++) await tick();
-    expect(h.el('chips').textContent).toBe('');
+    expect(chipNames(h)).toEqual([]);
 
     await h.click(`[data-topic="${A}"]`);
-    expect(h.el('chips').textContent).toBe('pasted-1.png');
+    expect(chipNames(h)).toEqual(['pasted-1.png']);
   });
 
   it('keeps the text across a reload, written when the page is hidden rather than per keystroke', async () => {
@@ -1842,8 +1850,8 @@ describe('webui page: pasting', () => {
     // Swallowed, or the `<img>` the clipboard carries beside the file pastes into the textarea
     // as markup on top of the attachment.
     expect(ev.defaultPrevented).toBe(true);
-    await until('the chip is rendered', () => h.el('chips').textContent !== '');
-    expect(h.el('chips').textContent).toBe('pasted-1.png');
+    await until('the chip is rendered', () => chipNames(h).length > 0);
+    expect(chipNames(h)).toEqual(['pasted-1.png']);
 
     (h.el('input') as HTMLTextAreaElement).value = 'what is this';
     await h.click('#composer button[type="submit"]');
@@ -1868,7 +1876,7 @@ describe('webui page: pasting', () => {
     h.el('input').dispatchEvent(pasteOf(h, [{ kind: 'file', type: 'image/jpeg', file: image(h, 'image.png', 'image/jpeg') }]));
     await until('the second chip', () => h.el('chips').children.length === 2);
 
-    expect(Array.from(h.el('chips').children).map((c) => c.textContent)).toEqual(['pasted-1.png', 'pasted-2.jpeg']);
+    expect(chipNames(h)).toEqual(['pasted-1.png', 'pasted-2.jpeg']);
   });
 
   it('leaves an ordinary text paste alone', async () => {
@@ -1881,7 +1889,7 @@ describe('webui page: pasting', () => {
     // Cancelling this one would mean pasting text into the composer no longer works at all.
     expect(ev.defaultPrevented).toBe(false);
     await tick();
-    expect(h.el('chips').textContent).toBe('');
+    expect(chipNames(h)).toEqual([]);
   });
 
   it('takes a paste that landed outside the composer', async () => {
@@ -1892,8 +1900,8 @@ describe('webui page: pasting', () => {
 
     h.doc.body.dispatchEvent(pasteOf(h, [{ kind: 'file', type: 'image/png', file: image(h, 'image.png', 'image/png') }]));
 
-    await until('the chip is rendered', () => h.el('chips').textContent !== '');
-    expect(h.el('chips').textContent).toBe('pasted-1.png');
+    await until('the chip is rendered', () => chipNames(h).length > 0);
+    expect(chipNames(h)).toEqual(['pasted-1.png']);
   });
 });
 
@@ -1925,7 +1933,7 @@ describe('webui page: the file picker', () => {
     ]);
 
     await until('both chips are rendered', () => h.el('chips').children.length === 2);
-    expect(Array.from(h.el('chips').children).map((c) => c.textContent)).toEqual([
+    expect(chipNames(h)).toEqual([
       'report.pdf',
       'logs.tar.zst',
     ]);
@@ -1938,6 +1946,141 @@ describe('webui page: the file picker', () => {
       ['report.pdf', 'application/pdf'],
       ['logs.tar.zst', ''],
     ]);
+  });
+});
+
+/**
+ * What is about to be sent can be looked at and taken back. Before, a chip was a name: a pasted
+ * screenshot could not be checked before it went, and one pasted by mistake could only be got rid
+ * of by sending it.
+ */
+describe('webui page: attachments in the composer', () => {
+  const A = 'a1b2c3d4';
+  const B = 'b2c3d4e5';
+
+  /** Paste one picture, the way the clipboard hands one over (see `pasteOf` above). */
+  const pasteImage = (h: Harness, type = 'image/png'): void => {
+    const file = new h.window.File([new Uint8Array([137, 80, 78, 71])], 'image.png', { type });
+    const ev = new h.window.Event('paste', { bubbles: true, cancelable: true });
+    Object.defineProperty(ev, 'clipboardData', {
+      value: { items: [{ kind: 'file', type, getAsFile: () => file }] },
+    });
+    h.el('input').dispatchEvent(ev);
+  };
+  const thumbs = (h: Harness): HTMLImageElement[] =>
+    Array.from(h.el('chips').querySelectorAll<HTMLImageElement>('img.thumb'));
+  const removeButton = (h: Harness, name: string): HTMLElement => {
+    const b = h.el('chips').querySelector<HTMLElement>(`button[aria-label="Remove ${name}"]`);
+    if (!b) throw new Error(`no remove button for ${name}`);
+    return b;
+  };
+
+  it('shows a pasted screenshot before it is sent, and leaves a document as its name', async () => {
+    const h = await open();
+    await h.emit(sync(A, [], [A]));
+    pasteImage(h);
+    await until('the chip is rendered', () => chipNames(h).length === 1);
+
+    const [thumb] = thumbs(h);
+    // A data: URL, because the page's CSP refuses blob: — an object URL would be a broken frame.
+    expect(thumb?.getAttribute('src')).toBe('data:image/png;base64,iVBORw==');
+    expect(thumb?.getAttribute('alt')).toBe('pasted-1.png');
+
+    const picker = h.el('picker');
+    Object.defineProperty(picker, 'files', {
+      value: [new h.window.File(['%PDF-1.7'], 'report.pdf', { type: 'application/pdf' })],
+      configurable: true,
+      writable: true,
+    });
+    picker.dispatchEvent(new h.window.Event('change', { bubbles: true }));
+    await until('the second chip', () => chipNames(h).length === 2);
+    expect(thumbs(h)).toHaveLength(1);
+  });
+
+  it('takes one attachment back off, and sends only the rest', async () => {
+    const h = await open();
+    await h.emit(sync(A, [], [A]));
+    pasteImage(h);
+    await until('the first chip', () => chipNames(h).length === 1);
+    pasteImage(h, 'image/jpeg');
+    await until('the second chip', () => chipNames(h).length === 2);
+
+    removeButton(h, 'pasted-1.png').click();
+    expect(chipNames(h)).toEqual(['pasted-2.jpeg']);
+
+    (h.el('input') as HTMLTextAreaElement).value = 'only the second one';
+    await h.click('#composer button[type="submit"]');
+    const files = h.calls.find((c) => c.path === 'api/send')?.body.files as Array<Record<string, string>>;
+    expect(files.map((f) => f.name)).toEqual(['pasted-2.jpeg']);
+    // Exactly the upload's three keys: api/send is .strict(), so anything the chips needed to
+    // remember about a file riding along on it would get the whole message refused.
+    expect(Object.keys(files[0]!).sort()).toEqual(['data', 'mime', 'name']);
+  });
+
+  it('sends nothing at all once the only attachment is removed', async () => {
+    const h = await open();
+    await h.emit(sync(A, [], [A]));
+    pasteImage(h);
+    await until('the chip is rendered', () => chipNames(h).length === 1);
+
+    removeButton(h, 'pasted-1.png').click();
+    await h.click('#composer button[type="submit"]');
+    expect(h.calls.filter((c) => c.path === 'api/send')).toHaveLength(0);
+  });
+
+  it('keeps a removed attachment removed across a topic switch', async () => {
+    // The draft a topic switch keeps holds the same list the chips draw; a removal that only
+    // repainted would come back the moment the topic was left and re-entered.
+    const h = await open();
+    await h.emit(sync(A, [], [A, B]));
+    pasteImage(h);
+    await until('the chip is rendered', () => chipNames(h).length === 1);
+    await h.click(`[data-topic="${B}"]`);
+    await h.click(`[data-topic="${A}"]`);
+    expect(chipNames(h)).toEqual(['pasted-1.png']);
+
+    removeButton(h, 'pasted-1.png').click();
+    await h.click(`[data-topic="${B}"]`);
+    await h.click(`[data-topic="${A}"]`);
+    expect(chipNames(h)).toEqual([]);
+  });
+
+  it('opens a thumbnail full-screen when it is tapped', async () => {
+    const h = await open();
+    await h.emit(sync(A, [], [A]));
+    pasteImage(h);
+    await until('the chip is rendered', () => thumbs(h).length === 1);
+
+    await h.click('#chips img.thumb');
+    expect(h.el('lightbox').hidden).toBe(false);
+    expect(h.el('lightbox-img').getAttribute('src')).toBe('data:image/png;base64,iVBORw==');
+    // Looking is not removing.
+    expect(chipNames(h)).toEqual(['pasted-1.png']);
+  });
+
+  it('builds a thumbnail once, rather than again on every paste', async () => {
+    // The src is the whole file again. Rebuilding every chip per paste re-parses and re-decodes
+    // every screenshot already attached — the same node being moved is what proves it was not.
+    const h = await open();
+    await h.emit(sync(A, [], [A]));
+    pasteImage(h);
+    await until('the first chip', () => thumbs(h).length === 1);
+    const first = thumbs(h)[0];
+    pasteImage(h);
+    await until('the second chip', () => thumbs(h).length === 2);
+    expect(thumbs(h)[0]).toBe(first);
+  });
+
+  it('keeps the name of a picture this browser cannot decode, and hides the broken frame', async () => {
+    const h = await open();
+    await h.emit(sync(A, [], [A]));
+    pasteImage(h, 'image/heic');
+    await until('the chip is rendered', () => thumbs(h).length === 1);
+
+    const [thumb] = thumbs(h);
+    thumb!.dispatchEvent(new h.window.Event('error'));
+    expect(thumb!.style.display).toBe('none');
+    expect(chipNames(h)).toEqual(['pasted-1.heic']);
   });
 });
 
@@ -2045,6 +2188,10 @@ describe('webui page: the narrow-screen stylesheet', () => {
 
   it('pads the send row past the home indicator', () => {
     expect(narrowBlock()).toContain('env(safe-area-inset-bottom');
+  });
+
+  it('gives the attachment × a target a finger can hit', () => {
+    expect(narrowBlock()).toContain('.chip-x{min-width:44px;min-height:44px}');
   });
 
   it('gives the drawer toggle a finger-sized target', () => {

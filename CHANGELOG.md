@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.40.0] - 2026-10-09
+
 ### Changed
 
 - **Nothing of the gateway's goes into the agent's prompt any more.** Every session used to open

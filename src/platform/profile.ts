@@ -54,6 +54,17 @@ export interface PlatformProfile<P extends PlatformConfig = PlatformConfig> {
   isThread(session: Session): boolean;
   /** Extract mime/size from a single media element (keys differ per platform). */
   attachmentMeta(el: h): { mime?: string; size?: number };
+  /**
+   * Translate this platform's own failure vocabulary into the core's (`core/outbound-errors.ts`).
+   *
+   * Called by satori-core around EVERY outbound call, so a profile declares its mapping ONCE
+   * instead of wrapping method by method — a mapping applied inside one method and nowhere else
+   * leaves the same rejection from every other path an anonymous failure.
+   *
+   * Return the error unchanged when nothing matches. Be conservative: typing a permanent failure
+   * (a 400) as a rate limit turns a loud one-time error into a silent retry loop.
+   */
+  classifyError?(e: unknown): unknown;
 
   // —— Capability-gated operations (absent = unsupported; satori-core degrades/throws per capabilities) ——
 

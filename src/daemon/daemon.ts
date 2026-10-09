@@ -15,6 +15,8 @@ import { SessionRegistry } from './session.js';
 import type { SessionStore } from './session-store.js';
 import { IpcServer } from '../ipc/server.js';
 import type { IpcAction } from '../ipc/protocol.js';
+import { OutboundPacer } from '../core/outbound-pacer.js';
+import { withOutboundPacing } from './paced-adapter.js';
 
 /** Valid slash name: lowercase/digit/_/-, 1-32 chars (Discord constraint). Non-matching names are skipped on registration. */
 const SLASH_NAME_RE = /^[a-z0-9_-]{1,32}$/;
@@ -186,11 +188,19 @@ export class Daemon {
    * dispatch it can't be clobbered by another connection (Node single-threaded, no interleaving).
    */
   private lastResolvedSessionId: SessionId | undefined;
+  /**
+   * Platform adapters keyed by instance id, each wrapped in the shared outbound pacer: every path
+   * that writes to a chat — turns, reverse commands, button acks — goes through these, so they all
+   * draw on the same per-chat budget (see daemon/paced-adapter.ts).
+   */
+  private readonly platforms: Map<string, PlatformAdapter>;
+  /** One write budget per chat, shared by every writer (see core/outbound-pacer.ts). */
+  private readonly pacer: OutboundPacer;
 
   constructor(
     private readonly config: Config,
     /** Platform adapters keyed by instance id (one daemon drives all configured instances). */
-    private readonly platforms: Map<string, PlatformAdapter>,
+    platforms: Map<string, PlatformAdapter>,
     agents: AgentFactory,
     socketPath: string,
     /** Persistent sessionKey → ACP sessionId map (context survives daemon restarts; /new clears). */
@@ -205,7 +215,12 @@ export class Daemon {
       },
     };
 
-    this.registry = new SessionRegistry(config, platforms, agents, clock, {
+    this.pacer = new OutboundPacer(config.outbound, clock);
+    this.platforms = new Map(
+      [...platforms].map(([id, adapter]) => [id, withOutboundPacing(adapter, this.pacer)])
+    );
+
+    this.registry = new SessionRegistry(config, this.platforms, agents, clock, {
       // A session's agent reported available commands → record and debounce re-registration of the union.
       onAvailableCommands: (sessionId, cmds) => this.onAgentCommands(sessionId, cmds),
     }, store);
@@ -266,6 +281,16 @@ export class Daemon {
     this.signalCleanup?.();
     this.signalCleanup = null;
     await this.ipc.stop();
+    // Deliver what the pacer is still holding BEFORE the adapters go down: a queued write is
+    // somebody's reply, and one that was paced or paused at the wrong moment must not be lost just
+    // because the process is leaving. Bounded by outbound.drainMs, so a chat the platform has
+    // silenced for minutes cannot hold the shutdown for the same minutes.
+    const drained = await this.pacer
+      .drain(this.config.outbound.drainMs)
+      .catch(() => ({ delivered: 0, abandoned: 0 }));
+    if (drained.delivered > 0 || drained.abandoned > 0) {
+      console.log(`[daemon] outbound drain: ${drained.delivered} delivered, ${drained.abandoned} abandoned`);
+    }
     for (const [id, adapter] of this.platforms) {
       await adapter.stop().catch((e) =>
         console.error(`[daemon] failed to stop platform instance "${id}":`, e instanceof Error ? e.message : e)

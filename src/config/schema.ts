@@ -137,6 +137,53 @@ const ExperienceSchema = z.object({
     })
     .default({}),
 
+  /**
+   * The per-chat write budget every outbound path shares (core/outbound-pacer.ts).
+   *
+   * One budget, not one per writer: the platform counts the reply, the tool bubbles, the
+   * reactions, the buttons and the agent's own reverse commands as a single stream per chat. Each
+   * writer politely throttling itself still adds up to a flood — which is what produced 78
+   * Telegram 429s, with `retry after` reaching 229 seconds, in one daemon run.
+   *
+   * Frozen: these are guardrails, not deployment decisions. The defaults track what the platforms
+   * actually enforce (Telegram: ~1 message/sec per chat, ~30/sec overall).
+   */
+  outbound: z
+    .object({
+      /** Sustained writes per second, per chat. */
+      ratePerSec: z.number().positive().default(1),
+      /**
+       * Writes allowed back-to-back on a chat that has been idle.
+       *
+       * Sized so a whole ORDINARY turn — the reactions, a tool bubble and its refreshes, the reply —
+       * goes out with no delay at all, and only sustained traffic is paced. Too small and pacing
+       * becomes a latency tax on every turn that uses a tool; too large and a flood gets a long
+       * head start before the rate limit bites. The failure this exists to prevent was hundreds of
+       * writes, not a dozen.
+       */
+      burst: z.number().int().positive().default(12),
+      /** Ceiling across all chats of one platform instance. */
+      globalRatePerSec: z.number().positive().default(25),
+      globalBurst: z.number().int().positive().default(30),
+      /**
+       * How long a tool-progress write may sit queued before it stops being worth sending. Past
+       * this it is dropped and the renderer's next paint carries the current state instead — a
+       * bubble showing where the agent was eight seconds ago is worse than one that skips ahead.
+       */
+      progressMaxWaitMs: z.number().int().nonnegative().default(8_000),
+      /**
+       * How long a finishing turn waits for its tool bubbles to land. Past this the turn stops
+       * WAITING; it does not cancel — a queued write still goes out, just after the ✅. Without a
+       * bound, a chat the platform paused for 229 s would hold the turn open for the same 229 s.
+       */
+      finalizeWaitMs: z.number().int().nonnegative().default(15_000),
+      /** Ceiling on a platform-stated wait, so one absurd value cannot silence a chat for the process. */
+      maxRetryAfterMs: z.number().int().positive().default(300_000),
+      /** How long `stop()` spends delivering the queue before abandoning it. */
+      drainMs: z.number().int().nonnegative().default(5_000),
+    })
+    .default({}),
+
   /** Tool-bubble renderer params. */
   tools: z
     .object({
@@ -144,6 +191,10 @@ const ExperienceSchema = z.object({
       /** accumulate: edit successive progress into one bubble (hermes default) / separate: new message per tool. */
       grouping: z.enum(['separate', 'accumulate']).default('accumulate'),
       previewLimit: z.number().int().positive().default(40),
+      /** First retry delay after a tool-bubble write fails without stating a wait (doubles per failure). */
+      retryIntervalMs: z.number().int().positive().default(1_200),
+      /** Cap on that doubling. A stated wait (RateLimitedError) is governed by outbound.maxRetryAfterMs. */
+      maxRetryMs: z.number().int().positive().default(30_000),
       defaultEmoji: z.string().default('⚙️'),
       emojiMap: z.record(z.string()).default({
         Read: '📖',

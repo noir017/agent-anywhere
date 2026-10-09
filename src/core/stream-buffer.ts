@@ -1,4 +1,5 @@
 import type { MessageRef } from '../types.js';
+import { retryAfterMsOf } from './outbound-errors.js';
 
 /**
  * Streaming buffer.
@@ -6,17 +7,29 @@ import type { MessageRef } from '../types.js';
  * Dual-trigger throttle: flush when charThreshold chars accumulate OR
  * flushIntervalMs elapses since the last edit. A cursor trails the live text and
  * is dropped on completion. Edits one message in place (first push sends to get a
- * ref, later pushes edit). Skips the call when text is unchanged. On rate-limit,
- * edit interval backs off exponentially; after repeated failures it degrades to
- * whole-message send. Overflow text is split into chunks without breaking code
+ * ref, later pushes edit). Skips the call when text is unchanged. On a failed write
+ * it backs off — for exactly as long as the platform said when it said (a
+ * RateLimitedError's retryAfterMs), exponentially otherwise — and nothing writes
+ * until the backoff ends; after repeated failures it degrades to whole-message send. Overflow text is split into chunks without breaking code
  * fences. [SILENT] suppresses all output.
  */
+
+/** Ceiling on a platform-stated wait when the caller sets none (see maxRetryAfterMs). */
+const DEFAULT_MAX_RETRY_AFTER_MS = 300_000;
 
 export interface StreamBufferOptions {
   charThreshold: number;
   flushIntervalMs: number;
   cursor: string;
+  /** Cap on the GUESSED backoff (a failure that states no wait). A stated wait is not capped by it. */
   maxBackoffMs: number;
+  /**
+   * Cap on a wait the platform STATED (RateLimitedError.retryAfterMs). Separate from maxBackoffMs
+   * because the two answer different questions: maxBackoffMs bounds a guess, and Telegram has been
+   * observed asking for 229 s — 22× the 10 s guess cap. This only guards against a nonsensical
+   * number keeping a turn's reply frozen indefinitely. Defaults to 5 minutes.
+   */
+  maxRetryAfterMs?: number;
   maxFailuresBeforeFallback: number;
   silentToken: string;
   maxMessageLength: number;
@@ -58,6 +71,12 @@ export class StreamBuffer {
   private lastEditAt = 0;
   private primaryRef: MessageRef | null = null;
   private currentBackoff: number;
+  /**
+   * No write before this time (0 = not paused). Set by a failure, cleared by a success. Gates BOTH
+   * triggers: gating only the idle timer (as the backoff used to) let a stream that kept producing
+   * text retry every charThreshold characters, deepening the very limit it was backing off from.
+   */
+  private pausedUntil = 0;
   private consecutiveFailures = 0;
   private degraded = false;         // degraded to whole-message send
   private cancelTimer: (() => void) | null = null;
@@ -126,21 +145,33 @@ export class StreamBuffer {
   private maybeFlush(): void {
     if (this.aborted) return;
     if (this.isSilent()) return;
+    const now = this.sink.now();
+
+    // Backing off: neither trigger may write. Arm the timer for the end of the pause instead, so
+    // the text accumulated meanwhile goes out in one write the moment the platform allows it.
+    if (now < this.pausedUntil) {
+      this.armTimer(this.pausedUntil - now);
+      return;
+    }
+
     const pendingChars = this.acc.length - this.lastRenderedBody.length;
-    const elapsed = this.sink.now() - this.lastEditAt;
+    const elapsed = now - this.lastEditAt;
 
     if (pendingChars >= this.opts.charThreshold || elapsed >= this.currentBackoff) {
       void this.flush(false);
       return;
     }
     // Not triggered: arm a fallback timer so an idle stream still flushes after the interval.
-    if (!this.cancelTimer) {
-      const wait = Math.max(0, this.currentBackoff - elapsed);
-      this.cancelTimer = this.sink.schedule(() => {
-        this.cancelTimer = null;
-        void this.flush(false);
-      }, wait);
-    }
+    this.armTimer(Math.max(0, this.currentBackoff - elapsed));
+  }
+
+  /** Arm the flush timer unless one is already pending. */
+  private armTimer(wait: number): void {
+    if (this.cancelTimer) return;
+    this.cancelTimer = this.sink.schedule(() => {
+      this.cancelTimer = null;
+      void this.flush(false);
+    }, wait);
   }
 
   /** Enqueue a flush onto the serial chain; the returned Promise resolves when it settles. */
@@ -320,12 +351,20 @@ export class StreamBuffer {
     this.lastEditAt = this.sink.now();
     this.consecutiveFailures = 0;
     this.currentBackoff = this.opts.flushIntervalMs; // reset backoff on success
+    this.pausedUntil = 0;
   }
 
-  private onEditFailure(_err: unknown): void {
+  private onEditFailure(err: unknown): void {
     this.consecutiveFailures++;
-    // Exponential backoff, capped at maxBackoffMs.
-    this.currentBackoff = Math.min(this.currentBackoff * 2, this.opts.maxBackoffMs);
+    // A stated wait is obeyed as stated (bounded only by maxRetryAfterMs): the platform knows how
+    // long its limit lasts, and retrying before then only re-earns it. Without one, back off
+    // exponentially, capped at maxBackoffMs.
+    const stated = retryAfterMsOf(err);
+    this.currentBackoff =
+      stated !== undefined
+        ? Math.min(stated, this.opts.maxRetryAfterMs ?? DEFAULT_MAX_RETRY_AFTER_MS)
+        : Math.min(this.currentBackoff * 2, this.opts.maxBackoffMs);
+    this.pausedUntil = this.sink.now() + this.currentBackoff;
     if (this.consecutiveFailures >= this.opts.maxFailuresBeforeFallback) {
       this.degraded = true;
     }

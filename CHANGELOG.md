@@ -5,6 +5,35 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+- **All outbound writes to one chat now share one budget.** The platform counts the reply, the
+  tool bubbles, the reactions, the buttons and the agent's own reverse commands as a single stream
+  per chat, but each writer throttled itself (or, for tool bubbles, didn't) — so a run of
+  back-to-back tool calls drew `429 Too Many Requests` from Telegram, 78 times in one daemon run
+  with `retry after` climbing to 229 seconds. A token bucket per chat (`core/outbound-pacer.ts`)
+  is applied once to every adapter in the daemon, so every outbound path is metered without
+  touching any of them. It is keyed on the chat, never the topic or thread, because a Telegram
+  forum topic shares its parent chat's flood budget. Under congestion the reply is never dropped,
+  a queued edit is replaced by a newer edit to the same message, a stale tool-progress write may
+  be skipped, and a typing beat is dropped rather than queued. `stop()` delivers what is still
+  queued before the adapters go down.
+- **A stated `retry_after` is obeyed instead of guessed at.** Profiles can now translate their own
+  failures through a `classifyError` seam applied to every outbound call; Telegram's 429 becomes a
+  `RateLimitedError` carrying the wait, which pauses the whole chat and which the stream buffer
+  and tool bubbles wait out exactly, rather than retrying after `stream.maxBackoffMs` (10 s). The
+  number is recovered from the error message, because adapter-telegram rethrows a fresh `Error`
+  and drops `parameters.retry_after`; a contract test fails if that format changes.
+- **A backoff holds back the character threshold too.** `StreamBuffer` gated only its idle timer
+  on the backoff, so a rate-limited stream that kept producing text still retried every
+  `stream.charThreshold` characters, deepening the limit rather than letting it expire.
+- **Tool progress no longer freezes during a long run of tool calls.** The tool bubble was
+  repainted inside the turn's side-effect chain and any failure was swallowed there, so after one
+  429 the bubble stayed on stale progress for the rest of the turn — and the reply waited behind
+  every progress write. Painting is now asynchronous: a failed write is retried with the newest
+  state, delivery is tracked by a revision watermark (a ✓ recorded while a write was in flight is
+  not counted as delivered by it), and a finishing turn waits at most `outbound.finalizeWaitMs`
+  for its bubbles before giving up on retries.
+
 ## [0.3.2] - 2026-09-28
 
 ### Changed

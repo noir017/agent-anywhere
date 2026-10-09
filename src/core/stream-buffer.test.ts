@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import type { MessageRef } from '../types.js';
+import { RateLimitedError } from './outbound-errors.js';
 import {
   StreamBuffer,
   splitIntoChunks,
@@ -230,6 +231,10 @@ interface FakeSink extends StreamSink {
   setNow(t: number): void;
   runTimers(): void;
   failEdits(n: number): void;
+  /** Every edit call, successful or not — what a backoff assertion has to count. */
+  editAttempts: number;
+  /** Next n edits throw `err` — for asserting on a specific failure class. */
+  failEditsWith(n: number, err: unknown): void;
 }
 
 /**
@@ -242,6 +247,7 @@ function makeSink(opts: { withDelete?: boolean; deleteThrows?: boolean } = {}): 
   const { withDelete = true, deleteThrows = false } = opts;
   let nowVal = 0;
   let editFailRemaining = 0;
+  let editFailWith: unknown;
   const pending: Array<{ fn: () => void; at: number }> = [];
   let msgSeq = 0;
 
@@ -249,15 +255,18 @@ function makeSink(opts: { withDelete?: boolean; deleteThrows?: boolean } = {}): 
     sends: [],
     edits: [],
     deletes: [],
+    editAttempts: 0,
     async send(text: string): Promise<MessageRef> {
       sink.sends.push(text);
       return { channelId: 'c', messageId: `m${++msgSeq}` };
     },
     async edit(ref: MessageRef, text: string): Promise<void> {
+      sink.editAttempts++;
       if (editFailRemaining > 0) {
         editFailRemaining--;
-        throw new Error('rate-limited');
+        throw editFailWith ?? new Error('rate-limited');
       }
+      editFailWith = undefined;
       sink.edits.push({ ref, text });
     },
     now: () => nowVal,
@@ -279,6 +288,10 @@ function makeSink(opts: { withDelete?: boolean; deleteThrows?: boolean } = {}): 
     },
     failEdits(n: number) {
       editFailRemaining = n;
+    },
+    failEditsWith(n: number, err: unknown) {
+      editFailRemaining = n;
+      editFailWith = err;
     },
   };
   if (withDelete) {
@@ -929,5 +942,128 @@ describe('splitByMeasure (render-aware chunking)', () => {
     const measure = (s: string) => s.length * 5; // extreme expansion
     const chunks = splitByMeasure(text, limit, measure);
     for (const c of chunks) expect(measure(c)).toBeLessThanOrEqual(limit);
+  });
+});
+
+/**
+ * A wait the platform NAMED beats the blind exponential cap.
+ *
+ * `maxBackoffMs` is a guess about how long a rate limit lasts. Telegram has answered
+ * `retry after 229` — 22× the 10 s default — so capping a stated wait at the guess means retrying
+ * far too early and re-earning the flood limit with every attempt.
+ */
+describe('stated retry_after overrides the blind backoff cap', () => {
+  /** Drive one flush attempt at `t`. */
+  async function tick(buf: StreamBuffer, sink: FakeSink, t: number, delta: string): Promise<void> {
+    sink.setNow(t);
+    buf.push(delta);
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+  }
+
+  it('waits the 229 s Telegram asked for, not the 10 s maxBackoffMs', async () => {
+    const sink = makeSink();
+    const buf = new StreamBuffer(makeOpts({ charThreshold: 1, maxBackoffMs: 10_000 }), sink);
+
+    await tick(buf, sink, 0, 'a'); // initial send opens the message
+    expect(sink.sends.length).toBe(1);
+
+    sink.failEditsWith(1, new RateLimitedError('flood', { retryAfterMs: 229_000 }));
+    await tick(buf, sink, 1_000, 'b');
+    expect(sink.editAttempts).toBe(1); // the failed one
+
+    // Past maxBackoffMs but far short of the stated wait: nothing may go out.
+    await tick(buf, sink, 20_000, 'c');
+    expect(sink.editAttempts).toBe(1);
+
+    // Past the stated wait: delivery resumes, carrying everything accumulated meanwhile.
+    await tick(buf, sink, 231_000, 'd');
+    expect(sink.editAttempts).toBe(2);
+    expect(sink.edits.at(-1)!.text).toBe('abcd▌');
+  });
+
+  it('clamps an absurd stated wait so one bad number cannot wedge the buffer', async () => {
+    const sink = makeSink();
+    const buf = new StreamBuffer(
+      makeOpts({ charThreshold: 1, maxBackoffMs: 10_000, maxRetryAfterMs: 60_000 }),
+      sink
+    );
+
+    await tick(buf, sink, 0, 'a');
+    sink.failEditsWith(1, new RateLimitedError('flood', { retryAfterMs: 86_400_000 }));
+    await tick(buf, sink, 1_000, 'b');
+    expect(sink.editAttempts).toBe(1);
+
+    await tick(buf, sink, 62_000, 'c'); // past the clamp, nowhere near a day
+    expect(sink.editAttempts).toBe(2);
+  });
+
+  it('an unquantified failure still uses the doubling path, capped', async () => {
+    const sink = makeSink();
+    const buf = new StreamBuffer(
+      makeOpts({ charThreshold: 1, flushIntervalMs: 800, maxBackoffMs: 10_000 }),
+      sink
+    );
+
+    await tick(buf, sink, 0, 'a');
+    sink.failEdits(1); // plain Error: no number to honor
+    await tick(buf, sink, 1_000, 'b');
+    expect(sink.editAttempts).toBe(1);
+
+    // Backoff doubled 800 → 1600; still inside it at +1000, through it at +2000.
+    await tick(buf, sink, 2_000, 'c');
+    expect(sink.editAttempts).toBe(1);
+    await tick(buf, sink, 3_000, 'd');
+    expect(sink.editAttempts).toBe(2);
+  });
+
+  it('the pause ends on its own: an idle stream flushes once the wait is over', async () => {
+    const sink = makeSink();
+    const buf = new StreamBuffer(makeOpts({ charThreshold: 1 }), sink);
+
+    await tick(buf, sink, 0, 'a');
+    sink.failEditsWith(1, new RateLimitedError('flood', { retryAfterMs: 30_000 }));
+    await tick(buf, sink, 1_000, 'b');
+    await tick(buf, sink, 2_000, 'c'); // arrives during the pause, arms the end-of-pause timer
+    expect(sink.editAttempts).toBe(1);
+
+    sink.setNow(31_000);
+    sink.runTimers();
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+    expect(sink.editAttempts).toBe(2);
+    expect(sink.edits.at(-1)!.text).toBe('abc▌');
+  });
+});
+
+/**
+ * Regression: the backoff used to gate only the idle TIMER, so the char threshold walked straight
+ * through it. A rate-limited stream that kept producing text therefore retried every
+ * `charThreshold` characters — deepening the flood instead of waiting it out.
+ */
+describe('a backoff holds back the char threshold too, not just the timer', () => {
+  it('does not retry every charThreshold chars while the platform says wait', async () => {
+    const sink = makeSink();
+    const buf = new StreamBuffer(
+      makeOpts({ charThreshold: 10, flushIntervalMs: 800, maxBackoffMs: 10_000 }),
+      sink
+    );
+
+    sink.setNow(0);
+    buf.push('0123456789'); // opens the message
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+    expect(sink.sends.length).toBe(1);
+
+    sink.setNow(1_000);
+    sink.failEditsWith(1, new RateLimitedError('flood', { retryAfterMs: 229_000 }));
+    buf.push('abcdefghij');
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+    expect(sink.editAttempts).toBe(1);
+
+    // Ten more threshold-sized bursts inside the wait: each one used to spend an API call.
+    for (let n = 0; n < 10; n++) {
+      sink.setNow(2_000 + n * 100);
+      buf.push('klmnopqrst');
+      for (let i = 0; i < 6; i++) await Promise.resolve();
+    }
+    expect(sink.editAttempts).toBe(1);
   });
 });

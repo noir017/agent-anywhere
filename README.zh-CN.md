@@ -1,3 +1,6 @@
+> **本项目已迁到 [noir017/talkcode](https://github.com/noir017/talkcode)**，2.0.0 起改名 talkcode。
+> 这个仓库保留 1.40.0 及之前的 Release，以及给上游提的 PR 分支。
+
 <div align="center">
 
 # Agent Anywhere

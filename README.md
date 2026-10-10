@@ -1,3 +1,6 @@
+> **This project moved to [noir017/talkcode](https://github.com/noir017/talkcode)** and was renamed talkcode in 2.0.0.
+> This repository keeps the releases up to 1.40.0 and the branches of pull requests open upstream.
+
 <div align="center">
 
 # Agent Anywhere
